@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ! -f /etc/munge/munge.key ]]; then
-  echo "[controller] missing /etc/munge/munge.key" >&2
+MUNGE_KEY=/etc/munge/munge.key
+
+if [[ ! -f "$MUNGE_KEY" ]]; then
+  echo "[controller] missing $MUNGE_KEY" >&2
   exit 1
 fi
 
-chmod 400 /etc/munge/munge.key
-chown munge:munge /etc/munge/munge.key
-mkdir -p /var/run/munge /var/log
-chown munge:munge /var/run/munge
+# munge needs strict permissions and dedicated runtime/log/state directories
+install -d -m 0700 -o munge -g munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+chmod 0400 "$MUNGE_KEY"
+chown munge:munge "$MUNGE_KEY"
 
+install -d -m 0700 /root/.ssh
 if [[ -f /root/.ssh/id_ed25519.pub ]]; then
   cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
-  chmod 600 /root/.ssh/authorized_keys
+  chmod 0600 /root/.ssh/authorized_keys
 fi
 
 ssh-keygen -A
-/usr/sbin/munged --foreground --verbose &
+/usr/sbin/munged --syslog
+sleep 1
+if ! pgrep -x munged >/dev/null; then
+  echo "[controller] munged failed to start" >&2
+  exit 1
+fi
+
 /usr/sbin/sshd
 
-mkdir -p /var/spool/slurmctld /var/log/slurm
-slurmctld -Dvvv
+install -d -m 0755 /var/spool/slurmctld /var/log/slurm
+exec slurmctld -Dvvv

@@ -31,6 +31,8 @@ kubectl version --client
 
 ```bash
 bash phase1/scripts/bootstrap-phase1.sh
+# 若網速慢或機器較慢，可提高等待時間
+# ROLLOUT_TIMEOUT=600s bash phase1/scripts/bootstrap-phase1.sh
 ```
 
 該腳本會完成以下事情：
@@ -45,6 +47,9 @@ bash phase1/scripts/bootstrap-phase1.sh
    - `slurm-ssh-key`
 5. 套用 `phase1/manifests/slurm-static.yaml`。
 6. 等待 Controller / Worker StatefulSet Ready。
+
+
+> 若 rollout timeout，`bootstrap-phase1.sh` 會自動輸出 `describe pods` 與 controller/worker logs，方便快速定位問題。
 
 ## 3) 驗證 Slurm 狀態
 

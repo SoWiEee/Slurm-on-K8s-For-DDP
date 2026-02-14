@@ -3,9 +3,18 @@ set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 KIND_CONFIG=${KIND_CONFIG:-}
+ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 
 if ! command -v kind >/dev/null 2>&1; then
   echo "kind is required" >&2
+  exit 1
+fi
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl is required" >&2
+  exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker is required" >&2
   exit 1
 fi
 
@@ -26,7 +35,20 @@ kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 phase1/scripts/create-secrets.sh slurm
 kubectl apply -f phase1/manifests/slurm-static.yaml
 
-kubectl -n slurm rollout status statefulset/slurm-controller --timeout=180s
-kubectl -n slurm rollout status statefulset/slurm-worker --timeout=180s
+set +e
+kubectl -n slurm rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
+rc1=$?
+kubectl -n slurm rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+rc2=$?
+set -e
+
+if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
+  echo "[bootstrap] rollout failed, collecting diagnostics..." >&2
+  kubectl -n slurm get pods -o wide || true
+  kubectl -n slurm describe pods || true
+  kubectl -n slurm logs statefulset/slurm-controller --all-containers=true --tail=200 || true
+  kubectl -n slurm logs statefulset/slurm-worker --all-containers=true --tail=200 || true
+  exit 1
+fi
 
 echo "Phase 1 deployment completed."

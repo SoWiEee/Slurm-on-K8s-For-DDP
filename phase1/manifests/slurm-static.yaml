@@ -39,7 +39,7 @@ metadata:
 data:
   slurm.conf: |
     ClusterName=kind-slurm
-    SlurmctldHost=slurm-controller-0
+    SlurmctldHost=slurm-controller-0.slurm-controller
     MpiDefault=none
     ProctrackType=proctrack/linuxproc
     ReturnToService=2
@@ -85,6 +85,16 @@ spec:
           ports:
             - containerPort: 22
             - containerPort: 6817
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm/slurm.conf
@@ -134,6 +144,16 @@ spec:
           ports:
             - containerPort: 22
             - containerPort: 6818
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null && pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm/slurm.conf
