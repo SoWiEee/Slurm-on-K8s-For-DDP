@@ -11,12 +11,11 @@ if [[ ! -f "$MUNGE_SRC" ]]; then
 fi
 
 # Prepare writable runtime locations and enforce secure munge ownership/permissions.
-for d in /etc/munge /run/munge /var/lib/munge /var/log/munge; do
-  mkdir -p "$d"
-  chown munge:munge "$d"
-  chmod 0700 "$d"
-done
+mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge
 chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+# munged requires execute bit for all on socket dir path.
+chmod 0711 /run/munge
 
 cp "$MUNGE_SRC" "$MUNGE_DST"
 chown munge:munge "$MUNGE_DST"

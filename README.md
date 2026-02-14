@@ -128,7 +128,8 @@ Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/cho
 這表示 `munged` 檢查到目錄權限/擁有者不安全。
 
 已修正 entrypoint 啟動流程：
-- 明確對 `/etc/munge`、`/run/munge`、`/var/lib/munge`、`/var/log/munge` 做 `chown munge:munge` 與 `chmod 0700`（含遞迴）
+- 明確對 `/etc/munge`、`/var/lib/munge`、`/var/log/munge` 做 `chown munge:munge` 與 `chmod 0700`（含遞迴）
+- `/run/munge` 使用 `chmod 0711`（`munged` 要求 socket 路徑對 all 具有 execute）
 - 以 `munge` 使用者啟動 `munged`，避免權限檢查不一致
 - 若 `munged` 啟動失敗，額外輸出上述目錄權限與 `id munge` 供除錯
 
