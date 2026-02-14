@@ -125,6 +125,33 @@ kubectl -n slurm logs deployment/slurm-elastic-operator -f
 kubectl -n slurm get statefulset slurm-worker -w
 ```
 
+可選進階設定（Milestone C + D）：
+
+- `PARTITIONS_JSON`：啟用每個 partition 的獨立擴縮。
+- `CHECKPOINT_GUARD_ENABLED=true` + `CHECKPOINT_PATH` + `MAX_CHECKPOINT_AGE_SECONDS`：啟用 checkpoint-aware scale-down 保護。
+
+範例（單 partition + checkpoint guard）：
+
+```bash
+kubectl -n slurm set env deployment/slurm-elastic-operator \
+  SLURM_PARTITION=debug \
+  WORKER_STATEFULSET=slurm-worker \
+  CHECKPOINT_GUARD_ENABLED=true \
+  CHECKPOINT_PATH=/shared/checkpoints/latest.ckpt \
+  MAX_CHECKPOINT_AGE_SECONDS=600
+```
+
+範例（多 partition）：
+
+```bash
+kubectl -n slurm set env deployment/slurm-elastic-operator \
+  PARTITIONS_JSON='[
+    {"partition":"debug","worker_statefulset":"slurm-worker-debug","min_replicas":1,"max_replicas":3,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60},
+    {"partition":"gpu","worker_statefulset":"slurm-worker-gpu","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":90,"checkpoint_path":"/shared/checkpoints/gpu-latest.ckpt","max_checkpoint_age_seconds":900}
+  ]'
+```
+
+
 ## 4) 常用操作
 
 ### 查看 Pod 狀態

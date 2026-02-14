@@ -478,3 +478,25 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
    - 欄位包含 policy/state/decision/cooldown，方便後續用 `jq` 或 Python 做 KPI 聚合。
 
 後續可直接在此基礎上往 Milestone C（partition-aware）與 Milestone D（checkpoint-aware）前進。
+
+## Milestone C + D 實作落地（已完成）
+
+本次完成兩個方向：
+
+### C) Partition-aware（每個 partition 獨立擴縮）
+
+- 新增 `PartitionConfig` 與 `PartitionState`，讓每個 partition 各自計算 target replicas。
+- 透過 `PARTITIONS_JSON` 支援多 partition 設定；若未提供則 fallback 到單 partition（`SLURM_PARTITION` + `WORKER_STATEFULSET`）。
+- control loop 以 partition 為迴圈單位，scale action 會指向對應 worker StatefulSet。
+
+### D) Checkpoint-aware（checkpoint 保護式縮容）
+
+- 新增 `running_jobs` 與 checkpoint age 判斷。
+- 當「有 running job 且準備 scale-down」時：
+  - checkpoint 狀態未知（檔案不存在/未設定）=> 阻擋縮容。
+  - checkpoint age 超過門檻（`MAX_CHECKPOINT_AGE_SECONDS`）=> 阻擋縮容。
+- 只有 checkpoint 在安全窗口時才允許縮容，降低 DDP 任務恢復成本。
+
+### 觀測面
+
+- 保持 Milestone B 的結構化日誌，並補充 partition/checkpoint 相關欄位，方便後續比較不同 partition 的行為與 checkpoint 保護命中率。

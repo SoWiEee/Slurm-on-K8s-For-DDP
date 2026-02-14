@@ -56,6 +56,8 @@ spec:
               value: slurm
             - name: CONTROLLER_POD
               value: slurm-controller-0
+            - name: SLURM_PARTITION
+              value: debug
             - name: WORKER_STATEFULSET
               value: slurm-worker
             - name: MIN_REPLICAS
@@ -70,3 +72,9 @@ spec:
               value: "15"
             - name: SCALE_DOWN_COOLDOWN_SECONDS
               value: "60"
+            - name: CHECKPOINT_GUARD_ENABLED
+              value: "true"
+            - name: CHECKPOINT_PATH
+              value: ""
+            - name: MAX_CHECKPOINT_AGE_SECONDS
+              value: "600"

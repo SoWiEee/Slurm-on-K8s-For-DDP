@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Phase 2 elastic scaler.
 
-Milestone A + B implementation:
-- Equivalent control behavior with clearer architecture (Collector / Policy / Actuator).
-- Structured JSON logs for observation, decisions, actions and errors.
+Milestone C + D implementation:
+- Partition-aware independent scaling.
+- Checkpoint-aware scale-down guard.
 """
 
 from __future__ import annotations
@@ -18,23 +18,44 @@ from typing import Any, Iterable
 
 
 @dataclass(frozen=True)
-class Config:
-    namespace: str = os.getenv("NAMESPACE", "slurm")
-    controller_pod: str = os.getenv("CONTROLLER_POD", "slurm-controller-0")
-    worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker")
-    min_replicas: int = int(os.getenv("MIN_REPLICAS", "1"))
-    max_replicas: int = int(os.getenv("MAX_REPLICAS", "3"))
-    scale_up_step: int = int(os.getenv("SCALE_UP_STEP", "1"))
-    scale_down_step: int = int(os.getenv("SCALE_DOWN_STEP", "1"))
-    poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
-    scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
-    policy_name: str = os.getenv("SCALING_POLICY", "basic_queue")
+class PartitionConfig:
+    partition: str
+    worker_statefulset: str
+    min_replicas: int
+    max_replicas: int
+    scale_up_step: int
+    scale_down_step: int
+    scale_down_cooldown: int
+    checkpoint_path: str = ""
+    max_checkpoint_age_seconds: int = 600
 
 
 @dataclass(frozen=True)
-class ClusterState:
+class Config:
+    namespace: str = os.getenv("NAMESPACE", "slurm")
+    controller_pod: str = os.getenv("CONTROLLER_POD", "slurm-controller-0")
+    poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
+    policy_name: str = os.getenv("SCALING_POLICY", "checkpoint_aware_queue")
+    checkpoint_guard_enabled: bool = os.getenv("CHECKPOINT_GUARD_ENABLED", "true").lower() == "true"
+    # For single-partition fallback.
+    default_partition: str = os.getenv("SLURM_PARTITION", "debug")
+    default_worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker")
+    default_min_replicas: int = int(os.getenv("MIN_REPLICAS", "1"))
+    default_max_replicas: int = int(os.getenv("MAX_REPLICAS", "3"))
+    default_scale_up_step: int = int(os.getenv("SCALE_UP_STEP", "1"))
+    default_scale_down_step: int = int(os.getenv("SCALE_DOWN_STEP", "1"))
+    default_scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
+    default_checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "")
+    default_max_checkpoint_age_seconds: int = int(os.getenv("MAX_CHECKPOINT_AGE_SECONDS", "600"))
+
+
+@dataclass(frozen=True)
+class PartitionState:
+    partition: str
+    worker_statefulset: str
     current_replicas: int
     pending_jobs: int
+    running_jobs: int
     busy_nodes: int
 
 
@@ -46,8 +67,6 @@ class ScalingDecision:
 
 
 class JsonLogger:
-    """Simple JSON-lines logger for operator events."""
-
     def emit(self, event_type: str, level: str = "INFO", **fields: Any) -> None:
         payload: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -86,96 +105,159 @@ class KubectlClient:
         )
 
 
-class ClusterStateCollector:
-    """Collects current cluster/slurm signals without making decisions."""
+class PartitionConfigLoader:
+    @staticmethod
+    def load(cfg: Config) -> list[PartitionConfig]:
+        raw = os.getenv("PARTITIONS_JSON", "").strip()
+        if not raw:
+            return [
+                PartitionConfig(
+                    partition=cfg.default_partition,
+                    worker_statefulset=cfg.default_worker_statefulset,
+                    min_replicas=cfg.default_min_replicas,
+                    max_replicas=cfg.default_max_replicas,
+                    scale_up_step=cfg.default_scale_up_step,
+                    scale_down_step=cfg.default_scale_down_step,
+                    scale_down_cooldown=cfg.default_scale_down_cooldown,
+                    checkpoint_path=cfg.default_checkpoint_path,
+                    max_checkpoint_age_seconds=cfg.default_max_checkpoint_age_seconds,
+                )
+            ]
 
-    def __init__(self, cfg: Config, client: KubectlClient):
-        self.cfg = cfg
+        payload = json.loads(raw)
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("PARTITIONS_JSON must be a non-empty JSON array")
+
+        partitions: list[PartitionConfig] = []
+        for item in payload:
+            partitions.append(
+                PartitionConfig(
+                    partition=item["partition"],
+                    worker_statefulset=item["worker_statefulset"],
+                    min_replicas=int(item.get("min_replicas", 1)),
+                    max_replicas=int(item.get("max_replicas", 1)),
+                    scale_up_step=int(item.get("scale_up_step", 1)),
+                    scale_down_step=int(item.get("scale_down_step", 1)),
+                    scale_down_cooldown=int(item.get("scale_down_cooldown", 60)),
+                    checkpoint_path=item.get("checkpoint_path", ""),
+                    max_checkpoint_age_seconds=int(item.get("max_checkpoint_age_seconds", 600)),
+                )
+            )
+        return partitions
+
+
+class ClusterStateCollector:
+    def __init__(self, client: KubectlClient):
         self.client = client
 
-    def get_current_replicas(self) -> int:
+    def get_current_replicas(self, statefulset: str) -> int:
         output = self.client.run(
-            [
-                "-n",
-                self.cfg.namespace,
-                "get",
-                "statefulset",
-                self.cfg.worker_statefulset,
-                "-o",
-                "json",
-            ]
+            ["-n", self.client.cfg.namespace, "get", "statefulset", statefulset, "-o", "json"]
         )
         payload = json.loads(output)
         return int(payload.get("spec", {}).get("replicas", 0))
 
-    def get_pending_jobs(self) -> int:
-        output = self.client.exec_in_controller("squeue -h -t PENDING | wc -l")
+    def get_pending_jobs(self, partition: str) -> int:
+        output = self.client.exec_in_controller(f"squeue -h -t PENDING -p {partition} | wc -l")
         return int(output or "0")
 
-    def get_busy_nodes(self) -> int:
-        # ALLOCATED/MIXED/COMPLETING are considered busy.
+    def get_running_jobs(self, partition: str) -> int:
+        output = self.client.exec_in_controller(f"squeue -h -t RUNNING -p {partition} | wc -l")
+        return int(output or "0")
+
+    def get_busy_nodes(self, partition: str) -> int:
         output = self.client.exec_in_controller(
-            r"sinfo -h -N -o '%T' | egrep -E 'ALLOCATED|MIXED|COMPLETING' | wc -l || true"
+            rf"sinfo -h -p {partition} -N -o '%T' | egrep -E 'ALLOCATED|MIXED|COMPLETING' | wc -l || true"
         )
         return int(output or "0")
 
-    def collect(self) -> ClusterState:
-        return ClusterState(
-            current_replicas=self.get_current_replicas(),
-            pending_jobs=self.get_pending_jobs(),
-            busy_nodes=self.get_busy_nodes(),
+    def get_checkpoint_age_seconds(self, checkpoint_path: str) -> int | None:
+        if not checkpoint_path:
+            return None
+        command = (
+            f"if [ -f '{checkpoint_path}' ]; then "
+            f"now=$(date +%s); mtime=$(stat -c %Y '{checkpoint_path}'); "
+            "echo $((now - mtime)); else echo -1; fi"
+        )
+        output = self.client.exec_in_controller(command)
+        age = int(output or "-1")
+        if age < 0:
+            return None
+        return age
+
+    def collect_partition_state(self, p: PartitionConfig) -> PartitionState:
+        return PartitionState(
+            partition=p.partition,
+            worker_statefulset=p.worker_statefulset,
+            current_replicas=self.get_current_replicas(p.worker_statefulset),
+            pending_jobs=self.get_pending_jobs(p.partition),
+            running_jobs=self.get_running_jobs(p.partition),
+            busy_nodes=self.get_busy_nodes(p.partition),
         )
 
 
-class BasicQueuePolicy:
-    """Equivalent to previous Phase 2 decision logic."""
+class CheckpointAwareQueuePolicy:
+    def __init__(self, guard_enabled: bool):
+        self.guard_enabled = guard_enabled
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def evaluate(self, state: ClusterState) -> ScalingDecision:
+    def evaluate(
+        self,
+        partition_cfg: PartitionConfig,
+        state: PartitionState,
+        checkpoint_age_seconds: int | None,
+    ) -> ScalingDecision:
         if state.pending_jobs > 0:
             target = clamp(
-                state.current_replicas + self.cfg.scale_up_step,
-                self.cfg.min_replicas,
-                self.cfg.max_replicas,
+                state.current_replicas + partition_cfg.scale_up_step,
+                partition_cfg.min_replicas,
+                partition_cfg.max_replicas,
             )
             return self._to_decision(state.current_replicas, target, "pending_jobs")
 
-        safe_floor = max(self.cfg.min_replicas, state.busy_nodes)
-        target = clamp(
-            state.current_replicas - self.cfg.scale_down_step,
+        safe_floor = max(partition_cfg.min_replicas, state.busy_nodes)
+        candidate_target = clamp(
+            state.current_replicas - partition_cfg.scale_down_step,
             safe_floor,
-            self.cfg.max_replicas,
+            partition_cfg.max_replicas,
         )
-        return self._to_decision(state.current_replicas, target, "no_pending_jobs")
+
+        if candidate_target < state.current_replicas and self.guard_enabled and state.running_jobs > 0:
+            if checkpoint_age_seconds is None:
+                return ScalingDecision(
+                    target_replicas=state.current_replicas,
+                    action="keep",
+                    reason="checkpoint_unknown_block_scale_down",
+                )
+            if checkpoint_age_seconds > partition_cfg.max_checkpoint_age_seconds:
+                return ScalingDecision(
+                    target_replicas=state.current_replicas,
+                    action="keep",
+                    reason="checkpoint_stale_block_scale_down",
+                )
+
+        return self._to_decision(state.current_replicas, candidate_target, "no_pending_jobs")
 
     @staticmethod
     def _to_decision(current: int, target: int, reason: str) -> ScalingDecision:
         if target > current:
-            action = "scale_up"
-        elif target < current:
-            action = "scale_down"
-        else:
-            action = "keep"
-        return ScalingDecision(target_replicas=target, action=action, reason=reason)
+            return ScalingDecision(target_replicas=target, action="scale_up", reason=reason)
+        if target < current:
+            return ScalingDecision(target_replicas=target, action="scale_down", reason=reason)
+        return ScalingDecision(target_replicas=target, action="keep", reason=reason)
 
 
 class StatefulSetActuator:
-    """Applies scaling decision to Kubernetes."""
-
-    def __init__(self, cfg: Config, client: KubectlClient):
-        self.cfg = cfg
+    def __init__(self, client: KubectlClient):
         self.client = client
 
-    def patch_replicas(self, replicas: int) -> None:
+    def patch_replicas(self, statefulset: str, replicas: int) -> None:
         self.client.run(
             [
                 "-n",
-                self.cfg.namespace,
+                self.client.cfg.namespace,
                 "patch",
                 "statefulset",
-                self.cfg.worker_statefulset,
+                statefulset,
                 "--type=merge",
                 "-p",
                 json.dumps({"spec": {"replicas": replicas}}),
@@ -183,108 +265,144 @@ class StatefulSetActuator:
         )
 
 
-def validate_config(cfg: Config) -> None:
-    if cfg.min_replicas < 0 or cfg.max_replicas < 0:
-        raise ValueError("replicas must be >= 0")
-    if cfg.min_replicas > cfg.max_replicas:
-        raise ValueError("MIN_REPLICAS cannot be larger than MAX_REPLICAS")
-
-
 class OperatorApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.logger = JsonLogger()
         self.client = KubectlClient(cfg)
-        self.collector = ClusterStateCollector(cfg, self.client)
-        self.policy = BasicQueuePolicy(cfg)
-        self.actuator = StatefulSetActuator(cfg, self.client)
-        self.last_scale_up_at = 0.0
+        self.collector = ClusterStateCollector(self.client)
+        self.policy = CheckpointAwareQueuePolicy(cfg.checkpoint_guard_enabled)
+        self.actuator = StatefulSetActuator(self.client)
+        self.partition_cfgs = PartitionConfigLoader.load(cfg)
+        self.last_scale_up_at: dict[str, float] = {p.partition: 0.0 for p in self.partition_cfgs}
 
     def run(self) -> None:
         self.logger.emit(
             "startup",
             policy=self.cfg.policy_name,
             config=asdict(self.cfg),
+            partitions=[asdict(p) for p in self.partition_cfgs],
         )
 
         while True:
-            try:
-                state = self.collector.collect()
-                decision = self.policy.evaluate(state)
+            for partition_cfg in self.partition_cfgs:
+                partition = partition_cfg.partition
+                try:
+                    state = self.collector.collect_partition_state(partition_cfg)
+                    checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
+                    decision = self.policy.evaluate(partition_cfg, state, checkpoint_age)
 
-                now = time.time()
-                cooldown_elapsed = now - self.last_scale_up_at
-                cooldown_remaining = max(
-                    self.cfg.scale_down_cooldown - int(cooldown_elapsed),
-                    0,
-                )
+                    now = time.time()
+                    cooldown_elapsed = now - self.last_scale_up_at[partition]
+                    cooldown_remaining = max(partition_cfg.scale_down_cooldown - int(cooldown_elapsed), 0)
 
-                self.logger.emit(
-                    "loop_observation",
-                    policy=self.cfg.policy_name,
-                    state=asdict(state),
-                    decision=asdict(decision),
-                    cooldown_remaining_seconds=cooldown_remaining,
-                )
-
-                if decision.action == "scale_up":
-                    self.actuator.patch_replicas(decision.target_replicas)
-                    self.last_scale_up_at = now
                     self.logger.emit(
-                        "scale_action",
+                        "loop_observation",
                         policy=self.cfg.policy_name,
-                        action="scale_up",
-                        from_replicas=state.current_replicas,
-                        to_replicas=decision.target_replicas,
-                        reason=decision.reason,
-                        pending_jobs=state.pending_jobs,
-                        busy_nodes=state.busy_nodes,
+                        partition=partition,
+                        state=asdict(state),
+                        decision=asdict(decision),
+                        checkpoint_age_seconds=checkpoint_age,
+                        cooldown_remaining_seconds=cooldown_remaining,
                     )
-                elif decision.action == "scale_down":
-                    if cooldown_elapsed >= self.cfg.scale_down_cooldown:
-                        self.actuator.patch_replicas(decision.target_replicas)
+
+                    if decision.action == "scale_up":
+                        self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
+                        self.last_scale_up_at[partition] = now
                         self.logger.emit(
                             "scale_action",
                             policy=self.cfg.policy_name,
-                            action="scale_down",
+                            partition=partition,
+                            action="scale_up",
+                            statefulset=partition_cfg.worker_statefulset,
                             from_replicas=state.current_replicas,
                             to_replicas=decision.target_replicas,
                             reason=decision.reason,
                             pending_jobs=state.pending_jobs,
+                            running_jobs=state.running_jobs,
                             busy_nodes=state.busy_nodes,
                         )
+                    elif decision.action == "scale_down":
+                        if cooldown_elapsed >= partition_cfg.scale_down_cooldown:
+                            self.actuator.patch_replicas(
+                                partition_cfg.worker_statefulset,
+                                decision.target_replicas,
+                            )
+                            self.logger.emit(
+                                "scale_action",
+                                policy=self.cfg.policy_name,
+                                partition=partition,
+                                action="scale_down",
+                                statefulset=partition_cfg.worker_statefulset,
+                                from_replicas=state.current_replicas,
+                                to_replicas=decision.target_replicas,
+                                reason=decision.reason,
+                                pending_jobs=state.pending_jobs,
+                                running_jobs=state.running_jobs,
+                                busy_nodes=state.busy_nodes,
+                            )
+                        else:
+                            self.logger.emit(
+                                "scale_skipped",
+                                policy=self.cfg.policy_name,
+                                partition=partition,
+                                action="scale_down",
+                                statefulset=partition_cfg.worker_statefulset,
+                                from_replicas=state.current_replicas,
+                                to_replicas=decision.target_replicas,
+                                reason="scale_down_cooldown",
+                                cooldown_remaining_seconds=cooldown_remaining,
+                                pending_jobs=state.pending_jobs,
+                                running_jobs=state.running_jobs,
+                                busy_nodes=state.busy_nodes,
+                            )
                     else:
                         self.logger.emit(
                             "scale_skipped",
                             policy=self.cfg.policy_name,
-                            action="scale_down",
+                            partition=partition,
+                            action="keep",
+                            statefulset=partition_cfg.worker_statefulset,
                             from_replicas=state.current_replicas,
                             to_replicas=decision.target_replicas,
-                            reason="scale_down_cooldown",
-                            cooldown_remaining_seconds=cooldown_remaining,
+                            reason=decision.reason,
+                            checkpoint_age_seconds=checkpoint_age,
                             pending_jobs=state.pending_jobs,
+                            running_jobs=state.running_jobs,
                             busy_nodes=state.busy_nodes,
                         )
-                else:
-                    self.logger.emit(
-                        "scale_skipped",
-                        policy=self.cfg.policy_name,
-                        action="keep",
-                        from_replicas=state.current_replicas,
-                        to_replicas=decision.target_replicas,
-                        reason=decision.reason,
-                        pending_jobs=state.pending_jobs,
-                        busy_nodes=state.busy_nodes,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.emit("error", level="ERROR", message=str(exc))
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.emit("error", level="ERROR", partition=partition, message=str(exc))
 
             time.sleep(self.cfg.poll_interval)
 
 
+def validate_config(cfg: Config, partition_cfgs: list[PartitionConfig]) -> None:
+    if cfg.poll_interval <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must be > 0")
+
+    seen: set[str] = set()
+    for p in partition_cfgs:
+        if p.partition in seen:
+            raise ValueError(f"duplicate partition in config: {p.partition}")
+        seen.add(p.partition)
+
+        if p.min_replicas < 0 or p.max_replicas < 0:
+            raise ValueError(f"{p.partition}: replicas must be >= 0")
+        if p.min_replicas > p.max_replicas:
+            raise ValueError(f"{p.partition}: min_replicas cannot be larger than max_replicas")
+        if p.scale_up_step <= 0 or p.scale_down_step <= 0:
+            raise ValueError(f"{p.partition}: scale steps must be > 0")
+        if p.scale_down_cooldown < 0:
+            raise ValueError(f"{p.partition}: scale_down_cooldown must be >= 0")
+        if p.max_checkpoint_age_seconds < 0:
+            raise ValueError(f"{p.partition}: max_checkpoint_age_seconds must be >= 0")
+
+
 def main() -> None:
     cfg = Config()
-    validate_config(cfg)
+    partition_cfgs = PartitionConfigLoader.load(cfg)
+    validate_config(cfg, partition_cfgs)
     OperatorApp(cfg).run()
 
 
