@@ -39,7 +39,8 @@ metadata:
 data:
   slurm.conf: |
     ClusterName=kind-slurm
-    SlurmctldHost=slurm-controller-0.slurm-controller
+    SlurmctldHost=slurm-controller-0
+    SlurmctldAddr=slurm-controller-0.slurm-controller.slurm.svc.cluster.local
     MpiDefault=none
     ProctrackType=proctrack/linuxproc
     ReturnToService=2
@@ -51,6 +52,7 @@ data:
     SwitchType=switch/none
     TaskPlugin=task/none
     SchedulerType=sched/backfill
+    MailProg=/bin/true
     SelectType=select/cons_tres
     SelectTypeParameters=CR_Core
 
@@ -59,7 +61,7 @@ data:
     AuthType=auth/munge
     CryptoType=crypto/munge
 
-    NodeName=slurm-worker-[0-2] CPUs=2 RealMemory=2048 State=UNKNOWN
+    NodeName=slurm-worker-[0-2] CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
     PartitionName=debug Nodes=slurm-worker-[0-2] Default=YES MaxTime=INFINITE State=UP
 ---
 apiVersion: apps/v1

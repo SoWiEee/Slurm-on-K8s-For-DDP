@@ -88,6 +88,8 @@ if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
     kubectl -n "$NAMESPACE" exec "$p" -- sh -c 'ls -lah /slurm-secrets 2>/dev/null || true' || true
   done
 
+  kubectl -n "$NAMESPACE" exec statefulset/slurm-worker -- sh -c 'getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true' || true
+
   echo "[bootstrap] context: $(kubectl config current-context)" >&2
   echo "[bootstrap] hint: try FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh" >&2
   exit 1

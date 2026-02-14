@@ -133,6 +133,13 @@ Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/cho
 - 以 `munge` 使用者啟動 `munged`，避免權限檢查不一致
 - 若 `munged` 啟動失敗，額外輸出上述目錄權限與 `id munge` 供除錯
 
+### 錯誤 5：`This host (...) not a valid controller` 或 worker 無法解析 controller FQDN
+
+已修正 `slurm.conf`：
+- `SlurmctldHost=slurm-controller-0`（與 Pod hostname 一致）
+- `SlurmctldAddr=slurm-controller-0.slurm-controller.slurm.svc.cluster.local`（固定可解析 FQDN）
+- 並把 worker CPU 拓撲參數調整為符合 Kind 節點常見硬體，降低 slurmd 拓撲不一致警告
+
 
 # 🔥 Motivation
 
