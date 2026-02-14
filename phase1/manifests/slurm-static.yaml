@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slurm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-controller
+  namespace: slurm
+spec:
+  clusterIP: None
+  selector:
+    app: slurm-controller
+  ports:
+    - name: slurmctld
+      port: 6817
+      targetPort: 6817
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-worker
+  namespace: slurm
+spec:
+  clusterIP: None
+  selector:
+    app: slurm-worker
+  ports:
+    - name: slurmd
+      port: 6818
+      targetPort: 6818
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-config
+  namespace: slurm
+data:
+  slurm.conf: |
+    ClusterName=kind-slurm
+    SlurmctldHost=slurm-controller-0
+    MpiDefault=none
+    ProctrackType=proctrack/linuxproc
+    ReturnToService=2
+    SlurmctldPidFile=/var/run/slurmctld.pid
+    SlurmdPidFile=/var/run/slurmd.pid
+    SlurmdSpoolDir=/var/spool/slurmd
+    SlurmUser=root
+    StateSaveLocation=/var/spool/slurmctld
+    SwitchType=switch/none
+    TaskPlugin=task/none
+    SchedulerType=sched/backfill
+    SelectType=select/cons_tres
+    SelectTypeParameters=CR_Core
+
+    SlurmctldPort=6817
+    SlurmdPort=6818
+    AuthType=auth/munge
+    CryptoType=crypto/munge
+
+    NodeName=slurm-worker-[0-1] CPUs=2 RealMemory=2048 State=UNKNOWN
+    PartitionName=debug Nodes=slurm-worker-[0-1] Default=YES MaxTime=INFINITE State=UP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurm-controller
+  namespace: slurm
+spec:
+  serviceName: slurm-controller
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-controller
+  template:
+    metadata:
+      labels:
+        app: slurm-controller
+    spec:
+      containers:
+        - name: slurm-controller
+          image: slurm-controller:phase1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 22
+            - containerPort: 6817
+          volumeMounts:
+            - name: slurm-config
+              mountPath: /etc/slurm/slurm.conf
+              subPath: slurm.conf
+            - name: munge-key
+              mountPath: /etc/munge/munge.key
+              subPath: munge.key
+            - name: ssh-key
+              mountPath: /root/.ssh/id_ed25519
+              subPath: id_ed25519
+              readOnly: true
+            - name: ssh-key
+              mountPath: /root/.ssh/id_ed25519.pub
+              subPath: id_ed25519.pub
+              readOnly: true
+      volumes:
+        - name: slurm-config
+          configMap:
+            name: slurm-config
+        - name: munge-key
+          secret:
+            secretName: slurm-munge-key
+        - name: ssh-key
+          secret:
+            secretName: slurm-ssh-key
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurm-worker
+  namespace: slurm
+spec:
+  serviceName: slurm-worker
+  replicas: 2
+  selector:
+    matchLabels:
+      app: slurm-worker
+  template:
+    metadata:
+      labels:
+        app: slurm-worker
+    spec:
+      containers:
+        - name: slurm-worker
+          image: slurm-worker:phase1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 22
+            - containerPort: 6818
+          volumeMounts:
+            - name: slurm-config
+              mountPath: /etc/slurm/slurm.conf
+              subPath: slurm.conf
+            - name: munge-key
+              mountPath: /etc/munge/munge.key
+              subPath: munge.key
+            - name: ssh-key
+              mountPath: /root/.ssh/id_ed25519
+              subPath: id_ed25519
+              readOnly: true
+            - name: ssh-key
+              mountPath: /root/.ssh/id_ed25519.pub
+              subPath: id_ed25519.pub
+              readOnly: true
+      volumes:
+        - name: slurm-config
+          configMap:
+            name: slurm-config
+        - name: munge-key
+          secret:
+            secretName: slurm-munge-key
+        - name: ssh-key
+          secret:
+            secretName: slurm-ssh-key

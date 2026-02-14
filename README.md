@@ -6,7 +6,77 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 
 # ✨ Features
 
+- ✅ Phase 1 已完成：可在 Kind 上部署「靜態 Slurm Controller + Worker」叢集。
+- ✅ 以腳本自動建立 Munge / SSH Secret，減少手動設定錯誤。
+- ✅ 提供一鍵 bootstrap + verify 腳本，讓新手可快速重現。
+- ✅ 將 Slurm 設定集中於 ConfigMap，提升可維護性與可讀性。
+
 # 🚀 Getting Started
+
+> 適用對象：Windows 11（已安裝 Docker Desktop、kind、kubectl）
+
+## 1) 前置檢查
+
+請先確認 Docker Desktop 已啟動，並可在終端機執行：
+
+```bash
+docker version
+kind version
+kubectl version --client
+```
+
+## 2) 建立與部署 Phase 1 環境
+
+在專案根目錄執行：
+
+```bash
+bash phase1/scripts/bootstrap-phase1.sh
+```
+
+該腳本會完成以下事情：
+
+1. 若不存在，建立 `slurm-lab` Kind 叢集。
+2. 建置兩個映像檔：
+   - `slurm-controller:phase1`
+   - `slurm-worker:phase1`
+3. 將映像載入 Kind。
+4. 自動產生並套用：
+   - `slurm-munge-key`
+   - `slurm-ssh-key`
+5. 套用 `phase1/manifests/slurm-static.yaml`。
+6. 等待 Controller / Worker StatefulSet Ready。
+
+## 3) 驗證 Slurm 狀態
+
+```bash
+bash phase1/scripts/verify-phase1.sh
+```
+
+你應該可以看到：
+
+- `sinfo` 有 `debug` 分區。
+- `slurm-worker-0`、`slurm-worker-1` 狀態可被 `scontrol` 正常辨識。
+- Controller 可 SSH 到 Worker（驗證 Pod 間 SSH 基本互通）。
+
+## 4) 常用操作
+
+### 查看 Pod 狀態
+
+```bash
+kubectl -n slurm get pods -o wide
+```
+
+### 查看 Controller 日誌
+
+```bash
+kubectl -n slurm logs statefulset/slurm-controller -f
+```
+
+### 清理環境
+
+```bash
+kind delete cluster --name slurm-lab
+```
 
 # 🔥 Motivation
 
