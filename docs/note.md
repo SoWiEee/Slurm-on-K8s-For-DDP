@@ -132,7 +132,7 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
 
 5. `munged: Error: PRNG seed dir is insecure: invalid ownership of "/var/lib/munge"`
    - `munged` 會檢查安全權限；只要 `/var/lib/munge` owner/mode 不符合就會直接退出。
-   - 解法：entrypoint 顯式修正 `/etc/munge`、`/run/munge`、`/var/lib/munge`、`/var/log/munge` 為 `munge:munge` + `0700`。
+   - 解法：entrypoint 顯式修正 `/etc/munge`、`/run/munge`、`/var/lib/munge`、`/var/log/munge` 為 `munge:munge` + `0700`（含遞迴），並改用 `munge` 使用者啟動 `munged`。
 
 ## 後續銜接（Phase 2 前）
 

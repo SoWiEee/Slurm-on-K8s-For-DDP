@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /var/run/sshd /var/run/munge /var/spool/slurmd /etc/slurm /root/.ssh \
-    && chown -R munge:munge /var/run/munge \
+RUN mkdir -p /var/run/sshd /var/run/munge /var/lib/munge /var/log/munge /var/spool/slurmd /etc/slurm /root/.ssh \
+    && chown -R munge:munge /var/run/munge /var/lib/munge /var/log/munge \
     && chmod 700 /root/.ssh
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

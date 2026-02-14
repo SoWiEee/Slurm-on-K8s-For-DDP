@@ -15,6 +15,7 @@ for d in /etc/munge /run/munge /var/lib/munge /var/log/munge; do
   chown munge:munge "$d"
   chmod 0700 "$d"
 done
+chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
 
 cp "$MUNGE_SRC" "$MUNGE_DST"
 chown munge:munge "$MUNGE_DST"
@@ -33,11 +34,15 @@ if [[ -f "$SSH_SRC_DIR/id_ed25519.pub" ]]; then
 fi
 
 ssh-keygen -A
-/usr/sbin/munged --syslog
+if ! su -s /bin/sh -c '/usr/sbin/munged --syslog' munge; then
+  echo "[worker] munged failed to start" >&2
+  ls -ld /var/lib/munge /run/munge /etc/munge /var/log/munge >&2 || true
+  id munge >&2 || true
+  exit 1
+fi
 sleep 1
 if ! pgrep -x munged >/dev/null; then
-  echo "[worker] munged failed to start" >&2
-  ls -ld /var/lib/munge /run/munge /etc/munge >&2 || true
+  echo "[worker] munged process missing after startup" >&2
   exit 1
 fi
 
