@@ -462,3 +462,19 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
 
 - 幾乎不改功能行為，風險最低。
 - 但會把架構打好，Phase 3/4 都會明顯更好推進。
+
+## Milestone A + B 實作落地（已完成）
+
+本次已先完成低風險重構與可觀測性強化：
+
+1. **等價重構（Milestone A）**
+   - 將 operator 程式拆為 `ClusterStateCollector`、`BasicQueuePolicy`、`StatefulSetActuator`。
+   - 以 `ClusterState` / `ScalingDecision` dataclass 作為層間資料契約。
+   - 保持與 Phase 2 既有規則等價（pending 觸發 scale-up、無 pending + busy floor + cooldown 控制 scale-down）。
+
+2. **結構化日誌（Milestone B）**
+   - 新增 JSON line logger（`JsonLogger`）。
+   - 事件型別：`startup`、`loop_observation`、`scale_action`、`scale_skipped`、`error`。
+   - 欄位包含 policy/state/decision/cooldown，方便後續用 `jq` 或 Python 做 KPI 聚合。
+
+後續可直接在此基礎上往 Milestone C（partition-aware）與 Milestone D（checkpoint-aware）前進。
