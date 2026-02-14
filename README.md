@@ -1,7 +1,10 @@
 # Slurm-on-K8s-For-DDP
 
 Adaptive HPC Scheduling on Cloud Native Infrastructure
+
 基於 Kubernetes 的彈性 Slurm 架構：應用於分散式 AI 訓練的動態資源調度與自動恢復
+
+# ✨ Features
 
 # 🚀 Getting Started
 
@@ -84,7 +87,9 @@ graph TD
 - 彈性感知 (Elasticity Awareness)：使用 torch.distributed.elastic 啟動訓練，允許訓練過程中 Worker 數量的動態變化。
 - 混沌工程測試 (Chaos Testing)：在訓練過程中，隨機刪除一個 K8s Pod (模擬節點故障)，驗證 Slurm 是否能重新排程任務，並從最新的 Checkpoint 恢復訓練，而非從頭開始。
 
-# ⚡ Timeline
+# 📘 Timeline
+
+> See development record/manual at `docs/note.md`
 
 Phase 1：基礎架構
 
