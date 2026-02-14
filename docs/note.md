@@ -284,3 +284,181 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
 ```
 
 這樣只更新 replicas，不會觸發不允許的 spec 欄位更新。
+
+## Phase 3 前的設計規劃（先記錄想法）
+
+以下是我對你列的三個方向的實作策略，目標是：
+
+- 盡量不破壞現有可運作的 Phase 2（可階梯式落地）
+- 每一步都可獨立驗證
+- 保持程式可讀、可維護、可觀測
+
+---
+
+### 1) 把 polling loop 抽象成策略介面（承接 DDP / checkpoint-aware 決策）
+
+#### 現況
+
+目前 `main.py` 是單一 loop：
+
+1. 讀 pending jobs
+2. 讀 busy nodes
+3. 算 desired replicas
+4. patch replicas
+
+這在 Phase 2 可用，但若要加上「DDP checkpoint-aware」判斷，決策會快速膨脹。
+
+#### 拆分目標
+
+把邏輯拆成三層：
+
+1. **State Collector（資料蒐集層）**
+   - 專職蒐集狀態，不做決策。
+   - 例：`pending_jobs`, `running_jobs`, `busy_nodes`, `idle_nodes`, `checkpoint_age_seconds`。
+
+2. **Policy（決策策略層）**
+   - 輸入目前 state + config，輸出 `ScalingDecision`。
+   - 可插拔：
+     - `BasicQueuePolicy`（現有 Phase 2 行為）
+     - `CheckpointAwarePolicy`（新增 checkpoint 保護邏輯）
+
+3. **Actuator（執行層）**
+   - 僅負責 patch/scale 與重試。
+   - 不知道為何縮放，只執行 `target_replicas`。
+
+#### 先期可行的 checkpoint-aware 規則（MVP）
+
+先不碰應用程式內部細節，採「保守保護」：
+
+- 若偵測目前有 DDP job 且距離最近 checkpoint 太久（或狀態未知），禁止 scale-down。
+- 若 checkpoint 在安全窗口內，才允許 scale-down。
+
+這可避免「即將可保存時被縮掉」導致訓練回復成本過高。
+
+#### 介面草案（概念）
+
+- `ClusterState`（dataclass）
+- `ScalingDecision`（target replicas + reason + policy name）
+- `Policy.evaluate(state, cfg) -> ScalingDecision`
+
+這樣後續就能平滑接上 Phase 3 應用事件，不需重寫 control loop。
+
+---
+
+### 2) 加入「每個 partition 的獨立擴縮」
+
+#### 現況限制
+
+現在只有單一 `slurm-worker` pool + 單一 `debug` partition；target replicas 是全域值。
+
+#### 目標架構
+
+改成「Partition 為單位」管理：
+
+- 每個 partition 對應一個 worker StatefulSet（或 Deployment）。
+- Operator 讀 partition 維度的 queue 壓力，分別計算 target replicas。
+
+#### 資料模型（建議）
+
+可先用一份靜態 mapping（env/json）開始：
+
+- `partition_name`
+- `worker_statefulset`
+- `min/max replicas`
+- `scale_up/down step`
+- `cooldown`
+
+例：
+
+- `debug -> slurm-worker-debug`
+- `gpu -> slurm-worker-gpu`
+
+#### 漸進落地順序
+
+1. 先保留單 partition，但把程式改成「列表迴圈」（即便列表只有一個）。
+2. 再新增第二個 partition 做 smoke test。
+3. 最後才把 Slurm 設定與 node naming 進一步自動化。
+
+這樣可以把風險切小，避免一次改太多造成不可逆故障。
+
+---
+
+### 3) 結構化日誌（支援量化評估與報告）
+
+#### 目標
+
+每次迴圈和每次縮放都留下 machine-readable 記錄，方便後續算 KPI：
+
+- 反應時間（job pending 到 scale-up 的秒數）
+- 資源利用率近似（busy/total）
+- scale actions 次數與抖動頻率
+
+#### 實作方式
+
+1. 日誌統一 JSON line（一行一事件）。
+2. 固定欄位：
+   - `ts`, `level`, `event_type`
+   - `policy`, `partition`, `current_replicas`, `target_replicas`
+   - `pending_jobs`, `busy_nodes`, `cooldown_remaining`
+   - `decision_reason`
+3. 事件分類：
+   - `loop_observation`
+   - `scale_action`
+   - `scale_skipped`
+   - `error`
+
+#### 報告銜接
+
+後續可直接用 `jq/python` 聚合：
+
+- 平均 scale-up latency
+- P95 scale-down latency
+- 單位時間縮放次數（看是否抖動）
+
+這會讓 Phase 4 的「評估與優化」有可重現數據，而不只文字描述。
+
+---
+
+## 建議的實作里程碑（小步快跑）
+
+### Milestone A（低風險）
+
+- 抽出 `ClusterState` / `ScalingDecision` / `Policy`。
+- 保持行為與現況一致（等價重構）。
+
+### Milestone B（可觀測性）
+
+- 全面改為 JSON structured logs。
+- 提供簡單 log parser 腳本輸出 baseline 指標。
+
+### Milestone C（partition-aware）
+
+- 改為 partition 清單迴圈。
+- 先在 `debug` + `debug2`（模擬）驗證雙池獨立擴縮。
+
+### Milestone D（checkpoint-aware）
+
+- 先加入保守規則（checkpoint 狀態未知時不縮）。
+- 再逐步與 DDP 訓練 wrapper 的 checkpoint metadata 對接。
+
+---
+
+## 風險與避險
+
+1. **策略誤判造成縮容過頭**
+   - 避險：加入 per-partition `min_replicas` 與 cooldown，並對關鍵任務加 scale-down guard。
+
+2. **partition mapping 與 slurm.conf 不一致**
+   - 避險：啟動時做 config validation，對不存在 partition/statefulset 直接告警並跳過。
+
+3. **log 太多造成噪音**
+   - 避險：區分 observation/action log level，並支援抽樣或週期性摘要。
+
+---
+
+## 我建議你下一步
+
+如果你同意，我下一個 PR 可以先做 **Milestone A + B**（等價重構 + 結構化日誌）：
+
+- 幾乎不改功能行為，風險最低。
+- 但會把架構打好，Phase 3/4 都會明顯更好推進。
