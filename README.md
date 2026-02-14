@@ -112,6 +112,14 @@ DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
 
 已改成把 ConfigMap 直接掛載到 `/etc/slurm`（不再使用 `subPath` 掛單檔），可降低 Windows/容器 runtime 下的 subPath 邊緣問題。
 
+### 錯誤 3：`chmod: changing permissions of '/etc/munge/munge.key': Read-only file system`
+
+Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/chown`。
+
+已改為：
+- Secret 掛載到 `/var/run/secrets/slurm/...`（避免 `subPath`）
+- entrypoint 啟動時把 key 複製到可寫入的 `/etc/munge/munge.key` 再設定權限
+
 
 # 🔥 Motivation
 

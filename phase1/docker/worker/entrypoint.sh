@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MUNGE_KEY=/etc/munge/munge.key
+MUNGE_SRC=/var/run/secrets/slurm/munge/munge.key
+MUNGE_DST=/etc/munge/munge.key
+SSH_SRC_DIR=/var/run/secrets/slurm/ssh
 
-if [[ ! -f "$MUNGE_KEY" ]]; then
-  echo "[worker] missing $MUNGE_KEY" >&2
+if [[ ! -f "$MUNGE_SRC" ]]; then
+  echo "[worker] missing $MUNGE_SRC" >&2
   exit 1
 fi
 
 install -d -m 0700 -o munge -g munge /etc/munge /run/munge /var/lib/munge /var/log/munge
-chmod 0400 "$MUNGE_KEY"
-chown munge:munge "$MUNGE_KEY"
+cp "$MUNGE_SRC" "$MUNGE_DST"
+chown munge:munge "$MUNGE_DST"
+chmod 0400 "$MUNGE_DST"
 
 install -d -m 0700 /root/.ssh
-if [[ -f /root/.ssh/id_ed25519.pub ]]; then
+if [[ -f "$SSH_SRC_DIR/id_ed25519" ]]; then
+  cp "$SSH_SRC_DIR/id_ed25519" /root/.ssh/id_ed25519
+  chmod 0600 /root/.ssh/id_ed25519
+fi
+if [[ -f "$SSH_SRC_DIR/id_ed25519.pub" ]]; then
+  cp "$SSH_SRC_DIR/id_ed25519.pub" /root/.ssh/id_ed25519.pub
+  chmod 0644 /root/.ssh/id_ed25519.pub
   cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
   chmod 0600 /root/.ssh/authorized_keys
 fi

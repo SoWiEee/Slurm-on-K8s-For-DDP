@@ -99,15 +99,10 @@ spec:
             - name: slurm-config
               mountPath: /etc/slurm
             - name: munge-key
-              mountPath: /etc/munge/munge.key
-              subPath: munge.key
-            - name: ssh-key
-              mountPath: /root/.ssh/id_ed25519
-              subPath: id_ed25519
+              mountPath: /var/run/secrets/slurm/munge
               readOnly: true
             - name: ssh-key
-              mountPath: /root/.ssh/id_ed25519.pub
-              subPath: id_ed25519.pub
+              mountPath: /var/run/secrets/slurm/ssh
               readOnly: true
       volumes:
         - name: slurm-config
@@ -157,15 +152,10 @@ spec:
             - name: slurm-config
               mountPath: /etc/slurm
             - name: munge-key
-              mountPath: /etc/munge/munge.key
-              subPath: munge.key
-            - name: ssh-key
-              mountPath: /root/.ssh/id_ed25519
-              subPath: id_ed25519
+              mountPath: /var/run/secrets/slurm/munge
               readOnly: true
             - name: ssh-key
-              mountPath: /root/.ssh/id_ed25519.pub
-              subPath: id_ed25519.pub
+              mountPath: /var/run/secrets/slurm/ssh
               readOnly: true
       volumes:
         - name: slurm-config
