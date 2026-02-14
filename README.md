@@ -35,6 +35,8 @@ bash phase1/scripts/bootstrap-phase1.sh
 # KUBE_CONTEXT=kind-slurm-lab bash phase1/scripts/bootstrap-phase1.sh
 # 若網速慢或機器較慢，可提高等待時間
 # ROLLOUT_TIMEOUT=600s bash phase1/scripts/bootstrap-phase1.sh
+# 若要清掉舊 StatefulSet revision 與舊 Pod
+# FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
 ```
 
 該腳本會完成以下事情：
@@ -117,7 +119,7 @@ DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
 Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/chown`。
 
 已改為：
-- Secret 掛載到 `/var/run/secrets/slurm/...`（避免 `subPath`）
+- Secret 掛載到 `/slurm-secrets/...`（避免 `subPath` 與系統 secrets 路徑衝突）
 - entrypoint 啟動時把 key 複製到可寫入的 `/etc/munge/munge.key` 再設定權限
 
 

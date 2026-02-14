@@ -7,6 +7,7 @@ ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
 NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
+FORCE_RECREATE=${FORCE_RECREATE:-false}
 
 if ! command -v kind >/dev/null 2>&1; then
   echo "kind is required" >&2
@@ -48,7 +49,15 @@ kind load docker-image slurm-controller:phase1 --name "$CLUSTER_NAME"
 kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 
 phase1/scripts/create-secrets.sh "$NAMESPACE"
+
+if [[ "$FORCE_RECREATE" == "true" ]]; then
+  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
+fi
+
 kubectl apply -f phase1/manifests/slurm-static.yaml
+kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker || true
 
 if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
   echo "namespace '$NAMESPACE' not found after apply; check current context: $(kubectl config current-context)" >&2
@@ -73,14 +82,17 @@ if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
   kubectl -n "$NAMESPACE" get all -o wide || true
   kubectl -n "$NAMESPACE" describe statefulset slurm-controller slurm-worker || true
   kubectl -n "$NAMESPACE" describe pods || true
+  kubectl -n "$NAMESPACE" get secret slurm-munge-key -o jsonpath='{.data}' || true
+  echo || true
 
   for p in $(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null); do
     kubectl -n "$NAMESPACE" logs "$p" --all-containers=true --tail=200 || true
     kubectl -n "$NAMESPACE" logs "$p" --all-containers=true --previous --tail=200 || true
+    kubectl -n "$NAMESPACE" exec "$p" -- sh -c 'ls -lah /slurm-secrets /slurm-secrets/munge /slurm-secrets/ssh 2>/dev/null || true' || true
   done
 
   echo "[bootstrap] context: $(kubectl config current-context)" >&2
-  echo "[bootstrap] hint: set KUBE_CONTEXT=kind-${CLUSTER_NAME} explicitly if needed." >&2
+  echo "[bootstrap] hint: try FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh" >&2
   exit 1
 fi
 
