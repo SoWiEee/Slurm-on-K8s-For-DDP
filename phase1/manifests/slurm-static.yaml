@@ -59,8 +59,8 @@ data:
     AuthType=auth/munge
     CryptoType=crypto/munge
 
-    NodeName=slurm-worker-[0-1] CPUs=2 RealMemory=2048 State=UNKNOWN
-    PartitionName=debug Nodes=slurm-worker-[0-1] Default=YES MaxTime=INFINITE State=UP
+    NodeName=slurm-worker-[0-2] CPUs=2 RealMemory=2048 State=UNKNOWN
+    PartitionName=debug Nodes=slurm-worker-[0-2] Default=YES MaxTime=INFINITE State=UP
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -97,8 +97,7 @@ spec:
             periodSeconds: 20
           volumeMounts:
             - name: slurm-config
-              mountPath: /etc/slurm/slurm.conf
-              subPath: slurm.conf
+              mountPath: /etc/slurm
             - name: munge-key
               mountPath: /etc/munge/munge.key
               subPath: munge.key
@@ -128,7 +127,7 @@ metadata:
   namespace: slurm
 spec:
   serviceName: slurm-worker
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: slurm-worker
@@ -156,8 +155,7 @@ spec:
             periodSeconds: 20
           volumeMounts:
             - name: slurm-config
-              mountPath: /etc/slurm/slurm.conf
-              subPath: slurm.conf
+              mountPath: /etc/slurm
             - name: munge-key
               mountPath: /etc/munge/munge.key
               subPath: munge.key

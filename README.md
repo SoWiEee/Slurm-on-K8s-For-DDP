@@ -60,7 +60,7 @@ bash phase1/scripts/verify-phase1.sh
 你應該可以看到：
 
 - `sinfo` 有 `debug` 分區。
-- `slurm-worker-0`、`slurm-worker-1` 狀態可被 `scontrol` 正常辨識。
+- `slurm-worker-0`、`slurm-worker-1`、`slurm-worker-2` 狀態可被 `scontrol` 正常辨識。
 - Controller 可 SSH 到 Worker（驗證 Pod 間 SSH 基本互通）。
 
 ## 4) 常用操作
@@ -82,6 +82,31 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 ```bash
 kind delete cluster --name slurm-lab
 ```
+
+
+## 5) Windows 常見錯誤（你這次遇到的）
+
+### 錯誤 1：`/usr/bin/env: '''bash\r''': No such file or directory`
+
+這代表腳本檔案是 CRLF（`\r\n`）換行，Linux 容器需要 LF（`\n`）。
+
+本專案已加入 `.gitattributes` 強制 shell/yaml/dockerfile 使用 LF。若你本機還是遇到：
+
+```bash
+git rm --cached -r .
+git reset --hard
+```
+
+再重新 build：
+
+```bash
+DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
+```
+
+### 錯誤 2：`error mounting ... /etc/slurm/slurm.conf ... no such file or directory`
+
+已改成把 ConfigMap 直接掛載到 `/etc/slurm`（不再使用 `subPath` 掛單檔），可降低 Windows/容器 runtime 下的 subPath 邊緣問題。
+
 
 # 🔥 Motivation
 

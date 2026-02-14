@@ -104,6 +104,19 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
 
 ---
 
+
+## E) 本次真實 root cause（依錯誤訊息）
+
+你提供的訊息其實有兩個獨立問題：
+
+1. `Exit Code: 127` + `/usr/bin/env: 'bash\r': No such file or directory`
+   - 代表 entrypoint 以 CRLF 換行被複製進 image，容器內解析 shebang 失敗。
+   - 解法：用 `.gitattributes` 強制 LF，並建議重置 working tree 後重建 image。
+
+2. `error mounting ... /etc/slurm/slurm.conf ... no such file or directory`
+   - 來自 `subPath` 掛單一檔案在某些環境容易碰到初始化邊緣錯誤。
+   - 解法：把 ConfigMap 整個掛到 `/etc/slurm`，避免 subPath mount path 問題。
+
 ## 後續銜接（Phase 2 前）
 
 - 把 worker 改成 Deployment + 動態 replicas。

@@ -4,6 +4,7 @@ set -euo pipefail
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 KIND_CONFIG=${KIND_CONFIG:-}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
+DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
 
 if ! command -v kind >/dev/null 2>&1; then
   echo "kind is required" >&2
@@ -26,8 +27,13 @@ if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
   fi
 fi
 
-docker build -t slurm-controller:phase1 phase1/docker/controller
-docker build -t slurm-worker:phase1 phase1/docker/worker
+build_flags=()
+if [[ "$DOCKER_BUILD_NO_CACHE" == "true" ]]; then
+  build_flags+=(--no-cache)
+fi
+
+docker build "${build_flags[@]}" -t slurm-controller:phase1 phase1/docker/controller
+docker build "${build_flags[@]}" -t slurm-worker:phase1 phase1/docker/worker
 
 kind load docker-image slurm-controller:phase1 --name "$CLUSTER_NAME"
 kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
@@ -47,7 +53,10 @@ if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
   kubectl -n slurm get pods -o wide || true
   kubectl -n slurm describe pods || true
   kubectl -n slurm logs statefulset/slurm-controller --all-containers=true --tail=200 || true
+  kubectl -n slurm logs statefulset/slurm-controller --all-containers=true --previous --tail=200 || true
   kubectl -n slurm logs statefulset/slurm-worker --all-containers=true --tail=200 || true
+  kubectl -n slurm logs statefulset/slurm-worker --all-containers=true --previous --tail=200 || true
+  echo "[bootstrap] hint: if you see '/usr/bin/env: bash\\r', re-clone after .gitattributes or run with fresh checkout." >&2
   exit 1
 fi
 
