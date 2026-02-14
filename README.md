@@ -119,7 +119,7 @@ DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
 Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/chown`。
 
 已改為：
-- Secret 掛載到 `/slurm-secrets/...`（避免 `subPath` 與系統 secrets 路徑衝突）
+- Secret 掛載到 `/slurm-secrets/*`（避免 `subPath` 與系統 secrets 路徑衝突）
 - entrypoint 啟動時把 key 複製到可寫入的 `/etc/munge/munge.key` 再設定權限
 
 

@@ -98,22 +98,28 @@ spec:
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm
-            - name: munge-key
-              mountPath: /slurm-secrets/munge
-              readOnly: true
-            - name: ssh-key
-              mountPath: /slurm-secrets/ssh
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
               readOnly: true
       volumes:
         - name: slurm-config
           configMap:
             name: slurm-config
-        - name: munge-key
-          secret:
-            secretName: slurm-munge-key
-        - name: ssh-key
-          secret:
-            secretName: slurm-ssh-key
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: slurm-ssh-key
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -151,19 +157,25 @@ spec:
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm
-            - name: munge-key
-              mountPath: /slurm-secrets/munge
-              readOnly: true
-            - name: ssh-key
-              mountPath: /slurm-secrets/ssh
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
               readOnly: true
       volumes:
         - name: slurm-config
           configMap:
             name: slurm-config
-        - name: munge-key
-          secret:
-            secretName: slurm-munge-key
-        - name: ssh-key
-          secret:
-            secretName: slurm-ssh-key
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: slurm-ssh-key
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub

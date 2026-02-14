@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MUNGE_SRC=/slurm-secrets/munge/munge.key
+MUNGE_SRC=/slurm-secrets/munge.key
 MUNGE_DST=/etc/munge/munge.key
-SSH_SRC_DIR=/slurm-secrets/ssh
+SSH_SRC_DIR=/slurm-secrets
 
 if [[ ! -f "$MUNGE_SRC" ]]; then
   echo "[controller] missing $MUNGE_SRC" >&2

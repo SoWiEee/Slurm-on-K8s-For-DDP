@@ -125,7 +125,7 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
 
 4. `chmod: changing permissions of '/etc/munge/munge.key': Read-only file system`
    - Kubernetes Secret volume 是唯讀，直接改 mount 檔案權限會失敗，導致 entrypoint 結束（Exit 1）。
-   - 解法：Secret 改掛到 `/slurm-secrets/munge`，啟動時複製到 `/etc/munge/munge.key` 後再 `chown/chmod`。
+   - 解法：Secret 改掛到 `/slurm-secrets/munge.key`，啟動時複製到 `/etc/munge/munge.key` 後再 `chown/chmod`。
    - 同時移除 munge/ssh 的 `subPath` 檔案掛載，改為目錄掛載降低 runtime 邊緣錯誤。
    - `bootstrap` 新增 `FORCE_RECREATE=true` 可刪除舊 StatefulSet/Pod，避免沿用舊 revision。
 
