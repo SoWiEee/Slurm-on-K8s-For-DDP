@@ -60,7 +60,9 @@ data:
     AuthType=auth/munge
     CryptoType=crypto/munge
 
-    NodeName=slurm-worker-[0-2] CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
+    NodeName=slurm-worker-0 NodeAddr=slurm-worker-0.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
+    NodeName=slurm-worker-1 NodeAddr=slurm-worker-1.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
+    NodeName=slurm-worker-2 NodeAddr=slurm-worker-2.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
     PartitionName=debug Nodes=slurm-worker-[0-2] Default=YES MaxTime=INFINITE State=UP
 ---
 apiVersion: apps/v1

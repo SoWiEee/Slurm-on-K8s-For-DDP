@@ -141,6 +141,10 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
    - 同時 worker 解析 controller 建議使用完整 FQDN，避免 namespace 搜尋路徑差異。
    - 解法：`SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)`，讓 controller 主機名比對與 worker DNS 解析同時成立。
 
+7. `Reason=NO NETWORK ADDRESS FOUND`（節點可用但顯示原因）
+   - 在 K8s 環境中，Slurm 有時無法從 `NodeName` 自動推導穩定位址。
+   - 解法：在每個 `NodeName` 額外指定 `NodeAddr`（FQDN）與 `NodeHostname`（短名），減少位址判定歧義。
+
 ## 後續銜接（Phase 2 前）
 
 - 把 worker 改成 Deployment + 動態 replicas。

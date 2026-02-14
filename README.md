@@ -10,6 +10,7 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 - ✅ 以腳本自動建立 Munge / SSH Secret，減少手動設定錯誤。
 - ✅ 提供一鍵 bootstrap + verify 腳本，讓新手可快速重現。
 - ✅ 將 Slurm 設定集中於 ConfigMap，提升可維護性與可讀性。
+- Phase 1.1 清理：在 `slurm.conf` 為每個 worker 明確設定 `NodeAddr`/`NodeHostname` FQDN 對應，降低 `NO NETWORK ADDRESS FOUND` 機率。
 
 # 🚀 Getting Started
 
@@ -69,6 +70,15 @@ bash phase1/scripts/verify-phase1.sh
 - `sinfo` 有 `debug` 分區。
 - `slurm-worker-0`、`slurm-worker-1`、`slurm-worker-2` 狀態可被 `scontrol` 正常辨識。
 - Controller 可 SSH 到 Worker（驗證 Pod 間 SSH 基本互通）。
+
+### Phase 1.1 清理：NodeAddr / NodeHostname 對應
+
+若 `scontrol show nodes` 曾出現 `Reason=NO NETWORK ADDRESS FOUND`，本專案已在 `slurm.conf` 為每個 worker 額外設定：
+
+- `NodeAddr=slurm-worker-<n>.slurm-worker.slurm.svc.cluster.local`
+- `NodeHostname=slurm-worker-<n>`
+
+這可降低 Slurm 在 K8s DNS 環境下的位址判定歧義。
 
 ## 4) 常用操作
 
