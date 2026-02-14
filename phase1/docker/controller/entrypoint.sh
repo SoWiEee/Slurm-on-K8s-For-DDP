@@ -10,8 +10,13 @@ if [[ ! -f "$MUNGE_SRC" ]]; then
   exit 1
 fi
 
-# Prepare writable runtime locations; do not chmod/chown read-only secret mounts directly.
-install -d -m 0700 -o munge -g munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+# Prepare writable runtime locations and enforce secure munge ownership/permissions.
+for d in /etc/munge /run/munge /var/lib/munge /var/log/munge; do
+  mkdir -p "$d"
+  chown munge:munge "$d"
+  chmod 0700 "$d"
+done
+
 cp "$MUNGE_SRC" "$MUNGE_DST"
 chown munge:munge "$MUNGE_DST"
 chmod 0400 "$MUNGE_DST"
@@ -33,6 +38,7 @@ ssh-keygen -A
 sleep 1
 if ! pgrep -x munged >/dev/null; then
   echo "[controller] munged failed to start" >&2
+  ls -ld /var/lib/munge /run/munge /etc/munge >&2 || true
   exit 1
 fi
 

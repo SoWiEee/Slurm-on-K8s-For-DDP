@@ -123,6 +123,15 @@ Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/cho
 - entrypoint 啟動時把 key 複製到可寫入的 `/etc/munge/munge.key` 再設定權限
 
 
+### 錯誤 4：`munged: Error: PRNG seed dir is insecure: invalid ownership of "/var/lib/munge"`
+
+這表示 `munged` 檢查到目錄權限/擁有者不安全。
+
+已修正 entrypoint 啟動流程：
+- 明確對 `/etc/munge`、`/run/munge`、`/var/lib/munge`、`/var/log/munge` 做 `chown munge:munge` 與 `chmod 0700`
+- 若 `munged` 啟動失敗，額外輸出上述目錄權限供除錯
+
+
 # 🔥 Motivation
 
 隨著深度學習模型的規模日益龐大，分散式訓練已成為常態。然而，目前的運算環境面臨兩難：

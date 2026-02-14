@@ -129,6 +129,11 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
    - 同時移除 munge/ssh 的 `subPath` 檔案掛載，改為目錄掛載降低 runtime 邊緣錯誤。
    - `bootstrap` 新增 `FORCE_RECREATE=true` 可刪除舊 StatefulSet/Pod，避免沿用舊 revision。
 
+
+5. `munged: Error: PRNG seed dir is insecure: invalid ownership of "/var/lib/munge"`
+   - `munged` 會檢查安全權限；只要 `/var/lib/munge` owner/mode 不符合就會直接退出。
+   - 解法：entrypoint 顯式修正 `/etc/munge`、`/run/munge`、`/var/lib/munge`、`/var/log/munge` 為 `munge:munge` + `0700`。
+
 ## 後續銜接（Phase 2 前）
 
 - 把 worker 改成 Deployment + 動態 replicas。
