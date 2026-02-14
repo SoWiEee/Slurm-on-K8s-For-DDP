@@ -11,6 +11,7 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 - ✅ 提供一鍵 bootstrap + verify 腳本，讓新手可快速重現。
 - ✅ 將 Slurm 設定集中於 ConfigMap，提升可維護性與可讀性。
 - Phase 1.1 清理：在 `slurm.conf` 為每個 worker 明確設定 `NodeAddr`/`NodeHostname` FQDN 對應，降低 `NO NETWORK ADDRESS FOUND` 機率。
+- ✅ Phase 2 已完成：新增 Python Elastic Operator，支援 `Pending Job -> Scale Up` 與 `Idle Node -> Scale Down`。
 
 # 🚀 Getting Started
 
@@ -79,6 +80,77 @@ bash phase1/scripts/verify-phase1.sh
 - `NodeHostname=slurm-worker-<n>`
 
 這可降低 Slurm 在 K8s DNS 環境下的位址判定歧義。
+
+## 3.5) 部署 Phase 2（Elastic Operator）
+
+在 Phase 1 Ready 後，執行：
+
+```bash
+bash phase2/scripts/bootstrap-phase2.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase2/scripts/bootstrap-phase2.sh
+# 需要重建 operator image 時
+# DOCKER_BUILD_NO_CACHE=true bash phase2/scripts/bootstrap-phase2.sh
+```
+
+該腳本會做以下事情：
+
+1. 確認 `slurm-controller` / `slurm-worker`（Phase 1）已存在。
+2. 建置 `slurm-elastic-operator:phase2` image 並載入 Kind。
+3. 套用 `phase2/manifests/slurm-phase2-operator.yaml`：
+   - 建立 Operator 的 ServiceAccount + RBAC。
+   - 部署 `slurm-elastic-operator` Deployment。
+4. 以 `kubectl scale` 將既有 `slurm-worker` 調整為 `1`（避免以不完整 StatefulSet manifest 更新導致驗證錯誤）。
+5. 等待 Operator 與 Worker rollout 完成。
+
+## 3.6) 驗證 Phase 2 擴縮行為
+
+```bash
+bash phase2/scripts/verify-phase2.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase2/scripts/verify-phase2.sh
+```
+
+驗證腳本會：
+
+1. 先將 worker replicas 固定為 1。
+2. 送出一個需要 2 個節點的短任務（預期先 Pending）。
+3. 觀察 Operator 是否把 `slurm-worker` 從 1 擴到 >=2。
+4. 取消任務後，等待 cooldown，確認能縮回 1。
+
+可用以下指令觀察 Operator：
+
+```bash
+kubectl -n slurm logs deployment/slurm-elastic-operator -f
+kubectl -n slurm get statefulset slurm-worker -w
+```
+
+可選進階設定（Milestone C + D）：
+
+- `PARTITIONS_JSON`：啟用每個 partition 的獨立擴縮。
+- `CHECKPOINT_GUARD_ENABLED=true` + `CHECKPOINT_PATH` + `MAX_CHECKPOINT_AGE_SECONDS`：啟用 checkpoint-aware scale-down 保護。
+
+範例（單 partition + checkpoint guard）：
+
+```bash
+kubectl -n slurm set env deployment/slurm-elastic-operator \
+  SLURM_PARTITION=debug \
+  WORKER_STATEFULSET=slurm-worker \
+  CHECKPOINT_GUARD_ENABLED=true \
+  CHECKPOINT_PATH=/shared/checkpoints/latest.ckpt \
+  MAX_CHECKPOINT_AGE_SECONDS=600
+```
+
+範例（多 partition）：
+
+```bash
+kubectl -n slurm set env deployment/slurm-elastic-operator \
+  PARTITIONS_JSON='[
+    {"partition":"debug","worker_statefulset":"slurm-worker-debug","min_replicas":1,"max_replicas":3,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60},
+    {"partition":"gpu","worker_statefulset":"slurm-worker-gpu","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":90,"checkpoint_path":"/shared/checkpoints/gpu-latest.ckpt","max_checkpoint_age_seconds":900}
+  ]'
+```
+
 
 ## 4) 常用操作
 
