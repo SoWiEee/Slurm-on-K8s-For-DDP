@@ -150,3 +150,114 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
 - 把 worker 改成 Deployment + 動態 replicas。
 - 將節點數量與 partition 設定改為可程式化更新。
 - 導入 Operator（Kopf）觀察 Pending jobs 並觸發 scale up/down。
+
+# Development Notes (Phase 2)
+
+## 目標
+
+完成 Timeline 的 Phase 2：
+
+1. 開發 Python Operator，實作 `Pending Job -> Scale Up`。
+2. 實作 `Idle Node -> Scale Down`。
+
+---
+
+## 開發想法
+
+## 1) 階梯式開發（先可用，再精緻）
+
+Phase 2 先走「低耦合、可觀測」路線：
+
+- 先用單一 Python 控制迴圈（polling）完成 MVP。
+- 透過 `kubectl exec` 讀取 controller 內的 Slurm 狀態（不先引入過多 framework）。
+- 只 patch 一個目標（`slurm-worker` StatefulSet replicas），避免一次改太多面向。
+
+這樣可以快速驗證核心路徑：
+
+`Pending Jobs -> replicas +1`，`No Pending + Busy 可縮 -> replicas -1`。
+
+## 2) 可維護性設計
+
+為了後續擴充（例如改成 Kopf / CRD）可平滑銜接，本次程式結構拆成清楚函式：
+
+- `get_pending_jobs`：只負責 queue 計數。
+- `get_busy_nodes`：只負責節點忙碌狀態計算。
+- `desired_replicas`：只負責擴縮決策。
+- `patch_replicas`：只負責寫回 K8s。
+
+搭配 `Config` dataclass + env vars，讓策略可由 manifest 調整，不需改程式碼。
+
+## 3) 防抖動策略
+
+如果任務剛結束就立即縮容，容易在短工作負載下反覆彈跳。
+
+因此加入：
+
+- `SCALE_DOWN_COOLDOWN_SECONDS`：scale-up 後短時間內先不縮。
+- `SCALE_UP_STEP` / `SCALE_DOWN_STEP`：讓擴縮速度可控。
+- `MIN_REPLICAS` / `MAX_REPLICAS`：避免超出 slurm.conf 已定義節點範圍。
+
+---
+
+## 除錯方式
+
+## A) Operator 沒有擴容
+
+1. 看 Operator log：
+
+```bash
+kubectl -n slurm logs deployment/slurm-elastic-operator -f
+```
+
+2. 檢查 RBAC 是否允許 `pods/exec` 與 patch statefulset：
+
+```bash
+kubectl -n slurm auth can-i create pods/exec --as=system:serviceaccount:slurm:slurm-elastic-operator
+kubectl -n slurm auth can-i patch statefulsets --as=system:serviceaccount:slurm:slurm-elastic-operator
+```
+
+3. 手動在 controller 驗證 pending：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- squeue -t PENDING
+```
+
+## B) 有擴容但沒有縮容
+
+1. 先確認 cooldown 是否尚未結束（預設 60 秒）。
+2. 確認 job 是否真的已清空：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- squeue
+```
+
+3. 檢查 busy 節點是否仍 > min_replicas，避免縮到執行中任務。
+
+## C) verify-phase2 失敗
+
+1. 先看 operator log：
+
+```bash
+kubectl -n slurm logs deployment/slurm-elastic-operator --tail=200
+```
+
+2. 再看 worker replicas 變化：
+
+```bash
+kubectl -n slurm get statefulset slurm-worker -w
+```
+
+3. 若 job 提交失敗，進 controller 直接測 `sbatch`：
+
+```bash
+kubectl -n slurm exec -it pod/slurm-controller-0 -- bash
+sbatch --help
+```
+
+---
+
+## 後續銜接（Phase 3 前）
+
+- 把目前 polling loop 抽象成策略介面，準備承接 DDP 訓練事件與 checkpoint-aware 決策。
+- 加入「每個 partition 的獨立擴縮」而不只單一 worker pool。
+- 將操作事件（scale up/down）輸出為結構化日誌，方便量化評估與報告撰寫。
