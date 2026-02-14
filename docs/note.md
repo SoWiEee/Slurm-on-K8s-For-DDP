@@ -261,3 +261,26 @@ sbatch --help
 - 把目前 polling loop 抽象成策略介面，準備承接 DDP 訓練事件與 checkpoint-aware 決策。
 - 加入「每個 partition 的獨立擴縮」而不只單一 worker pool。
 - 將操作事件（scale up/down）輸出為結構化日誌，方便量化評估與報告撰寫。
+
+## D) bootstrap-phase2 出現 StatefulSet invalid/forbidden update
+
+錯誤訊息像是：
+
+- `spec.selector: Required value`
+- `spec.template.spec.containers: Required value`
+- `updates to statefulset spec ... are forbidden`
+
+這通常是因為用 `kubectl apply` 套了一份「只有 replicas」的 StatefulSet YAML。
+StatefulSet 不是 Strategic Merge Patch；apply 會把它當成完整目標物件做驗證與更新，
+因此會命中 selector/template 必填與 immutable 欄位限制。
+
+修正策略：
+
+1. 將 Phase 2 manifest 移除 partial StatefulSet 定義。
+2. 改由 `bootstrap-phase2.sh` 對既有 `slurm-worker` 執行：
+
+```bash
+kubectl -n slurm scale statefulset/slurm-worker --replicas=1
+```
+
+這樣只更新 replicas，不會觸發不允許的 spec 欄位更新。

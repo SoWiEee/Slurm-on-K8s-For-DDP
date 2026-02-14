@@ -70,11 +70,3 @@ spec:
               value: "15"
             - name: SCALE_DOWN_COOLDOWN_SECONDS
               value: "60"
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: slurm-worker
-  namespace: slurm
-spec:
-  replicas: 1

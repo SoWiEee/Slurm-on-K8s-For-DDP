@@ -100,8 +100,8 @@ bash phase2/scripts/bootstrap-phase2.sh
 3. 套用 `phase2/manifests/slurm-phase2-operator.yaml`：
    - 建立 Operator 的 ServiceAccount + RBAC。
    - 部署 `slurm-elastic-operator` Deployment。
-   - 將 `slurm-worker` 初始 replicas 調整為 `1`（由 Operator 接管擴縮）。
-4. 等待 Operator 與 Worker rollout 完成。
+4. 以 `kubectl scale` 將既有 `slurm-worker` 調整為 `1`（避免以不完整 StatefulSet manifest 更新導致驗證錯誤）。
+5. 等待 Operator 與 Worker rollout 完成。
 
 ## 3.6) 驗證 Phase 2 擴縮行為
 
