@@ -39,8 +39,7 @@ metadata:
 data:
   slurm.conf: |
     ClusterName=kind-slurm
-    SlurmctldHost=slurm-controller-0
-    SlurmctldAddr=slurm-controller-0.slurm-controller.slurm.svc.cluster.local
+    SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)
     MpiDefault=none
     ProctrackType=proctrack/linuxproc
     ReturnToService=2
@@ -52,7 +51,7 @@ data:
     SwitchType=switch/none
     TaskPlugin=task/none
     SchedulerType=sched/backfill
-    MailProg=/bin/true
+    MailProg=/usr/bin/true
     SelectType=select/cons_tres
     SelectTypeParameters=CR_Core
 

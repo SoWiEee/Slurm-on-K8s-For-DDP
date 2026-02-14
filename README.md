@@ -136,8 +136,7 @@ Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/cho
 ### 錯誤 5：`This host (...) not a valid controller` 或 worker 無法解析 controller FQDN
 
 已修正 `slurm.conf`：
-- `SlurmctldHost=slurm-controller-0`（與 Pod hostname 一致）
-- `SlurmctldAddr=slurm-controller-0.slurm-controller.slurm.svc.cluster.local`（固定可解析 FQDN）
+- `SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)`（前段給 controller 主機名比對，括號內給 worker 解析位址）
 - 並把 worker CPU 拓撲參數調整為符合 Kind 節點常見硬體，降低 slurmd 拓撲不一致警告
 
 
