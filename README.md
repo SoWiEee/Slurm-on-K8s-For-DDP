@@ -31,6 +31,8 @@ kubectl version --client
 
 ```bash
 bash phase1/scripts/bootstrap-phase1.sh
+# 若你有多個 kube context，可明確指定 kind context
+# KUBE_CONTEXT=kind-slurm-lab bash phase1/scripts/bootstrap-phase1.sh
 # 若網速慢或機器較慢，可提高等待時間
 # ROLLOUT_TIMEOUT=600s bash phase1/scripts/bootstrap-phase1.sh
 ```
@@ -38,6 +40,7 @@ bash phase1/scripts/bootstrap-phase1.sh
 該腳本會完成以下事情：
 
 1. 若不存在，建立 `slurm-lab` Kind 叢集。
+- 腳本會自動切換到 `KUBE_CONTEXT`（預設 `kind-slurm-lab`），避免套用到錯誤叢集。
 2. 建置兩個映像檔：
    - `slurm-controller:phase1`
    - `slurm-worker:phase1`
@@ -55,6 +58,8 @@ bash phase1/scripts/bootstrap-phase1.sh
 
 ```bash
 bash phase1/scripts/verify-phase1.sh
+# 或指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase1/scripts/verify-phase1.sh
 ```
 
 你應該可以看到：

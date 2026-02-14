@@ -117,6 +117,11 @@ kubectl -n slurm exec pod/slurm-worker-0 -- unmunge
    - 來自 `subPath` 掛單一檔案在某些環境容易碰到初始化邊緣錯誤。
    - 解法：把 ConfigMap 整個掛到 `/etc/slurm`，避免 subPath mount path 問題。
 
+
+3. `No resources found in slurm namespace` + `namespaces "slurm" not found`
+   - 常見於 kubectl context 指到錯誤叢集（不是 `kind-slurm-lab`）。
+   - 解法：bootstrap / verify 都顯式切換到 `KUBE_CONTEXT`（預設 `kind-slurm-lab`），並在失敗輸出 current-context。
+
 ## 後續銜接（Phase 2 前）
 
 - 把 worker 改成 Deployment + 動態 replicas。
