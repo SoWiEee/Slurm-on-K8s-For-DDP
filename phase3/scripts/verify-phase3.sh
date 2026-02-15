@@ -385,8 +385,11 @@ wait_slurm_nodes_ready() {
   local state_lc
   local base_state
   local considered_count
+  local last_recover_ts
+  local now
 
   start="$(date +%s)"
+  last_recover_ts=0
   while true; do
     lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true)"
     ready_count=0
@@ -403,7 +406,7 @@ wait_slurm_nodes_ready() {
       state_lc="$(printf '%s' "${state}" | tr '[:upper:]' '[:lower:]')"
       base_state="$(printf '%s' "${state_lc}" | sed 's/[^a-z].*$//')"
 
-      if printf '%s' "${state_lc}" | grep -Eq 'down|drain|fail|not[_-]?respond|maint|unk'; then
+      if printf '%s' "${state_lc}" | grep -Eq 'down|drain|fail|not[_-]?respond|maint|unk|completing|\*'; then
         unhealthy_count=$((unhealthy_count + 1))
         continue
       fi
@@ -420,7 +423,14 @@ wait_slurm_nodes_ready() {
       return 0
     fi
 
-    if (( $(date +%s) - start > SLURM_NODE_READY_TIMEOUT_SECONDS )); then
+    now="$(date +%s)"
+    if (( unhealthy_count > 0 && now - last_recover_ts >= 20 )); then
+      log "detected unhealthy worker nodes during readiness wait; retrying RESUME"
+      recover_unhealthy_nodes || true
+      last_recover_ts="${now}"
+    fi
+
+    if (( now - start > SLURM_NODE_READY_TIMEOUT_SECONDS )); then
       log "timeout waiting slurm worker nodes ready: need ${required_nodes}, got ${ready_count} (considered=${considered_count}, unhealthy=${unhealthy_count})"
       slurm_exec_retry "sinfo -R || true" || true
       slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true
@@ -431,6 +441,7 @@ wait_slurm_nodes_ready() {
     sleep 4
   done
 }
+
 
 
 
@@ -481,18 +492,25 @@ recover_unhealthy_nodes() {
   local lines
   local node
   local state
+  local state_lc
 
   lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true)"
   while read -r node state; do
     if [[ -z "${node:-}" ]]; then
       continue
     fi
-    if printf '%s' "${state}" | grep -Eiq 'down|drain|not_responding|fail'; then
+    if [[ "${node}" != ${WORKER_NODE_NAME_PREFIX}* ]]; then
+      continue
+    fi
+
+    state_lc="$(printf '%s' "${state}" | tr '[:upper:]' '[:lower:]')"
+    if printf '%s' "${state_lc}" | grep -Eq 'down|drain|not[_-]?respond|fail|completing|\*'; then
       log "attempting RESUME for unhealthy node ${node} state=${state}"
       slurm_exec_retry "scontrol update NodeName=${node} State=RESUME" || true
     fi
   done <<< "${lines}"
 }
+
 
 ensure_multinode_prerequisites() {
   local required_nodes="$1"
