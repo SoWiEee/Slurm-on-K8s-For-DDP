@@ -10,6 +10,7 @@ L1_RETRY_INTERVAL_SECONDS=${L1_RETRY_INTERVAL_SECONDS:-10}
 DISABLE_OPERATOR_DURING_VERIFY=${DISABLE_OPERATOR_DURING_VERIFY:-true}
 WORKER_TARGET_REPLICAS=${WORKER_TARGET_REPLICAS:-2}
 WORKER_READY_MAX_WAIT_SECONDS=${WORKER_READY_MAX_WAIT_SECONDS:-240}
+SLURM_NODE_READY_MAX_WAIT_SECONDS=${SLURM_NODE_READY_MAX_WAIT_SECONDS:-240}
 
 operator_original_replicas=""
 operator_scaled_down="false"
@@ -96,6 +97,55 @@ on_error() {
 trap on_error ERR
 trap restore_operator EXIT
 
+
+wait_slurm_nodes_ready() {
+  local deadline=$(( $(date +%s) + SLURM_NODE_READY_MAX_WAIT_SECONDS ))
+
+  while (( $(date +%s) < deadline )); do
+    local status_lines bad_nodes=""
+    status_lines=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "sinfo -Nh -n ${worker_nodelist} -o '%N %T'" || true)
+
+    if [[ -n "$status_lines" ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local n st
+        n=$(awk '{print $1}' <<<"$line")
+        st=$(awk '{print $2}' <<<"$line")
+        if [[ "$st" != "idle" && "$st" != "mix" && "$st" != "allocated" ]]; then
+          bad_nodes+="${n}:${st} "
+        fi
+      done <<<"$status_lines"
+    fi
+
+    if [[ -z "$bad_nodes" ]]; then
+      return 0
+    fi
+
+    echo "[phase3/verify] waiting Slurm node readiness, unhealthy=[$bad_nodes]" >&2
+
+    kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
+      for n in slurm-worker-0 slurm-worker-1; do
+        scontrol update NodeName=\$n State=UNDRAIN >/dev/null 2>&1 || true
+        scontrol update NodeName=\$n State=RESUME >/dev/null 2>&1 || true
+      done
+    " || true
+
+    for n in slurm-worker-0 slurm-worker-1; do
+      if grep -q "${n}:" <<<"$bad_nodes"; then
+        echo "[phase3/verify] recycling pod ${n} due to Slurm state issue" >&2
+        kubectl -n "$NAMESPACE" delete pod "$n" --wait=true >/dev/null 2>&1 || true
+      fi
+    done
+
+    kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-0 --timeout="$VERIFY_TIMEOUT" || true
+    kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-1 --timeout="$VERIFY_TIMEOUT" || true
+    sleep 5
+  done
+
+  echo "[phase3/verify] Slurm nodes not schedulable in time (${worker_nodelist})" >&2
+  return 1
+}
+
 wait_worker_replicas_ready() {
   local desired=$1
   local deadline=$(( $(date +%s) + WORKER_READY_MAX_WAIT_SECONDS ))
@@ -158,6 +208,8 @@ kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
     scontrol update NodeName="\$n" State=RESUME >/dev/null 2>&1 || true
   done
 "
+
+wait_slurm_nodes_ready
 
 l1_ok=false
 for attempt in $(seq 1 "$L1_RETRY_COUNT"); do

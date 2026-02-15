@@ -719,6 +719,7 @@ error: timed out waiting for the condition on pods/slurm-worker-1
 - Node 狀態修復從單一 `state=resume` 改為 `UNDRAIN/RESUME` best-effort 並將錯誤靜默化，避免 `slurm_update error: Invalid node state specified` 提前干擾驗證流程。
 - 若 pod 不存在或沒有 previous terminated container，改成輸出 `skip` 訊息，避免 `NotFound/BadRequest` 噪音干擾判讀。
 - 移除錯誤路徑中的重複 restore 呼叫，避免出現雙重 `restoring operator replicas ...` 訊息。
+- 在 L1 `srun` 前新增 Slurm node readiness gate：若 `worker-0/1` 出現 `down/not_responding/completing`，會先做 best-effort `UNDRAIN/RESUME`，必要時重建對應 pod，再進入 `srun`，避免「Pod Running 但 Slurm 無可用節點」卡住。
 
 ---
 

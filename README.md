@@ -187,6 +187,7 @@ bash phase3/scripts/verify-phase3.sh
 
 - `DISABLE_OPERATOR_DURING_VERIFY=true|false`（預設 `true`）
 - `WORKER_READY_MAX_WAIT_SECONDS`：worker 目標副本穩定等待上限（預設 `240`）
+- `SLURM_NODE_READY_MAX_WAIT_SECONDS`：Slurm 節點可排程狀態等待上限（預設 `240`）
 
 
 驗證腳本分成三層：
@@ -196,6 +197,7 @@ bash phase3/scripts/verify-phase3.sh
    - 驗證期間會暫時把 `slurm-elastic-operator` scale 到 `0`（預設），避免 operator 把 worker 自動縮回 1 造成 `pod/slurm-worker-1` timeout；結束後自動還原。
    - 追加 `srun -N2 -n2 hostname`，確認跨 worker 任務可分派（MPI 類工作前提）。
    - 以 `--nodelist=slurm-worker-0,slurm-worker-1` 鎖定已存在 pod，避免 `slurm.conf` 中尚未啟用節點（如 `slurm-worker-2`）造成 DNS 解析失敗。
+   - 在 `srun` 前新增 Slurm node readiness gate，若節點為 `down/not_responding/completing` 會自動做 best-effort 修復並重建對應 worker pod。
    - Node 狀態修復改為 best-effort 且靜默執行（UNDRAIN/RESUME），避免部分 Slurm 版本輸出 `Invalid node state specified` 干擾判讀。
 2. **資料一致性層（Layer 2）**
    - `worker-0` 在 `/shared/checkpoints` 寫入檔案與 checksum。
