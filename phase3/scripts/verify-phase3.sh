@@ -352,19 +352,25 @@ recover_unhealthy_nodes() {
 
 assert_mpi_output() {
   local job_id="$1"
+  local out_path
+  local err_path
   local hosts
   local unique
 
-  hosts="$(controller_exec "test -f /root/slurm-${job_id}.out && awk -F= '/^rank-host=/{print \$2}' /root/slurm-${job_id}.out || true")"
+  out_path="$(get_job_stdout_path "${job_id}")"
+  err_path="$(get_job_stderr_path "${job_id}")"
+
+  hosts="$(controller_exec "for p in '${out_path}' '/root/${out_path}' '/${out_path}' '${err_path}' '/root/${err_path}' '/${err_path}' '/root/slurm-${job_id}.out'; do if [ -f \"$p\" ]; then grep -Eo 'rank-host=[^[:space:]]+' \"$p\" || true; fi; done | sed 's/^rank-host=//'" )"
+
   unique="$(printf '%s\n' "${hosts}" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
 
   if [[ -z "${unique}" || "${unique}" -lt 2 ]]; then
-    log "mpi output validation failed for job ${job_id}: unique_hosts=${unique:-0}"
-    controller_exec "test -f /root/slurm-${job_id}.out && tail -n 120 /root/slurm-${job_id}.out || true"
+    log "mpi output validation failed for job ${job_id}: unique_hosts=${unique:-0}, stdout=${out_path}, stderr=${err_path}"
+    controller_exec "for p in '${out_path}' '/root/${out_path}' '/${out_path}' '${err_path}' '/root/${err_path}' '/${err_path}' '/root/slurm-${job_id}.out'; do if [ -f \"$p\" ]; then echo '-----' \"$p\"; tail -n 120 \"$p\"; fi; done || true"
     return 1
   fi
 
-  log "mpi output validation passed: unique_hosts=${unique}"
+  log "mpi output validation passed: unique_hosts=${unique}, stdout=${out_path}"
 }
 
 

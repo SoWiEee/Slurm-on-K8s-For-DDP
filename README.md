@@ -207,6 +207,7 @@ bash phase3/scripts/verify-phase3.sh
 > verify 的 worker daemon 檢查改為「動態選取目前 Running 的 worker pods」，避免 rollout 期間命中已完成/已替換 pod 造成誤判。
 > `verify-phase3.sh` 會檢查 MPI job 的輸出是否至少包含 2 個不同 `rank-host`；若不足，視為 MPI 驗證失敗。
 > MPI 驗證會先由 `scontrol show job -o` 讀取該 job 的 `StdOut` 路徑再解析 `rank-host`（不再假設固定在 `/root/slurm-<jobid>.out`）。
+> 另外也會一併檢查 `StdErr` 與相對路徑 fallback（例如 `/root/<file>`），避免 Slurm 輸出路徑差異導致 `unique_hosts=0` 假陰性。
 > 預設 verify 期間會暫停 `slurm-elastic-operator`（避免 worker 被自動縮回），結束後自動恢復；可用 `DISABLE_OPERATOR_DURING_VERIFY=false` 關閉。
 > verify 會等待 `slurm-worker` 至少 N 個 Pod 達到 `READY 1/1` 且 `STATUS Running`（預設 N=2）才進行 daemon 檢查。
 > 暫停/恢復 operator 時看到舊 pod `Terminating/Error` 屬於 rollout 過程常見現象，重點是新 pod 最終恢復 `Running`。
