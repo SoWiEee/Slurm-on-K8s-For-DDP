@@ -168,8 +168,11 @@ bash phase3/scripts/bootstrap-phase3.sh
    - `statefulset/slurm-controller`
    - `statefulset/slurm-worker`
 3. 等待 Controller / Worker rollout 完成。
+4. 再等待 PVC 變成 `Bound` 並檢查 `/shared` 在 Pod 內可見。
 
 > 目前採用 PVC（local-path）作為本地 Kind 開發環境的共享儲存，方便先驗證 checkpoint/workflow。
+>
+> 若你看到 `timed out waiting for the condition on persistentvolumeclaims/slurm-shared-pvc`，通常是 StorageClass 為 `WaitForFirstConsumer`（PVC 會在 Pod 真正掛載後才 Bound）。目前腳本已把 PVC Bound 檢查移到 rollout 後，且失敗時會自動 dump `pvc/pv/storageclass/sts/pods/events` 方便除錯。
 
 ## 3.8) 驗證 Phase 3（三層驗證：低風險到高風險）
 

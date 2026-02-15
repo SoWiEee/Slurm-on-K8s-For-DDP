@@ -620,6 +620,28 @@ kubectl -n slurm exec pod/slurm-worker-1 -- cat /shared/checkpoints/mock_train.l
 
 ---
 
+## E) bootstrap-phase3 卡在 PVC Bound timeout
+
+症狀：
+
+```bash
+persistentvolumeclaim/slurm-shared-pvc unchanged
+error: timed out waiting for the condition on persistentvolumeclaims/slurm-shared-pvc
+```
+
+常見 root cause：
+
+- StorageClass 使用 `WaitForFirstConsumer`（例如 Kind 常見 local-path 行為）。
+- 這種模式下，PVC 不會在 `kubectl apply` 後立刻變 Bound，而是要等 Pod 真正消費 volume 才會綁定。
+
+修正策略：
+
+1. `bootstrap-phase3.sh` 先 patch StatefulSet + rollout。
+2. rollout 後再檢查 PVC Bound。
+3. 若失敗，自動 dump `pvc/pv/storageclass/sts/pods/events`，減少人工排查時間。
+
+---
+
 ## 下一步（銜接 PyTorch Training）
 
 1. 新增訓練 image（含 Python + PyTorch + torch.distributed）。
