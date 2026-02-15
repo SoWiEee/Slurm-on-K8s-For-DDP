@@ -211,14 +211,30 @@ print_job_status() {
 
 
 
+extract_job_field() {
+  local line="$1"
+  local key="$2"
+  printf '%s\n' "${line}" | awk -v k="${key}=" '{for(i=1;i<=NF;i++) if(index($i,k)==1){print substr($i,length(k)+1); exit}}'
+}
+
+normalize_path() {
+  local path="$1"
+  if [[ -z "${path}" ]]; then
+    printf '%s\n' ""
+    return
+  fi
+  printf '%s\n' "${path}" | sed 's#//*#/#g'
+}
+
 get_job_stdout_path() {
   local job_id="$1"
   local line
   local path
 
   line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
-  path="$(printf '%s\n' "${line}" | sed -n 's/.*StdOut=\([^ ]*\).*/\1/p')"
-  printf '%s\n' "${path:-slurm-${job_id}.out}"
+  path="$(extract_job_field "${line}" "StdOut")"
+  path="${path:-slurm-${job_id}.out}"
+  normalize_path "${path}"
 }
 
 get_job_stderr_path() {
@@ -227,8 +243,9 @@ get_job_stderr_path() {
   local path
 
   line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
-  path="$(printf '%s\n' "${line}" | sed -n 's/.*StdErr=\([^ ]*\).*/\1/p')"
-  printf '%s\n' "${path:-slurm-${job_id}.err}"
+  path="$(extract_job_field "${line}" "StdErr")"
+  path="${path:-slurm-${job_id}.err}"
+  normalize_path "${path}"
 }
 
 get_job_workdir() {
@@ -237,8 +254,9 @@ get_job_workdir() {
   local path
 
   line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
-  path="$(printf '%s\n' "${line}" | sed -n 's/.*WorkDir=\([^ ]*\).*/\1/p')"
-  printf '%s\n' "${path:-/root}"
+  path="$(extract_job_field "${line}" "WorkDir")"
+  path="${path:-/root}"
+  normalize_path "${path}"
 }
 
 list_candidate_output_paths() {
@@ -274,15 +292,22 @@ get_job_nodelist_info() {
   local line
   local num_nodes
   local nodelist
+  local raw_job_line
 
   line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
-  num_nodes="$(printf '%s
-' "${line}" | sed -n 's/.* NumNodes=\([^ ]*\).*//p')"
-  nodelist="$(printf '%s
-' "${line}" | sed -n 's/.* NodeList=\([^ ]*\).*//p')"
-  printf '%s %s
-' "${num_nodes:-0}" "${nodelist:-unknown}"
+  num_nodes="$(extract_job_field "${line}" "NumNodes")"
+  nodelist="$(extract_job_field "${line}" "NodeList")"
+
+  if [[ -z "${num_nodes}" || ! "${num_nodes}" =~ ^[0-9]+$ ]]; then
+    num_nodes=0
+  fi
+  if [[ -z "${nodelist}" ]]; then
+    nodelist=unknown
+  fi
+
+  printf '%s %s\n' "${num_nodes}" "${nodelist}"
 }
+
 
 get_job_state_exit() {
   local job_id="$1"
@@ -433,6 +458,7 @@ assert_mpi_output() {
   local node_info
   local num_nodes
   local nodelist
+  local raw_job_line
 
   candidates="$(list_candidate_output_paths "${job_id}" | sed '/^$/d' | awk '!seen[$0]++')"
 
@@ -451,6 +477,9 @@ assert_mpi_output() {
 
   log "debug: existing candidate files and tails"
   printf '%s\n' "${candidates}" | kubectl -n "${NAMESPACE}" exec -i "pod/${CONTROLLER_POD}" -- bash -lc "while IFS= read -r p; do [ -f \"\$p\" ] || continue; echo '-----' \"\$p\"; tail -n 120 \"\$p\"; done" || true
+
+  raw_job_line="$(slurm_exec_retry "scontrol show job ${job_id} -o" || true)"
+  log "debug: scontrol -o ${raw_job_line}"
 
   node_info="$(get_job_nodelist_info "${job_id}")"
   num_nodes="$(printf '%s' "${node_info}" | awk '{print $1}')"
