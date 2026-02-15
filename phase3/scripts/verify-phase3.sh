@@ -14,6 +14,7 @@ SLURM_NODE_READY_TIMEOUT_SECONDS="${SLURM_NODE_READY_TIMEOUT_SECONDS:-240}"
 WORKER_POD_READY_TIMEOUT_SECONDS="${WORKER_POD_READY_TIMEOUT_SECONDS:-240}"
 DISABLE_OPERATOR_DURING_VERIFY="${DISABLE_OPERATOR_DURING_VERIFY:-true}"
 OPERATOR_DEPLOYMENT_NAME="${OPERATOR_DEPLOYMENT_NAME:-slurm-elastic-operator}"
+WORKER_NODE_NAME_PREFIX="${WORKER_NODE_NAME_PREFIX:-slurm-worker-}"
 
 OPERATOR_REPLICAS_BEFORE_VERIFY=""
 
@@ -381,15 +382,22 @@ wait_slurm_nodes_ready() {
   local state
   local state_lc
   local base_state
+  local considered_count
 
   start="$(date +%s)"
   while true; do
     lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true)"
     ready_count=0
     unhealthy_count=0
+    considered_count=0
 
     while read -r node state; do
       [[ -z "${node:-}" ]] && continue
+      if [[ "${node}" != ${WORKER_NODE_NAME_PREFIX}* ]]; then
+        continue
+      fi
+
+      considered_count=$((considered_count + 1))
       state_lc="$(printf '%s' "${state}" | tr '[:upper:]' '[:lower:]')"
       base_state="$(printf '%s' "${state_lc}" | sed 's/[^a-z].*$//')"
 
@@ -406,12 +414,12 @@ wait_slurm_nodes_ready() {
     done <<< "${lines}"
 
     if (( ready_count >= required_nodes )); then
-      log "slurm nodes ready: ${ready_count}/${required_nodes} (unhealthy=${unhealthy_count})"
+      log "slurm worker nodes ready: ${ready_count}/${required_nodes} (considered=${considered_count}, unhealthy=${unhealthy_count})"
       return 0
     fi
 
     if (( $(date +%s) - start > SLURM_NODE_READY_TIMEOUT_SECONDS )); then
-      log "timeout waiting slurm nodes ready: need ${required_nodes}, got ${ready_count} (unhealthy=${unhealthy_count})"
+      log "timeout waiting slurm worker nodes ready: need ${required_nodes}, got ${ready_count} (considered=${considered_count}, unhealthy=${unhealthy_count})"
       slurm_exec_retry "sinfo -R || true" || true
       slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true
       slurm_exec_retry "scontrol show nodes | sed -n '1,120p'" || true
@@ -421,6 +429,7 @@ wait_slurm_nodes_ready() {
     sleep 4
   done
 }
+
 
 
 
