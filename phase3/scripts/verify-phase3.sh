@@ -269,21 +269,29 @@ list_candidate_output_paths() {
   err_path="$(get_job_stderr_path "${job_id}")"
   workdir="$(get_job_workdir "${job_id}")"
 
-  cat <<EOF
-${out_path}
-${err_path}
-${workdir}/${out_path}
-${workdir}/${err_path}
-/root/${out_path}
-/root/${err_path}
-/tmp/${out_path}
-/tmp/${err_path}
-/root/slurm-${job_id}.out
-/tmp/slurm-${job_id}.out
-/root/slurm-${job_id}.err
-/tmp/slurm-${job_id}.err
-EOF
+  if [[ "${out_path}" == /* ]]; then
+    printf '%s\n' "${out_path}"
+  else
+    normalize_path "${workdir}/${out_path}"
+    normalize_path "/root/${out_path}"
+    normalize_path "/tmp/${out_path}"
+  fi
+
+  if [[ "${err_path}" == /* ]]; then
+    printf '%s\n' "${err_path}"
+  else
+    normalize_path "${workdir}/${err_path}"
+    normalize_path "/root/${err_path}"
+    normalize_path "/tmp/${err_path}"
+  fi
+
+  normalize_path "/root/slurm-${job_id}.out"
+  normalize_path "/tmp/slurm-${job_id}.out"
+  normalize_path "/root/slurm-${job_id}.err"
+  normalize_path "/tmp/slurm-${job_id}.err"
 }
+
+
 
 
 
@@ -368,20 +376,44 @@ wait_slurm_nodes_ready() {
   local start
   local lines
   local ready_count
+  local unhealthy_count
+  local node
+  local state
+  local state_lc
+  local base_state
 
   start="$(date +%s)"
   while true; do
-    lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%T'" || true)"
-    ready_count="$(printf '%s\n' "${lines}" | grep -Eic 'idle|mix|allocated|alloc')"
+    lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true)"
+    ready_count=0
+    unhealthy_count=0
+
+    while read -r node state; do
+      [[ -z "${node:-}" ]] && continue
+      state_lc="$(printf '%s' "${state}" | tr '[:upper:]' '[:lower:]')"
+      base_state="$(printf '%s' "${state_lc}" | sed 's/[^a-z].*$//')"
+
+      if printf '%s' "${state_lc}" | grep -Eq 'down|drain|fail|not[_-]?respond|maint|unk'; then
+        unhealthy_count=$((unhealthy_count + 1))
+        continue
+      fi
+
+      case "${base_state}" in
+        idle|mix|allocated|alloc)
+          ready_count=$((ready_count + 1))
+          ;;
+      esac
+    done <<< "${lines}"
 
     if (( ready_count >= required_nodes )); then
-      log "slurm nodes ready: ${ready_count}/${required_nodes}"
+      log "slurm nodes ready: ${ready_count}/${required_nodes} (unhealthy=${unhealthy_count})"
       return 0
     fi
 
     if (( $(date +%s) - start > SLURM_NODE_READY_TIMEOUT_SECONDS )); then
-      log "timeout waiting slurm nodes ready: need ${required_nodes}, got ${ready_count}"
+      log "timeout waiting slurm nodes ready: need ${required_nodes}, got ${ready_count} (unhealthy=${unhealthy_count})"
       slurm_exec_retry "sinfo -R || true" || true
+      slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true
       slurm_exec_retry "scontrol show nodes | sed -n '1,120p'" || true
       return 1
     fi
@@ -389,6 +421,7 @@ wait_slurm_nodes_ready() {
     sleep 4
   done
 }
+
 
 
 verify_worker_daemons() {
