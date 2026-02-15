@@ -7,6 +7,7 @@ CONTROLLER_POD="${CONTROLLER_POD:-slurm-controller-0}"
 JOB_TIMEOUT_SECONDS="${JOB_TIMEOUT_SECONDS:-240}"
 SLURM_RETRY_COUNT="${SLURM_RETRY_COUNT:-8}"
 SLURM_RETRY_SLEEP_SECONDS="${SLURM_RETRY_SLEEP_SECONDS:-5}"
+JOB_COMPLETING_GRACE_SECONDS="${JOB_COMPLETING_GRACE_SECONDS:-300}"
 
 log() {
   printf '[phase3 verify] %s\n' "$*"
@@ -51,7 +52,12 @@ wait_job_done() {
   local job_id="$1"
   local start
   local queue_output
+  local states_output
+  local hard_deadline
+  local completing_deadline
   start="$(date +%s)"
+  hard_deadline=$((start + JOB_TIMEOUT_SECONDS))
+  completing_deadline=$((hard_deadline + JOB_COMPLETING_GRACE_SECONDS))
 
   while true; do
     queue_output="$(slurm_exec_retry "squeue -h -j ${job_id}" || true)"
@@ -59,15 +65,28 @@ wait_job_done() {
       return 0
     fi
 
-    if (( $(date +%s) - start > JOB_TIMEOUT_SECONDS )); then
-      log "timeout waiting for job ${job_id}"
-      slurm_exec_retry "squeue -j ${job_id} || true" || true
-      return 1
+    states_output="$(slurm_exec_retry "squeue -h -j ${job_id} -o '%T'" || true)"
+
+    if (( $(date +%s) > hard_deadline )); then
+      if [[ -n "${states_output}" ]] && printf '%s\n' "${states_output}" | grep -Evq 'COMPLETING|COMPLETED'; then
+        log "timeout waiting for job ${job_id}"
+        slurm_exec_retry "squeue -j ${job_id} || true" || true
+        return 1
+      fi
+
+      if (( $(date +%s) > completing_deadline )); then
+        log "timeout waiting for job ${job_id} (including completing grace ${JOB_COMPLETING_GRACE_SECONDS}s)"
+        slurm_exec_retry "squeue -j ${job_id} || true" || true
+        return 1
+      fi
+
+      log "job ${job_id} is completing; waiting extra grace window (${JOB_COMPLETING_GRACE_SECONDS}s)"
     fi
 
     sleep 4
   done
 }
+
 
 submit_job() {
   local script_path="$1"
@@ -79,14 +98,15 @@ submit_job() {
 print_job_status() {
   local job_id="$1"
 
-  if controller_exec "sacct -j ${job_id} --format=JobID,State,ExitCode --parsable2 >/dev/null 2>&1"; then
-    slurm_exec_retry "sacct -j ${job_id} --format=JobID,State,ExitCode --parsable2 | tail -n +3" || true
-    return
-  fi
+  log "job ${job_id} status (scontrol)"
+  slurm_exec_retry "scontrol show job ${job_id} | sed -n '1,8p'" || true
 
-  log "sacct unavailable, fallback to scontrol show job ${job_id}"
-  slurm_exec_retry "scontrol show job ${job_id} | sed -n '1,4p'" || true
+  if [[ "${ENABLE_SACCT_STATUS:-false}" == "true" ]]; then
+    log "job ${job_id} status (sacct enabled by flag)"
+    slurm_exec_retry "sacct -j ${job_id} --format=JobID,State,ExitCode --parsable2 | tail -n +3" || true
+  fi
 }
+
 
 main() {
   kubectl config use-context "${KUBE_CONTEXT}" >/dev/null

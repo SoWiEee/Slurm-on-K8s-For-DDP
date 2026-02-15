@@ -200,6 +200,8 @@ bash phase3/scripts/verify-phase3.sh
 
 > `verify-phase3.sh` 已加入 Slurm 指令重試（預設 8 次、每次間隔 5 秒），可降低 controller 短暫 timeout 造成的誤判。
 > 可用 `SLURM_RETRY_COUNT` 與 `SLURM_RETRY_SLEEP_SECONDS` 調整重試策略。
+> 若工作在 `CG/COMPLETING` 狀態，`verify-phase3.sh` 會再給一段 grace time（預設 `JOB_COMPLETING_GRACE_SECONDS=300`），避免即將完成卻被 timeout 誤判。
+> 預設以 `scontrol show job` 顯示 job 結果；若你要額外輸出 `sacct`，可設 `ENABLE_SACCT_STATUS=true`。
 
 
 ## 4) 常用操作
