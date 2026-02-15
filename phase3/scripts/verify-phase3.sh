@@ -231,15 +231,19 @@ assert_job_success() {
   case "${state}" in
     COMPLETED)
       if [[ "${exit_code}" != "0:0" ]]; then
-        log "job ${job_id} (${name}) exit code is ${exit_code} (expected 0:0)"
-        controller_exec "test -f /root/slurm-${job_id}.out && tail -n 80 /root/slurm-${job_id}.out || true"
+        local out_path
+        out_path="$(get_job_stdout_path "${job_id}")"
+        log "job ${job_id} (${name}) exit code is ${exit_code} (expected 0:0), stdout=${out_path}"
+        controller_exec "test -f '${out_path}' && tail -n 80 '${out_path}' || true"
         return 1
       fi
       return 0
       ;;
     *)
-      log "job ${job_id} (${name}) failed with state=${state} exit=${exit_code}"
-      controller_exec "test -f /root/slurm-${job_id}.out && tail -n 120 /root/slurm-${job_id}.out || true"
+      local out_path
+      out_path="$(get_job_stdout_path "${job_id}")"
+      log "job ${job_id} (${name}) failed with state=${state} exit=${exit_code}, stdout=${out_path}"
+      controller_exec "test -f '${out_path}' && tail -n 120 '${out_path}' || true"
       slurm_exec_retry "sinfo -R || true" || true
       slurm_exec_retry "scontrol show nodes | sed -n '1,120p'" || true
       return 1
