@@ -667,6 +667,25 @@ srun: error: slurm_set_addr: Unable to resolve "slurm-worker-2.slurm-worker.slur
 
 ---
 
+## G) verify-phase3 timeout 時自動 dump 資訊
+
+現在 `verify-phase3.sh` 已加上 `trap on_error`，只要任一步驟失敗（例如 `kubectl wait ... timeout`），會自動輸出：
+
+- `pods` / `statefulsets` / `endpoints`
+- `events`（最近 120 筆）
+- controller 內 `sinfo` + `scontrol show nodes`
+- controller 對 `worker-0/1/2` 的 `getent hosts`
+- `worker-0/1/2` 的 `describe` 與 logs tail
+
+這樣在「當下失敗現場」就能看到：
+
+1. Pod readiness 是否達標。
+2. Slurm node 是否 `NOT_RESPONDING` / `COMPLETING`。
+3. DNS 解析是否一致。
+4. worker 端是否有 slurmd/ssh/munge 啟動異常。
+
+---
+
 ## 下一步（銜接 PyTorch Training）
 
 1. 新增訓練 image（含 Python + PyTorch + torch.distributed）。

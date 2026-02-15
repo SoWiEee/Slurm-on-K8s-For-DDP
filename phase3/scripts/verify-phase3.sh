@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 NAMESPACE=${NAMESPACE:-slurm}
@@ -7,6 +7,56 @@ KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
 VERIFY_TIMEOUT=${VERIFY_TIMEOUT:-180s}
 L1_RETRY_COUNT=${L1_RETRY_COUNT:-3}
 L1_RETRY_INTERVAL_SECONDS=${L1_RETRY_INTERVAL_SECONDS:-10}
+
+dump_verify_diagnostics() {
+  {
+    echo "[phase3/verify] ===== diagnostics start ====="
+    echo "--- context ---"
+    kubectl config current-context || true
+    echo
+    echo "--- pods ---"
+    kubectl -n "$NAMESPACE" get pods -o wide || true
+    echo
+    echo "--- statefulsets ---"
+    kubectl -n "$NAMESPACE" get sts slurm-controller slurm-worker -o wide || true
+    echo
+    echo "--- endpoints ---"
+    kubectl -n "$NAMESPACE" get endpoints slurm-worker slurm-controller -o wide || true
+    echo
+    echo "--- recent events ---"
+    kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -n 120 || true
+    echo
+    echo "--- slurm controller view (sinfo/scontrol) ---"
+    kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc 'sinfo; scontrol show nodes' || true
+    echo
+    echo "--- DNS checks in controller ---"
+    kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc '
+      getent hosts slurm-worker-0.slurm-worker.slurm.svc.cluster.local || true
+      getent hosts slurm-worker-1.slurm-worker.slurm.svc.cluster.local || true
+      getent hosts slurm-worker-2.slurm-worker.slurm.svc.cluster.local || true
+    ' || true
+    echo
+    echo "--- worker-0 logs (tail) ---"
+    kubectl -n "$NAMESPACE" logs pod/slurm-worker-0 --tail=120 || true
+    echo
+    echo "--- worker-1 describe/logs (if exists) ---"
+    kubectl -n "$NAMESPACE" describe pod slurm-worker-1 || true
+    kubectl -n "$NAMESPACE" logs pod/slurm-worker-1 --tail=120 || true
+    echo
+    echo "--- worker-2 describe/logs (if exists) ---"
+    kubectl -n "$NAMESPACE" describe pod slurm-worker-2 || true
+    kubectl -n "$NAMESPACE" logs pod/slurm-worker-2 --tail=120 || true
+    echo "[phase3/verify] ===== diagnostics end ====="
+  } >&2
+}
+
+on_error() {
+  local exit_code=$?
+  echo "[phase3/verify] failed (exit=${exit_code}), dumping diagnostics..." >&2
+  dump_verify_diagnostics
+  exit "$exit_code"
+}
+trap on_error ERR
 
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
