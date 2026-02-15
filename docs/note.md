@@ -500,3 +500,129 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
 ### 觀測面
 
 - 保持 Milestone B 的結構化日誌，並補充 partition/checkpoint 相關欄位，方便後續比較不同 partition 的行為與 checkpoint 保護命中率。
+
+# Development Notes (Phase 3)
+
+## 目標
+
+完成 Timeline 的 Phase 3（先建立可維護、可階梯式擴充的驗證框架）：
+
+1. 建立共享儲存（PVC）並掛載到 controller/worker。
+2. 完成三層驗證：基礎互通、資料一致性、訓練語義。
+3. 讓後續 PyTorch DDP 可以直接替換 Layer 3，不需重寫整套驗證流程。
+
+---
+
+## 開發想法
+
+## 1) 先把風險拆層，避免一次把問題混在一起
+
+Phase 3 最容易踩坑的是：
+
+- Slurm 排程問題
+- K8s 儲存問題
+- 應用程式 checkpoint 問題
+
+若三者同時改，故障定位會非常慢。因此本次採「由低風險到高風險」三層：
+
+- Layer 1：只驗證 worker 間協調前提（排程/互通）。
+- Layer 2：只驗證共享資料一致性。
+- Layer 3：再驗證 checkpoint/resume 的語義連續性。
+
+## 2) 先用 PVC（local-path）建立可重現最小路徑
+
+在 Kind 單機開發環境中，PVC（local-path）部署最簡單、維護成本低。
+
+- 優點：不用先架 NFS server 就可做共享流程驗證。
+- 限制：不是完整 RWX/NFS 生產拓撲，但足夠作為 Phase 3 的 MVP。
+
+## 3) Layer 3 先用 mock-train，保留替換點
+
+這版刻意先不用 PyTorch 真實訓練，理由是先確認「機制」：
+
+- checkpoint 檔案是否能跨 worker 延續。
+- 重新執行後 step/optimizer/loss 是否連續。
+
+等這個機制穩定後，再把 `mock-train.sh` 替換成 `torch.save/torch.load` 的訓練腳本，就能低風險升級到真實 DDP。
+
+---
+
+## 除錯方式
+
+## A) `/shared` 在 Pod 內不存在
+
+1. 看 PVC 是否 Bound：
+
+```bash
+kubectl -n slurm get pvc slurm-shared-pvc
+```
+
+2. 看 StatefulSet 是否掛載成功：
+
+```bash
+kubectl -n slurm get sts slurm-controller -o yaml
+kubectl -n slurm get sts slurm-worker -o yaml
+```
+
+3. 進 Pod 驗證：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- ls -al /shared
+kubectl -n slurm exec pod/slurm-worker-0 -- ls -al /shared
+```
+
+## B) Layer 1 `srun -N2 -n2 hostname` 無法回傳兩個 host
+
+1. 看 node 是否可見：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- sinfo
+kubectl -n slurm exec pod/slurm-controller-0 -- scontrol show nodes
+```
+
+2. 若 worker 不足 2 個，先手動拉高 replicas：
+
+```bash
+kubectl -n slurm scale statefulset/slurm-worker --replicas=2
+kubectl -n slurm rollout status statefulset/slurm-worker --timeout=180s
+```
+
+## C) Layer 2 checksum/mtime 驗證失敗
+
+1. 先看每個 pod 實際檔案：
+
+```bash
+kubectl -n slurm exec pod/slurm-worker-0 -- ls -al /shared/checkpoints
+kubectl -n slurm exec pod/slurm-worker-1 -- ls -al /shared/checkpoints
+```
+
+2. 比對 checksum：
+
+```bash
+kubectl -n slurm exec pod/slurm-worker-0 -- sha256sum /shared/checkpoints/phase3_meta.txt
+kubectl -n slurm exec pod/slurm-worker-1 -- sha256sum /shared/checkpoints/phase3_meta.txt
+```
+
+3. 若 mtime 沒增加，檢查寫入命令是否真的 append 成功。
+
+## D) Layer 3 continuity 失敗
+
+1. 直接看 log：
+
+```bash
+kubectl -n slurm exec pod/slurm-worker-1 -- cat /shared/checkpoints/mock_train.log
+```
+
+2. 常見原因：
+- checkpoint 寫入不是 atomic（先寫 temp 再 mv 可降低毀損）。
+- resume 讀取邏輯沒先 source state。
+- 不同 worker 使用到不同路徑（需固定 `/shared/checkpoints/*`）。
+
+---
+
+## 下一步（銜接 PyTorch Training）
+
+1. 新增訓練 image（含 Python + PyTorch + torch.distributed）。
+2. 用 `torch.save/torch.load` 取代 `mock-train.sh` state file。
+3. 增加 chaos case：訓練中刪除一個 worker pod，驗證 Slurm 重排程後可 resume。
+4. 在驗證中納入 loss 曲線連續性門檻（例如斷點前後 loss 不應異常跳升）。

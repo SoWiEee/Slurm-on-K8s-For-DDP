@@ -151,6 +151,50 @@ kubectl -n slurm set env deployment/slurm-elastic-operator \
   ]'
 ```
 
+## 3.7) 部署 Phase 3（Shared PVC + 協調驗證 + Checkpoint/Resume）
+
+在 Phase 2 驗證完成後，執行：
+
+```bash
+bash phase3/scripts/bootstrap-phase3.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/bootstrap-phase3.sh
+```
+
+該腳本會做以下事情：
+
+1. 套用 `phase3/manifests/shared-storage.yaml` 建立 `slurm-shared-pvc`。
+2. 以 strategic patch 將 `/shared` 掛載到：
+   - `statefulset/slurm-controller`
+   - `statefulset/slurm-worker`
+3. 等待 Controller / Worker rollout 完成。
+
+> 目前採用 PVC（local-path）作為本地 Kind 開發環境的共享儲存，方便先驗證 checkpoint/workflow。
+
+## 3.8) 驗證 Phase 3（三層驗證：低風險到高風險）
+
+```bash
+bash phase3/scripts/verify-phase3.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/verify-phase3.sh
+```
+
+驗證腳本分成三層：
+
+1. **基礎互通層（Layer 1）**
+   - 沿用 `phase1/scripts/verify-phase1.sh`。
+   - 追加 `srun -N2 -n2 hostname`，確認跨 worker 任務可分派（MPI 類工作前提）。
+2. **資料一致性層（Layer 2）**
+   - `worker-0` 在 `/shared/checkpoints` 寫入檔案與 checksum。
+   - `worker-1` 驗證 checksum、mtime 遞增、路徑一致。
+   - 刪除 `worker-1` Pod 後重建，再確認可讀同一檔案。
+3. **訓練語義層（Layer 3）**
+   - 使用 `mock-train.sh` 模擬 checkpoint/resume 流程。
+   - 驗證重排程到另一個 worker 後，`step` 連續遞增。
+   - 驗證 `optimizer state`（以 `OPT` 模擬）與 `loss` 具有 continuity。
+
+> 建議流程：先讓 Layer 1/2 穩定，再替換 Layer 3 的 `mock-train.sh` 為 PyTorch 真實訓練腳本（`torch.save` / `torch.load`），以降低除錯複雜度。
+
 
 ## 4) 常用操作
 
@@ -316,11 +360,14 @@ Phase 2：Operator 開發
 - 開發 Python Operator，實作 "Pending Job -> Scale Up" 邏輯。
 - 實作 "Idle Node -> Scale Down" 邏輯。
 
-Phase 3：應用整合與容錯
+Phase 3：應用整合與容錯（本版先完成階梯式驗證骨架）
 
-- 整合 PyTorch DDP 應用。
-- 實作 Checkpoint/Resume 機制。
-- 進行故障模擬測試。
+- [x] Shared PVC 掛載至 controller/worker（`/shared`）。
+- [x] 三層驗證腳本：
+  - Layer 1：基礎互通（Slurm node 可見 + `srun` 跨 worker）
+  - Layer 2：資料一致性（checksum / mtime / 路徑一致 + pod 重建可讀）
+  - Layer 3：訓練語義（checkpoint/resume 的 step/loss/optimizer continuity）
+- [ ] 將 Layer 3 的 mock 訓練替換為 PyTorch DDP 真實訓練與 chaos 測試。
 
 Phase 4：評估與優化
 
