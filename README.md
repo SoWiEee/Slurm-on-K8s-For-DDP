@@ -183,11 +183,16 @@ bash phase3/scripts/verify-phase3.sh
 # 指定 context
 # KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/verify-phase3.sh
 ```
+可選參數：
+
+- `DISABLE_OPERATOR_DURING_VERIFY=true|false`（預設 `true`）
+
 
 驗證腳本分成三層：
 
 1. **基礎互通層（Layer 1）**
    - 沿用 `phase1/scripts/verify-phase1.sh`。
+   - 驗證期間會暫時把 `slurm-elastic-operator` scale 到 `0`（預設），避免 operator 把 worker 自動縮回 1 造成 `pod/slurm-worker-1` timeout；結束後自動還原。
    - 追加 `srun -N2 -n2 hostname`，確認跨 worker 任務可分派（MPI 類工作前提）。
    - 以 `--nodelist=slurm-worker-0,slurm-worker-1` 鎖定已存在 pod，避免 `slurm.conf` 中尚未啟用節點（如 `slurm-worker-2`）造成 DNS 解析失敗。
 2. **資料一致性層（Layer 2）**

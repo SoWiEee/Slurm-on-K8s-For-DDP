@@ -7,6 +7,10 @@ KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
 VERIFY_TIMEOUT=${VERIFY_TIMEOUT:-180s}
 L1_RETRY_COUNT=${L1_RETRY_COUNT:-3}
 L1_RETRY_INTERVAL_SECONDS=${L1_RETRY_INTERVAL_SECONDS:-10}
+DISABLE_OPERATOR_DURING_VERIFY=${DISABLE_OPERATOR_DURING_VERIFY:-true}
+
+operator_original_replicas=""
+operator_scaled_down="false"
 
 dump_verify_diagnostics() {
   {
@@ -19,6 +23,9 @@ dump_verify_diagnostics() {
     echo
     echo "--- statefulsets ---"
     kubectl -n "$NAMESPACE" get sts slurm-controller slurm-worker -o wide || true
+    echo
+    echo "--- operator deployment ---"
+    kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o wide || true
     echo
     echo "--- endpoints ---"
     kubectl -n "$NAMESPACE" get endpoints slurm-worker slurm-controller -o wide || true
@@ -34,6 +41,7 @@ dump_verify_diagnostics() {
       getent hosts slurm-worker-0.slurm-worker.slurm.svc.cluster.local || true
       getent hosts slurm-worker-1.slurm-worker.slurm.svc.cluster.local || true
       getent hosts slurm-worker-2.slurm-worker.slurm.svc.cluster.local || true
+      getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true
     ' || true
     echo
     echo "--- worker-0 logs (tail) ---"
@@ -50,15 +58,37 @@ dump_verify_diagnostics() {
   } >&2
 }
 
+restore_operator() {
+  if [[ "$operator_scaled_down" == "true" && -n "$operator_original_replicas" ]]; then
+    echo "[phase3/verify] restoring operator replicas to ${operator_original_replicas}" >&2
+    kubectl -n "$NAMESPACE" scale deployment/slurm-elastic-operator --replicas="$operator_original_replicas" >/dev/null || true
+    kubectl -n "$NAMESPACE" rollout status deployment/slurm-elastic-operator --timeout="$VERIFY_TIMEOUT" >/dev/null || true
+  fi
+}
+
 on_error() {
   local exit_code=$?
   echo "[phase3/verify] failed (exit=${exit_code}), dumping diagnostics..." >&2
   dump_verify_diagnostics
+  restore_operator
   exit "$exit_code"
 }
 trap on_error ERR
+trap restore_operator EXIT
 
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
+
+# Avoid phase2 operator racing against this verify (it may scale worker back to 1).
+if [[ "$DISABLE_OPERATOR_DURING_VERIFY" == "true" ]] && kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator >/dev/null 2>&1; then
+  operator_original_replicas=$(kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o jsonpath='{.spec.replicas}')
+  operator_original_replicas=${operator_original_replicas:-1}
+  if [[ "$operator_original_replicas" -gt 0 ]]; then
+    echo "[phase3/verify] scaling down slurm-elastic-operator from ${operator_original_replicas} to 0 during verification" >&2
+    kubectl -n "$NAMESPACE" scale deployment/slurm-elastic-operator --replicas=0
+    kubectl -n "$NAMESPACE" rollout status deployment/slurm-elastic-operator --timeout="$VERIFY_TIMEOUT"
+    operator_scaled_down="true"
+  fi
+fi
 
 # Layer 1: base connectivity + scheduling visibility.
 bash phase1/scripts/verify-phase1.sh

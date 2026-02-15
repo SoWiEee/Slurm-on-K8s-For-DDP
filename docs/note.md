@@ -686,6 +686,33 @@ srun: error: slurm_set_addr: Unable to resolve "slurm-worker-2.slurm-worker.slur
 
 ---
 
+## H) verify-phase3 等待 `slurm-worker-1` timeout（operator 競態）
+
+症狀（節錄）：
+
+```bash
+error: timed out waiting for the condition on pods/slurm-worker-1
+```
+
+搭配 diagnostics 可看到：
+
+- `statefulset/slurm-worker` 最後常回到 `READY 1/1`。
+- 只有 `slurm-worker-0` 存在。
+- 但驗證腳本正在等 `slurm-worker-1` Ready。
+
+常見 root cause：
+
+- Phase 2 的 `slurm-elastic-operator` 在無 pending job 時會主動 scale-down worker。
+- verify 腳本把 worker 拉到 2 的同時，operator 可能又縮回 1，造成等待 timeout。
+
+修正策略：
+
+1. verify 開始時暫時把 operator scale 到 0（預設開啟）。
+2. verify 結束（成功或失敗）都自動還原 operator replicas。
+3. 保留 `DISABLE_OPERATOR_DURING_VERIFY=false` 作為除錯開關（若要觀察 operator 互動）。
+
+---
+
 ## 下一步（銜接 PyTorch Training）
 
 1. 新增訓練 image（含 Python + PyTorch + torch.distributed）。
