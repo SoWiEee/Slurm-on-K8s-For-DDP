@@ -8,6 +8,7 @@ JOB_TIMEOUT_SECONDS="${JOB_TIMEOUT_SECONDS:-240}"
 SLURM_RETRY_COUNT="${SLURM_RETRY_COUNT:-8}"
 SLURM_RETRY_SLEEP_SECONDS="${SLURM_RETRY_SLEEP_SECONDS:-5}"
 JOB_COMPLETING_GRACE_SECONDS="${JOB_COMPLETING_GRACE_SECONDS:-300}"
+COMPLETING_LOG_INTERVAL_SECONDS="${COMPLETING_LOG_INTERVAL_SECONDS:-30}"
 
 log() {
   printf '[phase3 verify] %s\n' "$*"
@@ -55,6 +56,9 @@ wait_job_done() {
   local states_output
   local hard_deadline
   local completing_deadline
+  local last_completing_log=0
+  local now
+
   start="$(date +%s)"
   hard_deadline=$((start + JOB_TIMEOUT_SECONDS))
   completing_deadline=$((hard_deadline + JOB_COMPLETING_GRACE_SECONDS))
@@ -66,21 +70,25 @@ wait_job_done() {
     fi
 
     states_output="$(slurm_exec_retry "squeue -h -j ${job_id} -o '%T'" || true)"
+    now="$(date +%s)"
 
-    if (( $(date +%s) > hard_deadline )); then
+    if (( now > hard_deadline )); then
       if [[ -n "${states_output}" ]] && printf '%s\n' "${states_output}" | grep -Evq 'COMPLETING|COMPLETED'; then
         log "timeout waiting for job ${job_id}"
         slurm_exec_retry "squeue -j ${job_id} || true" || true
         return 1
       fi
 
-      if (( $(date +%s) > completing_deadline )); then
+      if (( now > completing_deadline )); then
         log "timeout waiting for job ${job_id} (including completing grace ${JOB_COMPLETING_GRACE_SECONDS}s)"
         slurm_exec_retry "squeue -j ${job_id} || true" || true
         return 1
       fi
 
-      log "job ${job_id} is completing; waiting extra grace window (${JOB_COMPLETING_GRACE_SECONDS}s)"
+      if (( now - last_completing_log >= COMPLETING_LOG_INTERVAL_SECONDS )); then
+        log "job ${job_id} is completing; waiting extra grace window (${JOB_COMPLETING_GRACE_SECONDS}s)"
+        last_completing_log="${now}"
+      fi
     fi
 
     sleep 4
@@ -108,6 +116,43 @@ print_job_status() {
 }
 
 
+get_job_state_exit() {
+  local job_id="$1"
+  local line
+  line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
+  printf '%s\n' "${line}" | sed -n 's/.*JobState=\([^ ]*\).*ExitCode=\([^ ]*\).*/\1 \2/p'
+}
+
+
+assert_job_success() {
+  local job_id="$1"
+  local name="$2"
+  local state_exit
+  local state
+  local exit_code
+
+  state_exit="$(get_job_state_exit "${job_id}")"
+  state="$(printf '%s' "${state_exit}" | awk '{print $1}')"
+  exit_code="$(printf '%s' "${state_exit}" | awk '{print $2}')"
+
+  case "${state}" in
+    COMPLETED)
+      if [[ "${exit_code}" != "0:0" ]]; then
+        log "job ${job_id} (${name}) exit code is ${exit_code} (expected 0:0)"
+        controller_exec "test -f /root/slurm-${job_id}.out && tail -n 80 /root/slurm-${job_id}.out || true"
+        return 1
+      fi
+      return 0
+      ;;
+    *)
+      log "job ${job_id} (${name}) failed with state=${state} exit=${exit_code}"
+      controller_exec "test -f /root/slurm-${job_id}.out && tail -n 120 /root/slurm-${job_id}.out || true"
+      return 1
+      ;;
+  esac
+}
+
+
 main() {
   kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
 
@@ -130,18 +175,21 @@ main() {
   wait_job_done "${shared_job}"
   controller_exec "ls -1 /shared/phase3 | tail -n 3"
   print_job_status "${shared_job}"
+  assert_job_success "${shared_job}" "phase3-shared"
 
   log "run MPI-like multi-node smoke"
   local mpi_job
   mpi_job="$(submit_job '/tmp/mpi-smoke.sbatch')"
   wait_job_done "${mpi_job}"
   print_job_status "${mpi_job}"
+  assert_job_success "${mpi_job}" "phase3-mpi-smoke"
 
   log "run PyTorch/checkpoint step"
   local torch_job
   torch_job="$(submit_job '/tmp/pytorch-elastic.sbatch')"
   wait_job_done "${torch_job}"
   print_job_status "${torch_job}"
+  assert_job_success "${torch_job}" "phase3-torch"
 
   log "phase3 verify completed"
 }
