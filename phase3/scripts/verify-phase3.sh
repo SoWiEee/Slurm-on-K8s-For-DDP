@@ -450,6 +450,15 @@ recover_unhealthy_nodes() {
   done <<< "${lines}"
 }
 
+ensure_multinode_prerequisites() {
+  local required_nodes="$1"
+  log "preflight multi-node prerequisites: required_nodes=${required_nodes}"
+  ensure_worker_capacity
+  verify_worker_daemons
+  recover_unhealthy_nodes
+  wait_slurm_nodes_ready "${required_nodes}"
+}
+
 assert_mpi_output() {
   local job_id="$1"
   local candidates
@@ -522,10 +531,7 @@ main() {
   print_job_status "${shared_job}"
   assert_job_success "${shared_job}" "phase3-shared"
 
-  ensure_worker_capacity
-  verify_worker_daemons
-  recover_unhealthy_nodes
-  wait_slurm_nodes_ready 2
+  ensure_multinode_prerequisites 2
 
   log "run MPI-like multi-node smoke"
   local mpi_job
@@ -536,6 +542,7 @@ main() {
   assert_mpi_output "${mpi_job}"
 
   log "run PyTorch/checkpoint step"
+  ensure_multinode_prerequisites 2
   local torch_job
   torch_job="$(submit_job '/tmp/pytorch-elastic.sbatch')"
   wait_job_done "${torch_job}"
