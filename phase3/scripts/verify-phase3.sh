@@ -197,6 +197,42 @@ submit_job() {
   printf '%s\n' "${out}" | awk '{print $4}'
 }
 
+should_retry_for_node_unavailable() {
+  local job_id="$1"
+  local reason
+  reason="$(slurm_exec_retry "squeue -h -j ${job_id} -o '%T %r'" || true)"
+
+  if printf '%s\n' "${reason}" | grep -Eiq 'PENDING .*Nodes required for job are DOWN, DRAINED|ReqNodeNotAvail'; then
+    return 0
+  fi
+  return 1
+}
+
+run_torch_job_with_retry() {
+  local script_path="$1"
+  local job_id
+  local attempt
+
+  for attempt in 1 2; do
+    job_id="$(submit_job "${script_path}")"
+    if wait_job_done "${job_id}"; then
+      printf '%s\n' "${job_id}"
+      return 0
+    fi
+
+    if (( attempt == 1 )) && should_retry_for_node_unavailable "${job_id}"; then
+      log "torch job ${job_id} pending due to node availability; recovering nodes and retrying once"
+      slurm_exec_retry "scancel ${job_id} || true" || true
+      recover_unhealthy_nodes
+      wait_slurm_nodes_ready 2
+      continue
+    fi
+
+    print_job_status "${job_id}"
+    return 1
+  done
+}
+
 print_job_status() {
   local job_id="$1"
 
@@ -606,8 +642,7 @@ main() {
   log "run PyTorch/checkpoint step"
   ensure_multinode_prerequisites 2
   local torch_job
-  torch_job="$(submit_job '/tmp/pytorch-elastic.sbatch')"
-  wait_job_done "${torch_job}"
+  torch_job="$(run_torch_job_with_retry '/tmp/pytorch-elastic.sbatch')"
   print_job_status "${torch_job}"
   assert_job_success "${torch_job}" "phase3-torch"
 
