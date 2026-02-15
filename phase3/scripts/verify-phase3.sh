@@ -11,6 +11,7 @@ JOB_COMPLETING_GRACE_SECONDS="${JOB_COMPLETING_GRACE_SECONDS:-300}"
 COMPLETING_LOG_INTERVAL_SECONDS="${COMPLETING_LOG_INTERVAL_SECONDS:-30}"
 VERIFY_MIN_WORKER_REPLICAS="${VERIFY_MIN_WORKER_REPLICAS:-2}"
 SLURM_NODE_READY_TIMEOUT_SECONDS="${SLURM_NODE_READY_TIMEOUT_SECONDS:-240}"
+WORKER_POD_READY_TIMEOUT_SECONDS="${WORKER_POD_READY_TIMEOUT_SECONDS:-240}"
 DISABLE_OPERATOR_DURING_VERIFY="${DISABLE_OPERATOR_DURING_VERIFY:-true}"
 OPERATOR_DEPLOYMENT_NAME="${OPERATOR_DEPLOYMENT_NAME:-slurm-elastic-operator}"
 
@@ -71,6 +72,7 @@ pause_operator_if_needed() {
   log "pausing operator ${OPERATOR_DEPLOYMENT_NAME} (replicas ${OPERATOR_REPLICAS_BEFORE_VERIFY} -> 0)"
   kubectl -n "${NAMESPACE}" scale deployment/"${OPERATOR_DEPLOYMENT_NAME}" --replicas=0 >/dev/null
   kubectl -n "${NAMESPACE}" rollout status deployment/"${OPERATOR_DEPLOYMENT_NAME}" --timeout=180s >/dev/null || true
+  wait_operator_quiesced || true
 }
 
 restore_operator_if_needed() {
@@ -89,6 +91,56 @@ restore_operator_if_needed() {
   log "restoring operator ${OPERATOR_DEPLOYMENT_NAME} replicas -> ${OPERATOR_REPLICAS_BEFORE_VERIFY}"
   kubectl -n "${NAMESPACE}" scale deployment/"${OPERATOR_DEPLOYMENT_NAME}" --replicas="${OPERATOR_REPLICAS_BEFORE_VERIFY}" >/dev/null || true
 }
+
+wait_operator_quiesced() {
+  local start
+  local running
+  local desired
+
+  start="$(date +%s)"
+  while true; do
+    desired="$(kubectl -n "${NAMESPACE}" get deployment "${OPERATOR_DEPLOYMENT_NAME}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)"
+    running="$(kubectl -n "${NAMESPACE}" get pods -l app=${OPERATOR_DEPLOYMENT_NAME} --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+
+    if [[ "${desired:-0}" == "0" ]] && [[ "${running:-0}" == "0" ]]; then
+      return 0
+    fi
+
+    if (( $(date +%s) - start > 180 )); then
+      log "operator did not fully quiesce in time (desired=${desired:-?}, running=${running:-?})"
+      kubectl -n "${NAMESPACE}" get deployment "${OPERATOR_DEPLOYMENT_NAME}" -o wide || true
+      kubectl -n "${NAMESPACE}" get pods -l app=${OPERATOR_DEPLOYMENT_NAME} -o wide || true
+      return 1
+    fi
+
+    sleep 2
+  done
+}
+
+wait_worker_pods_ready() {
+  local required="$1"
+  local start
+  local ready
+
+  start="$(date +%s)"
+  while true; do
+    ready="$(kubectl -n "${NAMESPACE}" get pods -l app=slurm-worker --no-headers 2>/dev/null | awk '$2=="1/1" && $3=="Running" {c++} END{print c+0}')"
+
+    if (( ready >= required )); then
+      log "worker pods ready: ${ready}/${required}"
+      return 0
+    fi
+
+    if (( $(date +%s) - start > WORKER_POD_READY_TIMEOUT_SECONDS )); then
+      log "timeout waiting worker pods ready: ${ready}/${required}"
+      kubectl -n "${NAMESPACE}" get pods -l app=slurm-worker -o wide || true
+      return 1
+    fi
+
+    sleep 3
+  done
+}
+
 
 wait_job_done() {
   local job_id="$1"
@@ -204,6 +256,7 @@ ensure_worker_capacity() {
   log "ensuring worker replicas >= ${VERIFY_MIN_WORKER_REPLICAS} for multi-node checks"
   kubectl -n "${NAMESPACE}" scale statefulset/slurm-worker --replicas="${VERIFY_MIN_WORKER_REPLICAS}" >/dev/null
   kubectl -n "${NAMESPACE}" rollout status statefulset/slurm-worker --timeout="${SLURM_NODE_READY_TIMEOUT_SECONDS}s"
+  wait_worker_pods_ready "${VERIFY_MIN_WORKER_REPLICAS}"
 }
 
 wait_slurm_nodes_ready() {
