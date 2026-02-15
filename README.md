@@ -12,6 +12,7 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 - ✅ 將 Slurm 設定集中於 ConfigMap，提升可維護性與可讀性。
 - Phase 1.1 清理：在 `slurm.conf` 為每個 worker 明確設定 `NodeAddr`/`NodeHostname` FQDN 對應，降低 `NO NETWORK ADDRESS FOUND` 機率。
 - ✅ Phase 2 已完成：新增 Python Elastic Operator，支援 `Pending Job -> Scale Up` 與 `Idle Node -> Scale Down`。
+- ✅ Phase 3 已完成（第一版）：提供共享儲存、MPI-like smoke test、PyTorch/checkpoint workload 腳本，支援階梯式驗證。
 
 # 🚀 Getting Started
 
@@ -150,6 +151,45 @@ kubectl -n slurm set env deployment/slurm-elastic-operator \
     {"partition":"gpu","worker_statefulset":"slurm-worker-gpu","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":90,"checkpoint_path":"/shared/checkpoints/gpu-latest.ckpt","max_checkpoint_age_seconds":900}
   ]'
 ```
+
+## 3.7) 部署 Phase 3（應用整合：Shared Storage -> MPI -> PyTorch）
+
+Phase 3 採階梯式落地，先把「共享儲存」打通，再驗證跨節點執行，最後再跑訓練/Checkpoint 工作負載。
+
+```bash
+bash phase3/scripts/bootstrap-phase3.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/bootstrap-phase3.sh
+# 若 rollout 較慢
+# ROLLOUT_TIMEOUT=600s bash phase3/scripts/bootstrap-phase3.sh
+```
+
+此腳本會：
+
+1. 檢查 `slurm-controller` 與 `slurm-worker` 是否為 Ready。
+2. 建立 `slurm-shared` PVC（`local-path`，模擬共享儲存）。
+3. 套用 `slurm-phase3-jobs` ConfigMap（內含三個 sbatch 模板）。
+4. 自動 patch `slurm-controller` / `slurm-worker` StatefulSet，掛載 `/shared`。
+
+## 3.8) 驗證 Phase 3 工作流
+
+```bash
+bash phase3/scripts/verify-phase3.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/verify-phase3.sh
+# 拉長單個 job 等待時間
+# JOB_TIMEOUT_SECONDS=360 bash phase3/scripts/verify-phase3.sh
+```
+
+驗證順序：
+
+1. **Shared Storage smoke**：提交 `shared-storage.sbatch`，確認 `/shared/phase3` 有輸出檔。
+2. **MPI-like smoke**：提交 `mpi-smoke.sbatch`，以 `srun --ntasks=2 --nodes=2` 驗證跨節點執行。
+3. **PyTorch/checkpoint step**：提交 `pytorch-elastic.sbatch`。
+   - 若 worker image 已安裝 `torch`，會使用 `torch.distributed.run`。
+   - 若尚未安裝，會 fallback 成純 Python checkpoint demo（仍可驗證共享 checkpoint 檔案機制）。
+
+> 建議：先用 fallback 路徑確認 Phase 3 pipeline，再升級 worker image 納入 PyTorch 套件，降低一次改動風險。
 
 
 ## 4) 常用操作
@@ -318,9 +358,10 @@ Phase 2：Operator 開發
 
 Phase 3：應用整合與容錯
 
-- 整合 PyTorch DDP 應用。
-- 實作 Checkpoint/Resume 機制。
-- 進行故障模擬測試。
+- ✅ Shared Storage 基礎：建立並掛載 `/shared`（PVC）。
+- ✅ MPI-like smoke：以 `srun` 驗證跨節點任務可執行。
+- ✅ PyTorch/Checkpoint 工作流：提供 `torchrun`（有 torch）/fallback（無 torch）雙路徑 sbatch 模板。
+- ⏳ Chaos 測試（刪 Pod + Resume）列為下一步。
 
 Phase 4：評估與優化
 

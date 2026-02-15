@@ -500,3 +500,138 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
 ### 觀測面
 
 - 保持 Milestone B 的結構化日誌，並補充 partition/checkpoint 相關欄位，方便後續比較不同 partition 的行為與 checkpoint 保護命中率。
+
+# Development Notes (Phase 3)
+
+## 目標
+
+完成 Timeline 的 Phase 3（第一版，採階梯式開發）：
+
+1. 先打通共享儲存（/shared）。
+2. 再驗證跨節點（MPI-like）工作負載。
+3. 最後導入 PyTorch/checkpoint 工作流（含 fallback 路徑）。
+
+---
+
+## 開發想法
+
+## 1) 階梯式（Storage -> MPI -> Training）
+
+Phase 3 最大風險是一次引入太多變因（PVC、MPI、PyTorch 套件、DDP 啟動參數）。
+因此拆成三層：
+
+- **Layer A: Shared Storage**
+  - 只驗證 `/shared` 讀寫是否可行。
+  - 若 A 不穩，B/C 一定不穩。
+
+- **Layer B: MPI-like smoke**
+  - 先不綁特定 MPI 發行版，直接用 Slurm `srun --nodes=2 --ntasks=2` 驗證跨節點。
+  - 目標是「先確認調度與跨節點執行路徑」。
+
+- **Layer C: PyTorch/checkpoint**
+  - 若 image 內有 torch：走 `python -m torch.distributed.run`。
+  - 若尚未安裝 torch：fallback 到純 Python checkpoint demo。
+  - 這樣可在不阻塞主流程的前提下，先驗證 checkpoint 資料流與檔案一致性。
+
+## 2) 可維護性設計
+
+- 用 `phase3/manifests/slurm-phase3-shared.yaml` 集中管理「共享儲存 + sbatch 模板」。
+- 用 `bootstrap-phase3.sh` 負責 infra 變更（PVC + StatefulSet 掛載 patch）。
+- 用 `verify-phase3.sh` 負責工作流驗證（三個 job 依序執行）。
+
+這種拆分讓未來要升級 PyTorch image、改 checkpoint 規則、加入 chaos test 時，不會和基礎 infra 攪在一起。
+
+## 3) 為何用 patch 掛載 `/shared`
+
+避免直接重寫 Phase 1 manifest，降低對既有可運作路徑的破壞：
+
+- `bootstrap-phase3.sh` 會先檢查 volume/volumeMount 是否存在。
+- 不存在才 patch（具 idempotent 行為）。
+- patch 後等待 rollout，失敗時可直接從 StatefulSet event 排查。
+
+---
+
+## 除錯方式
+
+## A) PVC 一直 Pending
+
+先看 StorageClass：
+
+```bash
+kubectl get storageclass
+```
+
+再看 PVC 事件：
+
+```bash
+kubectl -n slurm describe pvc slurm-shared
+```
+
+若 `local-path` 不存在，表示 kind/local-path provisioner 未正常啟用。
+
+## B) `/shared` 在 Pod 內看不到
+
+1. 看 StatefulSet spec 是否已包含 `shared-storage`：
+
+```bash
+kubectl -n slurm get statefulset slurm-worker -o yaml
+kubectl -n slurm get statefulset slurm-controller -o yaml
+```
+
+2. 看 rollout 是否完成：
+
+```bash
+kubectl -n slurm rollout status statefulset/slurm-worker
+kubectl -n slurm rollout status statefulset/slurm-controller
+```
+
+3. 進 Pod 驗證：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- ls -al /shared
+```
+
+## C) MPI-like job 卡 Pending
+
+1. 檢查是否有足夠 worker：
+
+```bash
+kubectl -n slurm get statefulset slurm-worker
+kubectl -n slurm exec pod/slurm-controller-0 -- squeue
+```
+
+2. 檢查 partition 與節點狀態：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- sinfo -R
+kubectl -n slurm exec pod/slurm-controller-0 -- scontrol show nodes
+```
+
+## D) PyTorch job 失敗
+
+1. 先判斷是 torch 缺失還是分散式參數問題：
+
+```bash
+kubectl -n slurm exec pod/slurm-worker-0 -- python3 -c 'import torch'
+```
+
+2. 若無 torch，先接受 fallback 路徑，確認 checkpoint 檔案仍有落盤：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- ls -al /shared/phase3
+```
+
+3. 若有 torch 但失敗，再查看 job 輸出與 controller log：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- sacct -j <job_id> --format=JobID,State,ExitCode
+kubectl -n slurm logs statefulset/slurm-controller --tail=200
+```
+
+---
+
+## 下一步（Phase 3.1）
+
+- 加入 chaos 測試腳本：訓練中隨機刪除 worker Pod。
+- 與 Phase 2 checkpoint guard 事件對齊，記錄「阻擋縮容」與「恢復成功」指標。
+- 將 phase3 verify 輸出整理成可直接放報告的 KPI 表格。

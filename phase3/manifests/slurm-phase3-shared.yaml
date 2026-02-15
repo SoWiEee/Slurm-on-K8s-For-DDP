@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurm-shared
+  namespace: slurm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-phase3-jobs
+  namespace: slurm
+data:
+  shared-storage.sbatch: |
+    #!/bin/bash
+    #SBATCH -J phase3-shared
+    #SBATCH -p debug
+    #SBATCH -N 1
+    #SBATCH --ntasks=1
+    set -euo pipefail
+
+    mkdir -p /shared/phase3
+    out="/shared/phase3/shared-check-$(date +%s).txt"
+    {
+      echo "timestamp=$(date -Iseconds)"
+      echo "host=$(hostname)"
+      echo "job_id=${SLURM_JOB_ID}"
+    } >"${out}"
+    echo "shared_file=${out}"
+
+  mpi-smoke.sbatch: |
+    #!/bin/bash
+    #SBATCH -J phase3-mpi-smoke
+    #SBATCH -p debug
+    #SBATCH -N 2
+    #SBATCH --ntasks=2
+    #SBATCH --exclusive
+    set -euo pipefail
+
+    echo "[phase3] mpi-like smoke test via srun"
+    srun --ntasks=2 --nodes=2 bash -lc 'echo "rank-host=$(hostname)"'
+
+  pytorch-elastic.sbatch: |
+    #!/bin/bash
+    #SBATCH -J phase3-torch
+    #SBATCH -p debug
+    #SBATCH -N 2
+    #SBATCH --ntasks=2
+    #SBATCH --exclusive
+    set -euo pipefail
+
+    script=/shared/phase3/ddp_checkpoint_demo.py
+
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "python3 not found in worker image"
+      exit 2
+    fi
+
+    cat >"${script}" <<'PY'
+    import json
+    import os
+    import time
+    from pathlib import Path
+
+    ckpt = Path('/shared/phase3/demo-checkpoint.json')
+    state = {'epoch': 0}
+    if ckpt.exists():
+      state = json.loads(ckpt.read_text())
+
+    for _ in range(3):
+      state['epoch'] += 1
+      ckpt.parent.mkdir(parents=True, exist_ok=True)
+      ckpt.write_text(json.dumps(state))
+      print(f"epoch={state['epoch']} host={os.uname().nodename}", flush=True)
+      time.sleep(2)
+    PY
+
+    if python3 -c 'import torch' >/dev/null 2>&1; then
+      echo "torch detected: running torchrun elastic demo"
+      srun --ntasks=2 --nodes=2 bash -lc \
+        'python3 -m torch.distributed.run --standalone --nproc_per_node=1 /shared/phase3/ddp_checkpoint_demo.py'
+    else
+      echo "torch not found, fallback to python checkpoint demo"
+      srun --ntasks=2 --nodes=2 bash -lc 'python3 /shared/phase3/ddp_checkpoint_demo.py'
+    fi
