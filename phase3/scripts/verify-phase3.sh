@@ -195,6 +195,61 @@ wait_slurm_nodes_ready() {
 }
 
 
+verify_worker_daemons() {
+  local idx
+  local pod
+
+  if (( VERIFY_MIN_WORKER_REPLICAS <= 0 )); then
+    return
+  fi
+
+  for (( idx=0; idx<VERIFY_MIN_WORKER_REPLICAS; idx++ )); do
+    pod="slurm-worker-${idx}"
+    log "checking daemon health on ${pod}"
+
+    if ! kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc 'pgrep -x munged >/dev/null && pgrep -x slurmd >/dev/null'; then
+      log "${pod} daemon health check failed"
+      kubectl -n "${NAMESPACE}" logs "pod/${pod}" --tail=120 || true
+      return 1
+    fi
+  done
+}
+
+recover_unhealthy_nodes() {
+  local lines
+  local node
+  local state
+
+  lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%N %T'" || true)"
+  while read -r node state; do
+    if [[ -z "${node:-}" ]]; then
+      continue
+    fi
+    if printf '%s' "${state}" | grep -Eiq 'down|drain|not_responding|fail'; then
+      log "attempting RESUME for unhealthy node ${node} state=${state}"
+      slurm_exec_retry "scontrol update NodeName=${node} State=RESUME" || true
+    fi
+  done <<< "${lines}"
+}
+
+assert_mpi_output() {
+  local job_id="$1"
+  local hosts
+  local unique
+
+  hosts="$(controller_exec "test -f /root/slurm-${job_id}.out && awk -F= '/^rank-host=/{print \$2}' /root/slurm-${job_id}.out || true")"
+  unique="$(printf '%s\n' "${hosts}" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
+
+  if [[ -z "${unique}" || "${unique}" -lt 2 ]]; then
+    log "mpi output validation failed for job ${job_id}: unique_hosts=${unique:-0}"
+    controller_exec "test -f /root/slurm-${job_id}.out && tail -n 120 /root/slurm-${job_id}.out || true"
+    return 1
+  fi
+
+  log "mpi output validation passed: unique_hosts=${unique}"
+}
+
+
 main() {
   kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
 
@@ -220,6 +275,8 @@ main() {
   assert_job_success "${shared_job}" "phase3-shared"
 
   ensure_worker_capacity
+  verify_worker_daemons
+  recover_unhealthy_nodes
   wait_slurm_nodes_ready 2
 
   log "run MPI-like multi-node smoke"
@@ -228,6 +285,7 @@ main() {
   wait_job_done "${mpi_job}"
   print_job_status "${mpi_job}"
   assert_job_success "${mpi_job}" "phase3-mpi-smoke"
+  assert_mpi_output "${mpi_job}"
 
   log "run PyTorch/checkpoint step"
   local torch_job

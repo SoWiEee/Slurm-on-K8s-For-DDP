@@ -31,7 +31,14 @@ data:
     set -euo pipefail
 
     echo "[phase3] mpi-like smoke test via srun"
-    srun --ntasks=2 --nodes=2 bash -lc 'echo "rank-host=$(hostname)"'
+    hosts=$(srun --ntasks=2 --nodes=2 bash -lc 'echo "rank-host=$(hostname)"')
+    echo "${hosts}"
+
+    unique_hosts=$(printf '%s\n' "${hosts}" | awk -F= '/^rank-host=/{print $2}' | sort -u | wc -l | tr -d ' ')
+    if [ "${unique_hosts}" -lt 2 ]; then
+      echo "[phase3][mpi-smoke] expected >=2 unique hosts, got ${unique_hosts}"
+      exit 42
+    fi
 
   pytorch-elastic.sbatch: |
     #!/bin/bash
