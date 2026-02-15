@@ -406,7 +406,7 @@ wait_slurm_nodes_ready() {
       state_lc="$(printf '%s' "${state}" | tr '[:upper:]' '[:lower:]')"
       base_state="$(printf '%s' "${state_lc}" | sed 's/[^a-z].*$//')"
 
-      if printf '%s' "${state_lc}" | grep -Eq 'down|drain|fail|not[_-]?respond|maint|unk|completing|\*'; then
+      if printf '%s' "${state_lc}" | grep -Eq 'down|drain|fail|not[_-]?respond|maint|unk|completing'; then
         unhealthy_count=$((unhealthy_count + 1))
         continue
       fi
@@ -504,7 +504,7 @@ recover_unhealthy_nodes() {
     fi
 
     state_lc="$(printf '%s' "${state}" | tr '[:upper:]' '[:lower:]')"
-    if printf '%s' "${state_lc}" | grep -Eq 'down|drain|not[_-]?respond|fail|completing|\*'; then
+    if printf '%s' "${state_lc}" | grep -Eq 'down|drain|not[_-]?respond|fail|completing'; then
       log "attempting RESUME for unhealthy node ${node} state=${state}"
       slurm_exec_retry "scontrol update NodeName=${node} State=RESUME" || true
     fi
