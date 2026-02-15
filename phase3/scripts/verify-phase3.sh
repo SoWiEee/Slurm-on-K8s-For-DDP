@@ -154,8 +154,8 @@ kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
 # on some Slurm versions (e.g. "Invalid node state specified").
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
   for n in slurm-worker-0 slurm-worker-1; do
-    scontrol update NodeName="$n" State=UNDRAIN >/dev/null 2>&1 || true
-    scontrol update NodeName="$n" State=RESUME >/dev/null 2>&1 || true
+    scontrol update NodeName="\$n" State=UNDRAIN >/dev/null 2>&1 || true
+    scontrol update NodeName="\$n" State=RESUME >/dev/null 2>&1 || true
   done
 "
 
