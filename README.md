@@ -176,6 +176,7 @@ bash phase3/scripts/bootstrap-phase3.sh
 > Phase 3 腳本不依賴 `rg`（ripgrep），避免在乾淨環境因缺少工具而失敗。
 > `slurm-shared` 會自動選擇可用 StorageClass（`local-path` 優先，其次 default/第一個可用 StorageClass）。
 > 若 PVC 在 timeout 內無法 `Bound`，腳本會直接停止並輸出 `get/describe pvc` + `get storageclass` 供除錯。
+> 若 StorageClass 是 `WaitForFirstConsumer`（例如你目前的 `standard`），PVC 會在 Pod 真正掛載後才 Bound；腳本已改成先 patch 掛載、再做 post-mount wait。
 
 ## 3.8) 驗證 Phase 3 工作流
 

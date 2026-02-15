@@ -63,8 +63,15 @@ resolve_storage_class() {
   exit 1
 }
 
+
+get_binding_mode() {
+  local sc="$1"
+  kubectl get storageclass "${sc}" -o jsonpath='{.volumeBindingMode}'
+}
+
 ensure_shared_pvc() {
   local sc="$1"
+  local binding_mode="$2"
   local pvc="slurm-shared"
 
   if kubectl -n "${NAMESPACE}" get pvc "${pvc}" >/dev/null 2>&1; then
@@ -97,6 +104,11 @@ spec:
   storageClassName: ${sc}
 YAML
 
+  if [[ "${binding_mode}" == "WaitForFirstConsumer" ]]; then
+    log "storageClass=${sc} 使用 WaitForFirstConsumer，先掛載到 Pod 後再等待 PVC Bound"
+    return
+  fi
+
   if ! kubectl -n "${NAMESPACE}" wait pvc/${pvc} --for=jsonpath='{.status.phase}'=Bound --timeout="${ROLLOUT_TIMEOUT}"; then
     log "PVC ${pvc} 在 ${ROLLOUT_TIMEOUT} 內未 Bound（storageClass=${sc}）"
     kubectl -n "${NAMESPACE}" get pvc "${pvc}" -o wide || true
@@ -106,11 +118,13 @@ YAML
   fi
 }
 
+
 apply_phase3_basics() {
   local sc="$1"
+  local binding_mode="$2"
   log "applying phase3 shared storage + job templates"
-  log "selected storageClass: ${sc}"
-  ensure_shared_pvc "${sc}"
+  log "selected storageClass: ${sc} (volumeBindingMode=${binding_mode})"
+  ensure_shared_pvc "${sc}" "${binding_mode}"
   kubectl apply -f "${MANIFEST}"
 }
 
@@ -140,14 +154,36 @@ patch_shared_mount() {
   kubectl -n "${NAMESPACE}" rollout status statefulset/"${target}" --timeout="${ROLLOUT_TIMEOUT}"
 }
 
+wait_shared_pvc_bound_post_mount() {
+  local sc="$1"
+  local binding_mode="$2"
+  local pvc="slurm-shared"
+
+  if [[ "${binding_mode}" != "WaitForFirstConsumer" ]]; then
+    return
+  fi
+
+  log "post-mount: waiting PVC ${pvc} to become Bound (storageClass=${sc})"
+  if ! kubectl -n "${NAMESPACE}" wait pvc/${pvc} --for=jsonpath='{.status.phase}'=Bound --timeout="${ROLLOUT_TIMEOUT}"; then
+    log "PVC ${pvc} 在掛載後仍未於 ${ROLLOUT_TIMEOUT} 內 Bound（storageClass=${sc}）"
+    kubectl -n "${NAMESPACE}" get pvc "${pvc}" -o wide || true
+    kubectl -n "${NAMESPACE}" describe pvc "${pvc}" || true
+    kubectl get storageclass || true
+    exit 1
+  fi
+}
+
 main() {
   local sc
+  local binding_mode
   ensure_context
   ensure_phase1_ready
   sc="$(resolve_storage_class)"
-  apply_phase3_basics "${sc}"
+  binding_mode="$(get_binding_mode "${sc}")"
+  apply_phase3_basics "${sc}" "${binding_mode}"
   patch_shared_mount slurm-controller
   patch_shared_mount slurm-worker
+  wait_shared_pvc_bound_post_mount "${sc}" "${binding_mode}"
   log "phase3 bootstrap done"
 }
 
