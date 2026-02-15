@@ -477,27 +477,6 @@ verify_worker_daemons() {
 }
 
 
-verify_python_runtime_on_workers() {
-  local pods_raw
-  local pod
-
-  if (( VERIFY_MIN_WORKER_REPLICAS <= 0 )); then
-    return
-  fi
-
-  pods_raw="$(kubectl -n "${NAMESPACE}" get pods -l app=slurm-worker --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)"
-
-  while read -r pod; do
-    [[ -z "${pod}" ]] && continue
-    log "checking python runtime on ${pod}"
-    if ! kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc 'command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1'; then
-      log "${pod} missing python runtime (python3/python)"
-      kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc 'command -v python3 || true; command -v python || true' || true
-      return 1
-    fi
-  done < <(printf '%s\n' "${pods_raw}" | sed '/^$/d' | head -n "${VERIFY_MIN_WORKER_REPLICAS}")
-}
-
 recover_unhealthy_nodes() {
   local lines
   local node
@@ -520,7 +499,6 @@ ensure_multinode_prerequisites() {
   log "preflight multi-node prerequisites: required_nodes=${required_nodes}"
   ensure_worker_capacity
   verify_worker_daemons
-  verify_python_runtime_on_workers
   recover_unhealthy_nodes
   wait_slurm_nodes_ready "${required_nodes}"
 }

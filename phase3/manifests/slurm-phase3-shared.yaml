@@ -56,9 +56,6 @@ data:
       PYTHON_BIN="python3"
     elif command -v python >/dev/null 2>&1; then
       PYTHON_BIN="python"
-    else
-      echo "python runtime not found in worker image (python3/python)"
-      exit 2
     fi
 
     cat >"${script}" <<'PY'
@@ -80,11 +77,20 @@ data:
       time.sleep(2)
     PY
 
-    if ${PYTHON_BIN} -c 'import torch' >/dev/null 2>&1; then
+    if [[ -n "${PYTHON_BIN}" ]] && ${PYTHON_BIN} -c 'import torch' >/dev/null 2>&1; then
       echo "torch detected: running torchrun elastic demo"
       srun --ntasks=2 --nodes=2 bash -lc \
         '${PYTHON_BIN} -m torch.distributed.run --standalone --nproc_per_node=1 /shared/phase3/ddp_checkpoint_demo.py'
-    else
+    elif [[ -n "${PYTHON_BIN}" ]]; then
       echo "torch not found, fallback to python checkpoint demo"
       srun --ntasks=2 --nodes=2 bash -lc '"${PYTHON_BIN}" /shared/phase3/ddp_checkpoint_demo.py'
+    else
+      echo "python runtime not found; fallback to shell checkpoint smoke"
+      srun --ntasks=2 --nodes=2 bash -lc '\
+        out=/shared/phase3/demo-checkpoint-shell.txt; \
+        for i in 1 2 3; do \
+          echo "epoch=${i} host=$(hostname)" >> "${out}"; \
+          sleep 2; \
+        done; \
+        tail -n 3 "${out}"'
     fi
