@@ -9,6 +9,8 @@ SLURM_RETRY_COUNT="${SLURM_RETRY_COUNT:-8}"
 SLURM_RETRY_SLEEP_SECONDS="${SLURM_RETRY_SLEEP_SECONDS:-5}"
 JOB_COMPLETING_GRACE_SECONDS="${JOB_COMPLETING_GRACE_SECONDS:-300}"
 COMPLETING_LOG_INTERVAL_SECONDS="${COMPLETING_LOG_INTERVAL_SECONDS:-30}"
+VERIFY_MIN_WORKER_REPLICAS="${VERIFY_MIN_WORKER_REPLICAS:-2}"
+SLURM_NODE_READY_TIMEOUT_SECONDS="${SLURM_NODE_READY_TIMEOUT_SECONDS:-240}"
 
 log() {
   printf '[phase3 verify] %s\n' "$*"
@@ -147,9 +149,49 @@ assert_job_success() {
     *)
       log "job ${job_id} (${name}) failed with state=${state} exit=${exit_code}"
       controller_exec "test -f /root/slurm-${job_id}.out && tail -n 120 /root/slurm-${job_id}.out || true"
+      slurm_exec_retry "sinfo -R || true" || true
+      slurm_exec_retry "scontrol show nodes | sed -n '1,120p'" || true
       return 1
       ;;
   esac
+}
+
+
+ensure_worker_capacity() {
+  if (( VERIFY_MIN_WORKER_REPLICAS <= 0 )); then
+    return
+  fi
+
+  log "ensuring worker replicas >= ${VERIFY_MIN_WORKER_REPLICAS} for multi-node checks"
+  kubectl -n "${NAMESPACE}" scale statefulset/slurm-worker --replicas="${VERIFY_MIN_WORKER_REPLICAS}" >/dev/null
+  kubectl -n "${NAMESPACE}" rollout status statefulset/slurm-worker --timeout="${SLURM_NODE_READY_TIMEOUT_SECONDS}s"
+}
+
+wait_slurm_nodes_ready() {
+  local required_nodes="$1"
+  local start
+  local lines
+  local ready_count
+
+  start="$(date +%s)"
+  while true; do
+    lines="$(slurm_exec_retry "sinfo -h -N -p debug -o '%T'" || true)"
+    ready_count="$(printf '%s\n' "${lines}" | grep -Eic 'idle|mix|allocated|alloc')"
+
+    if (( ready_count >= required_nodes )); then
+      log "slurm nodes ready: ${ready_count}/${required_nodes}"
+      return 0
+    fi
+
+    if (( $(date +%s) - start > SLURM_NODE_READY_TIMEOUT_SECONDS )); then
+      log "timeout waiting slurm nodes ready: need ${required_nodes}, got ${ready_count}"
+      slurm_exec_retry "sinfo -R || true" || true
+      slurm_exec_retry "scontrol show nodes | sed -n '1,120p'" || true
+      return 1
+    fi
+
+    sleep 4
+  done
 }
 
 
@@ -176,6 +218,9 @@ main() {
   controller_exec "ls -1 /shared/phase3 | tail -n 3"
   print_job_status "${shared_job}"
   assert_job_success "${shared_job}" "phase3-shared"
+
+  ensure_worker_capacity
+  wait_slurm_nodes_ready 2
 
   log "run MPI-like multi-node smoke"
   local mpi_job

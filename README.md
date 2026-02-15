@@ -203,6 +203,7 @@ bash phase3/scripts/verify-phase3.sh
 > 若工作在 `CG/COMPLETING` 狀態，`verify-phase3.sh` 會再給一段 grace time（預設 `JOB_COMPLETING_GRACE_SECONDS=300`），避免即將完成卻被 timeout 誤判。
 > 預設以 `scontrol show job` 顯示 job 結果；若你要額外輸出 `sacct`，可設 `ENABLE_SACCT_STATUS=true`。
 > 若任一 job 狀態不是 `COMPLETED` 或 ExitCode 非 `0:0`，verify 會直接失敗 (`exit 1`)，並輸出對應 `slurm-<jobid>.out` 片段。
+> verify 會先確保 `slurm-worker` 至少有 2 replicas，並等待 Slurm 端至少 2 個可用節點後才送出 MPI/Torch 多節點工作，降低節點尚未就緒導致的 `NonZeroExitCode`。
 
 
 ## 4) 常用操作
