@@ -8,6 +8,8 @@ VERIFY_TIMEOUT=${VERIFY_TIMEOUT:-180s}
 L1_RETRY_COUNT=${L1_RETRY_COUNT:-3}
 L1_RETRY_INTERVAL_SECONDS=${L1_RETRY_INTERVAL_SECONDS:-10}
 DISABLE_OPERATOR_DURING_VERIFY=${DISABLE_OPERATOR_DURING_VERIFY:-true}
+WORKER_TARGET_REPLICAS=${WORKER_TARGET_REPLICAS:-2}
+WORKER_READY_MAX_WAIT_SECONDS=${WORKER_READY_MAX_WAIT_SECONDS:-240}
 
 operator_original_replicas=""
 operator_scaled_down="false"
@@ -50,10 +52,12 @@ dump_verify_diagnostics() {
     echo "--- worker-1 describe/logs (if exists) ---"
     kubectl -n "$NAMESPACE" describe pod slurm-worker-1 || true
     kubectl -n "$NAMESPACE" logs pod/slurm-worker-1 --tail=120 || true
+    kubectl -n "$NAMESPACE" logs pod/slurm-worker-1 --previous --tail=120 || true
     echo
     echo "--- worker-2 describe/logs (if exists) ---"
     kubectl -n "$NAMESPACE" describe pod slurm-worker-2 || true
     kubectl -n "$NAMESPACE" logs pod/slurm-worker-2 --tail=120 || true
+    kubectl -n "$NAMESPACE" logs pod/slurm-worker-2 --previous --tail=120 || true
     echo "[phase3/verify] ===== diagnostics end ====="
   } >&2
 }
@@ -70,15 +74,39 @@ on_error() {
   local exit_code=$?
   echo "[phase3/verify] failed (exit=${exit_code}), dumping diagnostics..." >&2
   dump_verify_diagnostics
-  restore_operator
   exit "$exit_code"
 }
 trap on_error ERR
 trap restore_operator EXIT
 
+wait_worker_replicas_ready() {
+  local desired=$1
+  local deadline=$(( $(date +%s) + WORKER_READY_MAX_WAIT_SECONDS ))
+
+  while (( $(date +%s) < deadline )); do
+    local spec ready
+    spec=$(kubectl -n "$NAMESPACE" get sts slurm-worker -o jsonpath='{.spec.replicas}')
+    ready=$(kubectl -n "$NAMESPACE" get sts slurm-worker -o jsonpath='{.status.readyReplicas}')
+    ready=${ready:-0}
+
+    if [[ "$spec" != "$desired" ]]; then
+      echo "[phase3/verify] detected slurm-worker spec.replicas=${spec} (expected ${desired}); scaling back..." >&2
+      kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas="$desired" >/dev/null || true
+    fi
+
+    if [[ "$spec" == "$desired" && "$ready" -ge "$desired" ]]; then
+      return 0
+    fi
+
+    sleep 5
+  done
+
+  echo "[phase3/verify] worker replicas not ready in time (expected=${desired})" >&2
+  return 1
+}
+
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
-# Avoid phase2 operator racing against this verify (it may scale worker back to 1).
 if [[ "$DISABLE_OPERATOR_DURING_VERIFY" == "true" ]] && kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator >/dev/null 2>&1; then
   operator_original_replicas=$(kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o jsonpath='{.spec.replicas}')
   operator_original_replicas=${operator_original_replicas:-1}
@@ -90,17 +118,14 @@ if [[ "$DISABLE_OPERATOR_DURING_VERIFY" == "true" ]] && kubectl -n "$NAMESPACE" 
   fi
 fi
 
-# Layer 1: base connectivity + scheduling visibility.
 bash phase1/scripts/verify-phase1.sh
 
-# Keep two worker pods ready for phase3 checks.
-kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas=2
+kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas="$WORKER_TARGET_REPLICAS"
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$VERIFY_TIMEOUT"
+wait_worker_replicas_ready "$WORKER_TARGET_REPLICAS"
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-0 --timeout="$VERIFY_TIMEOUT"
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-1 --timeout="$VERIFY_TIMEOUT"
 
-# Explicitly target existing worker pods to avoid stale slurm node entries (e.g. worker-2)
-# causing DNS resolution failures in srun.
 worker_nodelist="slurm-worker-0,slurm-worker-1"
 
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
@@ -108,7 +133,6 @@ kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
   getent hosts slurm-worker-1.slurm-worker.slurm.svc.cluster.local >/dev/null
 "
 
-# Recover transient slurmd states before L1 srun (e.g. COMPLETING/NOT_RESPONDING).
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
   scontrol update nodename=slurm-worker-0 state=resume || true
   scontrol update nodename=slurm-worker-1 state=resume || true
@@ -138,7 +162,6 @@ fi
 
 echo "[L1] srun cross-worker execution verified (unique_hosts=${unique_hosts}, nodelist=${worker_nodelist})."
 
-# Layer 2: data consistency through shared volume.
 kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- bash -s <<'SCRIPT'
 set -euo pipefail
 mkdir -p /shared/checkpoints
@@ -170,7 +193,6 @@ kubectl -n "$NAMESPACE" exec pod/slurm-worker-1 -- bash -lc 'test -f /shared/che
 
 echo "[L2] shared checkpoint consistency verified (checksum/mtime/path/restart)."
 
-# Layer 3: training semantics (checkpoint/resume continuity).
 kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- bash -s <<'SCRIPT'
 set -euo pipefail
 mkdir -p /shared/scripts /shared/checkpoints

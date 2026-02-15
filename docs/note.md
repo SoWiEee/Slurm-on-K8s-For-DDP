@@ -711,6 +711,13 @@ error: timed out waiting for the condition on pods/slurm-worker-1
 2. verify 結束（成功或失敗）都自動還原 operator replicas。
 3. 保留 `DISABLE_OPERATOR_DURING_VERIFY=false` 作為除錯開關（若要觀察 operator 互動）。
 
+補強（本次）：
+
+- 新增 `wait_worker_replicas_ready` 守門邏輯：在等待期間持續檢查 `statefulset/slurm-worker` 的 `spec.replicas` 與 `readyReplicas`。
+- 若發現 `spec.replicas` 被外部改動（例如被其他控制器改回 1），會自動 re-scale 回目標值再繼續等。
+- diagnostics 追加 `kubectl logs --previous`（worker-1/2），提高對反覆重啟場景的可見性。
+- 移除錯誤路徑中的重複 restore 呼叫，避免出現雙重 `restoring operator replicas ...` 訊息。
+
 ---
 
 ## 下一步（銜接 PyTorch Training）
