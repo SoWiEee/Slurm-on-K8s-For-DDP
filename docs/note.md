@@ -638,7 +638,8 @@ error: timed out waiting for the condition on persistentvolumeclaims/slurm-share
 
 1. `bootstrap-phase3.sh` 先 patch StatefulSet + rollout。
 2. rollout 後再檢查 PVC Bound。
-3. 若失敗，自動 dump `pvc/pv/storageclass/sts/pods/events`，減少人工排查時間。
+3. 對 controller/worker 增加 `wait Ready` + `/shared` 可寫入檢查（`touch/rm`）+ retry，避免瞬間抖動導致假失敗。
+4. 若失敗，自動 dump `pvc/pv/storageclass/sts/pods/events`，並額外輸出兩個 Pod 內 `/shared` 與 mount 訊息。
 
 ---
 

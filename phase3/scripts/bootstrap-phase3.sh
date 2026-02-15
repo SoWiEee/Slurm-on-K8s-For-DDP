@@ -6,6 +6,8 @@ NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-180s}
 PVC_BOUND_TIMEOUT=${PVC_BOUND_TIMEOUT:-180s}
+POST_CHECK_RETRIES=${POST_CHECK_RETRIES:-6}
+POST_CHECK_INTERVAL_SECONDS=${POST_CHECK_INTERVAL_SECONDS:-5}
 
 on_error() {
   local exit_code=$?
@@ -30,8 +32,14 @@ on_error() {
     echo "--- pods ---"
     kubectl -n "$NAMESPACE" get pods -o wide || true
     echo
+    echo "--- controller /shared ---"
+    kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -c 'ls -ld /shared; mount | grep /shared || true' || true
+    echo
+    echo "--- worker /shared ---"
+    kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- sh -c 'ls -ld /shared; mount | grep /shared || true' || true
+    echo
     echo "--- recent events ---"
-    kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -n 60 || true
+    kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -n 80 || true
   } >&2
   exit "$exit_code"
 }
@@ -76,7 +84,23 @@ kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLL
 # after a Pod uses it. Therefore PVC Bound check is intentionally after rollout.
 kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Bound pvc/slurm-shared-pvc --timeout="$PVC_BOUND_TIMEOUT"
 
-kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- test -d /shared
-kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- test -d /shared
+kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-controller-0 --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-0 --timeout="$ROLLOUT_TIMEOUT"
+
+check_shared_ready() {
+  kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -c 'test -d /shared && touch /shared/.phase3-controller && rm -f /shared/.phase3-controller'
+  kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- sh -c 'test -d /shared && touch /shared/.phase3-worker && rm -f /shared/.phase3-worker'
+}
+
+attempt=1
+until check_shared_ready; do
+  if (( attempt >= POST_CHECK_RETRIES )); then
+    echo "[phase3/bootstrap] /shared post-check failed after ${POST_CHECK_RETRIES} attempts" >&2
+    exit 1
+  fi
+  echo "[phase3/bootstrap] /shared post-check failed, retry ${attempt}/${POST_CHECK_RETRIES} ..." >&2
+  sleep "$POST_CHECK_INTERVAL_SECONDS"
+  attempt=$((attempt + 1))
+done
 
 echo "Phase 3 shared storage bootstrap complete."
