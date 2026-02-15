@@ -209,6 +209,64 @@ print_job_status() {
 }
 
 
+
+
+get_job_stdout_path() {
+  local job_id="$1"
+  local line
+  local path
+
+  line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
+  path="$(printf '%s\n' "${line}" | sed -n 's/.*StdOut=\([^ ]*\).*/\1/p')"
+  printf '%s\n' "${path:-slurm-${job_id}.out}"
+}
+
+get_job_stderr_path() {
+  local job_id="$1"
+  local line
+  local path
+
+  line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
+  path="$(printf '%s\n' "${line}" | sed -n 's/.*StdErr=\([^ ]*\).*/\1/p')"
+  printf '%s\n' "${path:-slurm-${job_id}.err}"
+}
+
+get_job_workdir() {
+  local job_id="$1"
+  local line
+  local path
+
+  line="$(slurm_exec_retry "scontrol show job ${job_id} -o")"
+  path="$(printf '%s\n' "${line}" | sed -n 's/.*WorkDir=\([^ ]*\).*/\1/p')"
+  printf '%s\n' "${path:-/root}"
+}
+
+list_candidate_output_paths() {
+  local job_id="$1"
+  local out_path
+  local err_path
+  local workdir
+
+  out_path="$(get_job_stdout_path "${job_id}")"
+  err_path="$(get_job_stderr_path "${job_id}")"
+  workdir="$(get_job_workdir "${job_id}")"
+
+  cat <<EOF
+${out_path}
+${err_path}
+${workdir}/${out_path}
+${workdir}/${err_path}
+/root/${out_path}
+/root/${err_path}
+/tmp/${out_path}
+/tmp/${err_path}
+/root/slurm-${job_id}.out
+/tmp/slurm-${job_id}.out
+/root/slurm-${job_id}.err
+/tmp/slurm-${job_id}.err
+EOF
+}
+
 get_job_state_exit() {
   local job_id="$1"
   local line
@@ -352,25 +410,23 @@ recover_unhealthy_nodes() {
 
 assert_mpi_output() {
   local job_id="$1"
-  local out_path
-  local err_path
+  local candidates
   local hosts
   local unique
 
-  out_path="$(get_job_stdout_path "${job_id}")"
-  err_path="$(get_job_stderr_path "${job_id}")"
+  candidates="$(list_candidate_output_paths "${job_id}" | sed '/^$/d' | awk '!seen[$0]++')"
 
-  hosts="$(controller_exec "for p in '${out_path}' '/root/${out_path}' '/${out_path}' '${err_path}' '/root/${err_path}' '/${err_path}' '/root/slurm-${job_id}.out'; do if [ -f \"$p\" ]; then grep -Eo 'rank-host=[^[:space:]]+' \"$p\" || true; fi; done | sed 's/^rank-host=//'" )"
+  hosts="$(printf '%s\n' "${candidates}" | kubectl -n "${NAMESPACE}" exec -i "pod/${CONTROLLER_POD}" -- bash -lc "while IFS= read -r p; do [ -f \"\$p\" ] || continue; grep -Eo 'rank-host=[^[:space:]]+' \"\$p\" || true; done" | sed 's/^rank-host=//')"
 
   unique="$(printf '%s\n' "${hosts}" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
 
   if [[ -z "${unique}" || "${unique}" -lt 2 ]]; then
-    log "mpi output validation failed for job ${job_id}: unique_hosts=${unique:-0}, stdout=${out_path}, stderr=${err_path}"
-    controller_exec "for p in '${out_path}' '/root/${out_path}' '/${out_path}' '${err_path}' '/root/${err_path}' '/${err_path}' '/root/slurm-${job_id}.out'; do if [ -f \"$p\" ]; then echo '-----' \"$p\"; tail -n 120 \"$p\"; fi; done || true"
+    log "mpi output validation failed for job ${job_id}: unique_hosts=${unique:-0}"
+    printf '%s\n' "${candidates}" | kubectl -n "${NAMESPACE}" exec -i "pod/${CONTROLLER_POD}" -- bash -lc "while IFS= read -r p; do [ -f \"\$p\" ] || continue; echo '-----' \"\$p\"; tail -n 120 \"\$p\"; done" || true
     return 1
   fi
 
-  log "mpi output validation passed: unique_hosts=${unique}, stdout=${out_path}"
+  log "mpi output validation passed: unique_hosts=${unique}"
 }
 
 
