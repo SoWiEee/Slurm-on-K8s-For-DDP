@@ -5,22 +5,58 @@ CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
 VERIFY_TIMEOUT=${VERIFY_TIMEOUT:-180s}
+L1_RETRY_COUNT=${L1_RETRY_COUNT:-3}
+L1_RETRY_INTERVAL_SECONDS=${L1_RETRY_INTERVAL_SECONDS:-10}
 
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
 # Layer 1: base connectivity + scheduling visibility.
 bash phase1/scripts/verify-phase1.sh
 
+# Keep two worker pods ready for phase3 checks.
 kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas=2
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$VERIFY_TIMEOUT"
+kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-0 --timeout="$VERIFY_TIMEOUT"
+kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-1 --timeout="$VERIFY_TIMEOUT"
 
-unique_hosts=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "srun -N 2 -n 2 bash -lc 'hostname' | sort -u | wc -l")
-if [[ "$unique_hosts" -lt 2 ]]; then
-  echo "[L1] expected 2 hosts from srun, got ${unique_hosts}" >&2
+# Explicitly target existing worker pods to avoid stale slurm node entries (e.g. worker-2)
+# causing DNS resolution failures in srun.
+worker_nodelist="slurm-worker-0,slurm-worker-1"
+
+kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
+  getent hosts slurm-worker-0.slurm-worker.slurm.svc.cluster.local >/dev/null
+  getent hosts slurm-worker-1.slurm-worker.slurm.svc.cluster.local >/dev/null
+"
+
+# Recover transient slurmd states before L1 srun (e.g. COMPLETING/NOT_RESPONDING).
+kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
+  scontrol update nodename=slurm-worker-0 state=resume || true
+  scontrol update nodename=slurm-worker-1 state=resume || true
+"
+
+l1_ok=false
+for attempt in $(seq 1 "$L1_RETRY_COUNT"); do
+  set +e
+  unique_hosts=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "srun --nodelist=${worker_nodelist} -N 2 -n 2 bash -lc 'hostname' | sort -u | wc -l")
+  srun_rc=$?
+  set -e
+
+  if [[ "$srun_rc" -eq 0 && "$unique_hosts" -ge 2 ]]; then
+    l1_ok=true
+    break
+  fi
+
+  echo "[L1] srun attempt ${attempt}/${L1_RETRY_COUNT} failed (rc=${srun_rc}, unique_hosts=${unique_hosts:-0}), retrying..." >&2
+  kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc 'sinfo; scontrol show nodes | sed -n "1,120p"' >&2 || true
+  sleep "$L1_RETRY_INTERVAL_SECONDS"
+done
+
+if [[ "$l1_ok" != "true" ]]; then
+  echo "[L1] expected 2 hosts from srun on ${worker_nodelist}, got ${unique_hosts:-0}" >&2
   exit 1
 fi
 
-echo "[L1] srun cross-worker execution verified (unique_hosts=${unique_hosts})."
+echo "[L1] srun cross-worker execution verified (unique_hosts=${unique_hosts}, nodelist=${worker_nodelist})."
 
 # Layer 2: data consistency through shared volume.
 kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- bash -s <<'SCRIPT'

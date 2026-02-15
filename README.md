@@ -189,6 +189,7 @@ bash phase3/scripts/verify-phase3.sh
 1. **基礎互通層（Layer 1）**
    - 沿用 `phase1/scripts/verify-phase1.sh`。
    - 追加 `srun -N2 -n2 hostname`，確認跨 worker 任務可分派（MPI 類工作前提）。
+   - 以 `--nodelist=slurm-worker-0,slurm-worker-1` 鎖定已存在 pod，避免 `slurm.conf` 中尚未啟用節點（如 `slurm-worker-2`）造成 DNS 解析失敗。
 2. **資料一致性層（Layer 2）**
    - `worker-0` 在 `/shared/checkpoints` 寫入檔案與 checksum。
    - `worker-1` 驗證 checksum、mtime 遞增、路徑一致。

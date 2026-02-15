@@ -643,6 +643,30 @@ error: timed out waiting for the condition on persistentvolumeclaims/slurm-share
 
 ---
 
+## F) verify-phase3 Layer 1 出現 `Unable to resolve slurm-worker-2...`
+
+症狀（節錄）：
+
+```bash
+srun: error: slurm_set_addr: Unable to resolve "slurm-worker-2.slurm-worker.slurm.svc.cluster.local"
+[L1] expected 2 hosts from srun, got 1
+```
+
+常見 root cause：
+
+- `slurm.conf` 預先定義了 `slurm-worker-[0-2]`。
+- 但 Phase 3 驗證當下 worker replicas 只有 2，`worker-2` Pod 不存在。
+- 若 `srun` 未鎖定 node list，可能挑到不存在/未就緒節點，導致 getaddrinfo 失敗。
+
+修正策略：
+
+1. Layer 1 先確保 `slurm-worker-0/1` Ready。
+2. 在 controller 內先做兩個 FQDN 的 `getent hosts` 檢查。
+3. `srun` 改為 `--nodelist=slurm-worker-0,slurm-worker-1`。
+4. 加入 `scontrol update ... state=resume` 與 retry，降低暫時性 `NOT_RESPONDING` 影響。
+
+---
+
 ## 下一步（銜接 PyTorch Training）
 
 1. 新增訓練 image（含 Python + PyTorch + torch.distributed）。
