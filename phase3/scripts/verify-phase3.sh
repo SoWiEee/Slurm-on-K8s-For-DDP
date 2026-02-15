@@ -11,6 +11,10 @@ JOB_COMPLETING_GRACE_SECONDS="${JOB_COMPLETING_GRACE_SECONDS:-300}"
 COMPLETING_LOG_INTERVAL_SECONDS="${COMPLETING_LOG_INTERVAL_SECONDS:-30}"
 VERIFY_MIN_WORKER_REPLICAS="${VERIFY_MIN_WORKER_REPLICAS:-2}"
 SLURM_NODE_READY_TIMEOUT_SECONDS="${SLURM_NODE_READY_TIMEOUT_SECONDS:-240}"
+DISABLE_OPERATOR_DURING_VERIFY="${DISABLE_OPERATOR_DURING_VERIFY:-true}"
+OPERATOR_DEPLOYMENT_NAME="${OPERATOR_DEPLOYMENT_NAME:-slurm-elastic-operator}"
+
+OPERATOR_REPLICAS_BEFORE_VERIFY=""
 
 log() {
   printf '[phase3 verify] %s\n' "$*"
@@ -49,6 +53,41 @@ slurm_exec_retry() {
 
   printf '%s\n' "${output}" >&2
   return 1
+}
+
+pause_operator_if_needed() {
+  if [[ "${DISABLE_OPERATOR_DURING_VERIFY}" != "true" ]]; then
+    return
+  fi
+
+  if ! kubectl -n "${NAMESPACE}" get deployment "${OPERATOR_DEPLOYMENT_NAME}" >/dev/null 2>&1; then
+    log "operator deployment ${OPERATOR_DEPLOYMENT_NAME} not found, skip pause"
+    return
+  fi
+
+  OPERATOR_REPLICAS_BEFORE_VERIFY="$(kubectl -n "${NAMESPACE}" get deployment "${OPERATOR_DEPLOYMENT_NAME}" -o jsonpath='{.spec.replicas}')"
+  OPERATOR_REPLICAS_BEFORE_VERIFY="${OPERATOR_REPLICAS_BEFORE_VERIFY:-1}"
+
+  log "pausing operator ${OPERATOR_DEPLOYMENT_NAME} (replicas ${OPERATOR_REPLICAS_BEFORE_VERIFY} -> 0)"
+  kubectl -n "${NAMESPACE}" scale deployment/"${OPERATOR_DEPLOYMENT_NAME}" --replicas=0 >/dev/null
+  kubectl -n "${NAMESPACE}" rollout status deployment/"${OPERATOR_DEPLOYMENT_NAME}" --timeout=180s >/dev/null || true
+}
+
+restore_operator_if_needed() {
+  if [[ "${DISABLE_OPERATOR_DURING_VERIFY}" != "true" ]]; then
+    return
+  fi
+
+  if [[ -z "${OPERATOR_REPLICAS_BEFORE_VERIFY}" ]]; then
+    return
+  fi
+
+  if ! kubectl -n "${NAMESPACE}" get deployment "${OPERATOR_DEPLOYMENT_NAME}" >/dev/null 2>&1; then
+    return
+  fi
+
+  log "restoring operator ${OPERATOR_DEPLOYMENT_NAME} replicas -> ${OPERATOR_REPLICAS_BEFORE_VERIFY}"
+  kubectl -n "${NAMESPACE}" scale deployment/"${OPERATOR_DEPLOYMENT_NAME}" --replicas="${OPERATOR_REPLICAS_BEFORE_VERIFY}" >/dev/null || true
 }
 
 wait_job_done() {
@@ -217,7 +256,17 @@ verify_worker_daemons() {
     [[ -z "${pod}" ]] && continue
     log "checking daemon health on ${pod}"
 
-    if ! kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc 'pgrep -x munged >/dev/null && pgrep -x slurmd >/dev/null'; then
+    local ok="false"
+    local retry
+    for retry in 1 2 3 4; do
+      if kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc 'pgrep -x munged >/dev/null && pgrep -x slurmd >/dev/null'; then
+        ok="true"
+        break
+      fi
+      sleep 2
+    done
+
+    if [[ "${ok}" != "true" ]]; then
       log "${pod} daemon health check failed"
       kubectl -n "${NAMESPACE}" get pod "${pod}" -o wide || true
       kubectl -n "${NAMESPACE}" logs "pod/${pod}" --tail=120 || true
@@ -264,11 +313,14 @@ assert_mpi_output() {
 
 main() {
   kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
+  trap restore_operator_if_needed EXIT
 
   log "checking ConfigMap + shared mount"
   kubectl -n "${NAMESPACE}" get configmap slurm-phase3-jobs >/dev/null
   controller_exec 'test -d /shared'
   slurm_exec_retry 'sinfo -h' >/dev/null
+
+  pause_operator_if_needed
 
   log "injecting phase3 job scripts to controller pod"
   kubectl -n "${NAMESPACE}" get configmap slurm-phase3-jobs -o jsonpath='{.data.shared-storage\.sbatch}' | \
