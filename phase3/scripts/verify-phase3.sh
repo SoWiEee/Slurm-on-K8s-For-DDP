@@ -14,6 +14,30 @@ WORKER_READY_MAX_WAIT_SECONDS=${WORKER_READY_MAX_WAIT_SECONDS:-240}
 operator_original_replicas=""
 operator_scaled_down="false"
 
+pod_exists() {
+  local pod_name=$1
+  kubectl -n "$NAMESPACE" get pod "$pod_name" >/dev/null 2>&1
+}
+
+dump_pod_diagnostics() {
+  local pod_name=$1
+  echo "--- ${pod_name} describe/logs (if exists) ---"
+  if ! pod_exists "$pod_name"; then
+    echo "[phase3/verify] ${pod_name} not found (skip)."
+    return 0
+  fi
+
+  kubectl -n "$NAMESPACE" describe pod "$pod_name" || true
+  kubectl -n "$NAMESPACE" logs pod/"$pod_name" --tail=120 || true
+
+  # `--previous` only works when a terminated previous container exists.
+  if kubectl -n "$NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}' 2>/dev/null | grep -Eq '^[0-9]+$'; then
+    kubectl -n "$NAMESPACE" logs pod/"$pod_name" --previous --tail=120 || true
+  else
+    echo "[phase3/verify] ${pod_name} has no previous terminated container (skip --previous)."
+  fi
+}
+
 dump_verify_diagnostics() {
   {
     echo "[phase3/verify] ===== diagnostics start ====="
@@ -46,18 +70,11 @@ dump_verify_diagnostics() {
       getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true
     ' || true
     echo
-    echo "--- worker-0 logs (tail) ---"
-    kubectl -n "$NAMESPACE" logs pod/slurm-worker-0 --tail=120 || true
+    dump_pod_diagnostics "slurm-worker-0"
     echo
-    echo "--- worker-1 describe/logs (if exists) ---"
-    kubectl -n "$NAMESPACE" describe pod slurm-worker-1 || true
-    kubectl -n "$NAMESPACE" logs pod/slurm-worker-1 --tail=120 || true
-    kubectl -n "$NAMESPACE" logs pod/slurm-worker-1 --previous --tail=120 || true
+    dump_pod_diagnostics "slurm-worker-1"
     echo
-    echo "--- worker-2 describe/logs (if exists) ---"
-    kubectl -n "$NAMESPACE" describe pod slurm-worker-2 || true
-    kubectl -n "$NAMESPACE" logs pod/slurm-worker-2 --tail=120 || true
-    kubectl -n "$NAMESPACE" logs pod/slurm-worker-2 --previous --tail=120 || true
+    dump_pod_diagnostics "slurm-worker-2"
     echo "[phase3/verify] ===== diagnostics end ====="
   } >&2
 }

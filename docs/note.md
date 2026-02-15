@@ -716,6 +716,7 @@ error: timed out waiting for the condition on pods/slurm-worker-1
 - 新增 `wait_worker_replicas_ready` 守門邏輯：在等待期間持續檢查 `statefulset/slurm-worker` 的 `spec.replicas` 與 `readyReplicas`。
 - 若發現 `spec.replicas` 被外部改動（例如被其他控制器改回 1），會自動 re-scale 回目標值再繼續等。
 - diagnostics 追加 `kubectl logs --previous`（worker-1/2），提高對反覆重啟場景的可見性。
+- 若 pod 不存在或沒有 previous terminated container，改成輸出 `skip` 訊息，避免 `NotFound/BadRequest` 噪音干擾判讀。
 - 移除錯誤路徑中的重複 restore 呼叫，避免出現雙重 `restoring operator replicas ...` 訊息。
 
 ---

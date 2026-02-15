@@ -205,7 +205,7 @@ bash phase3/scripts/verify-phase3.sh
    - 驗證重排程到另一個 worker 後，`step` 連續遞增。
    - 驗證 `optimizer state`（以 `OPT` 模擬）與 `loss` 具有 continuity。
 
-若驗證流程任一步驟失敗（含 timeout），腳本會自動 dump 診斷資料：`pods/sts/endpoints/events`、controller 內的 `sinfo/scontrol`、DNS 檢查與 worker logs，方便快速定位是 K8s readiness、Slurm node 狀態或網路解析問題。
+若驗證流程任一步驟失敗（含 timeout），腳本會自動 dump 診斷資料：`pods/sts/endpoints/events`、controller 內的 `sinfo/scontrol`、DNS 檢查與 worker logs，方便快速定位是 K8s readiness、Slurm node 狀態或網路解析問題。對於不存在 pod 或沒有 previous container 的情況，會輸出 `skip` 訊息而非噪音錯誤。
 > 若看到 worker 反覆 `Created/Started` 後又 `Killing`，腳本會在等待期間偵測 `statefulset/slurm-worker.spec.replicas` 是否被外部改動（例如被其他控制器縮容），並自動拉回目標副本後繼續等待。
 
 
