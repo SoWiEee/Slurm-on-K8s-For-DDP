@@ -204,6 +204,7 @@ bash phase3/scripts/verify-phase3.sh
 > 預設以 `scontrol show job` 顯示 job 結果；若你要額外輸出 `sacct`，可設 `ENABLE_SACCT_STATUS=true`。
 > 若任一 job 狀態不是 `COMPLETED` 或 ExitCode 非 `0:0`，verify 會直接失敗 (`exit 1`)，並輸出對應 `slurm-<jobid>.out` 片段。
 > verify 會先確保 `slurm-worker` 至少有 2 replicas，並等待 Slurm 端至少 2 個可用節點後才送出 MPI/Torch 多節點工作，降低節點尚未就緒導致的 `NonZeroExitCode`。
+> verify 的 worker daemon 檢查改為「動態選取目前 Running 的 worker pods」，避免 rollout 期間命中已完成/已替換 pod 造成誤判。
 > `verify-phase3.sh` 會檢查 MPI job 的輸出是否至少包含 2 個不同 `rank-host`；若不足，視為 MPI 驗證失敗。
 
 

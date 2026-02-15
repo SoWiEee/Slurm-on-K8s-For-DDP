@@ -196,24 +196,36 @@ wait_slurm_nodes_ready() {
 
 
 verify_worker_daemons() {
-  local idx
+  local pods_raw
+  local pod_count
   local pod
 
   if (( VERIFY_MIN_WORKER_REPLICAS <= 0 )); then
     return
   fi
 
-  for (( idx=0; idx<VERIFY_MIN_WORKER_REPLICAS; idx++ )); do
-    pod="slurm-worker-${idx}"
+  pods_raw="$(kubectl -n "${NAMESPACE}" get pods -l app=slurm-worker --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)"
+  pod_count="$(printf '%s\n' "${pods_raw}" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+  if (( pod_count < VERIFY_MIN_WORKER_REPLICAS )); then
+    log "running worker pods are insufficient: ${pod_count}/${VERIFY_MIN_WORKER_REPLICAS}"
+    kubectl -n "${NAMESPACE}" get pods -l app=slurm-worker -o wide || true
+    return 1
+  fi
+
+  while read -r pod; do
+    [[ -z "${pod}" ]] && continue
     log "checking daemon health on ${pod}"
 
     if ! kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc 'pgrep -x munged >/dev/null && pgrep -x slurmd >/dev/null'; then
       log "${pod} daemon health check failed"
+      kubectl -n "${NAMESPACE}" get pod "${pod}" -o wide || true
       kubectl -n "${NAMESPACE}" logs "pod/${pod}" --tail=120 || true
       return 1
     fi
-  done
+  done < <(printf '%s\n' "${pods_raw}" | sed '/^$/d' | head -n "${VERIFY_MIN_WORKER_REPLICAS}")
 }
+
 
 recover_unhealthy_nodes() {
   local lines
