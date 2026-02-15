@@ -150,9 +150,13 @@ kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
   getent hosts slurm-worker-1.slurm-worker.slurm.svc.cluster.local >/dev/null
 "
 
+# Best-effort node state recovery. Keep silent to avoid noisy/unsupported-state errors
+# on some Slurm versions (e.g. "Invalid node state specified").
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "
-  scontrol update nodename=slurm-worker-0 state=resume || true
-  scontrol update nodename=slurm-worker-1 state=resume || true
+  for n in slurm-worker-0 slurm-worker-1; do
+    scontrol update NodeName="$n" State=UNDRAIN >/dev/null 2>&1 || true
+    scontrol update NodeName="$n" State=RESUME >/dev/null 2>&1 || true
+  done
 "
 
 l1_ok=false
