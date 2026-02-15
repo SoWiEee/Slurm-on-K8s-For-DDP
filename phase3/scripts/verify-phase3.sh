@@ -20,7 +20,7 @@ wait_job_done() {
   start="$(date +%s)"
 
   while true; do
-    if ! controller_exec "squeue -h -j ${job_id}" | rg -q .; then
+    if ! controller_exec "squeue -h -j ${job_id}" | grep -q .; then
       return 0
     fi
 

@@ -171,6 +171,9 @@ bash phase3/scripts/bootstrap-phase3.sh
 3. 套用 `slurm-phase3-jobs` ConfigMap（內含三個 sbatch 模板）。
 4. 自動 patch `slurm-controller` / `slurm-worker` StatefulSet，掛載 `/shared`。
 
+> Phase 3 腳本不依賴 `rg`（ripgrep），避免在乾淨環境因缺少工具而失敗。
+> 若 `slurm-shared` PVC 無法在 timeout 內進入 `Bound`，腳本會直接停止並輸出 `describe pvc` 供除錯（不再忽略錯誤繼續往下跑）。
+
 ## 3.8) 驗證 Phase 3 工作流
 
 ```bash

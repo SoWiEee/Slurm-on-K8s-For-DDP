@@ -635,3 +635,18 @@ kubectl -n slurm logs statefulset/slurm-controller --tail=200
 - 加入 chaos 測試腳本：訓練中隨機刪除 worker Pod。
 - 與 Phase 2 checkpoint guard 事件對齊，記錄「阻擋縮容」與「恢復成功」指標。
 - 將 phase3 verify 輸出整理成可直接放報告的 KPI 表格。
+
+
+## 本次修正（第二輪）
+
+你回報的兩個實際問題已納入修正：
+
+1. `rg: command not found`
+   - root cause：`bootstrap-phase3.sh` / `verify-phase3.sh` 依賴 ripgrep。
+   - 修正：改用系統預設可用的 `grep`，移除 Phase 3 腳本對 `rg` 的執行時依賴。
+
+2. `PVC wait timeout` 後腳本仍繼續 patch
+   - root cause：原本 `kubectl wait pvc ... || true` 會吞掉錯誤。
+   - 修正：改成 timeout 直接 fail-fast，並自動輸出 `kubectl get/describe pvc slurm-shared`，避免後續 rollout 產生二次錯誤訊號。
+
+這次調整重點是「錯誤可觀測且可立即中止」，讓問題定位更直覺。
