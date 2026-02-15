@@ -1,17 +1,4 @@
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: slurm-shared
-  namespace: slurm
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi
-  storageClassName: local-path
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: slurm-phase3-jobs

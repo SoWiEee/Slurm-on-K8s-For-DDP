@@ -162,17 +162,20 @@ bash phase3/scripts/bootstrap-phase3.sh
 # KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/bootstrap-phase3.sh
 # 若 rollout 較慢
 # ROLLOUT_TIMEOUT=600s bash phase3/scripts/bootstrap-phase3.sh
+# 若要強制指定 StorageClass
+# PHASE3_STORAGE_CLASS=standard bash phase3/scripts/bootstrap-phase3.sh
 ```
 
 此腳本會：
 
 1. 檢查 `slurm-controller` 與 `slurm-worker` 是否為 Ready。
-2. 建立 `slurm-shared` PVC（`local-path`，模擬共享儲存）。
+2. 建立 `slurm-shared` PVC（自動偵測可用 StorageClass；優先 `local-path`，否則 default/第一個可用項目）。
 3. 套用 `slurm-phase3-jobs` ConfigMap（內含三個 sbatch 模板）。
 4. 自動 patch `slurm-controller` / `slurm-worker` StatefulSet，掛載 `/shared`。
 
 > Phase 3 腳本不依賴 `rg`（ripgrep），避免在乾淨環境因缺少工具而失敗。
-> 若 `slurm-shared` PVC 無法在 timeout 內進入 `Bound`，腳本會直接停止並輸出 `describe pvc` 供除錯（不再忽略錯誤繼續往下跑）。
+> `slurm-shared` 會自動選擇可用 StorageClass（`local-path` 優先，其次 default/第一個可用 StorageClass）。
+> 若 PVC 在 timeout 內無法 `Bound`，腳本會直接停止並輸出 `get/describe pvc` + `get storageclass` 供除錯。
 
 ## 3.8) 驗證 Phase 3 工作流
 

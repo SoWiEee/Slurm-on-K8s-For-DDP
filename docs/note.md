@@ -650,3 +650,28 @@ kubectl -n slurm logs statefulset/slurm-controller --tail=200
    - 修正：改成 timeout 直接 fail-fast，並自動輸出 `kubectl get/describe pvc slurm-shared`，避免後續 rollout 產生二次錯誤訊號。
 
 這次調整重點是「錯誤可觀測且可立即中止」，讓問題定位更直覺。
+
+
+## 本次修正（第三輪：StorageClass 相容性）
+
+你最新回報的核心錯誤是：
+
+- `storageclass.storage.k8s.io "local-path" not found`
+
+### root cause
+
+Phase 3 先前把 PVC `storageClassName` 寫死成 `local-path`，但你的叢集目前沒有這個 StorageClass，導致 `slurm-shared` 永遠 Pending。
+
+### 修正
+
+1. `bootstrap-phase3.sh` 改為自動選擇 StorageClass：
+   - 優先 `PHASE3_STORAGE_CLASS`（若有指定）
+   - 否則 `local-path`（若存在）
+   - 否則 default StorageClass
+   - 否則第一個可用 StorageClass
+
+2. 當現有 `slurm-shared` 是 Pending 且 StorageClass 不符時，自動刪除並重建 PVC。
+
+3. 若現有 `slurm-shared` 已 Bound 且 StorageClass 不符，為避免資料風險，腳本會停止並提示手動處理。
+
+4. `phase3/manifests/slurm-phase3-shared.yaml` 改為僅管理 job ConfigMap；PVC 由 bootstrap 動態建立，避免不同叢集環境下被硬編值卡住。
