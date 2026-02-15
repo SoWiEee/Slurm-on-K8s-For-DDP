@@ -198,6 +198,9 @@ bash phase3/scripts/verify-phase3.sh
 
 > 建議：先用 fallback 路徑確認 Phase 3 pipeline，再升級 worker image 納入 PyTorch 套件，降低一次改動風險。
 
+> `verify-phase3.sh` 已加入 Slurm 指令重試（預設 8 次、每次間隔 5 秒），可降低 controller 短暫 timeout 造成的誤判。
+> 可用 `SLURM_RETRY_COUNT` 與 `SLURM_RETRY_SLEEP_SECONDS` 調整重試策略。
+
 
 ## 4) 常用操作
 
