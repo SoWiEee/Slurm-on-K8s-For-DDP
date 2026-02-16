@@ -222,6 +222,7 @@ bash phase3/scripts/bootstrap-phase3.sh
 
 ```bash
 bash phase3/scripts/verify-phase3.sh
+bash phase3/scripts/verify-phase3-e2e.sh
 # 或指定 context
 # KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/verify-phase3.sh
 ```
