@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -34,6 +35,7 @@ class PartitionConfig:
 class Config:
     namespace: str = os.getenv("NAMESPACE", "slurm")
     controller_pod: str = os.getenv("CONTROLLER_POD", "slurm-controller-0")
+    slurm_configmap: str = os.getenv("SLURM_CONFIGMAP", "slurm-config")
     poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
     policy_name: str = os.getenv("SCALING_POLICY", "checkpoint_aware_queue")
     checkpoint_guard_enabled: bool = os.getenv("CHECKPOINT_GUARD_ENABLED", "true").lower() == "true"
@@ -105,6 +107,115 @@ class KubectlClient:
         )
 
 
+    def get_configmap_slurm_conf(self) -> str:
+        # slurm.conf is stored in ConfigMap data under key "slurm.conf"
+        return self.run(
+            [
+                "-n",
+                self.cfg.namespace,
+                "get",
+                "configmap",
+                self.cfg.slurm_configmap,
+                "-o",
+                "jsonpath={.data.slurm\.conf}",
+            ]
+        )
+
+    def patch_configmap_slurm_conf(self, new_conf: str) -> None:
+        patch = {"data": {"slurm.conf": new_conf}}
+        self.run(
+            [
+                "-n",
+                self.cfg.namespace,
+                "patch",
+                "configmap",
+                self.cfg.slurm_configmap,
+                "--type",
+                "merge",
+                "-p",
+                json.dumps(patch),
+            ]
+        )
+
+
+
+def render_slurm_conf_for_replicas(existing_conf: str, partition: str, replicas: int) -> str:
+    """
+    Minimal "root-cause" fix for NO NETWORK ADDRESS spam:
+    keep slurm.conf NodeName/Partition Nodes aligned with *current* k8s replicas.
+
+    When slurm.conf lists NodeName entries for workers that don't exist as pods,
+    slurmctld will continuously try to resolve them and log:
+      get_addr_info ... Unable to resolve ... NO NETWORK ADDRESS FOUND
+
+    Strategy:
+      - Use the first existing slurm-worker NodeName line as a template.
+      - Rewrite NodeName lines to exactly slurm-worker-0..slurm-worker-(replicas-1).
+      - Rewrite PartitionName=<partition> Nodes=... accordingly.
+    """
+    replicas = max(1, int(replicas))
+
+    lines = existing_conf.splitlines()
+
+    # Find a template line (prefer worker-0)
+    tmpl = None
+    for l in lines:
+        if l.strip().startswith("NodeName=slurm-worker-0 "):
+            tmpl = l
+            break
+    if tmpl is None:
+        for l in lines:
+            if l.strip().startswith("NodeName=slurm-worker-"):
+                tmpl = l
+                break
+    if tmpl is None:
+        # Can't safely rewrite; return original
+        return existing_conf
+
+    # Remove existing slurm-worker NodeName lines
+    kept: list[str] = []
+    for l in lines:
+        if l.strip().startswith("NodeName=slurm-worker-"):
+            continue
+        kept.append(l)
+
+    def render_node_line(i: int) -> str:
+        out = tmpl
+        out = re.sub(r"NodeName=slurm-worker-\d+", f"NodeName=slurm-worker-{i}", out)
+        out = re.sub(
+            r"NodeAddr=slurm-worker-\d+\.slurm-worker\.slurm\.svc\.cluster\.local",
+            f"NodeAddr=slurm-worker-{i}.slurm-worker.slurm.svc.cluster.local",
+            out,
+        )
+        out = re.sub(r"NodeHostname=slurm-worker-\d+", f"NodeHostname=slurm-worker-{i}", out)
+        return out
+
+    node_lines = [render_node_line(i) for i in range(replicas)]
+
+    # Insert NodeName lines near the original template position (best-effort)
+    insert_at = 0
+    for idx, l in enumerate(kept):
+        if l.strip().startswith("CryptoType="):
+            insert_at = idx + 1
+            break
+    # Keep a blank line before nodes for readability
+    kept = kept[:insert_at] + [""] + node_lines + [""] + kept[insert_at:]
+
+    # Rewrite PartitionName Nodes=... for the target partition
+    nodes_expr = f"slurm-worker-[0-{replicas-1}]" if replicas > 1 else "slurm-worker-0"
+    out_lines: list[str] = []
+    part_re = re.compile(rf"^(PartitionName={re.escape(partition)}\b.*\bNodes=)(\S+)(.*)$")
+    for l in kept:
+        m = part_re.match(l.strip())
+        if m:
+            out_lines.append(f"{m.group(1)}{nodes_expr}{m.group(3)}")
+        else:
+            out_lines.append(l)
+
+    # Ensure trailing newline
+    return "\n".join(out_lines).rstrip() + "\n"
+
+
 class PartitionConfigLoader:
     @staticmethod
     def load(cfg: Config) -> list[PartitionConfig]:
@@ -167,7 +278,7 @@ class ClusterStateCollector:
 
     def get_busy_nodes(self, partition: str) -> int:
         output = self.client.exec_in_controller(
-            rf"sinfo -h -p {partition} -N -o '%T' | egrep -Ei 'ALLOCATED|MIXED|COMPLETING' | wc -l || true"
+            rf"sinfo -h -p {partition} -N -o '%T' | egrep -E 'ALLOCATED|MIXED|COMPLETING' | wc -l || true"
         )
         return int(output or "0")
 
@@ -371,6 +482,38 @@ class OperatorApp:
                             running_jobs=state.running_jobs,
                             busy_nodes=state.busy_nodes,
                         )
+
+                    # Root-cause fix: keep slurm.conf in sync with current k8s replicas.
+                    # Otherwise slurmctld will keep trying to resolve non-existent worker FQDNs
+                    # and nodes will get stuck with NO NETWORK ADDRESS FOUND.
+                    try:
+                        applied_replicas = state.current_replicas
+                        if decision.action == "scale_up":
+                            applied_replicas = decision.target_replicas
+                        elif decision.action == "scale_down" and cooldown_elapsed >= partition_cfg.scale_down_cooldown:
+                            applied_replicas = decision.target_replicas
+
+                        existing_conf = self.client.get_configmap_slurm_conf()
+                        new_conf = render_slurm_conf_for_replicas(existing_conf, partition_cfg.partition, applied_replicas)
+                        if new_conf != existing_conf:
+                            self.client.patch_configmap_slurm_conf(new_conf)
+                            # Reload slurmctld so it stops probing removed nodes immediately
+                            self.client.exec_in_controller("scontrol reconfigure || true")
+                            self.logger.emit(
+                                "slurm_conf_reconciled",
+                                policy=self.cfg.policy_name,
+                                partition=partition,
+                                replicas=applied_replicas,
+                                configmap=self.cfg.slurm_configmap,
+                            )
+                    except Exception as _exc:  # noqa: BLE001
+                        self.logger.emit(
+                            "slurm_conf_reconcile_failed",
+                            level="WARN",
+                            partition=partition,
+                            message=str(_exc),
+                        )
+
                 except Exception as exc:  # noqa: BLE001
                     self.logger.emit("error", level="ERROR", partition=partition, message=str(exc))
 
