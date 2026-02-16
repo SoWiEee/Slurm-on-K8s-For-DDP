@@ -15,6 +15,7 @@ kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
 kubectl get storageclass slurm-shared-nfs >/dev/null
 kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null
+
 # NOTE: PVC "Bound" is a phase (.status.phase), not a Condition. Use polling on phase instead of `kubectl wait --for=condition=Bound`.
 echo "[verify] Waiting for PVC slurm-shared-rwx to become Bound..."
 wait_seconds() {
@@ -42,27 +43,31 @@ done
 
 echo "[verify] Checking /shared mount + write test in slurm-login..."
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-login --timeout="$ROLLOUT_TIMEOUT" >/dev/null
-kubectl -n "$NAMESPACE" exec deploy/slurm-login -- sh -lc 'set -eu; mount | grep /shared; echo verify-$(date +%s) > /shared/.verify-test; tail -n 1 /shared/.verify-test'
+kubectl -n "$NAMESPACE" exec deploy/slurm-login -- sh -lc \
+  'set -eu; mount | grep -E " on /shared (type|)" >/dev/null; echo verify-$(date +%s) > /shared/.verify-test; tail -n 1 /shared/.verify-test'
 
 echo "[verify] Checking /shared mount in slurm-controller..."
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT" >/dev/null
-kubectl -n "$NAMESPACE" exec statefulset/slurm-controller -- sh -lc 'set -eu; mount | grep /shared; ls -la /shared | head'
+kubectl -n "$NAMESPACE" exec statefulset/slurm-controller -- sh -lc \
+  'set -eu; mount | grep -E " on /shared (type|)" >/dev/null; ls -la /shared | head'
+
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-login --timeout="$ROLLOUT_TIMEOUT"
 
 for pod in slurm-controller-0 slurm-worker-0; do
-  kubectl -n "$NAMESPACE" exec "pod/${pod}" -- test -d /shared
-  kubectl -n "$NAMESPACE" exec "pod/${pod}" -- sh -c "mount | grep -q ' /shared '"
+  echo "[verify] Checking /shared in $pod ..."
+  kubectl -n "$NAMESPACE" exec "pod/$pod" -- sh -lc 'test -d /shared && echo OK: /shared exists'
 done
 
-login_pod=$(kubectl -n "$NAMESPACE" get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
-kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- test -d /shared
-kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -c "mount | grep -q ' /shared '"
+login_pod="$(kubectl -n "$NAMESPACE" get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')"
+echo "[verify] Checking /shared in login pod ${login_pod} ..."
+kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -lc 'test -d /shared && echo OK: /shared exists'
+kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -lc 'mount | grep -E " on /shared (type|)" >/dev/null'
 
 marker="phase3-$(date +%s)"
-kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -c "echo ${marker} > /shared/.phase3-marker"
-kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- sh -c "grep -q ${marker} /shared/.phase3-marker"
-kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -c "grep -q ${marker} /shared/.phase3-marker"
+kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -lc "printf '%s\n' '${marker}' > /shared/.phase3-marker"
+kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- sh -lc "grep -Fqx '${marker}' /shared/.phase3-marker"
+kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -lc "grep -Fqx '${marker}' /shared/.phase3-marker"
 
 echo "Phase 3 verification passed: shared RWX volume is mounted across controller/worker/login."
