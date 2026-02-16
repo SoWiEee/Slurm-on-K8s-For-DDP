@@ -189,43 +189,6 @@ kubectl -n slurm set env deployment/slurm-elastic-operator \
 ```
 
 
-<<<<<<< HEAD
-=======
-
-## 3.7) 部署 Phase 3 共用儲存（CSI NFS + RWX PVC）
-
-```bash
-bash phase3/scripts/bootstrap-phase3.sh
-# 指定 context
-# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/bootstrap-phase3.sh
-# 可調整 checkpoint guard 路徑
-# CHECKPOINT_PATH=/shared/checkpoints/latest.ckpt bash phase3/scripts/bootstrap-phase3.sh
-```
-
-此腳本會：
-
-1. 安裝並啟用 `csi-driver-nfs`（若尚未安裝）。
-2. 建立 NFS 服務、`slurm-shared-nfs` StorageClass、`slurm-shared-pvc`（RWX）。
-3. 將 `/shared` 掛載到 `slurm-controller` 與 `slurm-worker`。
-4. 更新 operator 的 checkpoint guard 參數，並等待 rollout 完成。
-
-## 3.8) 驗證 MPI-style 多 worker 協同 + 自動擴縮
-
-```bash
-bash phase3/scripts/verify-phase3-mpi-autoscale.sh
-# 或指定 partition
-# PARTITION=debug bash phase3/scripts/verify-phase3-mpi-autoscale.sh
-```
-
-驗證內容：
-
-1. 先把 worker 縮到 1。
-2. 送出需 2 節點的 `srun`（MPI-style）任務。
-3. 驗證 worker 會自動擴到 >=2。
-4. 驗證 `/shared/checkpoints/latest.ckpt` 可由 controller/worker 都讀到。
-5. 任務結束後驗證 worker 會自動縮回 1。
-
->>>>>>> c83416678f150b029b0f4851662f14ffb49af98c
 ## 4) 常用操作
 
 ### 查看 Pod 狀態
@@ -353,7 +316,7 @@ graph TD
 - OS：Windows 11
 - Container Runtime：[Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - Orchestration：[Kubernetes](https://kubernetes.io/) (v1.30+) via [Kind (Kubernetes in Docker)](https://kind.sigs.k8s.io/)
-- Storage：[Local Path Provisioner](https://github.com/rancher/local-path-provisioner) (模擬 NFS 共享存儲)
+- Storage：NFS + [nfs-subdir-external-provisioner](https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner)（RWX Shared Storage for HPC workloads）
 
 核心組件
 
@@ -391,11 +354,18 @@ Phase 2：Operator 開發
 - 開發 Python Operator，實作 "Pending Job -> Scale Up" 邏輯。
 - 實作 "Idle Node -> Scale Down" 邏輯。
 
-Phase 3：應用整合與容錯
+Phase 3：Shared Storage + 應用整合與容錯
 
-- 整合 PyTorch DDP 應用。
-- 實作 Checkpoint/Resume 機制。
-- 進行故障模擬測試。
+- 在 Kind 單機環境部署 NFS Server（WSL/VM）並整合 nfs-subdir-external-provisioner。
+- 建立 StorageClass 與 RWX PVC，作為 Slurm shared home/checkpoints。
+- 將 Controller / Worker / Login Pod 掛載共享 NFS Volume。
+- 建立 PyTorch DDP 測試工作負載（CPU 版即可）。
+- 實作 checkpoint heartbeat + resume 機制。
+- 在 sbatch 工作中加入 --requeue 與自動恢復流程。
+- 實作 Operator checkpoint-aware scale-down guard。
+- 模擬 Worker Pod 故障並量測 RTO。
+- 模擬 Controller 重啟並驗證 Slurm state 恢復。
+- 記錄 provisioning latency 與 recovery metrics。
 
 Phase 4：評估與優化
 
