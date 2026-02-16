@@ -246,6 +246,12 @@ bash phase3/scripts/verify-phase3.sh
 - Controller / Worker / Login 三種 Pod 都有掛載 `/shared`。
 - 可由 controller 寫入檔案，並在 worker/login 讀取（驗證 RWX 共用路徑）。
 
+若 `bootstrap-phase3.sh` 在 provisioner rollout timeout，腳本現在會自動輸出 debug 訊息（deployment/pod describe、logs、events、PVC/PV 狀態）並附上常見 root cause 提示，優先檢查：
+
+- `NFS_SERVER:2049` 是否可由 Kind node 連線（含 Windows 防火牆）。
+- `/etc/exports` 是否放行 Kind 網段。
+- `NFS_PATH` 是否存在且已 export。
+
 
 ## 4) 常用操作
 

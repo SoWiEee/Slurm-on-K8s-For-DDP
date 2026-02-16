@@ -559,6 +559,20 @@ Phase 3 的痛點是跨層：
 
 ## 除錯方式
 
+## Timeout 分析（你回報的 rollout 卡住）
+
+症狀：`nfs-subdir-external-provisioner` rollout 一直停在 `0 of 1 updated replicas are available`。
+
+最常見是 provisioner pod 啟動後，無法成功 mount 外部 NFS，導致容器無法 Ready。
+
+高機率原因：
+
+- `NFS_SERVER` 雖然在主機可 ping，但 Kind node/container 到該 IP 的 `2049/tcp` 被防火牆或路由擋住。
+- NFS export CIDR 未包含 Kind 節點網段（WSL/Windows 環境常見）。
+- `NFS_PATH` 不存在或未在 `/etc/exports` 設定。
+
+為了縮短排查時間，`bootstrap-phase3.sh` 已加入 ERR trap：失敗時會自動列印 deployment/pod describe、pod logs、events、PVC/PV。
+
 ## A) PVC 一直 Pending
 
 1. 檢查 provisioner 狀態：
