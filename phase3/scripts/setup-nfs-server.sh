@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run this script inside Ubuntu WSL2/VM with root privileges.
+# Run this script inside Ubuntu (WSL2/VM) with root privileges.
+#
+# Notes for WSL2:
+# - If systemd is disabled, this script falls back to `service`.
+# - Your Kind/Docker containers must be able to reach NFS_SERVER IP/hostname you pass to bootstrap-phase3.sh.
+
 NFS_EXPORT_PATH=${NFS_EXPORT_PATH:-/srv/nfs/k8s}
-NFS_EXPORT_CIDR=${NFS_EXPORT_CIDR:-172.16.0.0/12}
-NFS_EXPORT_OPTIONS=${NFS_EXPORT_OPTIONS:-rw,sync,no_subtree_check,no_root_squash,insecure}
-# For troubleshooting only: export to all clients, then tighten CIDR after validation.
-NFS_EXPORT_ALLOW_ALL_DEBUG=${NFS_EXPORT_ALLOW_ALL_DEBUG:-false}
+
+# Allowed clients for /etc/exports.
+# For a quick local dev setup you can use "*".
+# If you prefer a CIDR, set e.g. "172.16.0.0/12" or your Docker/Kind bridge subnet.
+NFS_EXPORT_CLIENTS=${NFS_EXPORT_CLIENTS:-172.16.0.0/12}
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root: sudo bash phase3/scripts/setup-nfs-server.sh" >&2
@@ -14,41 +20,30 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server nfs-common rpcbind
+DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server
 
 mkdir -p "$NFS_EXPORT_PATH"
 chown nobody:nogroup "$NFS_EXPORT_PATH"
 chmod 0777 "$NFS_EXPORT_PATH"
 
-exports_file=/etc/exports
-backup_file="/etc/exports.bak.$(date +%Y%m%d%H%M%S)"
-cp "$exports_file" "$backup_file"
+exports_line="${NFS_EXPORT_PATH} ${NFS_EXPORT_CLIENTS}(rw,sync,no_subtree_check,no_root_squash)"
 
-if [[ "$NFS_EXPORT_ALLOW_ALL_DEBUG" == "true" ]]; then
-  export_target='*'
+if ! grep -qE "^\s*${NFS_EXPORT_PATH}\s" /etc/exports; then
+  echo "$exports_line" >> /etc/exports
 else
-  export_target="$NFS_EXPORT_CIDR"
+  # Replace existing line for this export path (best-effort)
+  sed -i -E "s|^\s*${NFS_EXPORT_PATH}\s.*|${exports_line}|g" /etc/exports
 fi
 
-# Replace existing exports for same path to avoid stale/restrictive old CIDR lines.
-tmp_exports=$(mktemp)
-awk -v path="$NFS_EXPORT_PATH" '$1 != path { print $0 }' "$exports_file" > "$tmp_exports"
-echo "${NFS_EXPORT_PATH} ${export_target}(${NFS_EXPORT_OPTIONS})" >> "$tmp_exports"
-cat "$tmp_exports" > "$exports_file"
-rm -f "$tmp_exports"
-
 exportfs -ra
-systemctl enable --now rpcbind || true
-systemctl enable --now nfs-server || systemctl enable --now nfs-kernel-server
+
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files >/dev/null 2>&1; then
+  systemctl enable --now nfs-server || systemctl enable --now nfs-kernel-server
+else
+  service nfs-kernel-server restart
+fi
 
 echo "NFS server ready"
 echo "Export path: ${NFS_EXPORT_PATH}"
-if [[ "$NFS_EXPORT_ALLOW_ALL_DEBUG" == "true" ]]; then
-  echo "Allowed target: * (debug mode)"
-else
-  echo "Allowed CIDR: ${NFS_EXPORT_CIDR}"
-fi
-echo "Export options: ${NFS_EXPORT_OPTIONS}"
-echo "Backup exports: ${backup_file}"
-echo "Current exports:"
-exportfs -v
+echo "Allowed clients: ${NFS_EXPORT_CLIENTS}"
+echo "Check with: exportfs -v"
