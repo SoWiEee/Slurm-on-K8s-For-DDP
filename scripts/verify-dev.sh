@@ -31,7 +31,7 @@ kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout=120s
 
 job_id=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "cat <<'EOF_INNER' >/tmp/phase2-job.sh
 #!/bin/bash
-sleep 120
+sleep 60
 EOF_INNER
 sbatch --parsable -N 2 /tmp/phase2-job.sh")
 echo "submitted job: ${job_id}"
