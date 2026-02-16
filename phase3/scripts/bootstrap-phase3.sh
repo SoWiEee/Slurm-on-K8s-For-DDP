@@ -39,6 +39,13 @@ analyze_mount_failures() {
   if echo "$event_text" | grep -q 'access denied by server while mounting'; then
     print_access_denied_fix
   fi
+
+  if echo "$event_text" | grep -q 'No route to host\|Connection timed out\|Connection refused'; then
+    cat >&2 <<NET
+[phase3 bootstrap][detected] 可能是 NFS 網路連線問題（路由/防火牆）
+請先確認 WSL/VM 防火牆與路由允許 2049/tcp。
+NET
+  fi
 }
 
 print_hint() {

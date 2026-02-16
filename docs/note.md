@@ -576,6 +576,11 @@ Phase 3 的痛點是跨層：
 
 另外 `setup-nfs-server.sh` 已改為「替換同一路徑既有 export 規則」再 `exportfs -ra`，降低舊設定殘留造成的誤判。
 
+針對「已重跑 setup 仍 access denied」：
+
+- 很可能 server 看到的 client source IP 並非你預期的 Kind 內網段（NAT/橋接差異）。
+- 已新增 `NFS_EXPORT_ALLOW_ALL_DEBUG=true` 模式，先用 `*` 驗證路徑與服務，再回收為精準 CIDR。
+
 ## A) PVC 一直 Pending
 
 1. 檢查 provisioner 狀態：

@@ -260,6 +260,14 @@ sudo NFS_EXPORT_PATH=/srv/nfs/k8s NFS_EXPORT_CIDR=172.16.0.0/12 bash phase3/scri
 
 新版 `setup-nfs-server.sh` 會替換同一路徑的舊 export 規則（避免殘留舊 CIDR 導致 mount 被拒）。
 
+若你像目前案例一樣已重跑 setup 仍是 `access denied`，可先用「debug 放寬 ACL」快速確認是否為來源位址判斷問題：
+
+```bash
+sudo NFS_EXPORT_PATH=/srv/nfs/k8s NFS_EXPORT_ALLOW_ALL_DEBUG=true bash phase3/scripts/setup-nfs-server.sh
+```
+
+若此模式可通，再改回 `NFS_EXPORT_CIDR=<你的實際來源網段>` 收斂權限。
+
 
 ## 4) 常用操作
 
