@@ -500,3 +500,58 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
 ### 觀測面
 
 - 保持 Milestone B 的結構化日誌，並補充 partition/checkpoint 相關欄位，方便後續比較不同 partition 的行為與 checkpoint 保護命中率。
+<<<<<<< HEAD
+=======
+
+## Development Notes (Phase 3 - Storage + MPI-style validation)
+
+## 目標
+
+1. 建立「可維護、持續維護中的」共享儲存元件，支援 RWX。
+2. 把共享儲存掛載到 controller/worker，作為 DDP checkpoint 基礎。
+3. 驗證多 worker 協同（MPI-style `srun`）與自動擴縮（不夠自動擴、閒置自動縮）。
+
+---
+
+## 設計選擇
+
+### 為何採用 CSI NFS
+
+- `csi-driver-nfs` 是 Kubernetes CSI 生態中持續維護的驅動，部署模型標準化。
+- 對目前 Kind/Windows 開發環境相對友善，能快速提供 RWX PVC。
+- 比起自製 hostPath 拼裝，更接近真實叢集儲存介面（StorageClass + PVC）。
+
+### 共享儲存掛載策略
+
+- 統一掛載路徑 `/shared`，避免應用程式/腳本出現多路徑分歧。
+- controller/worker 都掛同一個 `slurm-shared-pvc`，確保 checkpoint 與任務輸出可互讀。
+
+### MPI-style 協同驗證策略
+
+- 以 `sbatch + srun -N 2 -n 4` 派發跨節點任務（MPI-style 多 rank）。
+- 寫入 `/shared/jobs/mpi-hosts-<jobid>.txt` 與 `/shared/checkpoints/latest.ckpt`。
+- 驗證點：
+  1) worker 是否由 1 自動擴到 >=2。
+  2) controller/worker 是否都能讀到 checkpoint。
+  3) 任務結束後是否縮回 1。
+
+---
+
+## 常見除錯
+
+1. **PVC 無法 Bound**
+   - 先確認 `csi-driver-nfs` 相關 pod 是否 ready。
+   - 再確認 `StorageClass slurm-shared-nfs` 與 NFS Service DNS 是否可解析。
+
+2. **掛載後 pod 無法啟動**
+   - `kubectl describe pod` 看 mount event。
+   - 確認 NFS server pod 是否存活。
+
+3. **MPI-style 任務未觸發擴容**
+   - `squeue -t PENDING -p <partition>` 是否有 pending。
+   - operator log 是否有 `scale_action` 或 `scale_skipped`（例如 cooldown/guard）。
+
+4. **任務後不縮容**
+   - 檢查 checkpoint guard 是否阻擋（checkpoint unknown/stale）。
+   - 檢查是否仍有 running jobs 或 busy nodes。
+>>>>>>> c83416678f150b029b0f4851662f14ffb49af98c

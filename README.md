@@ -152,6 +152,43 @@ kubectl -n slurm set env deployment/slurm-elastic-operator \
 ```
 
 
+<<<<<<< HEAD
+=======
+
+## 3.7) 部署 Phase 3 共用儲存（CSI NFS + RWX PVC）
+
+```bash
+bash phase3/scripts/bootstrap-phase3.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/bootstrap-phase3.sh
+# 可調整 checkpoint guard 路徑
+# CHECKPOINT_PATH=/shared/checkpoints/latest.ckpt bash phase3/scripts/bootstrap-phase3.sh
+```
+
+此腳本會：
+
+1. 安裝並啟用 `csi-driver-nfs`（若尚未安裝）。
+2. 建立 NFS 服務、`slurm-shared-nfs` StorageClass、`slurm-shared-pvc`（RWX）。
+3. 將 `/shared` 掛載到 `slurm-controller` 與 `slurm-worker`。
+4. 更新 operator 的 checkpoint guard 參數，並等待 rollout 完成。
+
+## 3.8) 驗證 MPI-style 多 worker 協同 + 自動擴縮
+
+```bash
+bash phase3/scripts/verify-phase3-mpi-autoscale.sh
+# 或指定 partition
+# PARTITION=debug bash phase3/scripts/verify-phase3-mpi-autoscale.sh
+```
+
+驗證內容：
+
+1. 先把 worker 縮到 1。
+2. 送出需 2 節點的 `srun`（MPI-style）任務。
+3. 驗證 worker 會自動擴到 >=2。
+4. 驗證 `/shared/checkpoints/latest.ckpt` 可由 controller/worker 都讀到。
+5. 任務結束後驗證 worker 會自動縮回 1。
+
+>>>>>>> c83416678f150b029b0f4851662f14ffb49af98c
 ## 4) 常用操作
 
 ### 查看 Pod 狀態
