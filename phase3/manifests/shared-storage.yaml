@@ -49,3 +49,17 @@ spec:
         - name: shared-storage
           persistentVolumeClaim:
             claimName: slurm-shared-rwx
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-login
+  namespace: slurm
+spec:
+  selector:
+    app: slurm-login
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
