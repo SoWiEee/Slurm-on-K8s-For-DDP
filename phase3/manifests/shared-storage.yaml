@@ -41,11 +41,90 @@ spec:
         - name: slurm-login
           image: slurm-worker:phase1
           imagePullPolicy: IfNotPresent
-          command: ["/bin/bash", "-lc", "while true; do sleep 3600; done"]
+          # Start munged + sshd, but DO NOT start slurmd (login node is client-only).
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              SSH_SRC_DIR=/slurm-secrets
+
+              if [[ ! -f "$MUNGE_SRC" ]]; then
+                echo "[login] missing $MUNGE_SRC" >&2
+                exit 1
+              fi
+
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+
+              cp "$MUNGE_SRC" "$MUNGE_DST"
+              chown munge:munge "$MUNGE_DST"
+              chmod 0400 "$MUNGE_DST"
+
+              install -d -m 0700 /root/.ssh
+              if [[ -f "$SSH_SRC_DIR/id_ed25519" ]]; then
+                cp "$SSH_SRC_DIR/id_ed25519" /root/.ssh/id_ed25519
+                chmod 0600 /root/.ssh/id_ed25519
+              fi
+              if [[ -f "$SSH_SRC_DIR/id_ed25519.pub" ]]; then
+                cp "$SSH_SRC_DIR/id_ed25519.pub" /root/.ssh/id_ed25519.pub
+                chmod 0644 /root/.ssh/id_ed25519.pub
+                cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+                chmod 0600 /root/.ssh/authorized_keys
+              fi
+
+              ssh-keygen -A
+
+              if ! su -s /bin/sh -c '/usr/sbin/munged --syslog' munge; then
+                echo "[login] munged failed to start" >&2
+                ls -ld /var/lib/munge /run/munge /etc/munge /var/log/munge >&2 || true
+                id munge >&2 || true
+                exit 1
+              fi
+              sleep 1
+              pgrep -x munged >/dev/null
+
+              /usr/sbin/sshd
+
+              echo "[login] ready: munged+sshd running; shared at /shared"
+              tail -f /dev/null
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
           volumeMounts:
+            - name: slurm-config
+              mountPath: /etc/slurm
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
             - name: shared-storage
               mountPath: /shared
       volumes:
+        - name: slurm-config
+          configMap:
+            name: slurm-config
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: slurm-ssh-key
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
         - name: shared-storage
           persistentVolumeClaim:
             claimName: slurm-shared-rwx
@@ -53,6 +132,7 @@ spec:
 ---
 apiVersion: v1
 kind: Service
+
 metadata:
   name: slurm-login
   namespace: slurm
