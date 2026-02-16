@@ -11,6 +11,36 @@ PROVISIONER_NAMESPACE=${PROVISIONER_NAMESPACE:-nfs-provisioner}
 
 step="init"
 
+print_access_denied_fix() {
+  local node_ips
+  node_ips=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{end}' 2>/dev/null || true)
+
+  cat >&2 <<FIX
+[phase3 bootstrap][detected] kubelet 回報 "mount.nfs: access denied by server"
+這通常是 NFS server 的 /etc/exports 未允許 Kind 節點來源位址。
+
+請在 NFS Server (WSL/VM) 檢查：
+1) export 路徑是否存在：
+   sudo ls -ld ${NFS_PATH}
+2) exports 是否包含 Kind node 網段或 node IP：
+   # 參考 node internal IP: ${node_ips:-unknown}
+   ${NFS_PATH} 172.16.0.0/12(rw,sync,no_subtree_check,no_root_squash,insecure)
+3) 重新套用 export：
+   sudo exportfs -ra
+   sudo exportfs -v
+4) 確保 NFS 服務可用：
+   sudo systemctl status nfs-server || sudo systemctl status nfs-kernel-server
+FIX
+}
+
+analyze_mount_failures() {
+  local event_text
+  event_text=$(kubectl -n "$PROVISIONER_NAMESPACE" get events --sort-by=.metadata.creationTimestamp 2>/dev/null || true)
+  if echo "$event_text" | grep -q 'access denied by server while mounting'; then
+    print_access_denied_fix
+  fi
+}
+
 print_hint() {
   cat >&2 <<'HINT'
 [phase3 bootstrap][possible-causes]
@@ -52,6 +82,7 @@ dump_debug_info() {
   kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx -o wide >&2 || true
   kubectl get pv >&2 || true
 
+  analyze_mount_failures
   print_hint
 }
 

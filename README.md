@@ -249,8 +249,16 @@ bash phase3/scripts/verify-phase3.sh
 若 `bootstrap-phase3.sh` 在 provisioner rollout timeout，腳本現在會自動輸出 debug 訊息（deployment/pod describe、logs、events、PVC/PV 狀態）並附上常見 root cause 提示，優先檢查：
 
 - `NFS_SERVER:2049` 是否可由 Kind node 連線（含 Windows 防火牆）。
-- `/etc/exports` 是否放行 Kind 網段。
+- `/etc/exports` 是否放行 Kind 網段（若看到 `access denied by server while mounting`，幾乎可判定是這裡）。
 - `NFS_PATH` 是否存在且已 export。
+
+若你已經有舊的 `/etc/exports` 設定，建議直接重跑：
+
+```bash
+sudo NFS_EXPORT_PATH=/srv/nfs/k8s NFS_EXPORT_CIDR=172.16.0.0/12 bash phase3/scripts/setup-nfs-server.sh
+```
+
+新版 `setup-nfs-server.sh` 會替換同一路徑的舊 export 規則（避免殘留舊 CIDR 導致 mount 被拒）。
 
 
 ## 4) 常用操作

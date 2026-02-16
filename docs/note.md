@@ -570,8 +570,11 @@ Phase 3 的痛點是跨層：
 - `NFS_SERVER` 雖然在主機可 ping，但 Kind node/container 到該 IP 的 `2049/tcp` 被防火牆或路由擋住。
 - NFS export CIDR 未包含 Kind 節點網段（WSL/Windows 環境常見）。
 - `NFS_PATH` 不存在或未在 `/etc/exports` 設定。
+- `/etc/exports` 已有同路徑舊規則，仍套到舊 CIDR（這次案例的高機率原因）。
 
-為了縮短排查時間，`bootstrap-phase3.sh` 已加入 ERR trap：失敗時會自動列印 deployment/pod describe、pod logs、events、PVC/PV。
+為了縮短排查時間，`bootstrap-phase3.sh` 已加入 ERR trap：失敗時會自動列印 deployment/pod describe、pod logs、events、PVC/PV，若偵測到 `access denied by server while mounting` 會直接給 `/etc/exports` 修正指引。
+
+另外 `setup-nfs-server.sh` 已改為「替換同一路徑既有 export 規則」再 `exportfs -ra`，降低舊設定殘留造成的誤判。
 
 ## A) PVC 一直 Pending
 
