@@ -1,0 +1,51 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: slurm-shared-nfs
+provisioner: k8s-sigs.io/slurm-nfs-subdir-external-provisioner
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+parameters:
+  archiveOnDelete: "false"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurm-shared-rwx
+  namespace: slurm
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: slurm-shared-nfs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-login
+  namespace: slurm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-login
+  template:
+    metadata:
+      labels:
+        app: slurm-login
+    spec:
+      containers:
+        - name: slurm-login
+          image: slurm-worker:phase1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc", "while true; do sleep 3600; done"]
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /shared
+      volumes:
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx

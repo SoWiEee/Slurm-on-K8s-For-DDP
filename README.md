@@ -188,6 +188,64 @@ kubectl -n slurm set env deployment/slurm-elastic-operator \
   ]'
 ```
 
+## 3.7) 部署 Phase 3（Shared Storage / NFS）
+
+> 你可以先執行 `bash scripts/bootstrap-dev.sh` 建好 Phase 1 + 2，再接著執行本節的 Phase 3 腳本。
+
+### A. 在 WSL/VM 準備 NFS Server（只需一次）
+
+在 Ubuntu WSL2 或 Linux VM 中執行：
+
+```bash
+sudo bash phase3/scripts/setup-nfs-server.sh
+# 可選參數
+# sudo NFS_EXPORT_PATH=/srv/nfs/slurm NFS_EXPORT_CIDR=172.16.0.0/12 bash phase3/scripts/setup-nfs-server.sh
+```
+
+完成後取得該 WSL/VM 的 IP（供 Kind 節點連線）：
+
+```bash
+hostname -I
+```
+
+### B. 在 K8s 部署 nfs-subdir-external-provisioner + RWX PVC + Slurm 掛載
+
+在專案根目錄執行：
+
+```bash
+NFS_SERVER=<your-wsl-or-vm-ip> \
+NFS_PATH=/srv/nfs/k8s \
+bash phase3/scripts/bootstrap-phase3.sh
+
+# 可選：指定 context / timeout
+# KUBE_CONTEXT=kind-slurm-lab ROLLOUT_TIMEOUT=600s NFS_SERVER=192.168.x.x bash phase3/scripts/bootstrap-phase3.sh
+```
+
+此腳本會完成：
+
+1. 部署 `nfs-subdir-external-provisioner`（namespace: `nfs-provisioner`）。
+2. 建立 `StorageClass`：`slurm-shared-nfs`。
+3. 建立 RWX `PVC`：`slurm/slurm-shared-rwx`（給 shared home/checkpoints）。
+4. 建立 `slurm-login` Pod（Deployment）。
+5. 以 patch 方式將 `/shared` 掛載到：
+   - `slurm-controller`
+   - `slurm-worker`
+   - `slurm-login`
+
+### C. 驗證 Phase 3
+
+```bash
+bash phase3/scripts/verify-phase3.sh
+# 或指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/verify-phase3.sh
+```
+
+驗證腳本會確認：
+
+- `StorageClass` 存在、PVC 為 `Bound`。
+- Controller / Worker / Login 三種 Pod 都有掛載 `/shared`。
+- 可由 controller 寫入檔案，並在 worker/login 讀取（驗證 RWX 共用路徑）。
+
 
 ## 4) 常用操作
 
@@ -356,9 +414,9 @@ Phase 2：Operator 開發
 
 Phase 3：Shared Storage + 應用整合與容錯
 
-- 在 Kind 單機環境部署 NFS Server（WSL/VM）並整合 nfs-subdir-external-provisioner。
-- 建立 StorageClass 與 RWX PVC，作為 Slurm shared home/checkpoints。
-- 將 Controller / Worker / Login Pod 掛載共享 NFS Volume。
+- ✅ 在 Kind 單機環境部署 NFS Server（WSL/VM）並整合 nfs-subdir-external-provisioner。
+- ✅ 建立 StorageClass 與 RWX PVC，作為 Slurm shared home/checkpoints。
+- ✅ 將 Controller / Worker / Login Pod 掛載共享 NFS Volume。
 - 建立 PyTorch DDP 測試工作負載（CPU 版即可）。
 - 實作 checkpoint heartbeat + resume 機制。
 - 在 sbatch 工作中加入 --requeue 與自動恢復流程。

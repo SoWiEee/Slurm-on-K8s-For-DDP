@@ -500,58 +500,121 @@ kubectl -n slurm scale statefulset/slurm-worker --replicas=1
 ### 觀測面
 
 - 保持 Milestone B 的結構化日誌，並補充 partition/checkpoint 相關欄位，方便後續比較不同 partition 的行為與 checkpoint 保護命中率。
-<<<<<<< HEAD
-=======
 
-## Development Notes (Phase 3 - Storage + MPI-style validation)
+# Development Notes (Phase 3 - Shared Storage Milestone)
 
 ## 目標
 
-1. 建立「可維護、持續維護中的」共享儲存元件，支援 RWX。
-2. 把共享儲存掛載到 controller/worker，作為 DDP checkpoint 基礎。
-3. 驗證多 worker 協同（MPI-style `srun`）與自動擴縮（不夠自動擴、閒置自動縮）。
+完成 Timeline 的 Phase 3（目前 milestone）：
+
+1. 在 Kind 單機環境部署 NFS Server（WSL/VM）並整合 `nfs-subdir-external-provisioner`。
+2. 建立 StorageClass + RWX PVC，作為 Slurm shared home/checkpoints。
+3. 將 Controller / Worker / Login Pod 掛載共享 NFS Volume。
 
 ---
 
-## 設計選擇
+## 開發想法
 
-### 為何採用 CSI NFS
+## 1) 降低新手門檻：把「主機層 NFS」與「叢集層 Provisioner」拆開
 
-- `csi-driver-nfs` 是 Kubernetes CSI 生態中持續維護的驅動，部署模型標準化。
-- 對目前 Kind/Windows 開發環境相對友善，能快速提供 RWX PVC。
-- 比起自製 hostPath 拼裝，更接近真實叢集儲存介面（StorageClass + PVC）。
+Phase 3 的痛點是跨層：
 
-### 共享儲存掛載策略
+- NFS Server 要在 WSL/VM（主機層）先可用。
+- K8s 只負責透過 provisioner 動態建立 PV/PVC（叢集層）。
 
-- 統一掛載路徑 `/shared`，避免應用程式/腳本出現多路徑分歧。
-- controller/worker 都掛同一個 `slurm-shared-pvc`，確保 checkpoint 與任務輸出可互讀。
+因此拆成兩支腳本：
 
-### MPI-style 協同驗證策略
+- `phase3/scripts/setup-nfs-server.sh`：在 WSL/VM 一次性安裝/匯出 NFS。
+- `phase3/scripts/bootstrap-phase3.sh`：在 kind 叢集內部署 provisioner + storage + 掛載。
 
-- 以 `sbatch + srun -N 2 -n 4` 派發跨節點任務（MPI-style 多 rank）。
-- 寫入 `/shared/jobs/mpi-hosts-<jobid>.txt` 與 `/shared/checkpoints/latest.ckpt`。
-- 驗證點：
-  1) worker 是否由 1 自動擴到 >=2。
-  2) controller/worker 是否都能讀到 checkpoint。
-  3) 任務結束後是否縮回 1。
+這樣責任清楚，維護時不會把 host provisioning 和 cluster deployment 混在一起。
+
+## 2) 以「patch 既有 StatefulSet」方式整合，避免破壞 Phase 1/2
+
+`slurm-controller` / `slurm-worker` 已由 Phase 1/2 建立並可能被調整 replicas。
+
+若 Phase 3 直接重新 apply 全量 StatefulSet 清單，容易：
+
+- 把 replicas 覆蓋回舊值。
+- 觸發不必要欄位漂移。
+
+因此採用 `kubectl patch` 只追加：
+
+- `volumes.shared-storage`
+- `volumeMounts[/shared]`
+
+讓變更範圍最小化，也更容易 rollback。
+
+## 3) 先交付可驗證的共享儲存 MVP
+
+先完成共享卷生命線：
+
+- `StorageClass: slurm-shared-nfs`
+- `PVC: slurm-shared-rwx`（RWX）
+- Controller / Worker / Login 全掛載 `/shared`
+
+並用 `verify-phase3.sh` 做「跨 Pod 寫讀」驗證，確定 checkpoint/home 的基本前提成立。
 
 ---
 
-## 常見除錯
+## 除錯方式
 
-1. **PVC 無法 Bound**
-   - 先確認 `csi-driver-nfs` 相關 pod 是否 ready。
-   - 再確認 `StorageClass slurm-shared-nfs` 與 NFS Service DNS 是否可解析。
+## A) PVC 一直 Pending
 
-2. **掛載後 pod 無法啟動**
-   - `kubectl describe pod` 看 mount event。
-   - 確認 NFS server pod 是否存活。
+1. 檢查 provisioner 狀態：
 
-3. **MPI-style 任務未觸發擴容**
-   - `squeue -t PENDING -p <partition>` 是否有 pending。
-   - operator log 是否有 `scale_action` 或 `scale_skipped`（例如 cooldown/guard）。
+```bash
+kubectl -n nfs-provisioner get pods
+kubectl -n nfs-provisioner logs deployment/nfs-subdir-external-provisioner --tail=200
+```
 
-4. **任務後不縮容**
-   - 檢查 checkpoint guard 是否阻擋（checkpoint unknown/stale）。
-   - 檢查是否仍有 running jobs 或 busy nodes。
->>>>>>> c83416678f150b029b0f4851662f14ffb49af98c
+2. 常見 root cause：
+- `NFS_SERVER` IP 錯誤（Kind node 無法連線）。
+- `NFS_PATH` 在主機不存在或未 export。
+- `/etc/exports` CIDR 沒放行 Kind Docker 網段。
+
+## B) Pod 有掛 PVC 但 `/shared` 不可寫
+
+1. 先看 mount：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- mount | grep /shared
+```
+
+2. 再用最小寫入測試：
+
+```bash
+kubectl -n slurm exec pod/slurm-controller-0 -- sh -c 'echo ok > /shared/.rw-test'
+kubectl -n slurm exec pod/slurm-worker-0 -- cat /shared/.rw-test
+```
+
+3. 常見 root cause：
+- NFS export 權限不足（未 `rw` 或 root squash 行為不符預期）。
+- 主機路徑權限過嚴（建議先用 0777 快速驗證，再收斂）。
+
+## C) Login Pod 不存在或未 Ready
+
+1. 檢查 deployment：
+
+```bash
+kubectl -n slurm get deployment slurm-login
+kubectl -n slurm describe deployment slurm-login
+```
+
+2. 若 `ImagePullBackOff`，先確認本地有 `slurm-worker:phase1` 且 phase1 已完成。
+
+## D) 一鍵驗證
+
+```bash
+bash phase3/scripts/verify-phase3.sh
+```
+
+這支腳本會檢查：StorageClass、PVC Bound、三種 Pod 掛載、以及跨 Pod 寫讀一致性。
+
+---
+
+## 下一步（Phase 3 後續）
+
+- 將 PyTorch DDP CPU 測試工作負載導入 `/shared/checkpoints`。
+- 建立 checkpoint heartbeat + resume + `--requeue` 範例工作。
+- 在 operator 加入 checkpoint-aware scale-down guard 與量測指標。
