@@ -29,6 +29,25 @@ kubectl version --client
 
 ## 2) 建立與部署 Phase 1 環境
 
+> 建議：若你要直接進入功能開發，請改用「一鍵整合部署」腳本（會串接 Phase 1 + Phase 2）：
+
+```bash
+bash scripts/bootstrap-dev.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash scripts/bootstrap-dev.sh
+# 慢機器可提高 rollout timeout
+# ROLLOUT_TIMEOUT=600s bash scripts/bootstrap-dev.sh
+# 需要完全重建時
+# FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh
+```
+
+該腳本會依序執行：
+
+1. `phase1/scripts/bootstrap-phase1.sh`
+2. `phase2/scripts/bootstrap-phase2.sh`
+
+若你只要單獨驗證/調整某一階段，仍可使用下方分階段腳本。
+
 在專案根目錄執行：
 
 ```bash
@@ -59,6 +78,23 @@ bash phase1/scripts/bootstrap-phase1.sh
 > 若 rollout timeout，`bootstrap-phase1.sh` 會自動輸出 `describe pods` 與 controller/worker logs，方便快速定位問題。
 
 ## 3) 驗證 Slurm 狀態
+
+> 建議：若你使用整合部署腳本，可直接跑整合驗證：
+
+```bash
+bash scripts/verify-dev.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash scripts/verify-dev.sh
+# 放寬 Phase 2 擴縮觀察時間
+# VERIFY_TIMEOUT_SECONDS=240 bash scripts/verify-dev.sh
+```
+
+該腳本會依序執行：
+
+1. `phase1/scripts/verify-phase1.sh`
+2. `phase2/scripts/verify-phase2.sh`
+
+若你只想看 Phase 1 基礎健康狀態，可使用下方 Phase 1 驗證腳本。
 
 ```bash
 bash phase1/scripts/verify-phase1.sh
@@ -310,6 +346,7 @@ Phase 1：基礎架構
 - 建置 Slurm Docker Images (Controller/Worker)。
 - 在 Kind 上手動部署靜態 Slurm 集群。
 - 解決 Pod 間 SSH 互通與 Munge 認證問題。
+- 交付 `scripts/bootstrap-dev.sh` / `scripts/verify-dev.sh`，將 Phase 1 + Phase 2 串成一鍵部署與驗證流程，降低新開發者上手成本。
 
 Phase 2：Operator 開發
 
