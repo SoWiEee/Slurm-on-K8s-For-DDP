@@ -167,7 +167,7 @@ class ClusterStateCollector:
 
     def get_busy_nodes(self, partition: str) -> int:
         output = self.client.exec_in_controller(
-            rf"sinfo -h -p {partition} -N -o '%T' | egrep -E 'ALLOCATED|MIXED|COMPLETING' | wc -l || true"
+            rf"sinfo -h -p {partition} -N -o '%T' | egrep -Ei 'ALLOCATED|MIXED|COMPLETING' | wc -l || true"
         )
         return int(output or "0")
 
