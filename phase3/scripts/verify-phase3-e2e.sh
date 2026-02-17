@@ -12,6 +12,7 @@ LOGIN_DEPLOY=${LOGIN_DEPLOY:-slurm-login}
 
 MIN_WORKERS=${MIN_WORKERS:-1}
 TARGET_WORKERS=${TARGET_WORKERS:-2}
+MAX_WORKERS=${MAX_WORKERS:-4}
 
 SMOKE_DIR=${SMOKE_DIR:-/shared/phase3-smoke}
 PARTITION=${PARTITION:-debug}
@@ -60,10 +61,10 @@ kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "scontrol reconfi
 # Important: when worker pods don't exist, slurmctld may still consider the nodes idle for a while,
 # causing jobs to start and then fail during srun fan-out. Force non-existent nodes DOWN so the job stays PENDING.
 echo "[e2e] Marking non-existent worker nodes DOWN to keep the job pending (best-effort)..."
-for n in 1 2; do
+for n in $(seq 1 $((MAX_WORKERS - 1))); do
   if ! kubectl -n "$NAMESPACE" get pod "${WORKER_STS}-${n}" >/dev/null 2>&1; then
     kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc \
-      "scontrol update NodeName=slurm-worker-${n} State=DOWN Reason='scaledown' || true"
+      "scontrol update NodeName=${WORKER_STS}-${n} State=DOWN Reason='scaledown' || true"
   fi
 done
 kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "sinfo -N -l || true"
@@ -81,7 +82,7 @@ cat > "${tmp_sbatch}" <<EOF
 #!/usr/bin/env bash
 #SBATCH -J phase3-smoke
 #SBATCH -p ${PARTITION}
-#SBATCH -N 2
+#SBATCH -N 3
 #SBATCH --ntasks-per-node=1
 #SBATCH -o ${SMOKE_DIR}/out-%j.txt
 #SBATCH -e ${SMOKE_DIR}/err-%j.txt
@@ -102,14 +103,13 @@ kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc \
   "chmod +x /tmp/phase3-smoke.sbatch && mv -f /tmp/phase3-smoke.sbatch '${SMOKE_DIR}/phase3-smoke.sbatch'"
 
 
-echo "[e2e] Submitting trigger job that must wait for slurm-worker-1 (guaranteed PENDING)..."
+echo "[e2e] Submitting trigger job that requires 2 nodes (expected PENDING with MIN_WORKERS=1)..."
 trigger_jobid="$(kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "
 cat > '${SMOKE_DIR}/trigger.sbatch' <<'EOF'
 #!/usr/bin/env bash
 #SBATCH -J phase3-trigger
 #SBATCH -p ${PARTITION}
-#SBATCH -N 1
-#SBATCH -w slurm-worker-1
+#SBATCH -N 3
 #SBATCH -o ${SMOKE_DIR}/trigger-out-%j.txt
 #SBATCH -e ${SMOKE_DIR}/trigger-err-%j.txt
 echo trigger-start \$(date)
@@ -156,48 +156,55 @@ while true; do
   sleep 5
 done
 
-# Ensure worker-1 exists and is Ready
-kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/${WORKER_STS}-1" --timeout="$ROLLOUT_TIMEOUT"
+controller_fqdn="${CONTROLLER_POD}.slurm-controller.${NAMESPACE}.svc.cluster.local"
+for i in $(seq 1 $((TARGET_WORKERS - 1))); do
+  echo "[e2e] Waiting for ${WORKER_STS}-${i} pod to be Ready..."
+  kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/${WORKER_STS}-${i}" --timeout="$ROLLOUT_TIMEOUT"
 
-echo "[e2e] Waiting for worker-1 DNS to be resolvable from worker-0 (gate before RESUME)..."
-dns_deadline=$(( $(date +%s) + 180 ))
-worker1_fqdn="${WORKER_STS}-1.${WORKER_STS}.${NAMESPACE}.svc.cluster.local"
-while true; do
-  # worker-1 pod must exist and be Ready
-  if kubectl -n "$NAMESPACE" get pod "${WORKER_STS}-1" >/dev/null 2>&1; then
-    if kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/${WORKER_STS}-1" --timeout=5s >/dev/null 2>&1; then
-      # worker-0 must resolve worker-1 FQDN (this is what srun step uses via slurm.conf NodeAddr)
-      if kubectl -n "$NAMESPACE" exec "pod/${WORKER_STS}-0" -- sh -lc "getent hosts '${worker1_fqdn}' >/dev/null"; then
-        echo "[e2e] worker-1 DNS resolvable from worker-0: ${worker1_fqdn}"
-        break
-      fi
+  echo "[e2e] Waiting for DNS gates for ${WORKER_STS}-${i}..."
+  dns_deadline=$(( $(date +%s) + 180 ))
+  worker_fqdn="${WORKER_STS}-${i}.${WORKER_STS}.${NAMESPACE}.svc.cluster.local"
+  while true; do
+    # worker-0 must resolve the new worker (slurm uses NodeAddr -> FQDN)
+    ok_worker0="no"
+    if kubectl -n "$NAMESPACE" exec "pod/${WORKER_STS}-0" -- sh -lc "getent hosts '${worker_fqdn}' >/dev/null" >/dev/null 2>&1; then
+      ok_worker0="yes"
     fi
-  fi
-  if (( $(date +%s) >= dns_deadline )); then
-    echo "[e2e][ERROR] worker-1 not resolvable from worker-0 within timeout." >&2
-    kubectl -n "$NAMESPACE" get pods -l app=slurm-worker -o wide >&2 || true
-    kubectl -n "$NAMESPACE" get endpoints slurm-worker -o wide >&2 || true
-    exit 1
-  fi
-  sleep 3
-done
+    # new worker must resolve the controller (stepd contacts slurmctld)
+    ok_workerN="no"
+    if kubectl -n "$NAMESPACE" exec "pod/${WORKER_STS}-${i}" -- sh -lc "getent hosts '${controller_fqdn}' >/dev/null" >/dev/null 2>&1; then
+      ok_workerN="yes"
+    fi
+    if [[ "$ok_worker0" == "yes" && "$ok_workerN" == "yes" ]]; then
+      echo "[e2e] DNS OK: worker-0 -> ${worker_fqdn}, ${WORKER_STS}-${i} -> ${controller_fqdn}"
+      break
+    fi
+    if (( $(date +%s) >= dns_deadline )); then
+      echo "[e2e][ERROR] DNS not stable within timeout for ${WORKER_STS}-${i}." >&2
+      kubectl -n "$NAMESPACE" get pods -l app=slurm-worker -o wide >&2 || true
+      kubectl -n "$NAMESPACE" get endpoints slurm-worker -o wide >&2 || true
+      exit 1
+    fi
+    sleep 3
+  done
 
-echo "[e2e] Waiting for slurmctld to see slurm-worker-1 without NO NETWORK ADDRESS..."
-slurm_deadline=$(( $(date +%s) + 180 ))
-while true; do
-  reason="$(kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "scontrol show node slurm-worker-1 | awk -F'Reason=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
-  if [[ -n "$reason" ]] && echo "$reason" | grep -qi 'NO NETWORK ADDRESS'; then
-    echo "[e2e] slurm-worker-1 still has reason: $reason"
-  else
-    echo "[e2e] slurm-worker-1 reason ok: ${reason:-none}"
-    break
-  fi
-  if (( $(date +%s) >= slurm_deadline )); then
-    echo "[e2e][ERROR] slurm-worker-1 still not addressable in slurmctld within timeout." >&2
-    kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "sinfo -N -l || true; scontrol show node slurm-worker-1 || true" >&2 || true
-    exit 1
-  fi
-  sleep 3
+  echo "[e2e] Waiting for slurmctld to see ${WORKER_STS}-${i} without NO NETWORK ADDRESS..."
+  slurm_deadline=$(( $(date +%s) + 180 ))
+  while true; do
+    reason="$(kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "scontrol show node ${WORKER_STS}-${i} | awk -F'Reason=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
+    if [[ -n "$reason" ]] && echo "$reason" | grep -qi 'NO NETWORK ADDRESS'; then
+      echo "[e2e] ${WORKER_STS}-${i} still has reason: $reason"
+    else
+      echo "[e2e] ${WORKER_STS}-${i} reason ok: ${reason:-none}"
+      break
+    fi
+    if (( $(date +%s) >= slurm_deadline )); then
+      echo "[e2e][ERROR] ${WORKER_STS}-${i} still not addressable in slurmctld within timeout." >&2
+      kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "sinfo -N -l || true; scontrol show node ${WORKER_STS}-${i} || true" >&2 || true
+      exit 1
+    fi
+    sleep 3
+  done
 done
 
 echo "[e2e] Cancelling trigger job (it has served its purpose)..."
