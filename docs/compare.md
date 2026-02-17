@@ -127,3 +127,197 @@ C) 驗證與使用者體驗（sbatch 即可）
 2) operator：加入 scale-down（idle timeout + drain/down），並把 scale decision 與 MAX_WORKERS=4 綁死。  
 3) e2e：把 trigger job 的 -N 與 smoke job 的 -N 都完全參數化（TARGET_WORKERS/SMOKE_NODES），並把驗證輸出與錯誤 dump 做完整。  
 4) （可選）支援多種 worker class（cpu/gpu）與 partition mapping，為未來 DDP/GPU 訓練預留擴充點。
+---
+
+## Open-source landscape: Slurm-on-Kubernetes approaches (and how this project differs)
+
+This section focuses on *how* different projects bridge **Slurm’s job model** (multi-node allocations, steps, job arrays, fair-share, backfill, accounting) with **Kubernetes’ pod model** (desired state, controllers, autoscaling, service discovery).
+
+### 1) Slinky (slurm-operator + slurm-bridge): “Slurm on K8s” as a suite
+
+**What it is**
+- **slurm-operator** manages a Slurm cluster as Kubernetes resources (CRDs) and owns the lifecycle of controller/login/compute components.
+- **slurm-bridge** introduces a *Kubernetes-first execution path* where Slurm jobs are represented as Kubernetes objects and are executed as Kubernetes workloads/pods, while preserving a Slurm-facing UX.
+
+**Execution model**
+- Two patterns show up in Slinky deployments:
+  1) *Static/elastic Slurm nodes as pods* (Slurm sees node objects that correspond to pods).
+  2) *“Bridge” mode* where Slurm jobs are translated into Kubernetes jobs/pods (Slurm becomes a front-door + policy engine; Kubernetes becomes the runtime).
+
+**Where it shines**
+- Kubernetes-native lifecycle management of Slurm components and predictable day-2 operations (upgrades/rollouts/health).
+- A clearer separation between **Slurm as scheduler/policy** and **K8s as runtime** when using slurm-bridge.
+
+**Trade-offs**
+- More moving pieces and CRDs; adopting slurm-bridge is a bigger conceptual and operational step than “run slurmd in pods”.
+
+**References**
+- Slinky org + repos: https://github.com/SlinkyProject
+- AWS reference deployment on EKS: https://aws.amazon.com/blogs/containers/running-slurm-on-amazon-eks-with-slinky/
+
+### 2) Soperator (Nebius): Kubernetes-first Slurm operator with strong “cluster product” features
+
+**What it is**
+- A Kubernetes operator that manages Slurm clusters as k8s resources and emphasizes production features (HA/self-healing, isolation boundaries, GPU health checks, accounting integration, etc.).
+
+**Notable design choices**
+- **Kubernetes-first** stance with “bring the cluster to desired state continuously”.
+- Focus on *platform* features (accounting, GPU checks, secure access, isolation), not only “get Slurm running”.
+
+**Where it shines**
+- If you want a more feature-complete platform layer (multi-tenant boundaries, accounting, GPU health automation).
+
+**Trade-offs**
+- Larger scope than a minimal elastic worker scaler; higher adoption/maintenance cost, but a lot more features out-of-the-box.
+
+**References**
+- Repo: https://github.com/nebius/soperator
+- Background article: https://medium.com/nebius-ai/introducing-soperator-the-slurm-operator-for-kubernetes-a72ce73c4d57
+
+### 3) “Run Slurm inside Kubernetes” Helm charts / manifests (no dedicated operator)
+
+**What it is**
+- Traditional approach: containerize `slurmctld`/`slurmd`/`munge` and deploy with Helm/YAML.
+- Typically relies on headless services + stable DNS, and uses StatefulSets for predictable node identity.
+
+**Where it shines**
+- Minimal conceptual overhead; easiest to understand and debug.
+- Great for labs, PoCs, or as a base layer to evolve into an operator.
+
+**Trade-offs**
+- You own day-2 operations (upgrades, drift remediation), and elasticity requires custom automation.
+
+### 4) Kubernetes-native batch schedulers as “alternatives” (not Slurm, but often compared)
+
+If the goal is “HPC/AI batch on Kubernetes”, there are two Kubernetes-native families that people compare to Slurm:
+
+- **Volcano**: batch scheduling on Kubernetes with concepts like queues and gang scheduling.
+- **Kueue**: queueing/admission control for batch workloads, often paired with existing job controllers.
+
+These can replace some *job queueing* capabilities in Kubernetes, but they do **not** replicate the full Slurm ecosystem (Slurm CLI tooling, accounting model, partitions/QoS semantics, job arrays at Slurm-scale, etc.). Practically:
+- If your users are already Slurm-native, keeping Slurm as the front-door can be a huge UX and compatibility win.
+- If your environment is Kubernetes-native and you can change user workflows, Volcano/Kueue can be attractive.
+
+**References**
+- Volcano: https://github.com/volcano-sh/volcano
+- Kueue: https://github.com/kubernetes-sigs/kueue
+
+---
+
+## Where *this* project sits (today)
+
+Current approach: **“Slurm nodes as pods + an elastic operator that scales a Slurm worker StatefulSet based on demand.”**
+
+Key characteristics:
+- Slurm still schedules *Slurm nodes* (the mental model remains Slurm-native).
+- Kubernetes is used as the infrastructure layer to create/kill worker pods.
+- Elasticity logic lives in a small operator/controller loop (watch pending demand → scale worker StatefulSet up, and later scale down).
+
+Compared to Slinky:
+- Similarity: both can run Slurm components on Kubernetes and can represent compute nodes as pods.
+- Difference: this project currently **does not** introduce a “bridge” that turns each Slurm job into its own Kubernetes workload. It keeps the Slurm cluster model intact (controller + slurmd nodes), and only elastically changes node count.
+
+Compared to Soperator:
+- Similarity: both are “operatorized Slurm on Kubernetes”.
+- Difference: Soperator is a broader “platform product” with extra features (accounting/GPU checks/isolation/HA workflows). This project is intentionally narrower: focus on **correctness + elasticity + minimal moving parts**.
+
+---
+
+## Why keep Slurm when Kubernetes exists?
+
+Your quoted article’s core statement is directionally correct:
+
+- Kubernetes (by default) excels at **pod/service lifecycle** and keeping desired state.
+- Slurm excels at **batch/HPC job scheduling** for shared clusters: queueing, fairness, time limits, backfill, job arrays, multi-node allocations, and accounting.
+
+Yes, Kubernetes can approximate parts of this (PriorityClass/Quota, Volcano, Kueue, custom schedulers/controllers). The practical question is whether you want to:
+- re-create a mature HPC scheduling model (and its UX/ecosystem), or
+- reuse Slurm for the “HPC semantics” while using Kubernetes for infrastructure and operations.
+
+This project’s direction is: **reuse Slurm’s semantics and UX, and let Kubernetes provide the cloud-native substrate**.
+
+---
+
+## Future development plan (core tech → implementation → applications)
+
+Below is a pragmatic roadmap that keeps the “minimal, correct, elastic” philosophy while getting closer to a production-quality Slurm-on-K8s platform.
+
+### A) Core technical improvements (foundations)
+
+1. **Elasticity as a first-class control loop**
+   - Scale-up trigger: interpret pending demand from Slurm (jobs pending for resources, requested nodes, partitions).
+   - Scale-down trigger: identify idle nodes for a minimum idle window; drain + down nodes safely; then reduce replicas.
+   - Add a hard upper bound (`MAX_WORKERS=4` now; make it per-partition configurable later).
+
+2. **Make Slurm and K8s node lifecycle consistent**
+   - Guarantee stable node identity (`slurm-worker-N`) and DNS.
+   - Gate “RESUME/UP” on *network readiness* (DNS + reachability) to prevent `NO NETWORK ADDRESS` / race conditions.
+   - Prefer Slurm-native lifecycle hooks when possible (see “Resume/Suspend integration” below).
+
+3. **Networking robustness for multi-node workloads**
+   - Codify the DNS/service assumptions (headless Services, EndpointSlice readiness).
+   - Add active connectivity checks for `slurmd↔slurmctld` and `slurmd↔slurmd` (MPI/DDP cares about lateral connectivity too).
+   - Optional: NetworkPolicy templates and a “diagnostics bundle” command.
+
+4. **Observability & debuggability**
+   - Operator metrics: desired vs actual replicas, scale decisions, reasons, last errors.
+   - Slurm health exports: node states, pending reasons, queue depth, job throughput.
+   - Log correlation: jobid → scaled workers → pod names → events.
+
+5. **Security & multi-tenancy posture (incremental)**
+   - Clarify trust boundaries: what runs as root, what is user-controlled, what is operator-controlled.
+   - Plan for per-namespace or per-account partitions (longer-term), and secret handling (munge/ssh).
+
+### B) Implementation plan (incremental milestones)
+
+**Milestone B1: Scale-up correctness (done / stabilize)**
+- Ensure scale-up produces Ready workers, passes DNS gates, and Slurm sees nodes as allocatable reliably.
+- Improve resilience to transient `scontrol reconfigure` timeouts (retry with backoff; avoid taking failures as “truth”).
+
+**Milestone B2: Scale-down with safety**
+- Drain nodes (`DRAIN`) and wait for no running jobs on those nodes.
+- Mark nodes `DOWN` with reason, then scale StatefulSet down.
+- Add cool-down windows to prevent thrashing.
+
+**Milestone B3: Align with Slurm “power saving” interfaces (recommended)**
+- Use Slurm’s built-in *Suspend/Resume* hooks:
+  - `ResumeProgram` → request K8s scale-up for specific nodes/ranges
+  - `SuspendProgram` → request scale-down after idleness
+- Benefit: elasticity becomes “Slurm-driven” (Slurm asks for nodes when it needs them), reducing guesswork in the operator.
+
+**Milestone B4: Partition-aware elasticity**
+- Different partitions can map to different worker pools (CPU-only, GPU, high-mem).
+- Each pool has its own min/max and scheduling constraints (nodeSelector/tolerations).
+
+**Milestone B5: Packaging & UX**
+- Helm chart / kustomize overlays for reproducible deploys.
+- “One command” smoke tests for 1-node, 2-node, N-node, and MPI/DDP.
+- Documentation: a clear “concepts → deploy → run jobs → troubleshoot” flow.
+
+### C) Application enablement (what to support and how to prove it)
+
+1. **MPI**
+   - Provide an example `sbatch` for OpenMPI/MPICH.
+   - Validate: multi-node allreduce, latency, failure recovery expectations.
+
+2. **PyTorch DDP**
+   - Provide a canonical `sbatch` template (env vars, rendezvous, NCCL settings).
+   - Validate: 2–4 nodes training smoke (small model), logs show correct world size.
+
+3. **Job arrays / param sweeps**
+   - Provide examples that generate many small jobs.
+   - Validate: controller/API load, queue behavior, scale-up/down stability.
+
+4. **Accounting / governance**
+   - If you enable `slurmdbd` later: document how to get per-user usage reports.
+   - Decide whether “governance” lives in Slurm (accounts/QOS/fairshare) or in K8s (namespaces/quotas) or both.
+
+---
+
+## Practical next steps for *your* current state (MAX_WORKERS=4)
+
+1) Stabilize scale-up to 3–4 nodes under repeated runs (loop e2e 20–50 times).
+2) Add a minimal scale-down policy (idle window + drain + down + scale).
+3) Decide whether to move to Slurm `ResumeProgram/SuspendProgram` (strongly recommended once scale-up is stable).
+4) Expand the verification suite: add MPI + a tiny DDP smoke as “real workload proof”.
+
