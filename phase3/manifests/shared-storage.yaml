@@ -1,0 +1,145 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: slurm-shared-nfs
+provisioner: k8s-sigs.io/slurm-nfs-subdir-external-provisioner
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+parameters:
+  archiveOnDelete: "false"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurm-shared-rwx
+  namespace: slurm
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: slurm-shared-nfs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-login
+  namespace: slurm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-login
+  template:
+    metadata:
+      labels:
+        app: slurm-login
+    spec:
+      containers:
+        - name: slurm-login
+          image: slurm-worker:phase1
+          imagePullPolicy: IfNotPresent
+          # Start munged + sshd, but DO NOT start slurmd (login node is client-only).
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              SSH_SRC_DIR=/slurm-secrets
+
+              if [[ ! -f "$MUNGE_SRC" ]]; then
+                echo "[login] missing $MUNGE_SRC" >&2
+                exit 1
+              fi
+
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+
+              cp "$MUNGE_SRC" "$MUNGE_DST"
+              chown munge:munge "$MUNGE_DST"
+              chmod 0400 "$MUNGE_DST"
+
+              install -d -m 0700 /root/.ssh
+              if [[ -f "$SSH_SRC_DIR/id_ed25519" ]]; then
+                cp "$SSH_SRC_DIR/id_ed25519" /root/.ssh/id_ed25519
+                chmod 0600 /root/.ssh/id_ed25519
+              fi
+              if [[ -f "$SSH_SRC_DIR/id_ed25519.pub" ]]; then
+                cp "$SSH_SRC_DIR/id_ed25519.pub" /root/.ssh/id_ed25519.pub
+                chmod 0644 /root/.ssh/id_ed25519.pub
+                cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+                chmod 0600 /root/.ssh/authorized_keys
+              fi
+
+              ssh-keygen -A
+
+              if ! su -s /bin/sh -c '/usr/sbin/munged --syslog' munge; then
+                echo "[login] munged failed to start" >&2
+                ls -ld /var/lib/munge /run/munge /etc/munge /var/log/munge >&2 || true
+                id munge >&2 || true
+                exit 1
+              fi
+              sleep 1
+              pgrep -x munged >/dev/null
+
+              /usr/sbin/sshd
+
+              echo "[login] ready: munged+sshd running; shared at /shared"
+              tail -f /dev/null
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: slurm-config
+              mountPath: /etc/slurm
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+            - name: shared-storage
+              mountPath: /shared
+      volumes:
+        - name: slurm-config
+          configMap:
+            name: slurm-config
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: slurm-ssh-key
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
+
+---
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: slurm-login
+  namespace: slurm
+spec:
+  selector:
+    app: slurm-login
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

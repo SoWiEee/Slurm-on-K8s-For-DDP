@@ -41,7 +41,9 @@ class Config:
     default_partition: str = os.getenv("SLURM_PARTITION", "debug")
     default_worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker")
     default_min_replicas: int = int(os.getenv("MIN_REPLICAS", "1"))
-    default_max_replicas: int = int(os.getenv("MAX_REPLICAS", "3"))
+    # Upper bound for worker pod scale-out per partition.
+    # Keep this in sync with the maximum NodeName range defined in slurm.conf.
+    default_max_replicas: int = int(os.getenv("MAX_REPLICAS", "4"))
     default_scale_up_step: int = int(os.getenv("SCALE_UP_STEP", "1"))
     default_scale_down_step: int = int(os.getenv("SCALE_DOWN_STEP", "1"))
     default_scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
@@ -90,6 +92,29 @@ class KubectlClient:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         return result.stdout.strip()
 
+    def try_run(self, args: Iterable[str]) -> tuple[int, str, str]:
+        """Run kubectl but don't raise on non-zero exit codes.
+
+        Returns: (returncode, stdout, stderr)
+        """
+        cmd = ["kubectl", *args]
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    def pod_is_ready(self, pod_name: str) -> bool:
+        rc, out, _ = self.try_run(
+            [
+                "-n",
+                self.cfg.namespace,
+                "get",
+                "pod",
+                pod_name,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type=='Ready')].status}",
+            ]
+        )
+        return rc == 0 and out == "True"
+
     def exec_in_controller(self, command: str) -> str:
         return self.run(
             [
@@ -135,7 +160,8 @@ class PartitionConfigLoader:
                     partition=item["partition"],
                     worker_statefulset=item["worker_statefulset"],
                     min_replicas=int(item.get("min_replicas", 1)),
-                    max_replicas=int(item.get("max_replicas", 1)),
+                    # If the JSON doesn't specify max_replicas, fall back to global defaults.
+                    max_replicas=int(item.get("max_replicas", cfg.default_max_replicas)),
                     scale_up_step=int(item.get("scale_up_step", 1)),
                     scale_down_step=int(item.get("scale_down_step", 1)),
                     scale_down_cooldown=int(item.get("scale_down_cooldown", 60)),
@@ -276,6 +302,31 @@ class OperatorApp:
         self.partition_cfgs = PartitionConfigLoader.load(cfg)
         self.last_scale_up_at: dict[str, float] = {p.partition: 0.0 for p in self.partition_cfgs}
 
+    def _sync_slurm_node_states(self, partition_cfg: PartitionConfig) -> None:
+        """Best-effort: keep Slurm node states aligned with existing worker pods.
+
+        When pods are scaled down, Slurm can keep trying to resolve/connect to nodes that no longer
+        exist, leading to noisy logs and sometimes brittle job launches. We proactively set nodes
+        above the current StatefulSet replica count to DOWN (Reason=autoscale), and attempt to RESUME
+        nodes that have a Ready pod.
+
+        This is intentionally conservative and idempotent.
+        """
+
+        sts = partition_cfg.worker_statefulset
+        for i in range(partition_cfg.max_replicas):
+            nodename = f"{sts}-{i}"
+            if self.client.pod_ready(nodename):
+                # RESUME is best-effort (some states may reject); keep running regardless.
+                self.client.exec_in_controller(
+                    f"scontrol update NodeName={nodename} State=RESUME || true"
+                )
+            else:
+                # If the node exists in slurm.conf, mark it DOWN so the scheduler won't pick it.
+                self.client.exec_in_controller(
+                    f"scontrol update NodeName={nodename} State=DOWN Reason=autoscale || true"
+                )
+
     def run(self) -> None:
         self.logger.emit(
             "startup",
@@ -371,6 +422,11 @@ class OperatorApp:
                             running_jobs=state.running_jobs,
                             busy_nodes=state.busy_nodes,
                         )
+
+                    # Always keep Slurm node states aligned with pods, regardless of
+                    # whether we scaled this iteration. This avoids scheduling work to
+                    # non-existent nodes and reduces "NO NETWORK ADDRESS" churn.
+                    self._sync_slurm_node_states(partition_cfg)
                 except Exception as exc:  # noqa: BLE001
                     self.logger.emit("error", level="ERROR", partition=partition, message=str(exc))
 

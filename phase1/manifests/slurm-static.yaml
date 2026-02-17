@@ -10,6 +10,7 @@ metadata:
   namespace: slurm
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: slurm-controller
   ports:
@@ -24,6 +25,7 @@ metadata:
   namespace: slurm
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: slurm-worker
   ports:
@@ -63,7 +65,8 @@ data:
     NodeName=slurm-worker-0 NodeAddr=slurm-worker-0.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
     NodeName=slurm-worker-1 NodeAddr=slurm-worker-1.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
     NodeName=slurm-worker-2 NodeAddr=slurm-worker-2.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
-    PartitionName=debug Nodes=slurm-worker-[0-2] Default=YES MaxTime=INFINITE State=UP
+    NodeName=slurm-worker-3 NodeAddr=slurm-worker-3.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-3 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
+    PartitionName=debug Nodes=slurm-worker-[0-3] Default=YES MaxTime=INFINITE State=UP
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -131,7 +134,7 @@ metadata:
   namespace: slurm
 spec:
   serviceName: slurm-worker
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: slurm-worker

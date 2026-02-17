@@ -17,7 +17,7 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 
 > 適用對象：Windows 11（已安裝 Docker Desktop、kind、kubectl）
 
-## 1) 前置檢查
+## 1. 前置檢查
 
 請先確認 Docker Desktop 已啟動，並可在終端機執行：
 
@@ -27,9 +27,11 @@ kind version
 kubectl version --client
 ```
 
-## 2) 建立與部署 Phase 1 環境
+## 2. 建立與部署 Phase 1&2 環境
 
-> 建議：若你要直接進入功能開發，請改用「一鍵整合部署」腳本（已內建 Phase 1 + Phase 2 全流程，不是再去呼叫另一層腳本）：
+### 2.1 整合部署及驗證
+
+- 以下部署腳本會完成 Phase1, Phase2 的整合部署：
 
 ```bash
 bash scripts/bootstrap-dev.sh
@@ -41,15 +43,30 @@ bash scripts/bootstrap-dev.sh
 # FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh
 ```
 
-該腳本會在同一支檔案中完成：
+- 該腳本會在同一支檔案中完成：
 
 1. Kind/context 與工具檢查
 2. Phase 1 image build/load、secrets、manifest apply、rollout 檢查
 3. Phase 2 operator image build/load、manifest apply、worker 初始化為 1
 
-若你只要單獨驗證/調整某一階段，仍可使用下方分階段腳本。
+- 以下部署腳本會完成 Phase1, Phase2 的整合驗證：
 
-在專案根目錄執行：
+```bash
+bash scripts/verify-dev.sh
+# 指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash scripts/verify-dev.sh
+# 放寬 Phase 2 擴縮觀察時間
+# VERIFY_TIMEOUT_SECONDS=240 bash scripts/verify-dev.sh
+```
+
+- 該腳本會在同一支檔案中完成：
+
+1. Phase 1 健康檢查（pod ready、`sinfo`、`scontrol`、controller->worker SSH）
+2. Phase 2 擴縮檢查（先縮到 1、送 pending job 觸發 scale-up、取消後確認 scale-down）
+
+### 2.2 階段性部署及驗證
+
+- 在專案根目錄執行以下腳本來部署 Phase1：
 
 ```bash
 bash phase1/scripts/bootstrap-phase1.sh
@@ -61,7 +78,7 @@ bash phase1/scripts/bootstrap-phase1.sh
 # FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
 ```
 
-該腳本會完成以下事情：
+- 該腳本會完成以下事情：
 
 1. 若不存在，建立 `slurm-lab` Kind 叢集。
 - 腳本會自動切換到 `KUBE_CONTEXT`（預設 `kind-slurm-lab`），避免套用到錯誤叢集。
@@ -75,27 +92,9 @@ bash phase1/scripts/bootstrap-phase1.sh
 5. 套用 `phase1/manifests/slurm-static.yaml`。
 6. 等待 Controller / Worker StatefulSet Ready。
 
-
 > 若 rollout timeout，`bootstrap-phase1.sh` 會自動輸出 `describe pods` 與 controller/worker logs，方便快速定位問題。
 
-## 3) 驗證 Slurm 狀態
-
-> 建議：若你使用整合部署腳本，可直接跑整合驗證（同樣是單一腳本內建完整驗證邏輯）：
-
-```bash
-bash scripts/verify-dev.sh
-# 指定 context
-# KUBE_CONTEXT=kind-slurm-lab bash scripts/verify-dev.sh
-# 放寬 Phase 2 擴縮觀察時間
-# VERIFY_TIMEOUT_SECONDS=240 bash scripts/verify-dev.sh
-```
-
-該腳本會在同一支檔案中完成：
-
-1. Phase 1 健康檢查（pod ready、`sinfo`、`scontrol`、controller->worker SSH）
-2. Phase 2 擴縮檢查（先縮到 1、送 pending job 觸發 scale-up、取消後確認 scale-down）
-
-若你只想看 Phase 1 基礎健康狀態，可使用下方 Phase 1 驗證腳本。
+- 執行以下腳本來驗證 Phase1：
 
 ```bash
 bash phase1/scripts/verify-phase1.sh
@@ -109,18 +108,7 @@ bash phase1/scripts/verify-phase1.sh
 - `slurm-worker-0`、`slurm-worker-1`、`slurm-worker-2` 狀態可被 `scontrol` 正常辨識。
 - Controller 可 SSH 到 Worker（驗證 Pod 間 SSH 基本互通）。
 
-### Phase 1.1 清理：NodeAddr / NodeHostname 對應
-
-若 `scontrol show nodes` 曾出現 `Reason=NO NETWORK ADDRESS FOUND`，本專案已在 `slurm.conf` 為每個 worker 額外設定：
-
-- `NodeAddr=slurm-worker-<n>.slurm-worker.slurm.svc.cluster.local`
-- `NodeHostname=slurm-worker-<n>`
-
-這可降低 Slurm 在 K8s DNS 環境下的位址判定歧義。
-
-## 3.5) 部署 Phase 2（Elastic Operator）
-
-在 Phase 1 Ready 後，執行：
+- 執行以下腳本來部署 Phase2：
 
 ```bash
 bash phase2/scripts/bootstrap-phase2.sh
@@ -140,7 +128,7 @@ bash phase2/scripts/bootstrap-phase2.sh
 4. 以 `kubectl scale` 將既有 `slurm-worker` 調整為 `1`（避免以不完整 StatefulSet manifest 更新導致驗證錯誤）。
 5. 等待 Operator 與 Worker rollout 完成。
 
-## 3.6) 驗證 Phase 2 擴縮行為
+- 執行以下腳本來驗證 Phase2：
 
 ```bash
 bash phase2/scripts/verify-phase2.sh
@@ -188,8 +176,87 @@ kubectl -n slurm set env deployment/slurm-elastic-operator \
   ]'
 ```
 
+## 3. 部署 Phase 3（Shared Storage / NFS）
 
-## 4) 常用操作
+### 3.1 在 WSL/VM 準備 NFS Server
+
+在 Ubuntu WSL2 或 Linux VM 中執行：
+
+```bash
+sudo bash phase3/scripts/setup-nfs-server.sh
+# 可選參數
+# sudo NFS_EXPORT_PATH=/srv/nfs/slurm NFS_EXPORT_CIDR=172.16.0.0/12 bash phase3/scripts/setup-nfs-server.sh
+```
+
+完成後取得該 WSL/VM 的 IP（供 Kind 節點連線）：
+
+```bash
+hostname -I
+```
+
+### 3.2 在 K8s 部署 nfs-subdir-external-provisioner + RWX PVC + Slurm 掛載
+
+在專案根目錄執行：
+
+```bash
+NFS_SERVER=<your-wsl-or-vm-ip> \
+NFS_PATH=/srv/nfs/k8s \
+bash phase3/scripts/bootstrap-phase3.sh
+
+# 可選：指定 context / timeout
+# KUBE_CONTEXT=kind-slurm-lab ROLLOUT_TIMEOUT=600s NFS_SERVER=192.168.x.x bash phase3/scripts/bootstrap-phase3.sh
+```
+
+此腳本會完成：
+
+1. 部署 `nfs-subdir-external-provisioner`（namespace: `nfs-provisioner`）。
+2. 建立 `StorageClass`：`slurm-shared-nfs`。
+3. 建立 RWX `PVC`：`slurm/slurm-shared-rwx`（給 shared home/checkpoints）。
+4. 建立 `slurm-login` Pod（Deployment）。
+5. 以 patch 方式將 `/shared` 掛載到：
+   - `slurm-controller`
+   - `slurm-worker`
+   - `slurm-login`
+
+### 3.3 驗證 Phase 3
+
+```bash
+bash phase3/scripts/verify-phase3.sh
+bash phase3/scripts/verify-phase3-e2e.sh
+# 或指定 context
+# KUBE_CONTEXT=kind-slurm-lab bash phase3/scripts/verify-phase3.sh
+```
+
+驗證腳本會確認：
+
+- `StorageClass` 存在、PVC 為 `Bound`。
+- Controller / Worker / Login 三種 Pod 都有掛載 `/shared`。
+- 可由 controller 寫入檔案，並在 worker/login 讀取（驗證 RWX 共用路徑）。
+
+若 `bootstrap-phase3.sh` 在 provisioner rollout timeout，腳本現在會自動輸出 debug 訊息（deployment/pod describe、logs、events、PVC/PV 狀態）並附上常見 root cause 提示，優先檢查：
+
+- `NFS_SERVER:2049` 是否可由 Kind node 連線（含 Windows 防火牆）。
+- `/etc/exports` 是否放行 Kind 網段（若看到 `access denied by server while mounting`，幾乎可判定是這裡）。
+- `NFS_PATH` 是否存在且已 export。
+
+若你已經有舊的 `/etc/exports` 設定，建議直接重跑：
+
+```bash
+sudo NFS_EXPORT_PATH=/srv/nfs/k8s NFS_EXPORT_CIDR=172.16.0.0/12 bash phase3/scripts/setup-nfs-server.sh
+```
+
+新版 `setup-nfs-server.sh` 會替換同一路徑的舊 export 規則（避免殘留舊 CIDR 導致 mount 被拒）。
+
+若你像目前案例一樣已重跑 setup 仍是 `access denied`，可先用「debug 放寬 ACL」快速確認是否為來源位址判斷問題：
+
+```bash
+sudo NFS_EXPORT_PATH=/srv/nfs/k8s NFS_EXPORT_ALLOW_ALL_DEBUG=true bash phase3/scripts/setup-nfs-server.sh
+```
+
+若此模式可通，再改回 `NFS_EXPORT_CIDR=<你的實際來源網段>` 收斂權限。
+
+
+## 4. 常用操作
 
 ### 查看 Pod 狀態
 
@@ -208,56 +275,6 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 ```bash
 kind delete cluster --name slurm-lab
 ```
-
-
-## 5) Windows 常見錯誤（你這次遇到的）
-
-### 錯誤 1：`/usr/bin/env: '''bash\r''': No such file or directory`
-
-這代表腳本檔案是 CRLF（`\r\n`）換行，Linux 容器需要 LF（`\n`）。
-
-本專案已加入 `.gitattributes` 強制 shell/yaml/dockerfile 使用 LF。若你本機還是遇到：
-
-```bash
-git rm --cached -r .
-git reset --hard
-```
-
-再重新 build：
-
-```bash
-DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh
-```
-
-### 錯誤 2：`error mounting ... /etc/slurm/slurm.conf ... no such file or directory`
-
-已改成把 ConfigMap 直接掛載到 `/etc/slurm`（不再使用 `subPath` 掛單檔），可降低 Windows/容器 runtime 下的 subPath 邊緣問題。
-
-### 錯誤 3：`chmod: changing permissions of '/etc/munge/munge.key': Read-only file system`
-
-Kubernetes Secret 掛載本質是唯讀，不能直接在掛載點上 `chmod/chown`。
-
-已改為：
-- Secret 掛載到 `/slurm-secrets/*`（避免 `subPath` 與系統 secrets 路徑衝突）
-- entrypoint 啟動時把 key 複製到可寫入的 `/etc/munge/munge.key` 再設定權限
-
-
-### 錯誤 4：`munged: Error: PRNG seed dir is insecure: invalid ownership of "/var/lib/munge"`
-
-這表示 `munged` 檢查到目錄權限/擁有者不安全。
-
-已修正 entrypoint 啟動流程：
-- 明確對 `/etc/munge`、`/var/lib/munge`、`/var/log/munge` 做 `chown munge:munge` 與 `chmod 0700`（含遞迴）
-- `/run/munge` 使用 `chmod 0711`（`munged` 要求 socket 路徑對 all 具有 execute）
-- 以 `munge` 使用者啟動 `munged`，避免權限檢查不一致
-- 若 `munged` 啟動失敗，額外輸出上述目錄權限與 `id munge` 供除錯
-
-### 錯誤 5：`This host (...) not a valid controller` 或 worker 無法解析 controller FQDN
-
-已修正 `slurm.conf`：
-- `SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)`（前段給 controller 主機名比對，括號內給 worker 解析位址）
-- 並把 worker CPU 拓撲參數調整為符合 Kind 節點常見硬體，降低 slurmd 拓撲不一致警告
-
 
 # 🔥 Motivation
 
@@ -356,9 +373,9 @@ Phase 2：Operator 開發
 
 Phase 3：Shared Storage + 應用整合與容錯
 
-- 在 Kind 單機環境部署 NFS Server（WSL/VM）並整合 nfs-subdir-external-provisioner。
-- 建立 StorageClass 與 RWX PVC，作為 Slurm shared home/checkpoints。
-- 將 Controller / Worker / Login Pod 掛載共享 NFS Volume。
+- ✅ 在 Kind 單機環境部署 NFS Server（WSL/VM）並整合 nfs-subdir-external-provisioner。
+- ✅ 建立 StorageClass 與 RWX PVC，作為 Slurm shared home/checkpoints。
+- ✅ 將 Controller / Worker / Login Pod 掛載共享 NFS Volume。
 - 建立 PyTorch DDP 測試工作負載（CPU 版即可）。
 - 實作 checkpoint heartbeat + resume 機制。
 - 在 sbatch 工作中加入 --requeue 與自動恢復流程。
