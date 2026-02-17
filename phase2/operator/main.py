@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -35,7 +34,6 @@ class PartitionConfig:
 class Config:
     namespace: str = os.getenv("NAMESPACE", "slurm")
     controller_pod: str = os.getenv("CONTROLLER_POD", "slurm-controller-0")
-    slurm_configmap: str = os.getenv("SLURM_CONFIGMAP", "slurm-config")
     poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
     policy_name: str = os.getenv("SCALING_POLICY", "checkpoint_aware_queue")
     checkpoint_guard_enabled: bool = os.getenv("CHECKPOINT_GUARD_ENABLED", "true").lower() == "true"
@@ -43,7 +41,9 @@ class Config:
     default_partition: str = os.getenv("SLURM_PARTITION", "debug")
     default_worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker")
     default_min_replicas: int = int(os.getenv("MIN_REPLICAS", "1"))
-    default_max_replicas: int = int(os.getenv("MAX_REPLICAS", "3"))
+    # Upper bound for worker pod scale-out per partition.
+    # Keep this in sync with the maximum NodeName range defined in slurm.conf.
+    default_max_replicas: int = int(os.getenv("MAX_REPLICAS", "4"))
     default_scale_up_step: int = int(os.getenv("SCALE_UP_STEP", "1"))
     default_scale_down_step: int = int(os.getenv("SCALE_DOWN_STEP", "1"))
     default_scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
@@ -92,6 +92,29 @@ class KubectlClient:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         return result.stdout.strip()
 
+    def try_run(self, args: Iterable[str]) -> tuple[int, str, str]:
+        """Run kubectl but don't raise on non-zero exit codes.
+
+        Returns: (returncode, stdout, stderr)
+        """
+        cmd = ["kubectl", *args]
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    def pod_is_ready(self, pod_name: str) -> bool:
+        rc, out, _ = self.try_run(
+            [
+                "-n",
+                self.cfg.namespace,
+                "get",
+                "pod",
+                pod_name,
+                "-o",
+                "jsonpath={.status.conditions[?(@.type=='Ready')].status}",
+            ]
+        )
+        return rc == 0 and out == "True"
+
     def exec_in_controller(self, command: str) -> str:
         return self.run(
             [
@@ -105,115 +128,6 @@ class KubectlClient:
                 command,
             ]
         )
-
-
-    def get_configmap_slurm_conf(self) -> str:
-        # slurm.conf is stored in ConfigMap data under key "slurm.conf"
-        return self.run(
-            [
-                "-n",
-                self.cfg.namespace,
-                "get",
-                "configmap",
-                self.cfg.slurm_configmap,
-                "-o",
-                "jsonpath={.data.slurm\.conf}",
-            ]
-        )
-
-    def patch_configmap_slurm_conf(self, new_conf: str) -> None:
-        patch = {"data": {"slurm.conf": new_conf}}
-        self.run(
-            [
-                "-n",
-                self.cfg.namespace,
-                "patch",
-                "configmap",
-                self.cfg.slurm_configmap,
-                "--type",
-                "merge",
-                "-p",
-                json.dumps(patch),
-            ]
-        )
-
-
-
-def render_slurm_conf_for_replicas(existing_conf: str, partition: str, replicas: int) -> str:
-    """
-    Minimal "root-cause" fix for NO NETWORK ADDRESS spam:
-    keep slurm.conf NodeName/Partition Nodes aligned with *current* k8s replicas.
-
-    When slurm.conf lists NodeName entries for workers that don't exist as pods,
-    slurmctld will continuously try to resolve them and log:
-      get_addr_info ... Unable to resolve ... NO NETWORK ADDRESS FOUND
-
-    Strategy:
-      - Use the first existing slurm-worker NodeName line as a template.
-      - Rewrite NodeName lines to exactly slurm-worker-0..slurm-worker-(replicas-1).
-      - Rewrite PartitionName=<partition> Nodes=... accordingly.
-    """
-    replicas = max(1, int(replicas))
-
-    lines = existing_conf.splitlines()
-
-    # Find a template line (prefer worker-0)
-    tmpl = None
-    for l in lines:
-        if l.strip().startswith("NodeName=slurm-worker-0 "):
-            tmpl = l
-            break
-    if tmpl is None:
-        for l in lines:
-            if l.strip().startswith("NodeName=slurm-worker-"):
-                tmpl = l
-                break
-    if tmpl is None:
-        # Can't safely rewrite; return original
-        return existing_conf
-
-    # Remove existing slurm-worker NodeName lines
-    kept: list[str] = []
-    for l in lines:
-        if l.strip().startswith("NodeName=slurm-worker-"):
-            continue
-        kept.append(l)
-
-    def render_node_line(i: int) -> str:
-        out = tmpl
-        out = re.sub(r"NodeName=slurm-worker-\d+", f"NodeName=slurm-worker-{i}", out)
-        out = re.sub(
-            r"NodeAddr=slurm-worker-\d+\.slurm-worker\.slurm\.svc\.cluster\.local",
-            f"NodeAddr=slurm-worker-{i}.slurm-worker.slurm.svc.cluster.local",
-            out,
-        )
-        out = re.sub(r"NodeHostname=slurm-worker-\d+", f"NodeHostname=slurm-worker-{i}", out)
-        return out
-
-    node_lines = [render_node_line(i) for i in range(replicas)]
-
-    # Insert NodeName lines near the original template position (best-effort)
-    insert_at = 0
-    for idx, l in enumerate(kept):
-        if l.strip().startswith("CryptoType="):
-            insert_at = idx + 1
-            break
-    # Keep a blank line before nodes for readability
-    kept = kept[:insert_at] + [""] + node_lines + [""] + kept[insert_at:]
-
-    # Rewrite PartitionName Nodes=... for the target partition
-    nodes_expr = f"slurm-worker-[0-{replicas-1}]" if replicas > 1 else "slurm-worker-0"
-    out_lines: list[str] = []
-    part_re = re.compile(rf"^(PartitionName={re.escape(partition)}\b.*\bNodes=)(\S+)(.*)$")
-    for l in kept:
-        m = part_re.match(l.strip())
-        if m:
-            out_lines.append(f"{m.group(1)}{nodes_expr}{m.group(3)}")
-        else:
-            out_lines.append(l)
-
-    # Ensure trailing newline
-    return "\n".join(out_lines).rstrip() + "\n"
 
 
 class PartitionConfigLoader:
@@ -246,7 +160,8 @@ class PartitionConfigLoader:
                     partition=item["partition"],
                     worker_statefulset=item["worker_statefulset"],
                     min_replicas=int(item.get("min_replicas", 1)),
-                    max_replicas=int(item.get("max_replicas", 1)),
+                    # If the JSON doesn't specify max_replicas, fall back to global defaults.
+                    max_replicas=int(item.get("max_replicas", cfg.default_max_replicas)),
                     scale_up_step=int(item.get("scale_up_step", 1)),
                     scale_down_step=int(item.get("scale_down_step", 1)),
                     scale_down_cooldown=int(item.get("scale_down_cooldown", 60)),
@@ -387,6 +302,31 @@ class OperatorApp:
         self.partition_cfgs = PartitionConfigLoader.load(cfg)
         self.last_scale_up_at: dict[str, float] = {p.partition: 0.0 for p in self.partition_cfgs}
 
+    def _sync_slurm_node_states(self, partition_cfg: PartitionConfig) -> None:
+        """Best-effort: keep Slurm node states aligned with existing worker pods.
+
+        When pods are scaled down, Slurm can keep trying to resolve/connect to nodes that no longer
+        exist, leading to noisy logs and sometimes brittle job launches. We proactively set nodes
+        above the current StatefulSet replica count to DOWN (Reason=autoscale), and attempt to RESUME
+        nodes that have a Ready pod.
+
+        This is intentionally conservative and idempotent.
+        """
+
+        sts = partition_cfg.worker_statefulset
+        for i in range(partition_cfg.max_replicas):
+            nodename = f"{sts}-{i}"
+            if self.client.pod_ready(nodename):
+                # RESUME is best-effort (some states may reject); keep running regardless.
+                self.client.exec_in_controller(
+                    f"scontrol update NodeName={nodename} State=RESUME || true"
+                )
+            else:
+                # If the node exists in slurm.conf, mark it DOWN so the scheduler won't pick it.
+                self.client.exec_in_controller(
+                    f"scontrol update NodeName={nodename} State=DOWN Reason=autoscale || true"
+                )
+
     def run(self) -> None:
         self.logger.emit(
             "startup",
@@ -483,37 +423,10 @@ class OperatorApp:
                             busy_nodes=state.busy_nodes,
                         )
 
-                    # Root-cause fix: keep slurm.conf in sync with current k8s replicas.
-                    # Otherwise slurmctld will keep trying to resolve non-existent worker FQDNs
-                    # and nodes will get stuck with NO NETWORK ADDRESS FOUND.
-                    try:
-                        applied_replicas = state.current_replicas
-                        if decision.action == "scale_up":
-                            applied_replicas = decision.target_replicas
-                        elif decision.action == "scale_down" and cooldown_elapsed >= partition_cfg.scale_down_cooldown:
-                            applied_replicas = decision.target_replicas
-
-                        existing_conf = self.client.get_configmap_slurm_conf()
-                        new_conf = render_slurm_conf_for_replicas(existing_conf, partition_cfg.partition, applied_replicas)
-                        if new_conf != existing_conf:
-                            self.client.patch_configmap_slurm_conf(new_conf)
-                            # Reload slurmctld so it stops probing removed nodes immediately
-                            self.client.exec_in_controller("scontrol reconfigure || true")
-                            self.logger.emit(
-                                "slurm_conf_reconciled",
-                                policy=self.cfg.policy_name,
-                                partition=partition,
-                                replicas=applied_replicas,
-                                configmap=self.cfg.slurm_configmap,
-                            )
-                    except Exception as _exc:  # noqa: BLE001
-                        self.logger.emit(
-                            "slurm_conf_reconcile_failed",
-                            level="WARN",
-                            partition=partition,
-                            message=str(_exc),
-                        )
-
+                    # Always keep Slurm node states aligned with pods, regardless of
+                    # whether we scaled this iteration. This avoids scheduling work to
+                    # non-existent nodes and reduces "NO NETWORK ADDRESS" churn.
+                    self._sync_slurm_node_states(partition_cfg)
                 except Exception as exc:  # noqa: BLE001
                     self.logger.emit("error", level="ERROR", partition=partition, message=str(exc))
 
