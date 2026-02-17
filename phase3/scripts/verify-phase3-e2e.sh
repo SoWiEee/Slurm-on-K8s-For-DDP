@@ -8,250 +8,279 @@ ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 
 WORKER_STS=${WORKER_STS:-slurm-worker}
 CONTROLLER_POD=${CONTROLLER_POD:-slurm-controller-0}
-LOGIN_DEPLOY=${LOGIN_DEPLOY:-slurm-login}
+LOGIN_LABEL_SELECTOR=${LOGIN_LABEL_SELECTOR:-app=slurm-login}
 
+PARTITION=${PARTITION:-debug}
+SMOKE_DIR=${SMOKE_DIR:-/shared/phase3-smoke}
+
+# Scaling knobs
 MIN_WORKERS=${MIN_WORKERS:-1}
 TARGET_WORKERS=${TARGET_WORKERS:-2}
 MAX_WORKERS=${MAX_WORKERS:-4}
 
-SMOKE_DIR=${SMOKE_DIR:-/shared/phase3-smoke}
-PARTITION=${PARTITION:-debug}
+# How many nodes the smoke job should require
+SMOKE_NODES=${SMOKE_NODES:-$(( TARGET_WORKERS < MAX_WORKERS ? TARGET_WORKERS : MAX_WORKERS ))}
 
-wait_seconds() {
-  local t="$1"
-  if [[ "$t" =~ ^[0-9]+s$ ]]; then echo "${t%s}"; return; fi
-  if [[ "$t" =~ ^[0-9]+m$ ]]; then echo "$(( ${t%m} * 60 ))"; return; fi
-  if [[ "$t" =~ ^([0-9]+)m([0-9]+)s$ ]]; then echo "$(( ${BASH_REMATCH[1]} * 60 + ${BASH_REMATCH[2]} ))"; return; fi
-  echo 300
-}
+log() { echo "[e2e] $*" >&2; }
 
-deadline_after() { echo $(( $(date +%s) + $1 )); }
+die() { echo "[e2e][ERROR] $*" >&2; exit 1; }
 
 require_context() {
-  if ! kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$"; then
-    echo "kubectl context ${KUBE_CONTEXT} not found" >&2
-    kubectl config get-contexts -o name >&2 || true
-    exit 1
-  fi
-  kubectl config use-context "$KUBE_CONTEXT" >/dev/null
+  log "Using context: ${KUBE_CONTEXT}"
+  kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$" || die "kubectl context ${KUBE_CONTEXT} not found"
+  kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
+}
+
+get_login_pod() {
+  kubectl -n "${NAMESPACE}" get pod -l "${LOGIN_LABEL_SELECTOR}" -o jsonpath='{.items[0].metadata.name}'
 }
 
 exec_login() {
-  kubectl -n "$NAMESPACE" exec deploy/"$LOGIN_DEPLOY" -- bash -lc "$1"
+  local cmd="$1"
+  local pod
+  pod="$(get_login_pod)"
+  kubectl -n "${NAMESPACE}" exec "pod/${pod}" -- bash -lc "${cmd}"
 }
 
-echo "[e2e] Using context: ${KUBE_CONTEXT}"
-require_context
+wait_rollouts() {
+  log "Waiting for login/controller/worker to be ready..."
+  kubectl -n "${NAMESPACE}" rollout status deployment/slurm-login --timeout="${ROLLOUT_TIMEOUT}" >/dev/null
+  kubectl -n "${NAMESPACE}" rollout status statefulset/${WORKER_STS} --timeout="${ROLLOUT_TIMEOUT}" >/dev/null
+  kubectl -n "${NAMESPACE}" rollout status statefulset/slurm-controller --timeout="${ROLLOUT_TIMEOUT}" >/dev/null
+}
 
-echo "[e2e] Waiting for login/controller/worker to be ready..."
-kubectl -n "$NAMESPACE" rollout status deployment/"$LOGIN_DEPLOY" --timeout="$ROLLOUT_TIMEOUT"
-kubectl -n "$NAMESPACE" rollout status statefulset/"$WORKER_STS" --timeout="$ROLLOUT_TIMEOUT" || true
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
+mark_missing_nodes_down() {
+  log "Marking missing worker nodes DOWN (best-effort)..."
+  for n in $(seq 1 $((MAX_WORKERS - 1))); do
+    if ! kubectl -n "${NAMESPACE}" get pod "slurm-worker-${n}" >/dev/null 2>&1; then
+      kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+        "scontrol update NodeName=slurm-worker-${n} State=DOWN Reason='scaledown' || true" >/dev/null 2>&1 || true
+    fi
+  done
+  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'sinfo -N -l || true' || true
+}
 
-echo "[e2e] Checking sbatch exists on login..."
-exec_login "command -v sbatch >/dev/null && sbatch --version"
+write_smoke_sbatch_to_shared() {
+  local login_pod
+  login_pod="$(get_login_pod)"
+  log "login_pod=${login_pod}"
+  log "Writing smoke sbatch script into ${SMOKE_DIR} (no host-side expansion of SLURM env)..."
 
-echo "[e2e] Forcing workers to MIN_WORKERS=${MIN_WORKERS} (to create a pending job)..."
-kubectl -n "$NAMESPACE" scale statefulset/"$WORKER_STS" --replicas="$MIN_WORKERS"
-kubectl -n "$NAMESPACE" rollout status statefulset/"$WORKER_STS" --timeout="$ROLLOUT_TIMEOUT" || true
+  kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc "mkdir -p '${SMOKE_DIR}'"
 
-echo "[e2e] Refresh slurmctld view (best-effort)..."
-kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "scontrol reconfigure || true; sinfo -N -l || true"
-
-# Important: when worker pods don't exist, slurmctld may still consider the nodes idle for a while,
-# causing jobs to start and then fail during srun fan-out. Force non-existent nodes DOWN so the job stays PENDING.
-echo "[e2e] Marking non-existent worker nodes DOWN to keep the job pending (best-effort)..."
-for n in $(seq 1 $((MAX_WORKERS - 1))); do
-  if ! kubectl -n "$NAMESPACE" get pod "${WORKER_STS}-${n}" >/dev/null 2>&1; then
-    kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc \
-      "scontrol update NodeName=${WORKER_STS}-${n} State=DOWN Reason='scaledown' || true"
-  fi
-done
-kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "sinfo -N -l || true"
-
-echo "[e2e] Writing smoke sbatch script locally and copying to login pod (/shared)..."
-login_pod="$(kubectl -n "$NAMESPACE" get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')"
-echo "[e2e] login_pod=${login_pod}"
-
-# Ensure shared dir exists on login
-kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "mkdir -p '${SMOKE_DIR}'"
-
-# Create local sbatch script using a RELATIVE path to avoid Windows drive-letter issues with kubectl cp.
-tmp_sbatch=".phase3-smoke.$$.sbatch"
-cat > "${tmp_sbatch}" <<EOF
+  # IMPORTANT: this kubectl exec command string is double-quoted, so we must escape any $ or $(...)
+  # that should remain literal inside the sbatch script at runtime.
+  kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc "cat > '${SMOKE_DIR}/phase3-smoke.sbatch' <<'E2E_SBATCH'
 #!/usr/bin/env bash
 #SBATCH -J phase3-smoke
-#SBATCH -p ${PARTITION}
-#SBATCH -N 3
-#SBATCH --ntasks-per-node=1
+#SBATCH -p __PARTITION__
+#SBATCH -N __NODES__
 #SBATCH -o ${SMOKE_DIR}/out-%j.txt
 #SBATCH -e ${SMOKE_DIR}/err-%j.txt
-
 set -euo pipefail
-echo "jobid=\${SLURM_JOB_ID}"
-echo "nodelist=\${SLURM_NODELIST}"
-echo "[\$(date)] starting on \$(hostname)"
 
-# prove we ran on >=2 nodes by printing hostnames from srun
-srun -N2 -n2 bash -lc 'echo "hello from \$(hostname)"'
-EOF
+echo \"jobid=\${SLURM_JOB_ID}\"
+echo \"nodelist=\${SLURM_NODELIST}\"
+echo \"[\$(date -u)] starting on \$(hostname -s)\"
 
-# Copy into login pod, then move into /shared
-kubectl -n "$NAMESPACE" cp "./${tmp_sbatch}" "${login_pod}:/tmp/phase3-smoke.sbatch"
-rm -f "${tmp_sbatch}"
-kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc \
-  "chmod +x /tmp/phase3-smoke.sbatch && mv -f /tmp/phase3-smoke.sbatch '${SMOKE_DIR}/phase3-smoke.sbatch'"
+# One task per node; prefix output for stable parsing.
+srun -N __NODES__ -n __NODES__ hostname -s | sed 's/^/hello from /'
+E2E_SBATCH
+sed -i -e 's/__PARTITION__/${PARTITION}/g' -e 's/__NODES__/${SMOKE_NODES}/g' '${SMOKE_DIR}/phase3-smoke.sbatch'
+chmod +x '${SMOKE_DIR}/phase3-smoke.sbatch'"
+}
 
+submit_sbatch_jobid() {
+  local login_pod="$1" sbatch_path="$2"
+  kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc \
+    "sbatch '${sbatch_path}' | awk '{print \$4}'" | tr -d '\r\n'
+}
 
-echo "[e2e] Submitting trigger job that requires 2 nodes (expected PENDING with MIN_WORKERS=1)..."
-trigger_jobid="$(kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "
-cat > '${SMOKE_DIR}/trigger.sbatch' <<'EOF'
+wait_job_state() {
+  local login_pod="$1" jobid="$2" want="$3" timeout_s="$4"
+  local deadline st
+  deadline=$(( $(date +%s) + timeout_s ))
+  while true; do
+    st="$(kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc "squeue -h -j ${jobid} -o %T 2>/dev/null || true" | tr -d '\r')"
+    if [[ -n "${st}" ]]; then
+      log "job ${jobid} state=${st}"
+      if [[ "${st}" == "${want}" ]]; then
+        return 0
+      fi
+    else
+      log "job ${jobid} state=gone"
+    fi
+    (( $(date +%s) < deadline )) || return 1
+    sleep 3
+  done
+}
+
+wait_workers_scaled_ready() {
+  local want="$1" timeout_s="$2"
+  local deadline replicas ready
+  deadline=$(( $(date +%s) + timeout_s ))
+  while true; do
+    replicas="$(kubectl -n "${NAMESPACE}" get sts "${WORKER_STS}" -o jsonpath='{.spec.replicas}')"
+    ready="$(kubectl -n "${NAMESPACE}" get sts "${WORKER_STS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
+    log "worker_replicas=${replicas} ready=${ready}"
+    if (( replicas >= want && ready >= want )); then
+      return 0
+    fi
+    (( $(date +%s) < deadline )) || return 1
+    sleep 5
+  done
+}
+
+wait_dns_gates_for_worker() {
+  local idx="$1"
+  local worker_fqdn="slurm-worker-${idx}.slurm-worker.${NAMESPACE}.svc.cluster.local"
+  local controller_fqdn="slurm-controller-0.slurm-controller.${NAMESPACE}.svc.cluster.local"
+  local deadline ok0 okn
+  deadline=$(( $(date +%s) + 120 ))
+
+  log "Waiting for slurm-worker-${idx} pod to be Ready..."
+  kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/slurm-worker-${idx}" --timeout=300s >/dev/null
+
+  log "Waiting for DNS gates for slurm-worker-${idx}..."
+  while true; do
+    ok0=no
+    okn=no
+    if kubectl -n "${NAMESPACE}" exec pod/slurm-worker-0 -- sh -lc "getent hosts '${worker_fqdn}' >/dev/null" >/dev/null 2>&1; then ok0=yes; fi
+    if kubectl -n "${NAMESPACE}" exec "pod/slurm-worker-${idx}" -- sh -lc "getent hosts '${controller_fqdn}' >/dev/null" >/dev/null 2>&1; then okn=yes; fi
+    if [[ "${ok0}" == yes && "${okn}" == yes ]]; then
+      log "DNS OK: worker-0 -> ${worker_fqdn}, worker-${idx} -> ${controller_fqdn}"
+      return 0
+    fi
+    (( $(date +%s) < deadline )) || return 1
+    sleep 2
+  done
+}
+
+wait_slurm_node_reason_ok() {
+  local nodename="$1" timeout_s="$2"
+  local deadline reason
+  deadline=$(( $(date +%s) + timeout_s ))
+  while true; do
+    reason="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      "scontrol show node ${nodename} | awk -F'Reason=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
+    if [[ -z "${reason}" ]] || [[ "${reason}" == *"none"* ]]; then
+      log "${nodename} reason ok: none"
+      return 0
+    fi
+    log "${nodename} reason='${reason}' (waiting...)"
+    (( $(date +%s) < deadline )) || return 1
+    sleep 3
+  done
+}
+
+wait_job_finish() {
+  local login_pod="$1" jobid="$2" timeout_s="$3"
+  local deadline st
+  deadline=$(( $(date +%s) + timeout_s ))
+  while true; do
+    st="$(kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc "squeue -h -j ${jobid} -o %T 2>/dev/null || true" | tr -d '\r')"
+    if [[ -z "${st}" ]]; then
+      log "job ${jobid} not in queue anymore (finished)."
+      return 0
+    fi
+    log "job ${jobid} state=${st}"
+    (( $(date +%s) < deadline )) || return 1
+    sleep 5
+  done
+}
+
+verify_output_hosts() {
+  local login_pod="$1" jobid="$2" need="$3"
+
+  log "Verifying output exists on shared path: ${SMOKE_DIR}/out-${jobid}.txt"
+  kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc \
+    "test -s '${SMOKE_DIR}/out-${jobid}.txt' && echo '[e2e] out exists' && sed -n '1,220p' '${SMOKE_DIR}/out-${jobid}.txt'"
+
+  log "Checking output contains >=${need} distinct hostnames (multi-node evidence)..."
+  local distinct
+  distinct="$(kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc \
+    "grep -Eo 'hello from [^ ]+' '${SMOKE_DIR}/out-${jobid}.txt' | awk '{print \$3}' | sort -u | wc -l")"
+  log "distinct_hosts=${distinct}"
+
+  if (( distinct < need )); then
+    echo "[e2e][ERROR] Expected output from >=${need} hosts, got ${distinct}. Dumping out/err:" >&2
+    kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc \
+      "sed -n '1,260p' '${SMOKE_DIR}/out-${jobid}.txt' || true; sed -n '1,260p' '${SMOKE_DIR}/err-${jobid}.txt' || true" || true
+    exit 1
+  fi
+}
+
+main() {
+  require_context
+  wait_rollouts
+
+  log "Checking sbatch exists on login..."
+  exec_login 'command -v sbatch >/dev/null && sbatch --version' >/dev/null
+
+  log "Forcing workers to MIN_WORKERS=${MIN_WORKERS} (baseline)..."
+  kubectl -n "${NAMESPACE}" scale statefulset/${WORKER_STS} --replicas="${MIN_WORKERS}" >/dev/null
+  kubectl -n "${NAMESPACE}" rollout status statefulset/${WORKER_STS} --timeout="${ROLLOUT_TIMEOUT}" >/dev/null
+
+  log "Refresh slurmctld view (best-effort)..."
+  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'scontrol reconfigure || true; sinfo -N -l || true' || true
+
+  mark_missing_nodes_down
+  write_smoke_sbatch_to_shared
+
+  local login_pod trigger_jobid
+  login_pod="$(get_login_pod)"
+
+  log "Submitting trigger job that requires ${SMOKE_NODES} nodes (expected PENDING with MIN_WORKERS=${MIN_WORKERS})..."
+  exec_login "cat > '${SMOKE_DIR}/trigger.sbatch' <<'EOF_TRIG'
 #!/usr/bin/env bash
 #SBATCH -J phase3-trigger
 #SBATCH -p ${PARTITION}
-#SBATCH -N 3
+#SBATCH -N ${SMOKE_NODES}
 #SBATCH -o ${SMOKE_DIR}/trigger-out-%j.txt
 #SBATCH -e ${SMOKE_DIR}/trigger-err-%j.txt
 echo trigger-start \$(date)
 sleep 60
-EOF
-sbatch '${SMOKE_DIR}/trigger.sbatch' | awk '{print \$4}'
-")"
-echo "[e2e] trigger_jobid=${trigger_jobid}"
+EOF_TRIG" >/dev/null
 
-echo "[e2e] Waiting for trigger job to reach PENDING (operator scale-up trigger)..."
-pend_deadline=$(( $(date +%s) + 90 ))
-while true; do
-  st="$(kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "squeue -h -j ${trigger_jobid} -o %T 2>/dev/null || true")"
-  echo "[e2e] trigger state=${st:-gone}"
-  if [[ "$st" == "PENDING" ]]; then
-    break
+  trigger_jobid="$(submit_sbatch_jobid "${login_pod}" "${SMOKE_DIR}/trigger.sbatch")"
+  [[ -n "${trigger_jobid}" ]] || die "failed to submit trigger job"
+  log "trigger_jobid=${trigger_jobid}"
+
+  log "Waiting for trigger job to reach PENDING (operator scale-up trigger)..."
+  wait_job_state "${login_pod}" "${trigger_jobid}" "PENDING" 120 || die "trigger job did not reach PENDING"
+
+  log "Waiting for operator to scale workers to TARGET_WORKERS=${TARGET_WORKERS} (fallback to manual scale)..."
+  if ! wait_workers_scaled_ready "${TARGET_WORKERS}" 120; then
+    log "Operator did not scale in time; doing manual scale to ${TARGET_WORKERS}"
+    kubectl -n "${NAMESPACE}" scale statefulset/${WORKER_STS} --replicas="${TARGET_WORKERS}" >/dev/null
+    wait_workers_scaled_ready "${TARGET_WORKERS}" 300 || die "workers not ready after manual scale"
   fi
-  if (( $(date +%s) >= pend_deadline )); then
-    echo "[e2e][ERROR] trigger job did not reach PENDING within timeout." >&2
-    kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "squeue -l || true" >&2 || true
-    exit 1
-  fi
-  sleep 3
-done
+  log "Workers scaled and ready."
 
-echo "[e2e] Waiting for operator to scale workers to TARGET_WORKERS=${TARGET_WORKERS} (fallback to manual scale)..."
-scale_deadline=$(( $(date +%s) + 180 ))
-while true; do
-  replicas="$(kubectl -n "$NAMESPACE" get sts "$WORKER_STS" -o jsonpath='{.spec.replicas}')"
-  ready="$(kubectl -n "$NAMESPACE" get sts "$WORKER_STS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
-  echo "[e2e] worker_replicas=${replicas} ready=${ready}"
-
-  if [[ "${replicas}" -ge "${TARGET_WORKERS}" ]] && [[ "${ready}" -ge "${TARGET_WORKERS}" ]]; then
-    echo "[e2e] Workers scaled and ready."
-    break
-  fi
-
-  if (( $(date +%s) >= scale_deadline )); then
-    echo "[e2e][WARN] Operator did not scale in time; forcing scale to ${TARGET_WORKERS}..."
-    kubectl -n "$NAMESPACE" scale statefulset/"$WORKER_STS" --replicas="$TARGET_WORKERS"
-    kubectl -n "$NAMESPACE" rollout status statefulset/"$WORKER_STS" --timeout="$ROLLOUT_TIMEOUT"
-    break
-  fi
-  sleep 5
-done
-
-controller_fqdn="${CONTROLLER_POD}.slurm-controller.${NAMESPACE}.svc.cluster.local"
-for i in $(seq 1 $((TARGET_WORKERS - 1))); do
-  echo "[e2e] Waiting for ${WORKER_STS}-${i} pod to be Ready..."
-  kubectl -n "$NAMESPACE" wait --for=condition=Ready "pod/${WORKER_STS}-${i}" --timeout="$ROLLOUT_TIMEOUT"
-
-  echo "[e2e] Waiting for DNS gates for ${WORKER_STS}-${i}..."
-  dns_deadline=$(( $(date +%s) + 180 ))
-  worker_fqdn="${WORKER_STS}-${i}.${WORKER_STS}.${NAMESPACE}.svc.cluster.local"
-  while true; do
-    # worker-0 must resolve the new worker (slurm uses NodeAddr -> FQDN)
-    ok_worker0="no"
-    if kubectl -n "$NAMESPACE" exec "pod/${WORKER_STS}-0" -- sh -lc "getent hosts '${worker_fqdn}' >/dev/null" >/dev/null 2>&1; then
-      ok_worker0="yes"
-    fi
-    # new worker must resolve the controller (stepd contacts slurmctld)
-    ok_workerN="no"
-    if kubectl -n "$NAMESPACE" exec "pod/${WORKER_STS}-${i}" -- sh -lc "getent hosts '${controller_fqdn}' >/dev/null" >/dev/null 2>&1; then
-      ok_workerN="yes"
-    fi
-    if [[ "$ok_worker0" == "yes" && "$ok_workerN" == "yes" ]]; then
-      echo "[e2e] DNS OK: worker-0 -> ${worker_fqdn}, ${WORKER_STS}-${i} -> ${controller_fqdn}"
-      break
-    fi
-    if (( $(date +%s) >= dns_deadline )); then
-      echo "[e2e][ERROR] DNS not stable within timeout for ${WORKER_STS}-${i}." >&2
-      kubectl -n "$NAMESPACE" get pods -l app=slurm-worker -o wide >&2 || true
-      kubectl -n "$NAMESPACE" get endpoints slurm-worker -o wide >&2 || true
-      exit 1
-    fi
-    sleep 3
+  # DNS + slurm reason gates for newly created workers
+  for i in $(seq 1 $((TARGET_WORKERS - 1))); do
+    wait_dns_gates_for_worker "${i}" || die "DNS gates failed for worker-${i}"
+    wait_slurm_node_reason_ok "slurm-worker-${i}" 120 || die "slurm reason not ok for worker-${i}"
   done
 
-  echo "[e2e] Waiting for slurmctld to see ${WORKER_STS}-${i} without NO NETWORK ADDRESS..."
-  slurm_deadline=$(( $(date +%s) + 180 ))
-  while true; do
-    reason="$(kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "scontrol show node ${WORKER_STS}-${i} | awk -F'Reason=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
-    if [[ -n "$reason" ]] && echo "$reason" | grep -qi 'NO NETWORK ADDRESS'; then
-      echo "[e2e] ${WORKER_STS}-${i} still has reason: $reason"
-    else
-      echo "[e2e] ${WORKER_STS}-${i} reason ok: ${reason:-none}"
-      break
-    fi
-    if (( $(date +%s) >= slurm_deadline )); then
-      echo "[e2e][ERROR] ${WORKER_STS}-${i} still not addressable in slurmctld within timeout." >&2
-      kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc "sinfo -N -l || true; scontrol show node ${WORKER_STS}-${i} || true" >&2 || true
-      exit 1
-    fi
-    sleep 3
-  done
-done
+  log "Cancelling trigger job (it has served its purpose)..."
+  kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc "scancel ${trigger_jobid} || true" >/dev/null 2>&1 || true
 
-echo "[e2e] Cancelling trigger job (it has served its purpose)..."
-kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "scancel ${trigger_jobid} || true"
+  log "Submitting REAL multi-node smoke job from login..."
+  local jobid
+  jobid="$(submit_sbatch_jobid "${login_pod}" "${SMOKE_DIR}/phase3-smoke.sbatch")"
+  [[ -n "${jobid}" ]] || die "failed to submit smoke job"
+  log "jobid=${jobid}"
 
-echo "[e2e] Submitting REAL multi-node smoke job from login..."
-jobid="$(kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc \
-  "sbatch '${SMOKE_DIR}/phase3-smoke.sbatch' | awk '{print \$4}'")"
-echo "[e2e] jobid=${jobid}"
+  log "Refreshing slurmctld view (best-effort)..."
+  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'scontrol reconfigure || true; sinfo -N -l || true' || true
 
-echo "[e2e] Resuming slurm nodes for newly created worker pods (best-effort)..."
-kubectl -n "$NAMESPACE" exec pod/"$CONTROLLER_POD" -- bash -lc \
-  "scontrol reconfigure || true; sinfo -N -l || true"
+  log "Waiting for job to finish..."
+  wait_job_finish "${login_pod}" "${jobid}" 300 || die "job ${jobid} did not finish in time"
 
-echo "[e2e] Waiting for job to finish..."
-job_deadline=$(( $(date +%s) + 300 ))
-while true; do
-  state="$(kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc \
-    "squeue -h -j ${jobid} -o %T 2>/dev/null || true")"
-  if [[ -z "${state}" ]]; then
-    echo "[e2e] job not in queue anymore (finished)."
-    break
-  fi
-  echo "[e2e] job state=${state}"
-  if (( $(date +%s) >= job_deadline )); then
-    echo "[e2e][ERROR] Timed out waiting for job to finish." >&2
-    kubectl -n "$NAMESPACE" exec "${login_pod}" -- bash -lc "squeue -l || true; sinfo -N -l || true" >&2 || true
-    exit 1
-  fi
-  sleep 5
-done
+  verify_output_hosts "${login_pod}" "${jobid}" "${SMOKE_NODES}"
 
-out_file="${SMOKE_DIR}/out-${jobid}.txt"
-err_file="${SMOKE_DIR}/err-${jobid}.txt"
+  echo "Phase 3 E2E verification passed: sbatch ran a ${SMOKE_NODES}-node job and output is in shared (${SMOKE_DIR}) path."
+}
 
-echo "[e2e] Verifying output exists on shared path: ${out_file}"
-kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- bash -lc \
-  "test -s '${out_file}' && echo '[e2e] out exists' && sed -n '1,120p' '${out_file}'"
-
-echo "[e2e] Checking output contains >=2 distinct hostnames (multi-node evidence)..."
-distinct_hosts="$(kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- bash -lc \
-  "grep -Eo 'hello from [^ ]+' '${out_file}' | awk '{print \$3}' | sort -u | wc -l")"
-echo "[e2e] distinct_hosts=${distinct_hosts}"
-if [[ "${distinct_hosts}" -lt 2 ]]; then
-  echo "[e2e][ERROR] Expected output from >=2 hosts, got ${distinct_hosts}. Dumping out/err:" >&2
-  kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- bash -lc "sed -n '1,200p' '${out_file}' || true; sed -n '1,200p' '${err_file}' || true" >&2
-  exit 1
-fi
-
-echo "Phase 3 E2E verification passed: sbatch ran a multi-node job and output is in shared (/shared) path."
+main "$@"
