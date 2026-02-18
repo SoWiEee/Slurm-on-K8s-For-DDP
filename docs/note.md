@@ -640,3 +640,210 @@ bash phase3/scripts/verify-phase3.sh
 - 將 PyTorch DDP CPU 測試工作負載導入 `/shared/checkpoints`。
 - 建立 checkpoint heartbeat + resume + `--requeue` 範例工作。
 - 在 operator 加入 checkpoint-aware scale-down guard 與量測指標。
+
+---
+
+## Slurm-on-K8s（往 Slinky operator 方向）的分層架構筆記
+
+這一段是為了把「目前做法」與「未來想靠近 Slinky operator 的做法」放在同一張心智模型裡，之後新增功能（fair-share/QOS、MPI、DDP、彈性節點、治理）比較不會散掉。
+
+### 一、目前設計（Current）：Slurm in-cluster + 以 StatefulSet 當 Slurm nodes + 自製 elastic operator
+
+核心想法：
+- Slurm 還是以傳統模式運作（`slurmctld` + `slurmd`），只是把 controller/login/worker 全部容器化，跑在同一個 K8s namespace。
+- Slurm 的「node」對應到 K8s 的 `StatefulSet` Pod（`slurm-worker-{i}`），並用 headless service 提供穩定 DNS。
+- 彈性擴縮用一個簡單的 controller（`slurm-elastic-operator`）去觀察 queue 狀態，調整 `slurm-worker` 的 replicas。
+
+K8s 資源清單（以 namespace=slurm 為例）：
+- 工作負載（Workloads）
+  - `StatefulSet/slurm-controller`：`slurmctld` + `munged`
+  - `Deployment/slurm-login`：使用者入口（sbatch/srun/squeue 等）
+  - `StatefulSet/slurm-worker`：`slurmd` + `munged`（每個 Pod=一個 Slurm node）
+  - `Deployment/slurm-elastic-operator`：依 queue 狀態調整 `slurm-worker` replicas（上限/下限、cooldown、step）
+- 網路（Networking）
+  - `Service/slurm-controller`（headless）：讓 controller Pod 有穩定 DNS（例：`slurm-controller-0.slurm-controller.slurm.svc.cluster.local`）
+  - `Service/slurm-worker`（headless）：讓每個 worker 有穩定 DNS（例：`slurm-worker-2.slurm-worker.slurm.svc.cluster.local`）
+  - （可選）`Service/slurm-login`：若你要把 login 暴露給叢集外使用者
+- 設定/密鑰（Config & Secrets）
+  - `ConfigMap/slurm-config`：`slurm.conf`（NodeName/NodeAddr/Partition 等）
+  - `Secret/slurm-munge-key`：`munge.key`（controller/login/worker 必須一致）
+  - `Secret/slurm-ssh-key`：若你需要 ssh/workflow（非必要但常見）
+- 儲存（Storage）
+  - `PVC/PV`（或 hostPath）：提供 `/shared`（讓 login 產生 sbatch、job out/err、worker 執行結果可共享）
+
+ASCII 架構圖（目前）：
+
+```
++------------------------------ Kubernetes Cluster ------------------------------+
+|                                                                               |
+|  [Namespace: slurm]                                                           |
+|                                                                               |
+|  +--------------------+        headless svc        +--------------------+     |
+|  | slurm-controller-0 |<-------------------------->|  slurm-controller  |     |
+|  |  - slurmctld       |                           |  (ClusterIP None)  |     |
+|  |  - munged          |                           +--------------------+     |
+|  +---------^----------+                                                     
+|            | scontrol/squeue/sbatch RPC                                     
+|            |                                                                
+|  +---------+----------+        shared PVC         +--------------------+     |
+|  |  slurm-login (dep) |<------------------------->|   /shared (PVC)    |     |
+|  |  - sbatch/srun     |                           +--------------------+     |
+|  +---------^----------+                                                     
+|            | submits jobs                                                    
+|            v                                                                
+|  +--------------------+        headless svc        +--------------------+     |
+|  | slurm-worker (sts) |<-------------------------->|   slurm-worker     |     |
+|  |  - slurm-worker-0  |                           |  (ClusterIP None)  |     |
+|  |  - slurm-worker-1  |                           +--------------------+     |
+|  |  - slurm-worker-2  |                                                     
+|  |  - slurm-worker-3  |                                                     
+|  |  each: slurmd+munge|                                                     
+|  +--------------------+                                                     
+|                                                                               |
+|  +---------------------------+                                               |
+|  | slurm-elastic-operator    |  watches queue -> scale sts replicas          |
+|  +---------------------------+                                               |
+|                                                                               |
++-------------------------------------------------------------------------------+
+```
+
+已知特性與限制（建議你未來寫到 README/roadmap 的）
+- 你的彈性擴縮目前是「K8s replicas」尺度，不是 Slurm 的原生 elastic（例如 cloud burst）那種語意。
+- `slurm.conf` 需要預先宣告 `NodeName=slurm-worker-[0-3]` 才能做到 max=4 的動態擴到 4；如果沒宣告，`scontrol update` 會報 `Invalid node name`。
+- `NO NETWORK ADDRESS` 往往是 slurmctld 在解析 NodeAddr / NodeHostname 或 DNS 尚未 ready 時就做了 node state 更新，所以你後來加入 DNS gate/重試邏輯是必要的「K8s 化」措施。
+
+### 二、往 Slinky operator 靠近時，你會「多」哪些層？
+
+Slinky 的核心方向不是只有 autoscale，而是把 Slurm cluster 當成一個被 K8s controller 管理的「抽象資源」。
+你可以把它想成：把目前散在 YAML + scripts 的決策，移到 operator 裡用 reconciliation loop 做成可重入、可觀測、可治理。
+
+建議分層如下（對應你專案的 future work）：
+
+1) L0 基礎設施層（K8s Infra）
+- CNI/DNS/StorageClass、GPU device plugin、NodePool（spot/on-demand）
+- 這層的 KPI 是：Pod 啟動穩定性、DNS/網路收斂、PVC 性能、節點供給速度。
+
+2) L1 Slurm 控制面層（Slurm Control Plane）
+- `slurmctld` 高可用（optional）、state save location、升級/滾動策略
+- `munge` key rotation/一致性保證
+- （進階）slurmdbd + accounting（用於 fair-share/報表/計費）
+
+3) L2 Slurm 資源抽象層（Operator CRDs / Desired State）
+- 引入 CRD 來描述叢集期望狀態（名稱示例）：
+  - `SlurmCluster`：cluster 版本、image、munge/ssh secret reference、shared storage、partition policy
+  - `SlurmNodeSet`：worker 族群（cpu/gpu/feature/taint/toleration）、min/max、template
+  - `SlurmLoginSet`：login 入口（可能多副本）
+- operator 負責把 CRD reconcile 成：StatefulSet/Deployment/Service/ConfigMap/Secret/PVC。
+
+4) L3 彈性與排程治理層（Elasticity + Governance）
+- Autoscale 觸發來源不只看「有沒有 pending」，還要能讀：
+  - pending reason（資源不足、constraint、QOS、reservation）
+  - job 的資源向量（CPU/Mem/GPU/Nodes/Time）
+  - 叢集成本策略（上限 4 workers、cooldown、步進）
+- Scale-down 要做 drain：
+  - 對應 Slurm 的語意是 `DRAIN`/`DOWN`/`RESUME` + 確認無 job step
+  - 對應 K8s 的語意是優雅縮 Pod + 避免破壞正在跑的 job
+
+5) L4 使用者介面層（User UX / HPC Features）
+- 保持 `sbatch/srun/squeue/sacct` 的工作流（這正是 Slinky 願景的重點）
+- 強化 HPC 特性：MPI/多節點啟動一致性（gang-like）、job array、dependency、QOS/fair-share
+
+### 三、Future work（建議照這個順序做，風險最低）
+
+(1) 把「目前動態 worker」從 script 移到 operator 內，並把策略參數化
+- 把 `MAX_REPLICAS/MIN_REPLICAS/POLL_INTERVAL/COOLDOWN` 變成 CRD spec 或 ConfigMap。
+- 讓 operator 的決策可觀測：events/metrics（例如每次 scale 的原因、pending job 數量）。
+
+(2) 將 Slurm node lifecycle 做成「強一致」的 reconcile
+- 加入：DNS gate、`scontrol reconfigure` 重試、`scontrol update State=RESUME/DRAIN` 的狀態機。
+- 目標是把 `NO NETWORK ADDRESS` 類問題變成「operator 會自動收斂」而不是靠人工 rerun。
+
+(3) 引入 CRD（最小集）把 cluster spec 固化
+- 先做一個最小 `SlurmNodeSet`：只管 worker 的 min/max + pod template。
+- 做到後，你的 YAML 就能從「手寫 slurm.conf + sts」變成「宣告式 spec」。
+
+(4) 進階：Accounting/fair-share（slurmdbd）與多 partition policy
+- 這是讓「HPC 排程比純 K8s 更有利」真正發揮的關鍵，尤其是多人共享 GPU 時。
+
+(5) 進階：與 K8s batch 生態共存/整合
+- 選項 A：保留 Slurm 做 HPC queue，K8s 做 services（你現在的方向）。
+- 選項 B：評估與 Kueue/Volcano 整合（讓 Slurm 與 K8s native batch 有一致的 quota/policy），但這通常是後期工作。
+
+
+### 四、目前 K8s 資源對應表（方便之後做成 Slinky-like CRD）
+
+（以 `namespace=slurm` 為主；名稱以你目前專案慣例為例）
+
+Control plane / Access
+- `StatefulSet/slurm-controller`：`slurmctld` + `munged`（含 readiness/liveness）
+- `Service/slurm-controller`（Headless, `clusterIP: None`）：提供 `slurm-controller-0.slurm-controller...` 的穩定 DNS
+- `Deployment/slurm-login`：使用者入口（`sbatch/srun/squeue`），通常會 mount shared PVC
+- （可選）`Service/slurm-login`：若要提供 cluster 外部入口（NodePort/Ingress/SSH bastion）
+
+Compute plane
+- `StatefulSet/slurm-worker`：每個 Pod = 一個 Slurm node（`slurmd` + `munged`）
+- `Service/slurm-worker`（Headless）：提供 `slurm-worker-{i}.slurm-worker...` 的穩定 DNS
+
+Config / Secrets / Storage
+- `ConfigMap/slurm-config`：`slurm.conf`（NodeName/Partition/SlurmctldHost 等）
+- `Secret/slurm-munge-key`：`munge.key`（必須全域一致）
+- `Secret/slurm-ssh-key`：login/controller/worker 之間若需要 ssh/scp 的 key（可逐步減少依賴）
+- `PVC/<shared>` + `PV/<shared>`（或 hostPath/CSI）：提供 `/shared` 作為 job output 與 smoke 驗證路徑
+
+Elasticity / Governance
+- `Deployment/slurm-elastic-operator`：watch `squeue`/pending job 狀態，調整 `StatefulSet/slurm-worker` replicas
+- （建議新增）`ConfigMap/slurm-elastic-config`：把 min/max/cooldown/poll interval 參數化
+- （建議新增）`ServiceAccount/Role/RoleBinding`：最小權限（只允許讀 pod/sts、patch sts replicas、exec login/controller）
+
+觀測與除錯（可選）
+- `ServiceMonitor/PodMonitor`（Prometheus operator）：抓 slurm exporter/metrics
+- `NetworkPolicy`：讓 slurmd/slurmctld/munged 所需 port 可互通（並限制其他流量）
+
+### 五、ASCII 架構圖（Current vs. Future）
+
+Current（你現在的設計：slurmd pods + 自製 elastic operator）：
+
+    [Users]
+      |
+      |  sbatch/srun/squeue
+      v
+    +---------------------+             +-------------------------------+
+    |  slurm-login (Dep)  |  SSH/CLI    |  slurm-controller-0 (STS)     |
+    |  sbatch client      +------------>+  slurmctld + munged           |
+    |  /shared (PVC)      |             |  /etc/slurm (CM)              |
+    +----------+----------+             +---------------+---------------+
+               |                                        |
+               | shared output                           | slurmctld RPC
+               v                                        v
+         +-----------+                     +----------------------------+
+         |  /shared  |<------------------->|  slurm-worker-{i} (STS)    |
+         | PVC / PV  |   job I/O, logs     |  slurmd + munged           |
+         +-----------+                     |  /etc/slurm (CM)           |
+                                           +----------------------------+
+
+    +-----------------------------------------------+
+    | slurm-elastic-operator (Dep)                  |
+    | - watches pending jobs (via login/controller) |
+    | - scales slurm-worker StatefulSet replicas    |
+    +-----------------------------------------------+
+
+Future（靠近 Slinky operator：宣告式 CRD + reconcile + 更完整的治理）：
+
+    [Users] -> [slurm-login] -> [slurmctld]
+                         ^         |
+                         |         v
+                   +-----+-------------------+
+                   | Slurm Operator (CRD)    |
+                   | - SlurmCluster          |
+                   | - SlurmNodeSet(min/max) |
+                   | - Partitions/QOS        |
+                   | - DNS gate + node FSM   |
+                   +-----+-------------------+
+                         |
+                         v
+              K8s objects (STS/Dep/Svc/CM/Secret/PVC)
+                         |
+                         v
+                  slurm-worker pods (elastic)
+
+註：如果未來要更進一步走到「Slurm job -> K8s Pod」的 slurm-bridge 路線，架構會在 slurmctld 與 compute plane 之間多一層 bridge/launcher（把 job step 映射成 Pod/Job），那會牽涉到更大幅度的設計變更（但對 Kubernetes 原生 batch 生態整合也更深）。
