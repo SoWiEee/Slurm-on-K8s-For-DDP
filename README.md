@@ -315,7 +315,7 @@ graph TD
     style SlurmCtld fill:#bbf,stroke:#333,stroke-width:2px
 ```
 
-<img width="2356" height="1248" alt="圖片" src="https://github.com/user-attachments/assets/3e977928-dca4-4caf-9efb-20863858827f" />
+<img width="2356" height="1288" alt="圖片" src="https://github.com/user-attachments/assets/fcf8602d-5589-4406-864f-85099fcdcc2e" />
 
 核心流程如下：
 
