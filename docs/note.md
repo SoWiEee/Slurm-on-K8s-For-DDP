@@ -847,3 +847,525 @@ Future（靠近 Slinky operator：宣告式 CRD + reconcile + 更完整的治理
                   slurm-worker pods (elastic)
 
 註：如果未來要更進一步走到「Slurm job -> K8s Pod」的 slurm-bridge 路線，架構會在 slurmctld 與 compute plane 之間多一層 bridge/launcher（把 job step 映射成 Pod/Job），那會牽涉到更大幅度的設計變更（但對 Kubernetes 原生 batch 生態整合也更深）。
+
+## Phase A ~ D：往 Slinky-operator 方向演進的實作方式與規則
+
+這一段不是單純的「功能清單」，而是把目前專案從：
+
+- 單一 `slurm-worker` pool
+- 以 pending job 數量做粗粒度 autoscaling
+- 以固定 `slurm.conf` + e2e 腳本補 gate
+
+逐步推進到更接近 Slinky operator 的設計：
+
+- 多個 NodeSet / WorkerClass
+- 以 Slurm job demand 驅動對應 pool 的供給
+- 讓 K8s 只負責基礎設施與節點生命週期
+- 讓 Slurm 保持 HPC / AI 排程語意（queue、fair-share、job array、MPI、多節點 allocation）
+
+### 先講結論：我們要模仿 Slinky 的哪一部分？
+
+目前最值得學的是 `slurm-operator` 這條線，而不是直接跳到 `slurm-bridge`：
+
+- `slurm-operator` 的核心是 **CRD + control loop**，把 Slurm cluster / NodeSets / autoscaling 納入 Kubernetes 的宣告式管理。
+- `slurm-bridge` 的核心是把 Slurm workload 更直接映射到 Kubernetes scheduler / Pod 世界，這條路線更雲原生，但系統複雜度也更高。
+
+對本專案來說，短中期最合理的目標是：
+
+1. 保留 `sbatch / srun / squeue` 的使用者介面。
+2. 保留 `slurmctld + slurmd` 的 HPC scheduler 模型。
+3. 把 `worker pool` 做成有型別的 NodeSets。
+4. 讓 autoscaling 以 Slurm queue 的「需求類型」而不只是「需求數量」做決策。
+
+這樣最符合目前專案定位，也最容易和 Slinky operator 的設計對齊。
+
+---
+
+## Phase A：把單一 worker pool 升級成多個 WorkerClass / NodeSet
+
+### 目標
+
+把目前單一 `StatefulSet/slurm-worker` 的設計，提升為「多種 compute pool」。
+
+典型 pool 例子：
+
+- `cpu-small`
+- `cpu-large`
+- `gpu-a10`
+- `gpu-h100`
+- （未來可延伸）`highmem-cpu`、`interactive-gpu`、`mig-gpu`
+
+### 為什麼這一步是必要的
+
+目前系統只知道：
+
+- 有 job pending
+- 所以多開幾個 worker
+
+這樣只能解決「節點數量不足」，不能解決「節點種類不匹配」。
+
+但實際 AI / HPC job 會要求：
+
+- 幾個 node
+- 每 node 幾顆 CPU
+- 每 node 幾張 GPU
+- 特定 GPU 型號
+- 特定記憶體大小
+- 特定 feature / constraint
+
+如果不分 pool，就會出現這些問題：
+
+- GPU job 觸發 CPU-only worker 擴容
+- H100 job 被 A10 pool 接住
+- 小 CPU job 與大 GPU job 搶同一個供給池
+- worker 起來了，但 Slurm 根本不會把 job 派到它上面
+
+### 實作方式
+
+#### A-1. 在 Kubernetes 層建立多個 StatefulSet
+
+最小版本先不用 CRD，直接拆成多個 StatefulSet：
+
+- `slurm-worker-cpu-small`
+- `slurm-worker-gpu-a10`
+- `slurm-worker-gpu-h100`
+
+每個 StatefulSet 自己帶：
+
+- `resources.requests/limits`
+- `nodeSelector`
+- `tolerations`
+- `runtimeClassName`（若 GPU / Kata / 特殊 runtime 需要）
+- `volumeMounts`
+- 對應的 image 或 entrypoint
+
+#### A-2. 在 Slurm 層為每個 pool 給獨立語意
+
+有兩種做法：
+
+1. **固定 NodeName 範圍 + Feature / Gres 標記**
+2. **用 NodeSet / dynamic nodes 方式掛進 partition**
+
+本專案先建議用第 1 種，因為容易落地：
+
+例：
+
+```conf
+NodeName=cpu-small-[0-7] Feature=cpu-small CPUs=8 RealMemory=32000 State=UNKNOWN
+NodeName=gpu-a10-[0-3] Feature=gpu-a10 Gres=gpu:a10:1 CPUs=16 RealMemory=128000 State=UNKNOWN
+NodeName=gpu-h100-[0-3] Feature=gpu-h100 Gres=gpu:h100:1 CPUs=32 RealMemory=256000 State=UNKNOWN
+
+PartitionName=cpu Nodes=cpu-small-[0-7] Default=YES MaxTime=INFINITE State=UP
+PartitionName=gpu Nodes=gpu-a10-[0-3],gpu-h100-[0-3] MaxTime=INFINITE State=UP
+```
+
+#### A-3. 對應到 K8s 資源與命名規則
+
+建議直接把命名規則固定下來，避免後面 operator / e2e / config generation 亂掉。
+
+建議規則：
+
+- StatefulSet 名稱 = Slurm node prefix
+- Pod 名稱 = `prefix-ordinal`
+- Slurm `NodeName` = `prefix-ordinal`
+- Headless Service 名稱 = prefix
+- FQDN = `prefix-ordinal.prefix.namespace.svc.cluster.local`
+
+例如：
+
+- K8s: `StatefulSet/slurm-worker-gpu-a10`
+- Pod: `slurm-worker-gpu-a10-0`
+- Slurm: `NodeName=slurm-worker-gpu-a10-0`
+- FQDN: `slurm-worker-gpu-a10-0.slurm-worker-gpu-a10.slurm.svc.cluster.local`
+
+這樣 operator 不需要額外維護 mapping table。
+
+### 規則
+
+#### 規則 A-1：每個 WorkerClass 只能對應一種明確資源 profile
+
+不要做「通用 GPU pool」這種模糊命名。WorkerClass 必須能從名字看出：
+
+- 是否有 GPU
+- GPU 型號
+- CPU / memory 大小級別
+
+#### 規則 A-2：K8s 與 Slurm 的資源語意必須對齊
+
+如果 K8s 端 worker pod 限制是：
+
+- `nvidia.com/gpu: 1`
+- nodeSelector = `gpu-a10`
+
+那 Slurm 端就必須有：
+
+- `Gres=gpu:a10:1`
+- `Feature=gpu-a10`
+
+不要讓其中一邊是「抽象」另一邊是「實體」，否則最終一定會出現 worker 起來了但 job 不會分配，或 job 要求到了不存在的資源。
+
+#### 規則 A-3：先設定上限，再談動態
+
+在這一階段，仍建議保留每個 pool 的最大節點數（例如 `0..3`、`0..7`）。
+
+原因：
+
+- Slurm scheduler 需要可理解的 node inventory
+- operator 只要做「在上限內啟用/停用」即可
+- 除錯成本遠低於完全動態 node creation
+
+---
+
+## Phase B：operator 從 Slurm queue 解析 job demand，而不是只數 pending jobs
+
+### 目標
+
+把現在的 autoscaling 從：
+
+- `pending_jobs > 0 => replicas + 1`
+
+升級成：
+
+- 解析 pending jobs 的資源需求
+- 把 job 分配到對應 pool
+- 算出每個 pool 應該有多少 replicas
+
+### 為什麼這一步是必要的
+
+因為真正的 AI / HPC workload 不只要求「節點數量」，而是要求：
+
+- 幾個 node
+- 每 task 幾顆 CPU
+- 幾張 GPU
+- 哪一種 GPU
+- 多少記憶體
+- 哪個 partition / constraint
+
+如果不解析這些欄位，operator 就永遠只能做 demo 級的擴縮。
+
+### 實作方式
+
+#### B-1. 規範使用者 job 的提交語意
+
+先讓 job spec 語意清楚，否則 operator 沒有穩定輸入。
+
+建議要求使用者至少用這些參數：
+
+- `-N` / `--nodes`
+- `--cpus-per-task`
+- `--mem`
+- `--gpus` 或 `--gpus-per-node`
+- `--gres=gpu:<type>:<count>`
+- `--constraint=<feature>`
+
+例如：
+
+```bash
+#SBATCH -N 2
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:a10:1
+#SBATCH --constraint=gpu-a10
+```
+
+對使用者來說，這只是更明確地描述需求；對 operator 來說，這是唯一可靠的決策來源。
+
+#### B-2. 從 `squeue` / `scontrol show job` 取得資源需求
+
+第一版不需要碰 slurmrestd，直接從 controller/login 執行：
+
+- `squeue -t PENDING -o ...`
+- `scontrol show job <jobid>`
+
+operator 解析重點欄位：
+
+- `NumNodes`
+- `NumCPUs`
+- `ReqTRES`
+- `TresPerNode`
+- `TresPerTask`
+- `Features`
+- `Partition`
+- `JobState`
+- `Reason`
+
+#### B-3. 以 pool 規則表將 job 分類
+
+新增一個 rule table，例如：
+
+```python
+WorkerClass(
+  name="gpu-a10",
+  partitions=["gpu"],
+  required_features=["gpu-a10"],
+  gres=["gpu:a10"],
+  statefulset="slurm-worker-gpu-a10",
+  min_replicas=0,
+  max_replicas=4,
+)
+```
+
+決策過程：
+
+1. pending job 進來
+2. 看 `constraint/features/gres/partition`
+3. 找到唯一匹配的 WorkerClass
+4. 加總該 pool 的 demand
+
+#### B-4. 每個 pool 計算 target replicas
+
+第一版建議用簡單保守算法：
+
+- `target = min(max_replicas, max(current_replicas, sum(required_nodes_of_pending_jobs)))`
+
+再逐步升級成：
+
+- 扣除 idle/available nodes
+- 按 CPU/GPU 容量換算 node 數
+- 考慮 running jobs 佔用
+- 考慮 largest pending job
+
+### 規則
+
+#### 規則 B-1：operator 不能猜測資源型別
+
+如果 job 沒有明確填 `--gres` 或 `--constraint`，operator 最多只能落到某個 `default cpu` pool；不能自行假設它是 GPU job。
+
+#### 規則 B-2：一個 job 在某一輪決策中只能匹配一個 WorkerClass
+
+不要讓同一個 job 同時觸發兩個 pool 擴容，否則很難 debug，也容易 overprovision。
+
+#### 規則 B-3：把 resource parsing 與 scaling decision 拆成獨立模組
+
+建議模組分工：
+
+- `job_parser.py`
+- `workerclass_registry.py`
+- `capacity_planner.py`
+- `k8s_reconciler.py`
+
+不要把 parsing / policy / patch 全塞進同一個 loop。
+
+---
+
+## Phase C：做 pool-aware autoscaling policy（可治理、可預測）
+
+### 目標
+
+把 autoscaling 從「有 pending job 就加 1」變成：
+
+- 每個 pool 有自己的 min/max/cooldown
+- scale up/down 有明確 gate
+- 縮容不會把正在跑 job 的 node 收掉
+- pod Ready 與 Slurm Ready 對齊
+
+### 實作方式
+
+#### C-1. Scale up policy
+
+對每個 WorkerClass：
+
+1. 看 pending job demand
+2. 算出 target replicas
+3. `kubectl patch statefulset replicas`
+4. 等待：
+   - Pod Ready
+   - DNS 可解析
+   - `slurmd` register 到 `slurmctld`
+   - node 從 `DOWN/NO NETWORK ADDRESS` 變為 `IDLE`
+
+也就是說，K8s `Ready` 不代表 Slurm 可用，必須再加 Slurm gate。
+
+#### C-2. Scale down policy
+
+不要一看到 queue 空就縮。
+
+先做這幾步：
+
+1. 找出 pool 中目前 idle 且不在 running allocation 裡的 nodes
+2. 標 `DRAIN` 或 `DOWN Reason=autoscale`
+3. 等 Slurm 確認這些 node 不再被 job 使用
+4. 再縮 StatefulSet replicas
+
+這比直接縮 replicas 再讓 node 消失穩定很多。
+
+#### C-3. Cooldown / jitter control
+
+每個 WorkerClass 至少要有：
+
+- `scale_up_step`
+- `scale_down_step`
+- `scale_down_cooldown_seconds`
+- `min_replicas`
+- `max_replicas`
+
+避免：
+
+- job 剛進來就狂加
+- job 剛結束就狂縮
+- worker-1 / worker-2 在 30 秒內反覆建立/刪除
+
+#### C-4. pod state 與 Slurm node state 同步
+
+這一點非常接近 Slinky operator 的精神。
+
+你的 operator 應該做一個明確的 node FSM：
+
+- `PodMissing` -> `Slurm DOWN`
+- `PodReady but DNS not ready` -> `wait`
+- `PodReady + DNS OK + slurmd registered` -> `Slurm RESUME/IDLE`
+- `ScaleDownRequested` -> `DRAIN` -> `Pod delete`
+
+這樣 Slurm 與 K8s 才不會各自以為自己在對的狀態，最後互相打架。
+
+### 規則
+
+#### 規則 C-1：縮容一定先 drain，再刪 pod
+
+不要先刪 pod 再希望 Slurm 自己反應。你之前遇到的 `NO NETWORK ADDRESS`、stepd 解析錯誤，很多就是來自這種生命週期錯位。
+
+#### 規則 C-2：Ready gate 至少要三層
+
+一個新 worker 想被真正視為「可派 job」，至少要滿足：
+
+1. Pod Ready
+2. DNS/FQDN OK
+3. `scontrol show node` 不再是 `NO NETWORK ADDRESS` 且 state 可用
+
+#### 規則 C-3：autoscaling policy 不能寫死在程式裡
+
+把 min/max/cooldown/poll interval/workerclass mapping 放進 ConfigMap 或未來的 CRD `spec`，不要硬寫在 `main.py`。
+
+---
+
+## Phase D：把 Slurm 的核心價值做完整，不只會 scale worker
+
+### 目標
+
+讓這個專案不只是「K8s 上另一個 autoscaler」，而是有明確 HPC / AI 平台價值：
+
+- fair-share / queue / QOS
+- accounting / 報表
+- GRES / GPU-aware scheduling
+- 多節點 MPI / DDP 真的穩定
+- 對使用者維持 Slurm UX
+
+### 實作方式
+
+#### D-1. GPU-aware scheduling
+
+補齊：
+
+- `slurm.conf` 裡的 `Gres=`
+- 必要時的 `gres.conf`
+- 對應 K8s `nvidia.com/gpu` requests/limits
+- feature / constraint mapping
+
+例如：
+
+- `gpu-a10` WorkerClass -> `Gres=gpu:a10:1`
+- `gpu-h100` WorkerClass -> `Gres=gpu:h100:1`
+
+#### D-2. Queue / QOS / fairness
+
+至少要開始把這些概念放進 roadmap 與配置中：
+
+- `PartitionName=cpu / gpu / interactive`
+- `AccountingStorageType`（未來若接 slurmdbd）
+- account / qos / fair-share policy
+
+這才是為什麼「K8s 上還需要 Slurm」的重要價值之一。
+
+#### D-3. Job array / dependency / 多節點 smoke tests
+
+驗證不能只做 `hello from worker-*`。應該逐步擴充到：
+
+- job array smoke test
+- MPI smoke test
+- DDP/PyTorch smoke test
+- GPU job smoke test
+- job dependency smoke test
+
+#### D-4. 觀測與營運面
+
+加入：
+
+- operator metrics
+- Slurm queue metrics
+- 每個 WorkerClass 的 current/desired replicas
+- scale event audit log
+- accounting / 使用量報表
+
+### 規則
+
+#### 規則 D-1：先保留 Slurm UX，再談更雲原生的 bridge 路線
+
+本專案現階段不要急著把每個 Slurm job 都直接轉成 Kubernetes Job/Pod。先把 `sbatch` 路徑做穩、把 NodeSet autoscaling 做穩，這樣比較符合目前專案核心。
+
+#### 規則 D-2：每新增一種 WorkerClass，都要有 smoke test
+
+例如新增 `gpu-a10` 後，要有：
+
+- 一個 job 明確要求 `gpu:a10`
+- operator 能正確 scale `slurm-worker-gpu-a10`
+- Slurm 實際把 job 派到該 pool
+- 結束後正確 scale down
+
+#### 規則 D-3：Phase D 的重點不是「更多功能」，而是「把 Slurm 真正擅長的東西做出來」
+
+如果只是把 worker 自動開關做得更花俏，但沒有把：
+
+- queueing
+- fairness
+- GPU accounting
+- job array / multi-node reliability
+
+這些做出來，那它仍然只是一個 autoscaler，不是成熟的 Slurm-on-K8s 平台。
+
+---
+
+## 建議的落地順序（避免一次做太多）
+
+### 第一階段：先做出 NodeSet/WorkerClass 基礎
+
+1. `slurm-worker` 拆成 2 種 pool（例如 `cpu` / `gpu-a10`）
+2. `slurm.conf` 為每個 pool 宣告固定上限的 NodeName 範圍
+3. operator 增加 WorkerClass registry
+
+### 第二階段：把 pending job 分類到 pool
+
+1. 解析 `scontrol show job`
+2. 根據 `partition / features / gres` 選 pool
+3. 各 pool 各自計算 target replicas
+
+### 第三階段：把 node FSM 做完整
+
+1. Pod Ready gate
+2. DNS gate
+3. Slurm register gate
+4. scale-down drain gate
+
+### 第四階段：GPU / accounting / multi-node AI smoke tests
+
+1. `gres.conf` / GPU pool
+2. PyTorch / DDP smoke test
+3. queue / qos / accounting 規劃
+
+---
+
+## 與 Slinky / Slurm 官方設計的對應關係（方便後續對照）
+
+本專案未來可直接對照下列概念：
+
+- **Slinky slurm-operator**：NodeSet autoscaling、CRD-based control loop、scale to zero、cluster lifecycle
+- **Slurm GRES / TRES**：GPU / generic resources 的標準表示與 accounting
+- **Slurm dynamic nodes / NodeSets**：讓動態節點以 feature / nodeset 加入 partition
+
+因此，後續若要更像 Slinky operator，最自然的下一步其實不是「改 UI」，而是：
+
+1. 把 `WorkerClass` 升級成 CRD（例如 `SlurmNodeSet`）
+2. operator 改成 watch `SlurmNodeSet` / `SlurmCluster`
+3. autoscaling policy 從「程式常數」搬到 `spec`
+4. `slurm.conf` / include fragments 改由 operator 宣告式生成
+
+這樣你就會從目前的「專案型實作」走向「平台型 operator」。
