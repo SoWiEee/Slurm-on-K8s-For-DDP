@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-topology
+  namespace: slurm
+data:
+  topology.json: |
+    {
+      "workerClasses": [
+        {
+          "name": "cpu-standard",
+          "description": "Default CPU-only worker class used by the current project baseline.",
+          "image": "slurm-worker:phase1",
+          "resources": {
+            "requests": {"cpu": "4", "memory": "4Gi"},
+            "limits": {"cpu": "4", "memory": "4Gi"}
+          },
+          "slurmFeatures": ["cpu", "baseline"],
+          "gres": []
+        },
+        {
+          "name": "gpu-train",
+          "description": "Example GPU worker class for future Phase B/C demand-aware autoscaling.",
+          "image": "slurm-worker:phase1",
+          "resources": {
+            "requests": {"cpu": "8", "memory": "32Gi", "nvidia.com/gpu": "1"},
+            "limits": {"cpu": "8", "memory": "32Gi", "nvidia.com/gpu": "1"}
+          },
+          "nodeSelector": {"accelerator": "nvidia"},
+          "slurmFeatures": ["gpu"],
+          "gres": ["gpu:1"]
+        }
+      ],
+      "nodeSets": [
+        {
+          "name": "default-workers",
+          "workerClass": "cpu-standard",
+          "partition": "debug",
+          "statefulset": "slurm-worker",
+          "serviceName": "slurm-worker",
+          "nodeNamePrefix": "slurm-worker",
+          "minReplicas": 1,
+          "maxReplicas": 4,
+          "scaleUpStep": 1,
+          "scaleDownStep": 1,
+          "scaleDownCooldownSeconds": 60,
+          "checkpointPath": "",
+          "maxCheckpointAgeSeconds": 600
+        }
+      ]
+    }

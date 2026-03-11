@@ -27,6 +27,7 @@ fi
 docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f phase2/docker/operator/Dockerfile .
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
+kubectl apply -f phase2/manifests/slurm-phaseA-topology.yaml
 kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
 
 # Do NOT apply a partial StatefulSet manifest (will fail validation/update constraints).
