@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: slurm-topology
+  name: slurm-topology-example-phaseb
   namespace: slurm
 data:
   topology.json: |

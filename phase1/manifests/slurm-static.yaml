@@ -21,13 +21,43 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: slurm-worker
+  name: slurm-worker-cpu
   namespace: slurm
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    app: slurm-worker
+    app: slurm-worker-cpu
+  ports:
+    - name: slurmd
+      port: 6818
+      targetPort: 6818
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-worker-gpu-a10
+  namespace: slurm
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: slurm-worker-gpu-a10
+  ports:
+    - name: slurmd
+      port: 6818
+      targetPort: 6818
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-worker-gpu-h100
+  namespace: slurm
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: slurm-worker-gpu-h100
   ports:
     - name: slurmd
       port: 6818
@@ -56,17 +86,21 @@ data:
     MailProg=/usr/bin/true
     SelectType=select/cons_tres
     SelectTypeParameters=CR_Core
+    GresTypes=gpu
 
     SlurmctldPort=6817
     SlurmdPort=6818
     AuthType=auth/munge
     CryptoType=crypto/munge
 
-    NodeName=slurm-worker-0 NodeAddr=slurm-worker-0.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
-    NodeName=slurm-worker-1 NodeAddr=slurm-worker-1.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
-    NodeName=slurm-worker-2 NodeAddr=slurm-worker-2.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
-    NodeName=slurm-worker-3 NodeAddr=slurm-worker-3.slurm-worker.slurm.svc.cluster.local NodeHostname=slurm-worker-3 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN
-    PartitionName=debug Nodes=slurm-worker-[0-3] Default=YES MaxTime=INFINITE State=UP
+    NodeName=slurm-worker-cpu-[0-3] NodeAddr=slurm-worker-cpu-[0-3].slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-[0-3] CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 Feature=cpu,baseline State=UNKNOWN
+    NodeName=slurm-worker-gpu-a10-[0-3] NodeAddr=slurm-worker-gpu-a10-[0-3].slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-[0-3] CPUs=8 RealMemory=32000 Sockets=1 CoresPerSocket=4 ThreadsPerCore=2 Feature=gpu,gpu-a10 Gres=gpu:a10:1 State=UNKNOWN
+    NodeName=slurm-worker-gpu-h100-[0-3] NodeAddr=slurm-worker-gpu-h100-[0-3].slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-[0-3] CPUs=16 RealMemory=64000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 Feature=gpu,gpu-h100 Gres=gpu:h100:1 State=UNKNOWN
+
+    PartitionName=debug Nodes=slurm-worker-cpu-[0-3],slurm-worker-gpu-a10-[0-3],slurm-worker-gpu-h100-[0-3] Default=YES MaxTime=INFINITE State=UP
+  gres.conf: |
+    NodeName=slurm-worker-gpu-a10-[0-3] Name=gpu Type=a10 File=/dev/nvidia0
+    NodeName=slurm-worker-gpu-h100-[0-3] Name=gpu Type=h100 File=/dev/nvidia0
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -130,18 +164,139 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: slurm-worker
+  name: slurm-worker-cpu
   namespace: slurm
 spec:
-  serviceName: slurm-worker
+  serviceName: slurm-worker-cpu
   replicas: 1
   selector:
     matchLabels:
-      app: slurm-worker
+      app: slurm-worker-cpu
   template:
     metadata:
       labels:
-        app: slurm-worker
+        app: slurm-worker-cpu
+        worker-class: cpu-standard
+    spec:
+      containers:
+        - name: slurm-worker
+          image: slurm-worker:phase1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 22
+            - containerPort: 6818
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null && pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: slurm-config
+              mountPath: /etc/slurm
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+      volumes:
+        - name: slurm-config
+          configMap:
+            name: slurm-config
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: slurm-ssh-key
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurm-worker-gpu-a10
+  namespace: slurm
+spec:
+  serviceName: slurm-worker-gpu-a10
+  replicas: 0
+  selector:
+    matchLabels:
+      app: slurm-worker-gpu-a10
+  template:
+    metadata:
+      labels:
+        app: slurm-worker-gpu-a10
+        worker-class: gpu-a10
+    spec:
+      containers:
+        - name: slurm-worker
+          image: slurm-worker:phase1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 22
+            - containerPort: 6818
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null && pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: slurm-config
+              mountPath: /etc/slurm
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+      volumes:
+        - name: slurm-config
+          configMap:
+            name: slurm-config
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: slurm-ssh-key
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurm-worker-gpu-h100
+  namespace: slurm
+spec:
+  serviceName: slurm-worker-gpu-h100
+  replicas: 0
+  selector:
+    matchLabels:
+      app: slurm-worker-gpu-h100
+  template:
+    metadata:
+      labels:
+        app: slurm-worker-gpu-h100
+        worker-class: gpu-h100
     spec:
       containers:
         - name: slurm-worker

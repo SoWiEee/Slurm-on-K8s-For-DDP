@@ -51,20 +51,22 @@ kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 phase1/scripts/create-secrets.sh "$NAMESPACE"
 
 if [[ "$FORCE_RECREATE" == "true" ]]; then
-  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 --ignore-not-found=true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-a10 --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true
 fi
 
 kubectl apply -f phase1/manifests/slurm-static.yaml
-kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker || true
+kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker-cpu statefulset/slurm-worker-gpu-a10 statefulset/slurm-worker-gpu-h100 || true
 
 if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
   echo "namespace '$NAMESPACE' not found after apply; check current context: $(kubectl config current-context)" >&2
   exit 1
 fi
 
-if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker >/dev/null 2>&1; then
+if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 >/dev/null 2>&1; then
   echo "required statefulsets not found in namespace '$NAMESPACE'" >&2
   kubectl -n "$NAMESPACE" get all || true
   exit 1
@@ -73,14 +75,14 @@ fi
 set +e
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
 rc1=$?
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 rc2=$?
 set -e
 
 if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
   echo "[bootstrap] rollout failed, collecting diagnostics..." >&2
   kubectl -n "$NAMESPACE" get all -o wide || true
-  kubectl -n "$NAMESPACE" describe statefulset slurm-controller slurm-worker || true
+  kubectl -n "$NAMESPACE" describe statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 || true
   kubectl -n "$NAMESPACE" describe pods || true
   for p in $(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null); do
     kubectl -n "$NAMESPACE" logs "$p" --all-containers=true --tail=200 || true
@@ -89,7 +91,7 @@ if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
   done
 
   kubectl -n "$NAMESPACE" exec statefulset/slurm-controller -- sh -c 'hostname; getent hosts slurm-controller-0 || true; getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true' || true
-kubectl -n "$NAMESPACE" exec statefulset/slurm-worker -- sh -c 'getent hosts slurm-controller-0 || true; getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true' || true
+kubectl -n "$NAMESPACE" exec statefulset/slurm-worker-cpu -- sh -c 'getent hosts slurm-controller-0 || true; getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true' || true
 
   echo "[bootstrap] context: $(kubectl config current-context)" >&2
   echo "[bootstrap] hint: try FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh" >&2

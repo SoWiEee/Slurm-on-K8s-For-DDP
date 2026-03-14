@@ -14,7 +14,7 @@ if ! kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$"; then
 fi
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
-if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker >/dev/null 2>&1; then
+if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 >/dev/null 2>&1; then
   echo "Phase 1 resources not found in namespace ${NAMESPACE}. run phase1/scripts/bootstrap-phase1.sh first." >&2
   exit 1
 fi
@@ -27,14 +27,16 @@ fi
 docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f phase2/docker/operator/Dockerfile .
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
-kubectl apply -f phase2/manifests/slurm-phaseA-topology.yaml
+kubectl apply -f phase2/manifests/slurm-phaseB-topology.yaml
 kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
 
 # Do NOT apply a partial StatefulSet manifest (will fail validation/update constraints).
 # Scale existing Phase 1 worker StatefulSet in-place so operator can take over from 1 replica.
-kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas=1
+kubectl -n "$NAMESPACE" scale statefulset/slurm-worker-cpu --replicas=1
+kubectl -n "$NAMESPACE" scale statefulset/slurm-worker-gpu-a10 --replicas=0
+kubectl -n "$NAMESPACE" scale statefulset/slurm-worker-gpu-h100 --replicas=0
 
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-elastic-operator --timeout="$ROLLOUT_TIMEOUT"
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 
 echo "Phase 2 deployment completed."

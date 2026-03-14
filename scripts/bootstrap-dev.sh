@@ -56,20 +56,22 @@ echo "[dev bootstrap] applying phase1 secrets and manifests..."
 phase1/scripts/create-secrets.sh "$NAMESPACE"
 
 if [[ "$FORCE_RECREATE" == "true" ]]; then
-  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 --ignore-not-found=true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-a10 --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true
 fi
 
 kubectl apply -f phase1/manifests/slurm-static.yaml
-kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker || true
+kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker-cpu || true
 
 if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
   echo "namespace '$NAMESPACE' not found after apply; check current context: $(kubectl config current-context)" >&2
   exit 1
 fi
 
-if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker >/dev/null 2>&1; then
+if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 >/dev/null 2>&1; then
   echo "required phase1 statefulsets not found in namespace '$NAMESPACE'" >&2
   kubectl -n "$NAMESPACE" get all || true
   exit 1
@@ -78,14 +80,14 @@ fi
 set +e
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
 rc1=$?
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 rc2=$?
 set -e
 
 if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
   echo "[dev bootstrap] phase1 rollout failed, collecting diagnostics..." >&2
   kubectl -n "$NAMESPACE" get all -o wide || true
-  kubectl -n "$NAMESPACE" describe statefulset slurm-controller slurm-worker || true
+  kubectl -n "$NAMESPACE" describe statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 || true
   kubectl -n "$NAMESPACE" describe pods || true
   for p in $(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null); do
     kubectl -n "$NAMESPACE" logs "$p" --all-containers=true --tail=200 || true
@@ -101,13 +103,14 @@ docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f phase2/dock
 echo "[dev bootstrap] loading phase2 image to kind..."
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
-echo "[dev bootstrap] applying phase2 operator manifest..."
+echo "[dev bootstrap] applying phase2 topology + operator manifests..."
+kubectl apply -f phase2/manifests/slurm-phaseB-topology.yaml
 kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
 
 # Keep a single worker at start so operator scale-up path is observable.
-kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas=1
+kubectl -n "$NAMESPACE" scale statefulset/slurm-worker-cpu --replicas=1
 
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-elastic-operator --timeout="$ROLLOUT_TIMEOUT"
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 
 echo "[dev bootstrap] done. phase1 + phase2 deployed on context: ${KUBE_CONTEXT}"

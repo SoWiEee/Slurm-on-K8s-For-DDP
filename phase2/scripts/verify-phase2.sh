@@ -13,11 +13,12 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-controller-0 --time
 kubectl -n "$NAMESPACE" wait --for=condition=Available deployment/slurm-elastic-operator --timeout=120s
 
 # Ensure start point is 1 replica so pending jobs can trigger scale-up.
-kubectl -n "$NAMESPACE" scale statefulset/slurm-worker --replicas=1
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout=120s
+kubectl -n "$NAMESPACE" scale statefulset/slurm-worker-cpu --replicas=1
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout=120s
 
 job_id=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "cat <<'EOF' >/tmp/phase2-job.sh
 #!/bin/bash
+#SBATCH --constraint=baseline
 sleep 120
 EOF
 sbatch --parsable -N 2 /tmp/phase2-job.sh")
@@ -26,7 +27,7 @@ echo "submitted job: ${job_id}"
 start_ts=$(date +%s)
 scaled_up=false
 while true; do
-  replicas=$(kubectl -n "$NAMESPACE" get statefulset/slurm-worker -o jsonpath='{.spec.replicas}')
+  replicas=$(kubectl -n "$NAMESPACE" get statefulset/slurm-worker-cpu -o jsonpath='{.spec.replicas}')
   if [[ "${replicas}" -ge 2 ]]; then
     scaled_up=true
     break
@@ -45,13 +46,13 @@ if [[ "$scaled_up" != "true" ]]; then
   exit 1
 fi
 
-echo "scale-up verified: replicas=$(kubectl -n "$NAMESPACE" get statefulset/slurm-worker -o jsonpath='{.spec.replicas}')"
+echo "scale-up verified: replicas=$(kubectl -n "$NAMESPACE" get statefulset/slurm-worker-cpu -o jsonpath='{.spec.replicas}')"
 
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- scancel "$job_id"
 
 # Wait for cooldown + polling and verify scale-down.
 sleep 90
-replicas=$(kubectl -n "$NAMESPACE" get statefulset/slurm-worker -o jsonpath='{.spec.replicas}')
+replicas=$(kubectl -n "$NAMESPACE" get statefulset/slurm-worker-cpu -o jsonpath='{.spec.replicas}')
 if [[ "$replicas" -gt 1 ]]; then
   echo "warning: scale-down not completed yet (replicas=${replicas})" >&2
   kubectl -n "$NAMESPACE" logs deployment/slurm-elastic-operator --tail=200 >&2 || true
