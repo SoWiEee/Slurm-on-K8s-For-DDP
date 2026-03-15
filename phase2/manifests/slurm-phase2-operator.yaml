@@ -60,6 +60,13 @@ spec:
               value: debug
             - name: WORKER_STATEFULSET
               value: slurm-worker-cpu
+            - name: PARTITIONS_JSON
+              value: >-
+                [
+                  {"partition":"debug","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
+                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-a10","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-a10"],"match_gres":["gpu:a10"]},
+                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-h100","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-h100"],"match_gres":["gpu:h100"]}
+                ]
             - name: MIN_REPLICAS
               value: "1"
             - name: MAX_REPLICAS
@@ -76,5 +83,7 @@ spec:
               value: "true"
             - name: CHECKPOINT_PATH
               value: ""
+            - name: OPERATOR_LAYOUT_VERSION
+              value: "multi-pool-v2"
             - name: MAX_CHECKPOINT_AGE_SECONDS
               value: "600"

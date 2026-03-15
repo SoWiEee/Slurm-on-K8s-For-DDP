@@ -81,6 +81,48 @@ validate_rendered_manifest() {
   fi
 }
 
+
+operator_force_env() {
+  local partitions_json='[
+    {"partition":"debug","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
+    {"partition":"debug","worker_statefulset":"slurm-worker-gpu-a10","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-a10"],"match_gres":["gpu:a10"]},
+    {"partition":"debug","worker_statefulset":"slurm-worker-gpu-h100","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-h100"],"match_gres":["gpu:h100"]}
+  ]'
+
+  kubectl -n "$NAMESPACE" set env deployment/slurm-elastic-operator \
+    NAMESPACE="$NAMESPACE" \
+    CONTROLLER_POD="slurm-controller-0" \
+    SLURM_PARTITION="debug" \
+    WORKER_STATEFULSET="slurm-worker-cpu" \
+    PARTITIONS_JSON="$partitions_json" \
+    MIN_REPLICAS="1" \
+    MAX_REPLICAS="4" \
+    SCALE_UP_STEP="1" \
+    SCALE_DOWN_STEP="1" \
+    POLL_INTERVAL_SECONDS="15" \
+    SCALE_DOWN_COOLDOWN_SECONDS="60" \
+    CHECKPOINT_GUARD_ENABLED="true" \
+    CHECKPOINT_PATH="" \
+    MAX_CHECKPOINT_AGE_SECONDS="600" >/dev/null
+}
+
+validate_live_operator_config() {
+  kubectl -n "$NAMESPACE" get deployment/slurm-elastic-operator >/dev/null 2>&1 || return 0
+  local part_json
+  part_json=$(kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value}' 2>/dev/null || true)
+  if [[ -z "$part_json" ]]; then
+    echo "[dev bootstrap] ERROR: live slurm-elastic-operator deployment does not contain PARTITIONS_JSON" >&2
+    kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o yaml >&2 || true
+    exit 1
+  fi
+}
+
+force_replace_operator_deployment() {
+  kubectl -n "$NAMESPACE" delete deployment slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
+  kubectl -n "$NAMESPACE" annotate deployment/slurm-elastic-operator     bootstrap.dev/forced-at="$(date +%s)" --overwrite >/dev/null 2>&1 || true
+}
+
 log "ensuring kind cluster '${CLUSTER_NAME}' exists..."
 if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
   if [[ -n "$KIND_CONFIG" ]]; then
@@ -112,7 +154,23 @@ kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 
 log "rendering phase1 manifests (if generator exists)..."
 if [[ -f phase1/scripts/render-slurm-static.py ]]; then
-  python3 phase1/scripts/render-slurm-static.py
+  render_rc=0
+  python3 phase1/scripts/render-slurm-static.py || render_rc=$?
+
+  if [[ ! -s phase1/manifests/slurm-static.yaml ]]; then
+    echo "[dev bootstrap] ERROR: render failed and phase1/manifests/slurm-static.yaml was not produced" >&2
+    exit "${render_rc:-1}"
+  fi
+
+  if ! grep -q '^kind: StatefulSet$' phase1/manifests/slurm-static.yaml; then
+    echo "[dev bootstrap] ERROR: rendered slurm-static.yaml looks invalid" >&2
+    exit "${render_rc:-1}"
+  fi
+
+  if [[ "${render_rc}" -ne 0 ]]; then
+    echo "[dev bootstrap] warning: render script exited with code ${render_rc}, but output file exists; continuing" >&2
+  fi
+
   log "phase1 manifests rendered."
 fi
 
@@ -152,6 +210,7 @@ maybe_rollout_restart statefulset/slurm-worker-gpu-a10
 maybe_rollout_restart statefulset/slurm-worker-gpu-h100
 maybe_rollout_restart deployment/slurm-login
 maybe_rollout_restart deployment/slurm-elastic-operator
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
 # Force fresh pods so /etc/munge/munge.key is recopied from the projected secret at process start.
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true >/dev/null 2>&1 || true
@@ -189,7 +248,11 @@ log "loading phase2 image to kind..."
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
 log "applying phase2 operator manifest..."
-kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
+force_replace_operator_deployment
+operator_force_env
+validate_live_operator_config
+kubectl -n "$NAMESPACE" rollout restart deployment/slurm-elastic-operator >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
 
 # Keep a single baseline worker at start so scale-up paths are observable.
 kubectl -n "$NAMESPACE" scale statefulset/${baseline_worker_sts} --replicas=1 >/dev/null 2>&1 || true

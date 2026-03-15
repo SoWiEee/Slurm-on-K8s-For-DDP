@@ -1,44 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NAMESPACE=${1:-slurm}
-REGENERATE_SECRETS=${REGENERATE_SECRETS:-false}
-WORKDIR=$(mktemp -d)
+NAMESPACE="${1:-slurm}"
+REGENERATE_SECRETS="${REGENERATE_SECRETS:-false}"
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "[create-secrets] $1 is required" >&2
+    exit 1
+  }
+}
+
+log() {
+  echo "[create-secrets] $*"
+}
+
+require_tool kubectl
+require_tool ssh-keygen
+require_tool openssl
+
+WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-changed=false
+need_munge=true
+need_ssh=true
 
-if [[ "$REGENERATE_SECRETS" == "true" ]] || ! kubectl -n "$NAMESPACE" get secret slurm-munge-key >/dev/null 2>&1; then
-  python3 - <<'PY_CREATE_MUNGE' > "$WORKDIR/munge.key"
-import base64, os, sys
-# 768 random bytes become exactly 1024 base64 characters, avoiding SIGPIPE-prone shell pipelines.
-sys.stdout.write(base64.b64encode(os.urandom(768)).decode())
-PY_CREATE_MUNGE
-  kubectl -n "$NAMESPACE" create secret generic slurm-munge-key \
-    --from-file=munge.key="$WORKDIR/munge.key" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  echo "slurm-munge-key: applied"
-  changed=true
-else
-  echo "slurm-munge-key: unchanged"
+if [[ "$REGENERATE_SECRETS" != "true" ]]; then
+  if kubectl -n "$NAMESPACE" get secret slurm-munge-key >/dev/null 2>&1; then
+    need_munge=false
+  fi
+  if kubectl -n "$NAMESPACE" get secret slurm-ssh-key >/dev/null 2>&1; then
+    need_ssh=false
+  fi
 fi
 
-if [[ "$REGENERATE_SECRETS" == "true" ]] || ! kubectl -n "$NAMESPACE" get secret slurm-ssh-key >/dev/null 2>&1; then
+if [[ "$need_munge" == "true" ]]; then
+  log "generating munge key..."
+  openssl rand -out "$WORKDIR/munge.key" 1024
+
+  kubectl -n "$NAMESPACE" delete secret slurm-munge-key --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" create secret generic slurm-munge-key \
+    --from-file=munge.key="$WORKDIR/munge.key" >/dev/null
+
+  log "created secret slurm-munge-key"
+else
+  log "keeping existing secret slurm-munge-key"
+fi
+
+if [[ "$need_ssh" == "true" ]]; then
+  log "generating ssh keypair..."
   ssh-keygen -t ed25519 -N '' -f "$WORKDIR/id_ed25519" >/dev/null
+
+  kubectl -n "$NAMESPACE" delete secret slurm-ssh-key --ignore-not-found >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" create secret generic slurm-ssh-key \
     --from-file=id_ed25519="$WORKDIR/id_ed25519" \
-    --from-file=id_ed25519.pub="$WORKDIR/id_ed25519.pub" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  echo "slurm-ssh-key: applied"
-  changed=true
+    --from-file=id_ed25519.pub="$WORKDIR/id_ed25519.pub" >/dev/null
+
+  log "created secret slurm-ssh-key"
 else
-  echo "slurm-ssh-key: unchanged"
+  log "keeping existing secret slurm-ssh-key"
 fi
 
-if [[ "$changed" == "true" ]]; then
-  echo "Secrets changed in namespace: $NAMESPACE"
-else
-  echo "Secrets unchanged in namespace: $NAMESPACE"
-fi
+log "done"

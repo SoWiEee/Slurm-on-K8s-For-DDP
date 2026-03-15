@@ -286,7 +286,8 @@ spec:
                       path: id_ed25519.pub
 ---""")
     OUT.write_text("\n".join(docs).rstrip() + "\n")
-    print(f"Rendered {OUT} from {CFG}")
+    print(f"Rendered {OUT} from {CFG}", flush=True)
+    return 0
 
 if __name__ == "__main__":
     main()
