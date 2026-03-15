@@ -86,21 +86,35 @@ data:
     MailProg=/usr/bin/true
     SelectType=select/cons_tres
     SelectTypeParameters=CR_Core
-    GresTypes=gpu
 
     SlurmctldPort=6817
     SlurmdPort=6818
     AuthType=auth/munge
     CryptoType=crypto/munge
+    GresTypes=gpu
 
-    NodeName=slurm-worker-cpu-[0-3] NodeAddr=slurm-worker-cpu-[0-3].slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-[0-3] CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 Feature=cpu,baseline State=UNKNOWN
-    NodeName=slurm-worker-gpu-a10-[0-3] NodeAddr=slurm-worker-gpu-a10-[0-3].slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-[0-3] CPUs=8 RealMemory=32000 Sockets=1 CoresPerSocket=4 ThreadsPerCore=2 Feature=gpu,gpu-a10 Gres=gpu:a10:1 State=UNKNOWN
-    NodeName=slurm-worker-gpu-h100-[0-3] NodeAddr=slurm-worker-gpu-h100-[0-3].slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-[0-3] CPUs=16 RealMemory=64000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 Feature=gpu,gpu-h100 Gres=gpu:h100:1 State=UNKNOWN
-
-    PartitionName=debug Nodes=slurm-worker-cpu-[0-3],slurm-worker-gpu-a10-[0-3],slurm-worker-gpu-h100-[0-3] Default=YES MaxTime=INFINITE State=UP
+    NodeName=slurm-worker-cpu-0 NodeAddr=slurm-worker-cpu-0.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
+    NodeName=slurm-worker-cpu-1 NodeAddr=slurm-worker-cpu-1.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
+    NodeName=slurm-worker-cpu-2 NodeAddr=slurm-worker-cpu-2.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
+    NodeName=slurm-worker-cpu-3 NodeAddr=slurm-worker-cpu-3.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-3 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
+    NodeName=slurm-worker-gpu-a10-0 NodeAddr=slurm-worker-gpu-a10-0.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-0 CPUs=8 RealMemory=7000 Sockets=1 CoresPerSocket=4 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
+    NodeName=slurm-worker-gpu-a10-1 NodeAddr=slurm-worker-gpu-a10-1.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-1 CPUs=8 RealMemory=7000 Sockets=1 CoresPerSocket=4 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
+    NodeName=slurm-worker-gpu-a10-2 NodeAddr=slurm-worker-gpu-a10-2.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-2 CPUs=8 RealMemory=7000 Sockets=1 CoresPerSocket=4 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
+    NodeName=slurm-worker-gpu-a10-3 NodeAddr=slurm-worker-gpu-a10-3.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-3 CPUs=8 RealMemory=7000 Sockets=1 CoresPerSocket=4 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
+    NodeName=slurm-worker-gpu-h100-0 NodeAddr=slurm-worker-gpu-h100-0.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-0 CPUs=16 RealMemory=16000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
+    NodeName=slurm-worker-gpu-h100-1 NodeAddr=slurm-worker-gpu-h100-1.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-1 CPUs=16 RealMemory=16000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
+    NodeName=slurm-worker-gpu-h100-2 NodeAddr=slurm-worker-gpu-h100-2.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-2 CPUs=16 RealMemory=16000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
+    NodeName=slurm-worker-gpu-h100-3 NodeAddr=slurm-worker-gpu-h100-3.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-3 CPUs=16 RealMemory=16000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
+    PartitionName=debug Nodes=slurm-worker-cpu-0,slurm-worker-cpu-1,slurm-worker-cpu-2,slurm-worker-cpu-3,slurm-worker-gpu-a10-0,slurm-worker-gpu-a10-1,slurm-worker-gpu-a10-2,slurm-worker-gpu-a10-3,slurm-worker-gpu-h100-0,slurm-worker-gpu-h100-1,slurm-worker-gpu-h100-2,slurm-worker-gpu-h100-3 Default=YES MaxTime=INFINITE State=UP
   gres.conf: |
-    NodeName=slurm-worker-gpu-a10-[0-3] Name=gpu Type=a10 File=/dev/nvidia0
-    NodeName=slurm-worker-gpu-h100-[0-3] Name=gpu Type=h100 File=/dev/nvidia0
+    NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 File=/dev/null
+    NodeName=slurm-worker-gpu-a10-1 Name=gpu Type=a10 File=/dev/null
+    NodeName=slurm-worker-gpu-a10-2 Name=gpu Type=a10 File=/dev/null
+    NodeName=slurm-worker-gpu-a10-3 Name=gpu Type=a10 File=/dev/null
+    NodeName=slurm-worker-gpu-h100-0 Name=gpu Type=h100 File=/dev/null
+    NodeName=slurm-worker-gpu-h100-1 Name=gpu Type=h100 File=/dev/null
+    NodeName=slurm-worker-gpu-h100-2 Name=gpu Type=h100 File=/dev/null
+    NodeName=slurm-worker-gpu-h100-3 Name=gpu Type=h100 File=/dev/null
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -340,3 +354,4 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+---

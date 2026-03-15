@@ -50,14 +50,22 @@ kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 
 phase1/scripts/create-secrets.sh "$NAMESPACE"
 
+# Remove obsolete single-pool resources from older layouts.
+kubectl -n "$NAMESPACE" delete statefulset slurm-worker --ignore-not-found=true
+kubectl -n "$NAMESPACE" delete service slurm-worker --ignore-not-found=true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
+
 if [[ "$FORCE_RECREATE" == "true" ]]; then
-  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 --ignore-not-found=true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-a10 --ignore-not-found=true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true
+  kubectl -n "$NAMESPACE" delete service slurm-worker --ignore-not-found=true
 fi
 
+python3 phase1/scripts/render-slurm-static.py
 kubectl apply -f phase1/manifests/slurm-static.yaml
 kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker-cpu statefulset/slurm-worker-gpu-a10 statefulset/slurm-worker-gpu-h100 || true
 
@@ -66,7 +74,7 @@ if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 >/dev/null 2>&1; then
+if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu >/dev/null 2>&1; then
   echo "required statefulsets not found in namespace '$NAMESPACE'" >&2
   kubectl -n "$NAMESPACE" get all || true
   exit 1
