@@ -408,13 +408,6 @@ Phase 4：評估與優化
 - Related Paper: [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
 
 
-## Phase A topology model
+## Multi-pool Slurm config generation
 
-Phase A introduces a declarative `WorkerClass / NodeSet` topology model via `phase2/manifests/slurm-phaseA-topology.yaml`.
-The operator reads `ConfigMap/slurm-topology` (`topology.json`) and uses it as the source of truth for:
-- available worker classes
-- managed node sets / worker pools
-- per-pool scaling bounds and cooldowns
-- Slurm node-name prefix mapping for node state reconciliation
-
-This keeps the current single worker pool working, while establishing the data model needed for future multi-pool CPU/GPU autoscaling.
+The `phase1/scripts/render-slurm-static.py` script renders `phase1/manifests/slurm-static.yaml` from `phase1/manifests/worker-pools.json`. It expands every pool member into an explicit `NodeName` / `NodeAddr` entry, which avoids Slurm parser failures with ranged FQDNs such as `slurm-worker-cpu-[0-3].svc...`.
