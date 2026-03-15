@@ -136,6 +136,24 @@ spec:
         - name: slurm-controller
           image: slurm-controller:phase1
           imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              ssh-keygen -A >/dev/null 2>&1 || true
+              /usr/sbin/sshd
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              exec slurmctld -Dvvv
           ports:
             - containerPort: 22
             - containerPort: 6817
@@ -196,6 +214,24 @@ spec:
         - name: slurm-worker
           image: slurm-worker:phase1
           imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              ssh-keygen -A >/dev/null 2>&1 || true
+              /usr/sbin/sshd
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
             - containerPort: 6818
@@ -256,6 +292,24 @@ spec:
         - name: slurm-worker
           image: slurm-worker:phase1
           imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              ssh-keygen -A >/dev/null 2>&1 || true
+              /usr/sbin/sshd
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
             - containerPort: 6818
@@ -316,6 +370,24 @@ spec:
         - name: slurm-worker
           image: slurm-worker:phase1
           imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              ssh-keygen -A >/dev/null 2>&1 || true
+              /usr/sbin/sshd
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
             - containerPort: 6818

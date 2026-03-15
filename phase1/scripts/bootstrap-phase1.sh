@@ -2,108 +2,68 @@
 set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
-KIND_CONFIG=${KIND_CONFIG:-}
-ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
-DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
-NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
-FORCE_RECREATE=${FORCE_RECREATE:-false}
+NAMESPACE=${NAMESPACE:-slurm}
+ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
+REGENERATE_SECRETS=${REGENERATE_SECRETS:-false}
 
-if ! command -v kind >/dev/null 2>&1; then
-  echo "kind is required" >&2
-  exit 1
-fi
-if ! command -v kubectl >/dev/null 2>&1; then
-  echo "kubectl is required" >&2
-  exit 1
-fi
-if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required" >&2
-  exit 1
-fi
-
-if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
-  if [[ -n "$KIND_CONFIG" ]]; then
-    kind create cluster --name "$CLUSTER_NAME" --config "$KIND_CONFIG"
-  else
-    kind create cluster --name "$CLUSTER_NAME"
+validate_rendered_manifest() {
+  if ! grep -q '^\s*command:$' phase1/manifests/slurm-static.yaml; then
+    echo "phase1 rendered slurm-static.yaml does not contain explicit command blocks" >&2
+    exit 1
   fi
-fi
+}
+
+validate_live_command() {
+  local res="$1"
+  local live
+  live=$(kubectl -n "$NAMESPACE" get "$res" -o jsonpath='{.spec.template.spec.containers[0].command[0]}' 2>/dev/null || true)
+  if [[ "$live" != "/bin/bash" ]]; then
+    echo "phase1 live $res command[0] is '$live', expected /bin/bash" >&2
+    kubectl -n "$NAMESPACE" get "$res" -o yaml >&2 || true
+    exit 1
+  fi
+}
 
 if ! kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$"; then
-  echo "kubectl context ${KUBE_CONTEXT} not found. available contexts:" >&2
+  echo "kubectl context ${KUBE_CONTEXT} not found" >&2
   kubectl config get-contexts -o name >&2 || true
   exit 1
 fi
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
-build_flags=()
-if [[ "$DOCKER_BUILD_NO_CACHE" == "true" ]]; then
-  build_flags+=(--no-cache)
+if [[ -f phase1/scripts/render-slurm-static.py ]]; then
+  python3 phase1/scripts/render-slurm-static.py
+  echo "[phase1 bootstrap] phase1 manifests rendered."
 fi
+validate_rendered_manifest
 
-docker build "${build_flags[@]}" -t slurm-controller:phase1 phase1/docker/controller
-docker build "${build_flags[@]}" -t slurm-worker:phase1 phase1/docker/worker
-
-kind load docker-image slurm-controller:phase1 --name "$CLUSTER_NAME"
-kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
-
-phase1/scripts/create-secrets.sh "$NAMESPACE"
-
-# Remove obsolete single-pool resources from older layouts.
-kubectl -n "$NAMESPACE" delete statefulset slurm-worker --ignore-not-found=true
-kubectl -n "$NAMESPACE" delete service slurm-worker --ignore-not-found=true
-kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
-
-if [[ "$FORCE_RECREATE" == "true" ]]; then
-  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-a10 --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true
-  kubectl -n "$NAMESPACE" delete service slurm-worker --ignore-not-found=true
-fi
-
-python3 phase1/scripts/render-slurm-static.py
+REGENERATE_SECRETS="$REGENERATE_SECRETS" phase1/scripts/create-secrets.sh "$NAMESPACE"
+echo "[phase1 bootstrap] applying phase1 manifests..."
 kubectl apply -f phase1/manifests/slurm-static.yaml
-kubectl -n "$NAMESPACE" rollout restart statefulset/slurm-controller statefulset/slurm-worker-cpu statefulset/slurm-worker-gpu-a10 statefulset/slurm-worker-gpu-h100 || true
-
-if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
-  echo "namespace '$NAMESPACE' not found after apply; check current context: $(kubectl config current-context)" >&2
-  exit 1
+if [[ -f phase1/manifests/slurm-login.yaml ]]; then
+  kubectl apply -f phase1/manifests/slurm-login.yaml
 fi
+validate_live_command statefulset/slurm-controller
+validate_live_command statefulset/slurm-worker-cpu
 
-if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu >/dev/null 2>&1; then
-  echo "required statefulsets not found in namespace '$NAMESPACE'" >&2
-  kubectl -n "$NAMESPACE" get all || true
-  exit 1
-fi
+for r in statefulset/slurm-controller statefulset/slurm-worker-cpu deployment/slurm-login; do
+  kubectl -n "$NAMESPACE" get "$r" >/dev/null 2>&1 && kubectl -n "$NAMESPACE" rollout restart "$r" >/dev/null 2>&1 || true
+done
 
-set +e
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
+
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
-rc1=$?
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
-rc2=$?
-set -e
 
-if [[ $rc1 -ne 0 || $rc2 -ne 0 ]]; then
-  echo "[bootstrap] rollout failed, collecting diagnostics..." >&2
-  kubectl -n "$NAMESPACE" get all -o wide || true
-  kubectl -n "$NAMESPACE" describe statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 || true
-  kubectl -n "$NAMESPACE" describe pods || true
-  for p in $(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null); do
-    kubectl -n "$NAMESPACE" logs "$p" --all-containers=true --tail=200 || true
-    kubectl -n "$NAMESPACE" logs "$p" --all-containers=true --previous --tail=200 || true
-    kubectl -n "$NAMESPACE" exec "$p" -- sh -c 'ls -lah /slurm-secrets 2>/dev/null || true' || true
-  done
+controller_pod=$(kubectl -n "$NAMESPACE" get pod -l app=slurm-controller -o jsonpath='{.items[0].metadata.name}')
+for _ in $(seq 1 60); do
+  if kubectl -n "$NAMESPACE" exec "pod/${controller_pod}" -- bash -lc 'scontrol ping >/dev/null 2>&1'; then
+    break
+  fi
+  sleep 2
+done
 
-  kubectl -n "$NAMESPACE" exec statefulset/slurm-controller -- sh -c 'hostname; getent hosts slurm-controller-0 || true; getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true' || true
-kubectl -n "$NAMESPACE" exec statefulset/slurm-worker-cpu -- sh -c 'getent hosts slurm-controller-0 || true; getent hosts slurm-controller-0.slurm-controller.slurm.svc.cluster.local || true' || true
-
-  echo "[bootstrap] context: $(kubectl config current-context)" >&2
-  echo "[bootstrap] hint: try FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash phase1/scripts/bootstrap-phase1.sh" >&2
-  exit 1
-fi
-
-echo "Phase 1 deployment completed."
+echo "Phase 1 bootstrap completed."

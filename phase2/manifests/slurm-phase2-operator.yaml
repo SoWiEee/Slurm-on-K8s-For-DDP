@@ -11,7 +11,7 @@ metadata:
   namespace: slurm
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/exec", "configmaps"]
+    resources: ["pods", "pods/exec"]
     verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
@@ -56,10 +56,6 @@ spec:
               value: slurm
             - name: CONTROLLER_POD
               value: slurm-controller-0
-            - name: WORKER_TOPOLOGY_CONFIGMAP
-              value: slurm-topology
-            - name: WORKER_TOPOLOGY_KEY
-              value: topology.json
             - name: SLURM_PARTITION
               value: debug
             - name: WORKER_STATEFULSET

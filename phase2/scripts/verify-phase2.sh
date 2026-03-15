@@ -18,7 +18,6 @@ kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout=12
 
 job_id=$(kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc "cat <<'EOF' >/tmp/phase2-job.sh
 #!/bin/bash
-#SBATCH --constraint=baseline
 sleep 120
 EOF
 sbatch --parsable -N 2 /tmp/phase2-job.sh")
