@@ -39,7 +39,7 @@ class Config:
     checkpoint_guard_enabled: bool = os.getenv("CHECKPOINT_GUARD_ENABLED", "true").lower() == "true"
     # For single-partition fallback.
     default_partition: str = os.getenv("SLURM_PARTITION", "debug")
-    default_worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker")
+    default_worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker-cpu")
     default_min_replicas: int = int(os.getenv("MIN_REPLICAS", "1"))
     # Upper bound for worker pod scale-out per partition.
     # Keep this in sync with the maximum NodeName range defined in slurm.conf.
