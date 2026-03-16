@@ -360,31 +360,29 @@ class OperatorApp:
         self.last_scale_up_at: dict[str, float] = {p.worker_statefulset: 0.0 for p in self.partition_cfgs}
 
     def _reconfigure_slurm(self) -> None:
-        self.client.exec_in_controller("scontrol reconfigure >/dev/null 2>&1 || true")
+        """Avoid periodic reconfigure storms.
+
+        The static slurm.conf already contains all potential nodes. Calling
+        `scontrol reconfigure` on every polling loop forces slurmctld to resolve
+        every configured NodeAddr, including pods for scaled-to-zero replicas.
+        In Kubernetes those pod FQDNs do not exist until the pod exists, so the
+        controller can block on repeated DNS failures and make `sinfo`/`squeue`
+        time out.
+
+        Keep the hook for future targeted use, but do nothing in the steady-state
+        operator loop.
+        """
+        return None
 
     def _sync_slurm_node_states(self, partition_cfg: PartitionConfig) -> None:
-        sts = partition_cfg.worker_statefulset
-        self._reconfigure_slurm()
-        for i in range(partition_cfg.max_replicas):
-            nodename = f"{sts}-{i}"
-            rc, _, _ = self.client.try_run(
-                [
-                    "-n",
-                    self.cfg.namespace,
-                    "exec",
-                    f"pod/{self.cfg.controller_pod}",
-                    "--",
-                    "bash",
-                    "-lc",
-                    f"scontrol show node {nodename} >/dev/null 2>&1",
-                ]
-            )
-            if rc != 0:
-                continue
-            if self.client.pod_ready(nodename):
-                self.client.exec_in_controller(f"scontrol update NodeName={nodename} State=RESUME || true")
-            else:
-                self.client.exec_in_controller(f"scontrol update NodeName={nodename} State=DOWN Reason=autoscale || true")
+        """Best-effort node sync without touching non-existent pods.
+
+        Slurm learns scaled-up nodes from slurmd registration automatically, and
+        scaled-down nodes naturally become non-responding. Avoid probing every
+        configured ordinal because most of them are intentionally absent when the
+        pool is scaled down.
+        """
+        return None
 
     def run(self) -> None:
         self.logger.emit(
@@ -393,8 +391,6 @@ class OperatorApp:
             config=asdict(self.cfg),
             partitions=[asdict(p) for p in self.partition_cfgs],
         )
-        self._reconfigure_slurm()
-
         while True:
             for partition_cfg in self.partition_cfgs:
                 key = partition_cfg.worker_statefulset
@@ -479,8 +475,6 @@ class OperatorApp:
                             running_jobs=state.running_jobs,
                             busy_nodes=state.busy_nodes,
                         )
-
-                    self._sync_slurm_node_states(partition_cfg)
                 except Exception as exc:  # noqa: BLE001
                     self.logger.emit("error", level="ERROR", partition=partition_cfg.partition, statefulset=key, message=str(exc))
             time.sleep(self.cfg.poll_interval)

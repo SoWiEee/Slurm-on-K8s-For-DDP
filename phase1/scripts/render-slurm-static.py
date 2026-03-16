@@ -1,35 +1,41 @@
-
 #!/usr/bin/env python3
 from __future__ import annotations
 import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CFG = ROOT / "phase1" / "manifests" / "worker-pools.json"
 OUT = ROOT / "phase1" / "manifests" / "slurm-static.yaml"
 
+
 def indent(text: str, n: int) -> str:
     pad = " " * n
     return "\n".join(pad + line if line else line for line in text.splitlines())
 
+
 def build_slurm_conf(cfg: dict) -> tuple[str, str]:
-    node_lines = []
-    gres_lines = []
-    partition_nodes = []
-    gres_types = set()
+    node_lines: list[str] = []
+    gres_lines: list[str] = []
+    partition_nodes: list[str] = []
+    gres_types: set[str] = set()
 
     for pool in cfg["workerPools"]:
         name = pool["name"]
         svc = pool["service"]
         features = pool.get("features", [])
         gres = pool.get("gres", [])
-        extra = []
+        extra: list[str] = []
         if features:
             extra.append(f"Feature={','.join(features)}")
         if gres:
             extra.append(f"Gres={','.join(gres)}")
             for g in gres:
                 gres_types.add(g.split(":")[0])
+
+        # Keep the static maxNodes model for compatibility with the current
+        # phase2 operator, which only scales StatefulSets and does not rewrite
+        # slurm.conf on each scale event.
         for i in range(pool["maxNodes"]):
             node_name = f"{name}-{i}"
             node_addr = f"{node_name}.{svc}.slurm.svc.cluster.local"
@@ -46,7 +52,12 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
             node_lines.append(line)
             partition_nodes.append(node_name)
             for g in gres:
-                gres_lines.append(f"NodeName={node_name} Name={g.split(':')[0]} Type={g.split(':')[1]} File=/dev/null")
+                parts = g.split(":")
+                if len(parts) >= 2:
+                    gres_lines.append(
+                        f"NodeName={node_name} Name={parts[0]} Type={parts[1]} File=/dev/null"
+                    )
+
     header = [
         "ClusterName=kind-slurm",
         "SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)",
@@ -83,10 +94,11 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
     gres_conf = "\n".join(gres_lines) + ("\n" if gres_lines else "")
     return slurm_conf, gres_conf
 
-def main():
+
+def main() -> int:
     cfg = json.loads(CFG.read_text())
     slurm_conf, gres_conf = build_slurm_conf(cfg)
-    docs = []
+    docs: list[str] = []
     docs.append("""apiVersion: v1
 kind: Namespace
 metadata:
@@ -286,8 +298,9 @@ spec:
                       path: id_ed25519.pub
 ---""")
     OUT.write_text("\n".join(docs).rstrip() + "\n")
-    print(f"Rendered {OUT} from {CFG}", flush=True)
+    print(f"Rendered {OUT} from {CFG}")
     return 0
 
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

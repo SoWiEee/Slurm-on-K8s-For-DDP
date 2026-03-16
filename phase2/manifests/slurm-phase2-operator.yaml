@@ -83,7 +83,5 @@ spec:
               value: "true"
             - name: CHECKPOINT_PATH
               value: ""
-            - name: OPERATOR_LAYOUT_VERSION
-              value: "multi-pool-v2"
             - name: MAX_CHECKPOINT_AGE_SECONDS
               value: "600"
