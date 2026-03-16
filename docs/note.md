@@ -463,3 +463,487 @@ verify 的責任是驗證主路徑，不是取代人工 debug。
   - Shared Storage + 應用整合 + 容錯
 
 這樣比較符合目前實際開發順序，也避免把已完成的 operator 演進錯掛到 Shared Storage 底下。
+
+---
+
+# Development Notes (Phase 2-E Proposal: Single Cluster Dual-Subnet Design)
+
+這一節是**基於目前專案結構**，規劃「單一 Kubernetes cluster 內的兩個子網路」該怎麼落地。這裡先講結論：
+
+- 你的題目**有可能**被要求做跨網路，但通常教授要看的不是「硬切兩個 namespace 或兩台機器」這麼表面。
+- 真正有價值的是：
+  - 你能不能把 **control plane traffic** 跟 **data plane traffic** 分開。
+  - 你能不能描述 **不同 worker pool / 不同 workload class** 的網路需求。
+  - 你能不能讓未來的 DDP / MPI / checkpoint I/O 有比較合理的網路演進空間。
+
+如果你只是把「operator 一池、worker 一池」硬拆成兩個網路，這個切法其實很弱，因為 operator 並不是高資料流量角色，切它沒有明顯收益。
+
+## 一、先釐清：為什麼你的題目可能會用到跨網路
+
+### 1. Slurm + K8s 本來就有兩種流量
+
+在你現在的架構裡，至少有兩種性質不同的流量：
+
+1. **管理面流量**
+   - `slurmctld <-> slurmd`
+   - `login <-> controller`
+   - operator 呼叫 `kubectl` / K8s API
+   - readiness probe / service discovery / DNS
+
+2. **資料面流量**
+   - MPI / NCCL / PyTorch DDP worker-to-worker
+   - checkpoint / dataset / shared storage I/O
+   - 後續若接真實 training，這部分才是大流量來源
+
+教授若要求你做跨網路，通常是在逼你思考：
+
+- 這兩種流量能不能分離
+- 分離之後有沒有比較接近真實 HPC / AI cluster
+- 當網路特性不同時，scheduler / operator / workload placement 是否要跟著調整
+
+### 2. 好處是什麼
+
+如果做對，好處有三個：
+
+#### A. 降低 control plane 被 data plane 干擾
+
+訓練流量大時，若全部都走同一張 Pod 網路，容易讓：
+
+- Slurm query timeout
+- node registration 變慢
+- `sinfo` / `squeue` / `scontrol` 抖動
+
+你前面已經碰過很多 timeout。雖然主因不只網路，但把資料面與管理面切開，確實能降低這種風險。
+
+#### B. 更接近真實叢集設計
+
+真實 HPC / AI cluster 很常是：
+
+- 管理網路一套
+- 高速資料網路另一套
+
+你現在是 Kind 單機，當然不會真的變快很多，但**架構概念**會更完整。
+
+#### C. 讓後續 Phase 3 / DDP / fault tolerance 有研究價值
+
+你之後若要做：
+
+- DDP 多節點訓練
+- checkpoint-aware autoscaling
+- worker class 的網路感知調度
+
+那麼「不同網路對不同 workload 的影響」本身就能變成可寫進報告的內容。
+
+## 二、基於目前專案，最合理的切法是什麼
+
+## 結論先講
+
+**最合理的切法不是 `worker 一池 / operator 一池`，也不是 `CPU pool 一網 / GPU pool 一網`。**
+
+基於你現在的結構，最合理的是：
+
+### 方案：
+
+- **Net-A：管理子網路（management subnet）**
+  - 所有 Pod 都保留既有 K8s 預設 Pod 網路
+  - 給 controller、login、operator、worker 全部使用
+  - 負責 Slurm control traffic、K8s API、DNS、probe、一般 service discovery
+
+- **Net-B：資料子網路（data subnet）**
+  - 只額外掛到需要高資料流量的 Pod
+  - 第一階段先掛到 `slurm-login`、`slurm-worker-cpu`、`slurm-worker-gpu-a10`、`slurm-worker-gpu-h100`
+  - controller / operator **不要**先掛，避免把 control plane 複雜化
+  - 未來 DDP / MPI / NCCL / checkpoint 可優先綁這張網卡
+
+這樣才符合你的專案現況。
+
+### 為什麼這樣切比較合理
+
+因為你現在真正需要解決的是：
+
+- Slurm control plane 要穩
+- worker-to-worker 的資料面未來要能擴展
+
+所以控制面要盡量保守，資料面再額外拉出來。
+
+如果你把 operator 拉去另一個網路，收益很小，複雜度卻上升。
+
+如果你把 CPU / GPU 直接硬拆成兩張不同網路，也太早了。因為現在 CPU / GPU 的差異主要是 **resource / constraint / gres**，不是網路型態。
+
+## 三、在單一 cluster 內，兩個子網路應該怎麼落地
+
+你現在是 Kind，代表：
+
+- 預設 CNI 會給你一套 Pod 網路
+- 你若要第二張網路，通常要靠 **Multus CNI**
+- IP 分配可以搭配 **Whereabouts**
+
+### 建議組合
+
+1. **Primary network**
+   - 保留 Kind/K8s 預設 Pod network
+   - 不要動 controller、operator 的主通訊路徑
+
+2. **Secondary network**
+   - 導入 `Multus + Whereabouts`
+   - 用 `NetworkAttachmentDefinition` 提供額外介面
+   - worker / login Pod 透過 annotation 掛第二張 NIC
+
+### 推薦的 CNI 型態
+
+若你只是要在**單機 Kind**裡做概念驗證：
+
+- 可先用 `bridge` + `whereabouts`
+- 因為最容易在本地驗證
+
+若你未來真的要更接近實機 L2 行為：
+
+- 可再評估 `macvlan` 或 `ipvlan`
+- 但在 Docker Desktop / Kind / Windows 這組環境下，除錯成本會顯著上升
+
+### 實際上可定義成：
+
+- `slurm-mgmt`：其實沿用預設 pod network，不額外建 NAD
+- `slurm-data`：額外的 secondary subnet，例如 `192.168.20.0/24`
+
+也就是說，你口頭上是兩個子網路，但實作上通常會是：
+
+- 一個是預設 cluster pod CIDR
+- 一個是 Multus 附加網段
+
+這是最務實的做法。
+
+## 四、基於你現在結構，哪些元件該掛哪個網路
+
+## 1. `slurm-controller`
+
+建議：
+
+- **只保留 management subnet**
+- 不要先掛 data subnet
+
+理由：
+
+- 它是控制面核心
+- 你現在已經有 `slurmctld` query timeout、reconfigure、FQDN resolve 等問題
+- 先別把 controller 的網路模型弄更複雜
+
+## 2. `slurm-elastic-operator`
+
+建議：
+
+- **只保留 management subnet**
+
+理由：
+
+- 它只需要 K8s API + Slurm query
+- 不是資料面角色
+- 把它丟進第二網路沒有實際收益
+
+## 3. `slurm-login`
+
+建議：
+
+- **management subnet + data subnet 雙介面**
+
+理由：
+
+- 它是提交工作的入口
+- 後續你若要在 login container 內測試 MPI/DDP，會需要直接觸碰資料面
+- 它也可當作除錯入口，檢查 worker 間資料網路是否互通
+
+## 4. `slurm-worker-cpu`
+
+建議：
+
+- **management subnet + data subnet 雙介面**
+
+理由：
+
+- 現在 CPU pool 是 baseline pool
+- Phase 2 驗證、DDP CPU 原型、MPI smoke test 都可能先落在這裡
+- 不該只有 control network
+
+## 5. `slurm-worker-gpu-a10` / `slurm-worker-gpu-h100`
+
+建議：
+
+- **management subnet + data subnet 雙介面**
+
+理由：
+
+- 真正高資料流量 workload 最後多半會落在這裡
+- 之後若要區分 NCCL/訓練流量走哪張卡，這些 pool 是主要受益者
+
+## 五、你問的「要不要切成兩個網路，各自放不同元件」的更精確回答
+
+### 不建議的切法
+
+#### 切法 A：worker 一池、operator 一池
+
+這很像做了切分，但其實沒有抓到重點。
+
+問題：
+
+- operator 流量很小
+- worker 才是真正資料面主角
+- 這種切法無法支撐你後續 DDP / MPI 的論述
+
+#### 切法 B：CPU 一網、GPU 一網
+
+這也太快。
+
+問題：
+
+- 你現在 CPU / GPU 差異是 compute class，不是 network class
+- 除非你後續真的要模擬不同 fabric，例如：
+  - CPU pool 走一般乙太網
+  - GPU pool 走高速 fabric
+- 否則這樣切只是增加驗證成本
+
+### 比較好的切法
+
+#### 切法 C：control plane / data plane
+
+這才是目前最值得做的切法。
+
+也就是：
+
+- controller / operator 只走管理網
+- login / workers 除了管理網，再多一張資料網
+
+這個切法有明確理由，也容易寫進設計文件與口試說明。
+
+## 六、基於目前 repo，可怎麼接到現有結構
+
+你現在 repo 裡已經有這些很適合承接網路拓撲的地方：
+
+- `phase1/manifests/worker-pools.json`
+- `phase2/manifests/slurm-phaseA-topology.yaml`
+- `phase2/manifests/slurm-phaseB-topology.yaml`
+- `phase2/operator/main.py`
+
+這代表你其實已經有「拓撲配置」這個概念，只是目前偏向：
+
+- worker class
+- node set
+- autoscaling policy
+
+下一步可以把 network 屬性補進同一條鏈。
+
+### 建議新增的 topology 欄位
+
+可在 `workerClasses` 或 `nodeSets` 裡加入：
+
+```json
+{
+  "name": "gpu-a10-workers",
+  "workerClass": "gpu-a10",
+  "partition": "debug",
+  "statefulset": "slurm-worker-gpu-a10",
+  "serviceName": "slurm-worker-gpu-a10",
+  "networkAttachments": ["slurm-data"],
+  "networkRole": "data-plane"
+}
+```
+
+對 CPU pool 也加：
+
+```json
+{
+  "name": "cpu-workers",
+  "workerClass": "cpu-standard",
+  "partition": "debug",
+  "statefulset": "slurm-worker-cpu",
+  "serviceName": "slurm-worker-cpu",
+  "networkAttachments": ["slurm-data"],
+  "networkRole": "data-plane"
+}
+```
+
+而 controller / operator 則標成：
+
+```json
+{
+  "networkRole": "control-plane",
+  "networkAttachments": []
+}
+```
+
+### 後續 manifest 生成器應做的事
+
+你現在 `phase1/scripts/render-slurm-static.py` 已經會從 `worker-pools.json` 生成 StatefulSet。
+
+所以之後可擴成：
+
+1. 若 pool 有 `networkAttachments`
+2. 就在 Pod template metadata 加上 Multus annotation
+3. 例如：
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/networks: slurm-data
+```
+
+這樣可以把「拓撲配置 -> manifest 生成」串成一條完整 pipeline。
+
+## 七、推薦你分成兩個落地階段
+
+## Phase 2-E.1：先做結構正確，但不追求性能提升
+
+目標：
+
+- 保留既有 Phase 1 / Phase 2 能運作
+- 額外讓 login / worker 掛第二張網卡
+- 驗證第二張網卡存在、能互 ping、能做基本通訊
+
+你應該先做到：
+
+1. 安裝 Multus
+2. 建立 `slurm-data` 的 NAD
+3. 只改 login / worker manifests
+4. verify 增加：
+   - Pod 內 `ip addr` 可看到第二張介面
+   - login 與 worker 能經資料網互通
+
+### 這一階段不要做的事
+
+- 不要一開始就改 controller 通訊走第二網
+- 不要一開始就想讓 Slurm NodeAddr 改綁第二網
+- 不要一開始就混入 NCCL / MPI / shared storage 調校
+
+不然你會一次炸三個層面，根本無法 debug。
+
+## Phase 2-E.2：再做 workload-aware network usage
+
+第二階段才考慮：
+
+- `NodeAddr` 是否切到 data subnet
+- MPI/DDP 是否顯式綁第二張 NIC
+- checkpoint I/O 是否透過 data plane 減少 management 干擾
+- autoscaling policy 是否考慮 network class
+
+這階段才比較像研究題目。
+
+## 八、可參考的開源專案 / 元件
+
+以下是你該看的，不是因為它們和你專題一模一樣，而是因為它們各自解決你會碰到的某一塊問題。
+
+### 1. Multus CNI
+
+用途：
+
+- 在 K8s Pod 上掛多張網卡
+- 這是你做單 cluster 雙子網最核心的元件
+
+你若不導入 Multus，基本上很難把現在的 Pod 做成「主網 + 資料網」雙介面模型。
+
+### 2. Whereabouts
+
+用途：
+
+- 給 secondary network 做 IPAM
+- 很適合 Multus 附掛網段
+
+因為你需要讓 worker / login 的第二張網卡在同一個附加網段拿到可管理 IP。
+
+### 3. NVIDIA k8s-device-plugin
+
+用途：
+
+- 若未來 GPU pool 要更像真實環境，這是 GPU 資源宣告基礎
+
+你現在是以 Slurm feature / gres 模擬 GPU pool，這在專案初期是合理的。但若教授往「真實 GPU 調度」追問，這條線你得知道。
+
+### 4. Volcano / kube-batch
+
+用途：
+
+- K8s 上的 batch / gang scheduling 參考實作
+
+不是要你改用它，而是你可以借它們理解：
+
+- HPC/AI workload 在 K8s 上常怎麼描述拓撲、queue、資源群組
+- 網路 / 資源池 / job class 怎麼在控制器層被表達
+
+### 5. Kubeflow Training Operator / MPI Operator
+
+用途：
+
+- 看分散式訓練 workload 在 K8s 內怎麼處理 worker 通訊與 Pod 角色
+
+你現在不是要直接搬它，但它能讓你理解：
+
+- 為什麼 login / launcher / worker 的網路角色不同
+- 為什麼 data plane 和 control plane 分離有價值
+
+## 九、你現在最該避免的錯誤假設
+
+### 假設 1：跨網路一定要拆成兩群元件
+
+不一定。
+
+更合理的是：
+
+- 同一批 worker 同時有兩張網卡
+- 一張負責管理，一張負責資料
+
+### 假設 2：做跨網路一定會讓效能大幅變好
+
+在 Kind + Docker Desktop + 單機下，**不會有明顯真實效能提升**。
+
+這件事你要誠實。這比較像：
+
+- 架構驗證
+- 拓撲建模
+- 為未來實體叢集或多節點實驗打底
+
+### 假設 3：先把 Slurm 通訊全面切到第二網路比較厲害
+
+這通常是更容易炸。
+
+你現在最需要的是**穩定可驗證**，不是一次把所有通訊改掉。
+
+## 十、我對你目前專案的具體建議
+
+若你要把「單一 cluster 內兩個子網路」變成下一個可交付里程碑，我建議這樣切：
+
+### 建議的里程碑名稱
+
+- **Phase 2-E: Dual-Network Topology in Single Cluster**
+
+### 里程碑內容
+
+1. 導入 Multus 與 secondary subnet
+2. login / worker 掛第二張 data-plane NIC
+3. controller / operator 保持只走 management network
+4. topology 檔補上 network metadata
+5. verify 增加雙網卡存在性與資料網路互通檢查
+6. 保持目前 CPU / GPU autoscaling 邏輯不變
+
+### 驗收條件
+
+- `bootstrap-dev.sh` 仍可完成部署
+- `verify-dev.sh` 原有 CPU / GPU 路徑不被破壞
+- login / worker 內可看到第二張介面
+- 指定 Pod 能透過 data subnet 互通
+- 文件能說清楚 control-plane / data-plane 分工
+
+## 十一、最後結論
+
+基於你現在的 repo 結構，**最值得做的單一 cluster 兩子網方案**是：
+
+- **既有 Pod network 當 management subnet**
+- **Multus 附加 network 當 data subnet**
+- **controller / operator 留在 management only**
+- **login + all worker pools 掛 management + data 雙網卡**
+
+這個方案有幾個優點：
+
+- 不會直接破壞你現在已經跑通的 Phase 1 / Phase 2 主路徑
+- 能合理回答「為什麼要跨網路」
+- 能和你現有的 topology / worker pool / autoscaling 結構接起來
+- 能為之後的 DDP、checkpoint、shared storage、network-aware scheduling 留出空間
+
+如果你下一步真的要做，我建議先把它當成 **Phase 2-E**，而不是急著塞進 Phase 3。因為它本質上還是在補強「elastic multi-pool control/data topology」，還沒進到 shared storage / workload recovery 的核心。
