@@ -117,12 +117,6 @@ validate_live_operator_config() {
   fi
 }
 
-force_replace_operator_deployment() {
-  kubectl -n "$NAMESPACE" delete deployment slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
-  kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
-  kubectl -n "$NAMESPACE" annotate deployment/slurm-elastic-operator     bootstrap.dev/forced-at="$(date +%s)" --overwrite >/dev/null 2>&1 || true
-}
-
 log "ensuring kind cluster '${CLUSTER_NAME}' exists..."
 if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
   if [[ -n "$KIND_CONFIG" ]]; then
@@ -156,21 +150,17 @@ log "rendering phase1 manifests (if generator exists)..."
 if [[ -f phase1/scripts/render-slurm-static.py ]]; then
   render_rc=0
   python3 phase1/scripts/render-slurm-static.py || render_rc=$?
-
   if [[ ! -s phase1/manifests/slurm-static.yaml ]]; then
-    echo "[dev bootstrap] ERROR: render failed and phase1/manifests/slurm-static.yaml was not produced" >&2
+    echo "[dev bootstrap] ERROR: render script failed and phase1/manifests/slurm-static.yaml is missing or empty" >&2
     exit "${render_rc:-1}"
   fi
-
   if ! grep -q '^kind: StatefulSet$' phase1/manifests/slurm-static.yaml; then
-    echo "[dev bootstrap] ERROR: rendered slurm-static.yaml looks invalid" >&2
-    exit "${render_rc:-1}"
+    echo "[dev bootstrap] ERROR: rendered slurm-static.yaml looks incomplete" >&2
+    exit 1
   fi
-
-  if [[ "${render_rc}" -ne 0 ]]; then
-    echo "[dev bootstrap] warning: render script exited with code ${render_rc}, but output file exists; continuing" >&2
+  if [[ ${render_rc:-0} -ne 0 ]]; then
+    echo "[dev bootstrap] warning: render script exited with code ${render_rc}, but output file exists; continuing"
   fi
-
   log "phase1 manifests rendered."
 fi
 
@@ -248,10 +238,9 @@ log "loading phase2 image to kind..."
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
 log "applying phase2 operator manifest..."
-force_replace_operator_deployment
+kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
 operator_force_env
 validate_live_operator_config
-kubectl -n "$NAMESPACE" rollout restart deployment/slurm-elastic-operator >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
 
 # Keep a single baseline worker at start so scale-up paths are observable.
