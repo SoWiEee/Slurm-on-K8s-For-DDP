@@ -21,6 +21,7 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 - ✅ **Phase 2-B 已完成**：完成結構化日誌，支援 `startup` / `loop_observation` / `scale_action` / `scale_skipped` / `error` 事件輸出。
 - ✅ **Phase 2-C 已完成**：完成 multi-pool / partition-aware autoscaling，支援 CPU / GPU worker pool 獨立擴縮。
 - ✅ **Phase 2-D 已完成**：完成 checkpoint-aware scale-down guard，避免執行中工作在 checkpoint 狀態未知時被過早縮容。
+- ✅ **Phase 2-E 已完成 MVP**：新增 dual-subnet topology、正式 runtime manifest、`slurm-ddp-runtime` helper，並讓 login/worker 可以把 DDP/NCCL/Gloo traffic 綁定到 `net2`。
 - ✅ **Dev workflow 已補強**：`scripts/bootstrap-dev.sh` 與 `scripts/verify-dev.sh` 可覆蓋目前 Phase 1 + Phase 2 開發驗證流程。
 - ✅ **GPU pool smoke test 已納入 verify**：`verify-dev.sh` 會驗證 CPU pool 與 GPU pool 的基本 scale-up / execute / scale-down 行為。
 
@@ -80,6 +81,7 @@ bash scripts/verify-dev.sh
 4. CPU pool `sbatch` smoke test。
 5. CPU pool scale-up / scale-down 驗證。
 6. GPU pool smoke test，確認 GPU constraint / GRES 會導向 `slurm-worker-gpu-a10`，並在工作完成後縮回 0。
+7. `phase2/scripts/verify-network.sh` 可視化展示 Phase 2-E 的雙子網設計；若 cluster 已安裝 Multus，還能額外檢查 runtime network attachment。
 
 若最終看到：
 
@@ -118,6 +120,28 @@ bash phase2/scripts/bootstrap-phase2.sh
 ```bash
 bash phase2/scripts/verify-phase2.sh
 ```
+
+
+### Phase 2-E MVP
+
+部署：
+
+```bash
+bash phase2/scripts/bootstrap-phase2e.sh
+```
+
+驗證：
+
+```bash
+bash phase2/scripts/verify-network.sh
+```
+
+這一版 MVP 的策略是：
+
+- `slurm-controller` 與 `slurm-elastic-operator` 保持 management-only。
+- `slurm-login` 與 worker pools 掛上 `management + data`。
+- `ddp-env.sh` 會將 `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` 指向 `net2`。
+- `verify-network.sh` 會檢查 annotation、`network-status`、container 內 `net2`、以及 login 對 worker 的 data-plane SSH。
 
 ### Phase 3
 
