@@ -439,6 +439,125 @@ verify 的責任是驗證主路徑，不是取代人工 debug。
 
 ---
 
+# Development Notes (Phase 2-E)
+
+## 目標
+
+在**單一 Kubernetes cluster** 內引入兩個子網路，將目前 Slurm-on-K8s 架構區分成：
+
+- **management subnet**：給 `slurm-controller`、`slurm-login`、`slurmd/slurmctld` 控制流量、SSH、健康檢查、Kubernetes API 溝通使用
+- **data subnet**：給 worker 間的 DDP / MPI / checkpoint / east-west data flow 使用
+
+## 這一輪新增的檔案
+
+- `phase2/manifests/slurm-phaseE-topology.yaml`
+  - 用 `ConfigMap/slurm-topology` 描述 dual-subnet 拓撲
+- `phase2/manifests/slurm-phaseE-multus.example.yaml`
+  - 提供 `slurm-mgmt-net` / `slurm-data-net` 的 Multus 範例
+- `phase2/scripts/bootstrap-phase2e.sh`
+  - 套用 topology，並把 login / worker / controller / operator 的 pod template 補上 network annotation
+- `phase2/scripts/verify-network.sh`
+  - 以可視化方式展示拓撲，並在 Multus 已安裝時驗證 runtime network attachment
+
+## 設計判斷
+
+### 1. 這次不把 operator 當成 data plane 成員
+
+`slurm-elastic-operator` 的工作主要是：
+
+- 查 Slurm queue / node state
+- patch StatefulSet replicas
+- 寫 log
+
+它不是高流量資料交換元件，所以只放在 **management subnet** 即可。若硬把 operator 拉進 data subnet，只會增加複雜度，沒有明顯效益。
+
+### 2. login 與 worker 要雙網
+
+這次規劃裡：
+
+- `slurm-login` 同時接 `management + data`
+- `slurm-worker-*` 同時接 `management + data`
+- `slurm-controller` / `slurm-elastic-operator` 僅接 `management`
+
+這個切法的好處是：
+
+- Slurm 控制流量維持單純
+- 之後若要做 PyTorch DDP / MPI / NCCL，能逐步把高流量傳輸導向 `data subnet`
+- verify 時也能清楚展示哪些元件是 control plane、哪些元件是 dual-homed compute plane
+
+### 3. 這一版先做可落地 scaffold，不強迫 repo 立刻全面切到第二張網
+
+原因很直接：你目前的 Phase 1 / Phase 2 主路徑已經跑通，若現在直接把 `slurmctld <-> slurmd` 全面改成第二張 NIC，風險很高。
+
+所以這一版的策略是：
+
+1. 先用 topology + annotations 把雙子網設計嵌進 repo
+2. 讓 `verify-network.sh` 可以在**沒有 Multus** 時先做拓撲驗證
+3. 若 cluster 內已安裝 Multus，再做 runtime dual-network 驗證
+
+這樣你拿給教授看時，不會陷入「環境少一個 CNI 元件就整套不能 demo」的窘境。
+
+## verify-network.sh 的展示方式
+
+這支腳本故意分成兩層：
+
+### A. Topology view
+
+不依賴 Multus。會直接展示：
+
+- management subnet / data subnet 名稱與用途
+- controller / operator / login / worker 的邏輯歸屬
+- ASCII 架構圖
+- pod template 上是否已有 `k8s.v1.cni.cncf.io/networks` annotation
+
+### B. Runtime view
+
+若 cluster 已有 Multus 與 `network-status` annotation，則額外展示：
+
+- `slurm-mgmt-net` / `slurm-data-net` 是否存在
+- Pod 實際拿到哪些 interface
+- 每張網卡對應的 IP
+
+## 目前限制
+
+### 1. 這不是「開箱即用的真雙網」，而是以 repo 現況為基礎的最小可用落地版
+
+因為你目前用的是 kind，原生不會自己給第二張 Pod NIC。真正要讓 runtime 出現雙網，還需要：
+
+- Multus CNI
+- `NetworkAttachmentDefinition`
+- cluster node 內對應 bridge / IPAM 可正常工作
+
+### 2. operator 目前還沒有用 topology 自動決定某個 job 要走哪張 NIC
+
+也就是說，Phase 2-E 目前完成的是：
+
+- **網路拓撲建模**
+- **workload placement 規劃**
+- **runtime 驗證 scaffolding**
+
+下一步若要更深入，才是：
+
+- 將 `data interface` 寫入 worker 啟動流程
+- 讓 DDP / MPI workload 明確選用 `net2`
+- 將 checkpoint / shared storage traffic 與 control traffic 分離
+
+## 建議後續里程碑
+
+### Phase 2-E.1
+- 安裝 Multus 到 dev cluster
+- 套用 `slurm-phaseE-multus.example.yaml`
+- 跑 `verify-network.sh` 做 live demo
+
+### Phase 2-E.2
+- 在 worker 啟動腳本中把 `net2` 暴露成可用資料網路介面
+- 補一個小型 worker-to-worker `iperf3` 或 `ping` 驗證
+
+### Phase 2-E.3
+- 在 Phase 3 的 DDP / checkpoint workload 中，明確使用 data subnet
+- 量測 control path 與 data path 分離後的穩定度差異
+
+
 # Development Notes (Phase 3 - Shared Storage Milestone)
 
 這部分保留原始規劃方向，因為目前 Shared Storage / DDP / requeue / 恢復量測仍是接下來的工作重點。
@@ -947,3 +1066,28 @@ metadata:
 - 能為之後的 DDP、checkpoint、shared storage、network-aware scheduling 留出空間
 
 如果你下一步真的要做，我建議先把它當成 **Phase 2-E**，而不是急著塞進 Phase 3。因為它本質上還是在補強「elastic multi-pool control/data topology」，還沒進到 shared storage / workload recovery 的核心。
+
+
+# Development Notes (Phase 2-E MVP)
+
+## 目標
+
+把原本只有 topology / annotation scaffold 的雙子網設計，補成真正可執行的 MVP。
+
+## 已完成內容
+
+- 將 `slurm-ddp-runtime` ConfigMap 納入基礎 manifest，讓 login / worker pod 啟動時就會安裝 `/opt/slurm-runtime/ddp-env.sh`。
+- `ddp-env.sh` 會把 `NCCL_SOCKET_IFNAME`、`GLOO_SOCKET_IFNAME`、`SLURM_DATA_IFACE` 綁到 `net2`。
+- `phase2/scripts/bootstrap-phase2e.sh` 改成預設要求 Multus runtime，並套用正式 `NetworkAttachmentDefinition`。
+- `phase2/scripts/verify-network.sh` 從單純展示 topology，升級為檢查 annotation、`network-status`、container 內 `net2`、以及 login 對 worker 的 data-plane SSH。
+
+## 這版刻意沒做的事
+
+- 沒有把 `slurm.conf` 的 `NodeAddr` 改到 data subnet。MVP 仍維持 Slurm control traffic 走 management network。
+- 沒有建立完整的 data-plane DNS / service discovery。`MASTER_ADDR` 仍建議由提交腳本明確指定。
+
+## 為什麼這樣切
+
+因為現在專案的穩定性仍依賴 StatefulSet FQDN 與既有 Slurm static node 宣告。若一口氣把 `NodeAddr` 也搬到 secondary network，會把 control path、DNS、以及 scale-to-zero 的問題綁在一起，風險太高。
+
+這版先把最關鍵的 DDP collective traffic 與 Slurm control traffic 分流，先把跨網路能力做成可驗證的功能，再考慮完整 data-plane rendezvous。
