@@ -127,6 +127,11 @@ bash phase2/scripts/verify-phase2.sh
 部署：
 
 ```bash
+# 先安裝 Multus
+kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset.yml
+kubectl -n kube-system rollout status ds/kube-multus-ds
+
+# 再套用 Phase 2-E
 bash phase2/scripts/bootstrap-phase2e.sh
 ```
 
@@ -136,12 +141,25 @@ bash phase2/scripts/bootstrap-phase2e.sh
 bash phase2/scripts/verify-network.sh
 ```
 
-這一版 MVP 的策略是：
+這一版 MVP 的設計與邏輯如下：
 
-- `slurm-controller` 與 `slurm-elastic-operator` 保持 management-only。
-- `slurm-login` 與 worker pools 掛上 `management + data`。
-- `ddp-env.sh` 會將 `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` 指向 `net2`。
-- `verify-network.sh` 會檢查 annotation、`network-status`、container 內 `net2`、以及 login 對 worker 的 data-plane SSH。
+- `kindnet` 保留為 **primary management network**，承擔 Slurm control、SSH、kubectl、health-check 等管理流量。
+- `slurm-controller` 與 `slurm-elastic-operator` 維持單網卡，不掛 secondary network，避免把 control path 複雜化。
+- `slurm-login` 與 worker pools 透過 Multus 額外掛上一張 `slurm-data-net`，在 pod 內顯示為 `net2`。
+- `slurm-data-net` 在 Kind dev 環境使用 `ptp + host-local IPAM`，因為當前節點有 `ptp` plugin，沒有 `bridge` plugin；這是為了讓 MVP 在現場環境可執行。
+- `/opt/slurm-runtime/ddp-env.sh` 會將 `NCCL_SOCKET_IFNAME=net2`、`GLOO_SOCKET_IFNAME=net2`、`SLURM_DATA_IFACE=net2` 注入執行環境，讓 DDP collective traffic 優先綁到 secondary NIC。
+- `slurm.conf` 的 `NodeAddr` 仍維持 management path。這版 MVP 的重點是 **control plane 與 data plane 分流**，不是把整個 Slurm 控制面搬去 secondary network。
+- `verify-network.sh` 現在以 annotation、`network-status`、container 內 `net2`、secondary IP、以及 runtime helper 存在性作為 MVP 成功條件；login 對 worker 的 data-plane SSH 只保留為 warning-only probe，不再是 hard fail。
+
+目前可接受的驗證成功標準是：
+
+1. login / worker pod 都為 Running。
+2. `k8s.v1.cni.cncf.io/networks` annotation 已正確套用到 login / worker。
+3. `network-status` 中可看到 `slurm-data-net -> net2 -> 192.168.20.x`。
+4. pod 內 `/proc/net/dev` 可看到 `net2`。
+5. `/opt/slurm-runtime/ddp-env.sh` 存在，且可看到 `NCCL_SOCKET_IFNAME=net2`、`GLOO_SOCKET_IFNAME=net2`。
+
+這不等於完整 shared data fabric 已完成。`ptp` 版本的 secondary network 主要是把 **第二張網卡與 DDP 綁定邏輯做出來**，後續若要驗證更強的 east-west reachability 或完整 data-plane rendezvous，仍需要再升級網路設計。
 
 ### Phase 3
 
