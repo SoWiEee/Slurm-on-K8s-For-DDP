@@ -4,6 +4,8 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 
 基於 Kubernetes 的彈性 Slurm 架構，目標是把 Slurm 的 HPC 批次排程能力帶到雲端原生環境，並逐步支援分散式 AI 訓練、共享儲存、自動擴縮與故障恢復。
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
+
 # 🔥 Motivation
 
 隨著深度學習模型規模持續成長，分散式訓練逐漸成為常態。Kubernetes 擅長彈性資源供給，但預設排程器不擅長 HPC workload；Slurm 擅長批次排程，但典型部署多半偏靜態、缺乏雲端原生彈性。
