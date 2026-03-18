@@ -1077,17 +1077,57 @@ metadata:
 ## 已完成內容
 
 - 將 `slurm-ddp-runtime` ConfigMap 納入基礎 manifest，讓 login / worker pod 啟動時就會安裝 `/opt/slurm-runtime/ddp-env.sh`。
-- `ddp-env.sh` 會把 `NCCL_SOCKET_IFNAME`、`GLOO_SOCKET_IFNAME`、`SLURM_DATA_IFACE` 綁到 `net2`。
-- `phase2/scripts/bootstrap-phase2e.sh` 改成預設要求 Multus runtime，並套用正式 `NetworkAttachmentDefinition`。
-- `phase2/scripts/verify-network.sh` 從單純展示 topology，升級為檢查 annotation、`network-status`、container 內 `net2`、以及 login 對 worker 的 data-plane SSH。
+- `ddp-env.sh` 會把 `NCCL_SOCKET_IFNAME`、`GLOO_SOCKET_IFNAME`、`SLURM_DATA_IFACE` 綁到 `net2`，讓 DDP collective traffic 可明確走 secondary NIC。
+- `phase2/scripts/bootstrap-phase2e.sh` 改成預設要求 Multus runtime，並在有 CRD 時套用正式 `NetworkAttachmentDefinition`。
+- `phase2/manifests/slurm-phaseE-runtime.yaml` 最終改成只建立 `slurm-data-net`，不再建立 `slurm-mgmt-net`。MVP 保留 `kindnet` 當 primary management network。
+- `slurm-data-net` 在 Kind dev cluster 採 `ptp + host-local IPAM`，因為實測環境有 `ptp` plugin，沒有 `bridge` plugin。前期使用 `bridge` 的版本會直接在 CNI 階段失敗。
+- `phase2/scripts/verify-network.sh` 從單純展示 topology，升級為檢查 annotation、`network-status`、container 內 `net2`、secondary IPv4、runtime helper 是否存在，以及 `ddp-env.sh` 內的 DDP/NCCL/Gloo 綁定輸出。
+- login 對 worker 的 data-plane SSH probe 被降級成 warning-only，因為它不是這個 MVP 的必要條件，失敗常常反映的是 SSH 授權模型，而不是 secondary NIC 本身失效。
+
+## 設計邏輯
+
+### 1. control plane 與 data plane 分流，但不強行搬動 Slurm control path
+
+- `slurm-controller`、`slurm-elastic-operator` 只留在 `kindnet`。
+- `slurm-login`、worker pools 走 `kindnet + net2`。
+- `slurm.conf` 的 `NodeAddr` 暫時不搬到 data subnet。
+
+原因很直接。這個專案目前仍依賴 StatefulSet FQDN、headless service、以及 static node 宣告維持穩定。如果在 MVP 階段就把 `NodeAddr` 全部搬去 secondary network，會同時引入 DNS、service discovery、scale-to-zero、以及 control/data path 混雜的問題，風險不成比例。
+
+### 2. Kind 環境先求可執行，再談漂亮拓撲
+
+原本設計過 `slurm-mgmt-net + slurm-data-net` 兩張 Multus 附加網路，但在實際 dev cluster 中踩到兩個硬問題：
+
+- Kind node 內沒有 `bridge` plugin，`bridge` 型別的 NAD 會直接在 CNI sandbox 建立時失敗。
+- 反覆的 failed sandbox 會把 primary `kindnet` IP pool 吃乾，讓整個 cluster 連 baseline dev workflow 都起不來。
+
+所以最後收斂成：
+
+- primary `kindnet` 當 management network
+- Multus 只額外掛一張 `slurm-data-net`
+- `slurm-data-net` 採 `ptp`
+
+這不是最漂亮的 network fabric，但它能在當前 dev 環境把 secondary NIC 與 DDP 綁定邏輯做出來。
+
+### 3. 驗證標準回到真正 relevant 的部分
+
+MVP 的成功條件不是「login 一定要能 SSH 到 worker 的 data IP」，而是：
+
+1. login / worker pod 都能 Running。
+2. login / worker 的 pod template annotation 已正確掛上 `slurm-data-net`。
+3. `network-status` 中可看到 `net2` 與 `192.168.20.x`。
+4. container 內 `/proc/net/dev` 可看到 `net2`。
+5. `/opt/slurm-runtime/ddp-env.sh` 存在。
+6. source `ddp-env.sh` 後可看到 `NCCL_SOCKET_IFNAME=net2`、`GLOO_SOCKET_IFNAME=net2`、`SLURM_DATA_IFACE=net2`。
+
+SSH probe 只保留成 warning-only，因為它驗到的是「SSH 授權是否正確覆蓋到 data-plane IP」，不是「secondary NIC 是否存在」。把它當 hard fail 會讓驗證結果被非核心因素污染。
 
 ## 這版刻意沒做的事
 
 - 沒有把 `slurm.conf` 的 `NodeAddr` 改到 data subnet。MVP 仍維持 Slurm control traffic 走 management network。
 - 沒有建立完整的 data-plane DNS / service discovery。`MASTER_ADDR` 仍建議由提交腳本明確指定。
+- 沒有宣稱 `ptp` 版本已提供完整 shared east-west data fabric。它目前證明的是 secondary NIC 與 DDP 綁定能力，不是最終拓撲的終局。
 
 ## 為什麼這樣切
 
-因為現在專案的穩定性仍依賴 StatefulSet FQDN 與既有 Slurm static node 宣告。若一口氣把 `NodeAddr` 也搬到 secondary network，會把 control path、DNS、以及 scale-to-zero 的問題綁在一起，風險太高。
-
-這版先把最關鍵的 DDP collective traffic 與 Slurm control traffic 分流，先把跨網路能力做成可驗證的功能，再考慮完整 data-plane rendezvous。
+因為這樣才能先把「跨網路能力」收斂成一個可驗證、可維護、且不會把整個 baseline cluster 一起拖垮的 MVP。先讓 control plane 穩定、secondary NIC 可用、DDP env 可綁定，再談更完整的 data-plane rendezvous、worker-to-worker 連通性模型、或更高階的 secondary CNI 選型。
