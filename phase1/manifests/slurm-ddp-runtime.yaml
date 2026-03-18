@@ -1,0 +1,46 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-ddp-runtime
+  namespace: slurm
+  labels:
+    phase: phase2-e
+    runtime-role: cross-network-mvp
+data:
+  ddp-env.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    iface="${SLURM_DATA_IFACE:-net2}"
+    port="${MASTER_PORT:-29500}"
+
+    data_ip=""
+    if command -v ip >/dev/null 2>&1 && ip -o -4 addr show dev "$iface" >/dev/null 2>&1; then
+      data_ip=$(ip -o -4 addr show dev "$iface" | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    fi
+
+    export SLURM_DATA_IFACE="$iface"
+    export NCCL_SOCKET_IFNAME="$iface"
+    export GLOO_SOCKET_IFNAME="$iface"
+    export TP_SOCKET_IFNAME="$iface"
+    export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
+    export MASTER_PORT="$port"
+
+    if [[ -n "$data_ip" ]]; then
+      export SLURM_DATA_IP="$data_ip"
+      export DDP_LOCAL_DATA_IP="$data_ip"
+    fi
+
+    echo "[ddp-env] iface=$iface data_ip=${data_ip:-<none>} master=${MASTER_ADDR:-<unset>}:${MASTER_PORT}" >&2
+  sample-ddp-job.sh: |
+    #!/usr/bin/env bash
+    # Example usage inside slurm-login:
+    #   sbatch /opt/slurm-runtime/sample-ddp-job.sh
+    # Replace the final python command with the real training entrypoint.
+    # MASTER_ADDR is intentionally left to the submitter so control-plane DNS can
+    # stay stable while collective traffic is pinned to net2.
+    set -euo pipefail
+    source /opt/slurm-runtime/ddp-env.sh
+    export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)}"
+    srun bash -lc 'source /opt/slurm-runtime/ddp-env.sh && env | grep -E "^(MASTER_ADDR|MASTER_PORT|NCCL_SOCKET_IFNAME|GLOO_SOCKET_IFNAME|SLURM_DATA_IP)=" | sort'

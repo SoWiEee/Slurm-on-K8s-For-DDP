@@ -1,0 +1,28 @@
+# Phase 2-E example secondary networks for a single-cluster dual-subnet demo.
+#
+# This file assumes Multus CNI is already installed in the cluster.
+# On a plain kind cluster, these CRDs will not work until Multus is installed.
+# The chosen CNI here is bridge + host-local so the demo can stay inside a single node.
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: slurm-data-net
+  namespace: slurm
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "bridge",
+      "bridge": "slurm-data-br",
+      "isGateway": true,
+      "ipMasq": false,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.20.0/24",
+        "rangeStart": "192.168.20.100",
+        "rangeEnd": "192.168.20.199",
+        "routes": [{"dst": "192.168.20.0/24"}]
+      }
+    }

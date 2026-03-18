@@ -40,6 +40,7 @@ validate_rendered_manifest
 
 REGENERATE_SECRETS="$REGENERATE_SECRETS" phase1/scripts/create-secrets.sh "$NAMESPACE"
 echo "[phase1 bootstrap] applying phase1 manifests..."
+kubectl apply -f phase1/manifests/slurm-ddp-runtime.yaml
 kubectl apply -f phase1/manifests/slurm-static.yaml
 if [[ -f phase1/manifests/slurm-login.yaml ]]; then
   kubectl apply -f phase1/manifests/slurm-login.yaml

@@ -169,6 +169,7 @@ validate_rendered_manifest
 log "creating/applying secrets..."
 REGENERATE_SECRETS="$REGENERATE_SECRETS" phase1/scripts/create-secrets.sh "$NAMESPACE"
 log "applying phase1 manifests..."
+kubectl apply -f phase1/manifests/slurm-ddp-runtime.yaml
 
 # Remove obsolete single-pool resources from older layouts.
 kubectl -n "$NAMESPACE" delete statefulset slurm-worker --ignore-not-found=true >/dev/null 2>&1 || true
