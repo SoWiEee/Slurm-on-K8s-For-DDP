@@ -206,7 +206,7 @@ graph TD
     style SlurmCtld fill:#bbf,stroke:#333,stroke-width:2px
 ```
 
-<img width="2356" height="1288" alt="圖片" src="https://github.com/user-attachments/assets/fcf8602d-5589-4406-864f-85099fcdcc2e" />
+<img width="2604" height="1484" alt="圖片" src="https://github.com/user-attachments/assets/79b3b075-5d92-4545-adbf-89bfc14bbb4f" />
 
 
 - `slurm-controller`：執行 `slurmctld`。
