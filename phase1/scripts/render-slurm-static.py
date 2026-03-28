@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -96,6 +97,25 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Render slurm-static.yaml from worker-pools.json")
+    parser.add_argument(
+        "--with-shared-storage",
+        action="store_true",
+        help="Include /shared NFS volumeMount and PVC volume in all StatefulSets (Phase 3+)",
+    )
+    args = parser.parse_args()
+
+    # Snippets injected into every StatefulSet when --with-shared-storage is set.
+    # The PVC claimName must match what phase3/manifests/shared-storage.yaml creates.
+    shared_vm = (
+        "\n            - name: shared-storage\n              mountPath: /shared"
+        if args.with_shared_storage else ""
+    )
+    shared_vol = (
+        "\n        - name: shared-storage\n          persistentVolumeClaim:\n            claimName: slurm-shared-rwx"
+        if args.with_shared_storage else ""
+    )
+
     cfg = json.loads(CFG.read_text())
     slurm_conf, gres_conf = build_slurm_conf(cfg)
     docs: list[str] = []
@@ -141,7 +161,7 @@ spec:
         cm += "  gres.conf: |\n" + indent(gres_conf.rstrip("\n"), 4) + "\n"
     cm += "---"
     docs.append(cm)
-    docs.append("""apiVersion: apps/v1
+    docs.append(f"""apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: slurm-controller
@@ -197,7 +217,7 @@ spec:
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
-              readOnly: true
+              readOnly: true{shared_vm}
       volumes:
         - name: slurm-config
           configMap:
@@ -216,7 +236,7 @@ spec:
                     - key: id_ed25519
                       path: id_ed25519
                     - key: id_ed25519.pub
-                      path: id_ed25519.pub
+                      path: id_ed25519.pub{shared_vol}
 ---""")
     for pool in cfg["workerPools"]:
         docs.append(f"""apiVersion: apps/v1
@@ -276,7 +296,7 @@ spec:
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
-              readOnly: true
+              readOnly: true{shared_vm}
       volumes:
         - name: slurm-config
           configMap:
@@ -295,7 +315,7 @@ spec:
                     - key: id_ed25519
                       path: id_ed25519
                     - key: id_ed25519.pub
-                      path: id_ed25519.pub
+                      path: id_ed25519.pub{shared_vol}
 ---""")
     OUT.write_text("\n".join(docs).rstrip() + "\n")
     print(f"Rendered {OUT} from {CFG}")

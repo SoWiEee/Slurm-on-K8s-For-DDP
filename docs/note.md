@@ -1515,3 +1515,96 @@ File=/dev/null   # Kind 環境模擬，無真實硬體
 | 是否有 CPU 實體隔離？ | ❌ `TaskPlugin=task/none`，無 binding/cgroup |
 | 同一 worker GPU 能讓兩個 job 共用？ | ❌ 每台只有 1 GPU，整數消耗 |
 | GPU GRES 是真實硬體？ | ❌ `File=/dev/null`，Kind 環境純排程模擬 |
+
+---
+
+## Operator 與部署流程改進（2026-03-28）
+
+本輪針對程式碼品質與可靠性進行三項改進：
+
+### 1. 消除 N+1 kubectl exec（`phase2/operator/main.py`）
+
+**問題：** 每次 poll 週期，`collect_partition_state()` 對每個 pool 分兩次呼叫 `_jobs_by_pool()`（PENDING / RUNNING），每次先用 `squeue -o %i` 取 job ID 清單，再對每個 job 呼叫一次 `scontrol show job -o <id>`。若有 N 個 pending + M 個 running job，三個 pool 共會產生：
+
+```
+6 squeue 呼叫 + (N+M) × scontrol 呼叫
+```
+
+**修正：**
+
+- 新增 `_jobs_by_pool_and_state(partition)`：一次 `squeue -h -t PENDING,RUNNING -o '%i|%T|%N|%f|%b'`，在 Python 端解析並按 pool 分類。
+- 新增 `collect_all_partition_states()`：將相同 partition 的多個 pool（三個 pool 都用 `debug`）合併為一次 squeue 呼叫。
+- `OperatorApp.run()` 改為呼叫 `collect_all_partition_states()` 取代逐個 `collect_partition_state()`。
+
+每個 poll 週期的 exec 呼叫數對比：
+
+| | 修改前 | 修改後 |
+|--|--|--|
+| squeue | 6 | 1 |
+| scontrol show job | N+M（隨 job 數線性增長） | 0 |
+| sinfo | 3 | 3 |
+| statefulset get | 3 | 3 |
+| **合計** | **12 + N + M** | **7（固定）** |
+
+移除的方法：`_job_ids()`、`_jobs_by_pool()`、`get_pending_jobs()`、`get_running_jobs()`。
+
+### 2. Operator Liveness Probe（`phase2/operator/main.py` + `phase2/manifests/slurm-phase2-operator.yaml`）
+
+**問題：** Operator Deployment 沒有 liveness probe，若 polling loop 卡死（如 kubectl exec 無限 hang），K8s 不會自動重啟。
+
+**修正：**
+
+- `main.py`：每次 poll loop 全部完成後執行 `pathlib.Path("/tmp/operator-alive").touch()`（heartbeat）。
+- `slurm-phase2-operator.yaml`：加入 `livenessProbe`，檢查 heartbeat file 是否在 120 秒內有更新（= 8 個 poll 週期的緩衝）。
+  ```yaml
+  livenessProbe:
+    exec:
+      command: ["/bin/sh", "-c", "test -f /tmp/operator-alive && test $(( $(date +%s) - $(stat -c %Y /tmp/operator-alive) )) -lt 120"]
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    failureThreshold: 3
+  ```
+
+### 3. Phase 3 NFS 補丁持久化（跨越多個檔案）
+
+**問題：** 舊做法是由 `bootstrap-phase3.sh` 的 `ensure_mount()` 對已運行的 StatefulSet 做 JSON patch 加上 `/shared` volumeMount。若之後重新執行 `bootstrap-dev.sh`，它會重新 render `slurm-static.yaml`（不含 NFS），再 `kubectl apply` 蓋掉這些 patch，NFS mount 就消失。
+
+**修正：**
+
+**`phase1/scripts/render-slurm-static.py`：**
+- 新增 `--with-shared-storage` flag（`argparse`）。
+- 啟用時，controller 與所有 worker pool StatefulSet 的 template 中都會注入：
+  - `volumeMounts: - name: shared-storage mountPath: /shared`
+  - `volumes: - name: shared-storage persistentVolumeClaim: claimName: slurm-shared-rwx`
+- 生成的 `slurm-static.yaml` 本身就包含 NFS volume，後續任何 `kubectl apply` 都保持一致。
+
+**`scripts/bootstrap-dev.sh`：**
+- render 前先檢查 PVC `slurm-shared-rwx` 是否存在：
+  ```bash
+  if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
+    render_flags+=(--with-shared-storage)
+  fi
+  ```
+- 若 Phase 3 已部署，自動帶入 flag，確保 re-run 也不會遺失 NFS。
+
+**`phase3/scripts/bootstrap-phase3.sh`：**
+- 移除 `ensure_mount()` 函式與所有 `patch` 呼叫（共約 50 行）。
+- 改為 PVC Bound 後直接執行：
+  ```bash
+  python3 phase1/scripts/render-slurm-static.py --with-shared-storage
+  kubectl apply -f phase1/manifests/slurm-static.yaml
+  ```
+- `slurm-static.yaml` 磁碟上的版本更新為含 NFS 的版本，後續所有 bootstrap 都以此為準。
+
+**持久化的完整流程：**
+
+```
+首次 Phase 3 bootstrap
+  → render --with-shared-storage → 更新 slurm-static.yaml
+  → kubectl apply → StatefulSets 含 /shared
+
+重新執行 bootstrap-dev.sh（e.g. 更新 operator 後）
+  → 偵測到 slurm-shared-rwx PVC 存在
+  → render --with-shared-storage → 仍含 /shared
+  → kubectl apply → NFS mount 不遺失
+```

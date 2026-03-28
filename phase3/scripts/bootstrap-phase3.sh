@@ -1,33 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
-jsonpatch_escape() {
-  # Usage: jsonpatch_escape 'string' -> prints JSON-escaped string
-  python3 - <<'PY' "$1"
-import json,sys
-print(json.dumps(sys.argv[1]))
-PY
-}
-
-patch_add_shared_volume() {
-  local kind="$1" name="$2" ns="$3"
-  # Add volume if not present
-  if ! kubectl -n "$ns" get "$kind" "$name" -o jsonpath='{.spec.template.spec.volumes[*].name}' | tr ' ' '
-' | grep -qx 'shared-storage'; then
-    kubectl -n "$ns" patch "$kind" "$name" --type='json' -p='[{"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"shared-storage","persistentVolumeClaim":{"claimName":"slurm-shared-rwx"}}}]'
-  fi
-}
-
-patch_add_shared_mount() {
-  local kind="$1" name="$2" ns="$3" container="$4" mountPath="$5"
-  # Add mount if not present
-  if ! kubectl -n "$ns" get "$kind" "$name" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"$container"'")].volumeMounts[*].mountPath}' 2>/dev/null | tr ' ' '
-' | grep -qx "$mountPath"; then
-    kubectl -n "$ns" patch "$kind" "$name" --type='json' -p='[{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"shared-storage","mountPath":"'"$mountPath"'"}}]'
-  fi
-}
-
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
@@ -108,55 +81,13 @@ while true; do
   sleep 2
 done
 
-# Helper: ensure a volume + volumeMount exist (idempotent) using JSONPatch.
-ensure_mount() {
-  local kind="$1" name="$2" container="$3" vol_name="$4" claim="$5" mnt="$6"
-
-  # Add volume if missing
-  if ! kubectl -n "$NAMESPACE" get "$kind/$name" \
-        -o jsonpath='{range .spec.template.spec.volumes[*]}{.name}{"\n"}{end}' \
-        2>/dev/null | grep -qx "$vol_name"; then
-    local vol_patch
-    vol_patch=$(printf '[{"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"%s","persistentVolumeClaim":{"claimName":"%s"}}}]' \
-      "$vol_name" "$claim")
-    kubectl -n "$NAMESPACE" patch "$kind/$name" --type='json' -p "$vol_patch"
-  fi
-
-  # Find container index (kubectl jsonpath does NOT support $i,$c := ...)
-  local names idx=-1 i=0
-  names="$(kubectl -n "$NAMESPACE" get "$kind/$name" -o jsonpath='{.spec.template.spec.containers[*].name}')"
-  for n in $names; do
-    if [[ "$n" == "$container" ]]; then idx=$i; break; fi
-    i=$((i+1))
-  done
-  if (( idx < 0 )); then
-    echo "Container ${container} not found in ${kind}/${name}. Containers: ${names}" >&2
-    exit 1
-  fi
-
-  # Ensure volumeMounts array exists (some manifests omit it)
-  if ! kubectl -n "$NAMESPACE" get "$kind/$name" \
-        -o jsonpath="{.spec.template.spec.containers[$idx].volumeMounts}" 2>/dev/null | grep -q .; then
-    kubectl -n "$NAMESPACE" patch "$kind/$name" --type='json' \
-      -p "$(printf '[{"op":"add","path":"/spec/template/spec/containers/%s/volumeMounts","value":[]}]' "$idx")"
-  fi
-
-  # Add volumeMount if missing
-  if ! kubectl -n "$NAMESPACE" get "$kind/$name" \
-        -o jsonpath="{.spec.template.spec.containers[$idx].volumeMounts[*].mountPath}" \
-        2>/dev/null | tr ' ' '\n' | grep -qx "$mnt"; then
-    local mnt_patch
-    mnt_patch=$(printf '[{"op":"add","path":"/spec/template/spec/containers/%s/volumeMounts/-","value":{"name":"%s","mountPath":"%s"}}]' \
-      "$idx" "$vol_name" "$mnt")
-    kubectl -n "$NAMESPACE" patch "$kind/$name" --type='json' -p "$mnt_patch"
-  fi
-}
-
-
-ensure_mount statefulset slurm-controller     slurm-controller shared-storage slurm-shared-rwx /shared
-ensure_mount statefulset slurm-worker-cpu     slurm-worker     shared-storage slurm-shared-rwx /shared
-ensure_mount statefulset slurm-worker-gpu-a10 slurm-worker     shared-storage slurm-shared-rwx /shared
-ensure_mount statefulset slurm-worker-gpu-h100 slurm-worker    shared-storage slurm-shared-rwx /shared
+# Regenerate slurm-static.yaml with the /shared NFS volume baked in, then apply it.
+# This is persistent: subsequent bootstrap-dev.sh or bootstrap-phase2.sh re-runs will
+# detect the PVC and call render-slurm-static.py --with-shared-storage automatically,
+# so the NFS mount survives any future kubectl apply of slurm-static.yaml.
+echo "Regenerating slurm-static.yaml with --with-shared-storage..."
+python3 phase1/scripts/render-slurm-static.py --with-shared-storage
+kubectl apply -f phase1/manifests/slurm-static.yaml
 
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"

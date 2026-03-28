@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -230,21 +231,39 @@ class ClusterStateCollector:
                 return pool
         return None
 
-    def _job_ids(self, partition: str, states: str) -> list[str]:
-        output = self.client.exec_in_controller(f"squeue -h -p {partition} -t {states} -o %i || true")
-        return [line.strip() for line in output.splitlines() if line.strip()]
+    def _jobs_by_pool_and_state(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
+        """Fetch all PENDING and RUNNING jobs for a partition in a single squeue call.
 
-    def _jobs_by_pool(self, partition: str, states: str) -> dict[str, list[dict[str, str]]]:
-        result = {p.worker_statefulset: [] for p in self.partition_cfgs if p.partition == partition}
-        for job_id in self._job_ids(partition, states):
-            line = self.client.exec_in_controller(f"scontrol show job -o {job_id} || true")
+        Returns {worker_statefulset: {"PENDING": [...], "RUNNING": [...]}}.
+        Fields per job: NodeList, Features, TresPerNode — enough for pool classification.
+        """
+        output = self.client.exec_in_controller(
+            f"squeue -h -p {partition} -t PENDING,RUNNING -o '%i|%T|%N|%f|%b' || true"
+        )
+        result: dict[str, dict[str, list[dict[str, str]]]] = {
+            p.worker_statefulset: {"PENDING": [], "RUNNING": []}
+            for p in self.partition_cfgs
+            if p.partition == partition
+        }
+        for line in output.splitlines():
+            line = line.strip()
             if not line:
                 continue
-            fields = self._parse_kv_line(line)
+            parts = line.split("|", 4)
+            if len(parts) < 5:
+                continue
+            _jobid, state, nodelist, features, tres_per_node = parts
+            fields = {
+                "NodeList": nodelist,
+                "Features": features,
+                "TresPerNode": tres_per_node,
+            }
             pool = self._classify_job(fields)
             if pool is None:
                 continue
-            result.setdefault(pool.worker_statefulset, []).append(fields)
+            bucket = result.setdefault(pool.worker_statefulset, {"PENDING": [], "RUNNING": []})
+            if state in ("PENDING", "RUNNING"):
+                bucket[state].append(fields)
         return result
 
     def get_current_replicas(self, statefulset: str) -> int:
@@ -253,14 +272,6 @@ class ClusterStateCollector:
         )
         payload = json.loads(output)
         return int(payload.get("spec", {}).get("replicas", 0))
-
-    def get_pending_jobs(self, partition_cfg: PartitionConfig) -> int:
-        jobs = self._jobs_by_pool(partition_cfg.partition, "PENDING")
-        return len(jobs.get(partition_cfg.worker_statefulset, []))
-
-    def get_running_jobs(self, partition_cfg: PartitionConfig) -> int:
-        jobs = self._jobs_by_pool(partition_cfg.partition, "RUNNING")
-        return len(jobs.get(partition_cfg.worker_statefulset, []))
 
     def get_busy_nodes(self, partition_cfg: PartitionConfig) -> int:
         prefix = partition_cfg.worker_statefulset
@@ -282,14 +293,43 @@ class ClusterStateCollector:
         return None if age < 0 else age
 
     def collect_partition_state(self, p: PartitionConfig) -> PartitionState:
+        jobs = self._jobs_by_pool_and_state(p.partition)
+        pool_jobs = jobs.get(p.worker_statefulset, {"PENDING": [], "RUNNING": []})
         return PartitionState(
             partition=p.partition,
             worker_statefulset=p.worker_statefulset,
             current_replicas=self.get_current_replicas(p.worker_statefulset),
-            pending_jobs=self.get_pending_jobs(p),
-            running_jobs=self.get_running_jobs(p),
+            pending_jobs=len(pool_jobs["PENDING"]),
+            running_jobs=len(pool_jobs["RUNNING"]),
             busy_nodes=self.get_busy_nodes(p),
         )
+
+    def collect_all_partition_states(self) -> dict[str, PartitionState]:
+        """Collect state for all pools with minimal squeue calls.
+
+        Jobs are fetched once per unique partition name, so pools that share a
+        partition (e.g. all three pools using 'debug') only trigger one squeue
+        exec instead of one per pool.
+        """
+        jobs_by_partition: dict[str, dict[str, dict[str, list[dict[str, str]]]]] = {
+            partition: self._jobs_by_pool_and_state(partition)
+            for partition in {p.partition for p in self.partition_cfgs}
+        }
+        return {
+            p.worker_statefulset: PartitionState(
+                partition=p.partition,
+                worker_statefulset=p.worker_statefulset,
+                current_replicas=self.get_current_replicas(p.worker_statefulset),
+                pending_jobs=len(
+                    jobs_by_partition[p.partition].get(p.worker_statefulset, {}).get("PENDING", [])
+                ),
+                running_jobs=len(
+                    jobs_by_partition[p.partition].get(p.worker_statefulset, {}).get("RUNNING", [])
+                ),
+                busy_nodes=self.get_busy_nodes(p),
+            )
+            for p in self.partition_cfgs
+        }
 
 
 class CheckpointAwareQueuePolicy:
@@ -392,10 +432,11 @@ class OperatorApp:
             partitions=[asdict(p) for p in self.partition_cfgs],
         )
         while True:
+            all_states = self.collector.collect_all_partition_states()
             for partition_cfg in self.partition_cfgs:
                 key = partition_cfg.worker_statefulset
                 try:
-                    state = self.collector.collect_partition_state(partition_cfg)
+                    state = all_states[key]
                     checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
                     decision = self.policy.evaluate(partition_cfg, state, checkpoint_age)
 
@@ -477,6 +518,7 @@ class OperatorApp:
                         )
                 except Exception as exc:  # noqa: BLE001
                     self.logger.emit("error", level="ERROR", partition=partition_cfg.partition, statefulset=key, message=str(exc))
+            pathlib.Path("/tmp/operator-alive").touch()
             time.sleep(self.cfg.poll_interval)
 
 

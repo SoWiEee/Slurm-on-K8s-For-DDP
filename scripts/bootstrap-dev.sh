@@ -148,8 +148,13 @@ kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 
 log "rendering phase1 manifests (if generator exists)..."
 if [[ -f phase1/scripts/render-slurm-static.py ]]; then
+  render_flags=()
+  if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
+    render_flags+=(--with-shared-storage)
+    log "phase3 NFS PVC detected — rendering with shared storage"
+  fi
   render_rc=0
-  python3 phase1/scripts/render-slurm-static.py || render_rc=$?
+  python3 phase1/scripts/render-slurm-static.py "${render_flags[@]}" || render_rc=$?
   if [[ ! -s phase1/manifests/slurm-static.yaml ]]; then
     echo "[dev bootstrap] ERROR: render script failed and phase1/manifests/slurm-static.yaml is missing or empty" >&2
     exit "${render_rc:-1}"
