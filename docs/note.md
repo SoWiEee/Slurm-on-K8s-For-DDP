@@ -1311,3 +1311,207 @@ Slurm 的 CPU management 文件就是沿著這條路設計的。citeturn99
 - **CPU worker：目前在隔離與可預測性上還不夠完整。**
 - **GPU worker：目前不應視為可共享；預設應視為單 job 獨占 GPU。**
 - **在 kind 裡，這些驗證應被視為控制流與資源語意驗證，不應過度解讀成真實裸機效能結論。**
+
+---
+
+## Phase 3 — 共享儲存與 sbatch 輸出調查（2026-03-28）
+
+### 背景問題
+
+確認 Phase 1/2 完成後，使用者是否可以從 Login Pod 提交 `sbatch` 並取回輸出檔案（`*.out`、`*.err`）？
+
+### Phase 1/2 的限制分析
+
+`slurm-login.yaml`（Phase 1/2 版本）的 volumeMounts 只有：
+
+```
+/etc/slurm           ← ConfigMap（唯讀）
+/slurm-secrets       ← Secret（唯讀）
+/opt/slurm-runtime-src ← ConfigMap（唯讀）
+```
+
+Worker pods 同樣**沒有任何共享可寫 Volume**。
+
+Slurm 預設將 `slurm-<JOBID>.out` 寫到 `$SLURM_SUBMIT_DIR`，但 job 是在 worker pod 上執行的，worker 的本機 ephemeral 檔案系統與 login pod 完全隔離。因此：
+
+- `srun`（互動式）：stdout 透過 Slurm I/O forwarding 回傳，**可用**。
+- `sbatch`：job 成功提交與執行，但輸出檔案寫在 worker 的本機磁碟，login pod **看不到**。
+
+verify-dev.sh 的 smoke test 刻意使用 `sleep N` job，迴避了這個問題。
+
+### Phase 3 實作現況
+
+Phase 3 **已完成實作**，並非只有設計：
+
+| 檔案 | 內容 |
+|------|------|
+| `phase3/scripts/setup-nfs-server.sh` | 在 Windows 11 主機上建立 NFS Server（`/srv/nfs/k8s`） |
+| `phase3/manifests/nfs-subdir-provisioner.tmpl.yaml` | NFS subdir external provisioner Deployment（需替換 `__NFS_SERVER__` / `__NFS_PATH__`） |
+| `phase3/manifests/shared-storage.yaml` | StorageClass `slurm-shared-nfs` + PVC `slurm-shared-rwx`（20Gi RWX） |
+| `phase3/scripts/bootstrap-phase3.sh` | 部署 provisioner → 建立 PVC → patch controller/worker/login 加入 `/shared` mount |
+| `phase3/scripts/verify-phase3.sh` | 驗證 PVC Bound + `/shared` 掛載在所有 pod 上 |
+| `phase3/scripts/verify-phase3-e2e.sh` | **完整 e2e 測試**：login 提交 `sbatch -o /shared/out-%j.txt`，等待完成，從 login 讀回輸出驗證 |
+
+Phase 3 部署後，`/shared` 以 ReadWriteMany 方式同時掛載到：
+- `slurm-controller-0`
+- `slurm-worker-0`（以及所有副本）
+- `slurm-login`
+
+使用者只需在 job script 加入：
+
+```bash
+#SBATCH --output=/shared/out-%j.txt
+#SBATCH --error=/shared/err-%j.txt
+```
+
+job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出。
+
+### 已知的 Phase 2 + Phase 3 整合缺口
+
+`bootstrap-phase3.sh` 目前只 patch Phase 1 的單一 worker StatefulSet：
+
+```bash
+ensure_mount statefulset slurm-controller  slurm-controller  ...
+ensure_mount statefulset slurm-worker      slurm-worker      ...   ← Phase 1 名稱
+```
+
+Phase 2 引入多節點池後，worker StatefulSet 名稱已改為：
+- `slurm-worker-cpu`
+- `slurm-worker-gpu-a10`
+- `slurm-worker-gpu-h100`
+
+所以 **Phase 3 bootstrap 跑完後，GPU worker pods 不會掛載 `/shared`**，提交到 GPU pool 的 job 無法寫輸出到共享路徑。
+
+另外，`phase3/manifests/shared-storage.yaml` 重新定義了 `slurm-login` Deployment，但遺漏了 Phase 2-E 加入的 `slurm-ddp-runtime` volume mount。若先部署 Phase 2-E 再部署 Phase 3，login pod 會失去 DDP runtime 環境變數。
+
+### Phase 3 後續計畫
+
+#### 修正：bootstrap-phase3.sh 補齊多節點池
+
+在 `ensure_mount` 呼叫後補上 Phase 2 的三個 pool：
+
+```bash
+ensure_mount statefulset slurm-worker-cpu     slurm-worker  shared-storage slurm-shared-rwx /shared
+ensure_mount statefulset slurm-worker-gpu-a10 slurm-worker  shared-storage slurm-shared-rwx /shared
+ensure_mount statefulset slurm-worker-gpu-h100 slurm-worker shared-storage slurm-shared-rwx /shared
+```
+
+（需先確認每個 StatefulSet 的 container name）
+
+#### 修正：shared-storage.yaml 保留 DDP runtime volume
+
+`slurm-login` Deployment 的 volumes 應補回：
+
+```yaml
+- name: slurm-ddp-runtime
+  configMap:
+    name: slurm-ddp-runtime
+    defaultMode: 0755
+```
+
+以及對應 `volumeMounts`。
+
+或者改為：`bootstrap-phase3.sh` 不重新 apply 完整 Deployment YAML，改用 `ensure_mount` 的 JSON patch 方式把 shared-storage volume 加進現有的 login deployment，避免覆蓋 Phase 2 已有的設定。
+
+#### verify-phase3-e2e.sh 補齊多節點池驗證
+
+目前 e2e 測試使用 `WORKER_STS=slurm-worker`（預設），需要加入對 `slurm-worker-cpu` 的顯式支援。在 Phase 2+3 整合後，驗證腳本應傳入：
+
+```bash
+WORKER_STS=slurm-worker-cpu bash phase3/scripts/verify-phase3-e2e.sh
+```
+
+#### 部署順序建議
+
+在 Phase 2 + Phase 3 同時啟用時，建議部署順序為：
+
+```
+1. bash scripts/bootstrap-dev.sh          # Phase 1 + Phase 2
+2. sudo bash phase3/scripts/setup-nfs-server.sh  # 主機端 NFS（一次性）
+3. NFS_SERVER=<ip> bash phase3/scripts/bootstrap-phase3.sh
+4. bash phase3/scripts/verify-phase3.sh
+5. WORKER_STS=slurm-worker-cpu bash phase3/scripts/verify-phase3-e2e.sh
+```
+
+---
+
+## CPU / GPU 資源分配與多 Job 共用調查（2026-03-28）
+
+### 背景問題
+
+1. Job 是否能指定要用多少 CPU 和 GPU？
+2. 一台 worker 的 CPU cores 是否能同時給兩個不同的 job 使用？
+3. GPU 是否能被多個 job 共用？
+
+### 相關設定（slurm-static.yaml / slurm.conf）
+
+```
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core
+TaskPlugin=task/none
+GresTypes=gpu
+```
+
+每台 worker 節點宣告：
+```
+CPUs=4  Sockets=1  CoresPerSocket=2  ThreadsPerCore=2  RealMemory=3500
+```
+
+GPU worker 額外宣告（gres.conf）：
+```
+Gres=gpu:a10:1   # A10 pool，每台 1 張
+Gres=gpu:h100:1  # H100 pool，每台 1 張
+File=/dev/null   # Kind 環境模擬，無真實硬體
+```
+
+### Job 指定資源的方式
+
+標準 Slurm 旗標均支援：
+
+```bash
+# CPU
+#SBATCH --cpus-per-task=2   # 每個 task 要 2 cores
+#SBATCH --ntasks=4          # 4 個 task（共 8 cores）
+
+# GPU
+#SBATCH --gres=gpu:a10:1    # 要 1 張 A10
+#SBATCH --constraint=gpu-a10
+```
+
+### CPU 多 Job 共用分析
+
+`select/cons_tres` + `SelectTypeParameters=CR_Core` 啟用 **Consumable Resources 模式**，Slurm 以 core 為單位追蹤每台節點的資源消耗。每台 CPU worker 有 4 個可分配 CPU slot，可同時排入多個 job：
+
+| Job A | Job B | 同一 worker 可行？ |
+|-------|-------|------------------|
+| `--cpus-per-task=2` | `--cpus-per-task=2` | ✅ 各佔 2 cores，合計 4 |
+| `--cpus-per-task=3` | `--cpus-per-task=2` | ❌ 超過 4 cores，排到不同 worker |
+| `--cpus-per-task=4` | 任意 | ❌ 整台 worker 被佔滿 |
+
+**結論：排程語意層面可以做到 CPU packing（多 job 共用同一 worker）。**
+
+### GPU 多 Job 共用分析
+
+每台 GPU worker 只宣告 `Gres=gpu:a10:1`（1 張）。GRES 是整數消耗，無分數分配。
+
+- Job A 請求 `--gres=gpu:a10:1` → 佔用整張 GPU
+- Job B 同樣請求 → 必須等 A 結束，或排到另一台 worker
+
+**結論：GPU 不支援多 Job 共用，每台 worker 同時只能跑一個 GPU job。**
+
+### 重要限制：TaskPlugin=task/none
+
+`TaskPlugin=task/none` 代表 Slurm 只在**排程計算層面**追蹤 core 數量，但不執行任何 CPU binding 或 cgroup 隔離。兩個 job 被排到同一 worker 後，OS 層面的 process 可跑在任意 CPU 上，沒有強制 pinning。
+
+在真實 HPC 環境通常改為 `TaskPlugin=task/cgroup` 來強制隔離。但在本 Kind/Docker 環境中，cgroup 設定會疊加在 K8s / container runtime 的抽象之上，只適合驗證排程控制流，不適合測試效能隔離。
+
+### 調查結論
+
+| 問題 | 結果 |
+|------|------|
+| Job 能指定 CPU 數量？ | ✅ `--cpus-per-task`、`--ntasks` |
+| Job 能指定 GPU 數量？ | ✅ `--gres=gpu:a10:1` |
+| 同一 worker CPU 能讓兩個 job 共用？ | ✅ 排程層面可以（`CR_Core` consumable） |
+| 是否有 CPU 實體隔離？ | ❌ `TaskPlugin=task/none`，無 binding/cgroup |
+| 同一 worker GPU 能讓兩個 job 共用？ | ❌ 每台只有 1 GPU，整數消耗 |
+| GPU GRES 是真實硬體？ | ❌ `File=/dev/null`，Kind 環境純排程模擬 |
