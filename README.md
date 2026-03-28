@@ -2,35 +2,114 @@
 
 Adaptive HPC Scheduling on Cloud Native Infrastructure
 
-基於 Kubernetes 的彈性 Slurm 架構，目標是把 Slurm 的 HPC 批次排程能力帶到雲端原生環境，並逐步支援分散式 AI 訓練、共享儲存、自動擴縮與故障恢復。
+> 把 HPC 排程器搬進 Kubernetes，讓 AI 訓練任務既能用 Slurm 的精準資源管理，又能享受雲端的彈性伸縮。
 
-# 🔥 Motivation
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 
-隨著深度學習模型規模持續成長，分散式訓練逐漸成為常態。Kubernetes 擅長彈性資源供給，但預設排程器不擅長 HPC workload；Slurm 擅長批次排程，但典型部署多半偏靜態、缺乏雲端原生彈性。
+---
 
-本專案的核心問題是：
+## 🔥 Motivation
 
-**能不能把 Slurm 的 HPC 排程能力放進 Kubernetes，並進一步支援動態節點、共享儲存、checkpoint-aware autoscaling，以及 DDP workload 的故障恢復。**
+如果你曾經跑過分散式 AI 訓練，你大概有過這樣的經驗：
 
-# ✨ Features
+- 租了 8 張 GPU，但模型訓練只用了一半，剩下的資源就這樣閒著。
+- 任務跑到一半節點掛掉，checkpoint 沒存好，重頭來過。
+- 想擴充節點，卻要等管理員手動改設定。
 
-- ✅ **Phase 1 已完成**：可在 Kind 上部署靜態 Slurm Controller + Login + Worker 叢集。
-- ✅ **Phase 1 強化完成**：修正 Munge/SSH/ConfigMap 掛載、`NodeAddr`/`NodeHostname`、bootstrap/verify 穩定性。
-- ✅ **Phase 2 已完成**：新增 Python Elastic Operator，支援 `Pending Job -> Scale Up` 與 `Idle Node -> Scale Down`。
-- ✅ **Phase 2-A 已完成**：完成 operator 等價重構，將資料蒐集、決策、執行拆層。
-- ✅ **Phase 2-B 已完成**：完成結構化日誌，支援 `startup` / `loop_observation` / `scale_action` / `scale_skipped` / `error` 事件輸出。
-- ✅ **Phase 2-C 已完成**：完成 multi-pool / partition-aware autoscaling，支援 CPU / GPU worker pool 獨立擴縮。
-- ✅ **Phase 2-D 已完成**：完成 checkpoint-aware scale-down guard，避免執行中工作在 checkpoint 狀態未知時被過早縮容。
-- ✅ **Dev workflow 已補強**：`scripts/bootstrap-dev.sh` 與 `scripts/verify-dev.sh` 可覆蓋目前 Phase 1 + Phase 2 開發驗證流程。
-- ✅ **GPU pool smoke test 已納入 verify**：`verify-dev.sh` 會驗證 CPU pool 與 GPU pool 的基本 scale-up / execute / scale-down 行為。
+這些問題的根源在於：**現有工具在「資源彈性」和「排程精準度」之間做了取捨。**
 
-# 🚀 Getting Started
+| 工具 | 擅長 | 不擅長 |
+|------|------|--------|
+| *ubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意 |
+| Slurm | 批次排程、CPU/GPU 精準分配、叢集治理 | 動態節點、雲端彈性、容錯恢復 |
 
-> 適用環境：Windows 11 + Docker Desktop + kind + kubectl
+本專案的目標很直接：**讓兩者合作**。把 Slurm 跑在 Kubernetes 上，用 Kubernetes 的彈性支撐 Slurm 的排程能力，並在此基礎上實作 AI 訓練所需的共享儲存與 checkpoint 容錯。
 
-## 1. 前置檢查
+---
 
-請先確認 Docker Desktop 已啟動，並可在終端機執行：
+## 🔄 System Architecture
+
+用一句話說：**你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。**
+
+稍微展開一點：
+
+1. 使用者登入 Login Pod，用熟悉的 `sbatch` 指令提交訓練任務。
+2. Elastic Operator 偵測到有 pending job，自動擴充對應的 worker 節點（CPU / GPU-A10 / GPU-H100 各自獨立管理）。
+3. 訓練結果存在所有節點都能讀寫的 NFS 共享磁碟（`/shared`）。
+4. 任務結束後，Operator 確認節點閒置且 checkpoint 安全，才把資源縮回去。
+
+```
+使用者 → sbatch → Slurm Controller → 排程到 Worker Pod
+                        ↑
+              Elastic Operator（Python）
+              偵測 Queue → 擴 / 縮 Worker StatefulSet
+```
+
+---
+
+## 系統架構
+
+```mermaid
+graph TD
+    User["使用者\n(sbatch / srun)"] --> Login["Login Pod"]
+    Login --> SlurmCtld["Slurm Controller\n(StatefulSet)"]
+
+    subgraph "Kubernetes Cluster (Kind)"
+        SlurmCtld
+        Operator["Elastic Operator\n(Python)"]
+
+        subgraph "Worker Pools（動態伸縮）"
+            CPU["slurm-worker-cpu\n(min=1, max=4)"]
+            A10["slurm-worker-gpu-a10\n(min=0, max=4)"]
+            H100["slurm-worker-gpu-h100\n(min=0, max=4)"]
+        end
+
+        NFS["共享儲存 /shared\n(NFS + RWX PVC)"]
+    end
+
+    Operator -->|"監聽 Queue\n決定 replicas"| SlurmCtld
+    Operator -->|kubectl patch| CPU
+    Operator -->|kubectl patch| A10
+    Operator -->|kubectl patch| H100
+    CPU & A10 & H100 -->|掛載| NFS
+    Login -->|讀取輸出| NFS
+
+    style Operator fill:#f9f,stroke:#333,stroke-width:2px
+    style SlurmCtld fill:#bbf,stroke:#333,stroke-width:2px
+    style NFS fill:#bfb,stroke:#333,stroke-width:2px
+```
+
+<img width="2604" height="1484" alt="System Overview" src="https://github.com/user-attachments/assets/79b3b075-5d92-4545-adbf-89bfc14bbb4f" />
+
+### 主要元件說明
+
+| 元件 | 角色 |
+|------|------|
+| `slurm-controller` | 執行 `slurmctld`，負責所有排程決策 |
+| `slurm-login` | 使用者入口，提供 `sbatch`、`srun`、`squeue` 等指令 |
+| `slurm-worker-*` | 實際執行計算的節點，分 CPU / GPU-A10 / GPU-H100 三個池 |
+| `slurm-elastic-operator` | 自製 Python Operator，監控 Queue 狀態並動態調整各 pool 的 replicas |
+| NFS + RWX PVC | 跨所有節點的共享磁碟，job 輸出直接寫入 `/shared` |
+
+---
+
+## 📘 Development Progress
+
+| Phase | 狀態 | 內容 |
+|-------|------|------|
+| **Phase 1**：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge/SSH 認證，靜態節點預宣告 |
+| **Phase 2**：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
+| **Phase 2-E**：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
+| **Phase 3**：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
+| **Phase 4**：評估與報告 | ⏳ 進行中 | 量測 provisioning latency、recovery time、resource efficiency |
+
+---
+
+## 🚀 Getting Started
+
+> 環境需求：Windows 11 + Docker Desktop + Kind + kubectl
+
+### 1. 確認工具已安裝
 
 ```bash
 docker version
@@ -38,289 +117,164 @@ kind version
 kubectl version --client
 ```
 
-## 2. 一鍵部署與驗證目前開發版本
-
-### 2.1 整合部署
-
-在專案根目錄執行：
+### 2. 一鍵部署（Phase 1 + Phase 2）
 
 ```bash
 bash scripts/bootstrap-dev.sh
-# 指定 context
-# KUBE_CONTEXT=kind-slurm-lab bash scripts/bootstrap-dev.sh
-# 慢機器可提高 rollout timeout
-# ROLLOUT_TIMEOUT=600s bash scripts/bootstrap-dev.sh
-# 需要完全重建時
-# FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh
 ```
 
-這支腳本目前會完成：
+這支腳本會自動完成：建立 Kind 叢集 → 建置 Docker image → 套用所有 manifest → 啟動 Elastic Operator → 設定三個 worker pool 的初始 replica 數。
 
-1. Kind/context 與工具檢查。
-2. Phase 1 image build/load、secrets、manifest apply、rollout 檢查。
-3. Phase 2 operator image build/load、manifest apply。
-4. 強制補齊 operator runtime env，包含 `PARTITIONS_JSON`、`OPERATOR_LAYOUT_VERSION` 等 multi-pool 設定。
-5. 初始化 worker pool 狀態：CPU baseline 保留 1 個，GPU pool 預設縮為 0，方便觀察自動擴縮。
+> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap-dev.sh`
+> 需要完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh`
 
-### 2.2 整合驗證
+### 3. 驗證部署
 
 ```bash
 bash scripts/verify-dev.sh
-# 指定 context
-# KUBE_CONTEXT=kind-slurm-lab bash scripts/verify-dev.sh
-# 放寬觀察時間
-# VERIFY_TIMEOUT_SECONDS=240 bash scripts/verify-dev.sh
 ```
 
-目前 `verify-dev.sh` 會執行：
+驗證流程包含：Pod readiness → Slurm controller ping → CPU pool sbatch smoke test → CPU pool 自動擴縮 → GPU pool 路由驗證。
+看到 `[dev verify] done. phase1 + phase2 checks passed.` 就代表一切正常。
 
-1. 核心 Pod readiness 檢查。
-2. Slurm client warm-up 與 controller ping。
-3. 單節點 `srun` smoke test。
-4. CPU pool `sbatch` smoke test。
-5. CPU pool scale-up / scale-down 驗證。
-6. GPU pool smoke test，確認 GPU constraint / GRES 會導向 `slurm-worker-gpu-a10`，並在工作完成後縮回 0。
-
-若最終看到：
-
-```text
-[dev verify] done. phase1 + phase2 checks passed.
-```
-
-代表目前開發版的 Phase 1 與 Phase 2 主路徑已通過驗證。
-
-## 3. 階段性部署與驗證
-
-### Phase 1
-
-部署：
+### 4. 部署共享儲存（Phase 3）
 
 ```bash
-bash phase1/scripts/bootstrap-phase1.sh
-```
-
-驗證：
-
-```bash
-bash phase1/scripts/verify-phase1.sh
-```
-
-### Phase 2
-
-部署：
-
-```bash
-bash phase2/scripts/bootstrap-phase2.sh
-```
-
-驗證：
-
-```bash
-bash phase2/scripts/verify-phase2.sh
-```
-
-### Phase 3
-
-目前 README 保留原本的 Shared Storage / Application Integration 規劃，但依目前實際開發進度，`Phase 2-A ~ Phase 2-D` 屬於 **Phase 2 底下的細分里程碑**，不是 Shared Storage 的內容。
-
-若要部署 NFS / RWX PVC 流程，可參考既有 Phase 3 指令：
-
-```bash
+# 主機端 NFS server（只需執行一次）
 sudo bash phase3/scripts/setup-nfs-server.sh
+
+# 部署 NFS provisioner + 掛載到所有 pod
 NFS_SERVER=<your-ip> NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+
+# 驗證
 bash phase3/scripts/verify-phase3.sh
 bash phase3/scripts/verify-phase3-e2e.sh
 ```
 
-# 🔄 System Architecture
-
-本專案採用「Slurm control plane in Kubernetes + 自製 elastic operator」的設計：
-
-```mermaid
-graph TD
-    User[使用者] -->|提交 sbatch| SlurmCtld["Slurm Controller (StatefulSet)"]
-    
-    subgraph "Kubernetes Cluster (Kind)"
-        SlurmCtld
-        Operator["Elastic Slurm Operator (Python/Kopf)"]
-        
-        subgraph "Data Plane (Dynamic)"
-            Worker1["Slurm Worker Pod 1"]
-            Worker2["Slurm Worker Pod 2"]
-            Worker3["Slurm Worker Pod 3"]
-        end
-        
-        SharedVol["Shared Storage (NFS/PVC)"]
-    end
-
-    Operator -->|監控 Pending Jobs| SlurmCtld
-    Operator -->|動態擴展 Replicas| Worker1
-    Worker1 -->|掛載| SharedVol
-    Worker2 -->|掛載| SharedVol
-    
-    style Operator fill:#f9f,stroke:#333,stroke-width:2px
-    style SlurmCtld fill:#bbf,stroke:#333,stroke-width:2px
-```
-
-<img width="2356" height="1288" alt="圖片" src="https://github.com/user-attachments/assets/fcf8602d-5589-4406-864f-85099fcdcc2e" />
-
-
-- `slurm-controller`：執行 `slurmctld`。
-- `slurm-login`：提供 `sbatch/srun/squeue/sinfo` 等入口。
-- `slurm-worker-*`：對應 Slurm node，採多 pool 形式管理。
-- `slurm-elastic-operator`：讀取 queue / node 狀態，決定各 pool 的 replicas。
-
-目前資料面已發展成 **multi-pool worker layout**：
-
-- `slurm-worker-cpu`
-- `slurm-worker-gpu-a10`
-- `slurm-worker-gpu-h100`
-
-其中 autoscaling 由 `PARTITIONS_JSON` 描述各 pool 的：
-
-- `worker_statefulset`
-- `min_replicas` / `max_replicas`
-- `scale_up_step` / `scale_down_step`
-- `scale_down_cooldown`
-- `match_features`
-- `match_gres`
-- `fallback`
-
-# 🧱 Tech Stack
-
-基礎設施與環境
-
-- OS：Windows 11
-- Container Runtime：Docker Desktop
-- Orchestration：Kubernetes via Kind
-- Scheduler：Slurm
-- Authentication：Munge
-- Operator：Python
-- Shared Storage：NFS + `nfs-subdir-external-provisioner`（Phase 3 規劃與實作路徑保留）
-
-# 📘 Development Progress
-
-> 詳細踩坑、debug 筆記與設計演進請看 `docs/note.md`
-
-## Phase 1：基礎架構
-
-- 建置 Slurm Controller / Worker image。
-- 在 Kind 上部署靜態 Slurm 叢集。
-- 修正 Pod 間 SSH、Munge、ConfigMap/Secret 掛載、FQDN 解析等問題。
-- 補齊 `bootstrap` / `verify` 腳本。
-
-## Phase 2：Elastic Operator
-
-### Phase 2 核心
-
-- 完成 `Pending Job -> Scale Up`。
-- 完成 `Idle Node -> Scale Down`。
-- 完成 `bootstrap-dev.sh` / `verify-dev.sh` 開發工作流。
-
-### Phase 2-A：Operator 架構重構
-
-- 將 operator 分成 state collector / policy / actuator。
-- 以 dataclass 管理 `ClusterState` / `ScalingDecision`。
-- 保持既有策略等價，先追求可維護性。
-
-### Phase 2-B：結構化日誌
-
-- 導入 JSON line log。
-- 補齊 `startup`、`loop_observation`、`scale_action`、`scale_skipped`、`error`。
-- 方便後續做 latency、抖動、恢復時間分析。
-
-### Phase 2-C：Multi-pool / Partition-aware Autoscaling
-
-- 引入 `PARTITIONS_JSON`。
-- 支援 CPU / GPU pool 各自 scale。
-- 支援 `match_features` / `match_gres` / `fallback`，讓不同工作可導向不同節點池。
-- 目前 dev verify 已驗證 `slurm-worker-gpu-a10` smoke path。
-
-### Phase 2-D：Checkpoint-aware Scale-down Guard
-
-- 當 queue 清空但仍有執行中工作時，checkpoint 狀態未知可阻擋縮容。
-- 支援 `CHECKPOINT_GUARD_ENABLED`、`CHECKPOINT_PATH`、`MAX_CHECKPOINT_AGE_SECONDS`。
-- 為 Phase 3 的 DDP / resume / requeue 奠定基礎。
-
-## Phase 3：Shared Storage + 應用整合與容錯
-
-- ✅ 在 Kind 單機環境部署 NFS Server 與 `nfs-subdir-external-provisioner` 的路徑已建立。
-- ✅ 建立 StorageClass 與 RWX PVC 的流程已建立。
-- ✅ 將 Controller / Worker / Login Pod 掛載共享 NFS 的流程已建立。
-- ⏳ 待完成 PyTorch DDP CPU workload、checkpoint heartbeat、resume、`--requeue`、故障恢復量測。
-
-## Phase 4：評估與優化
-
-- 收集 provisioning latency / recovery time / scheduling overhead。
-- 撰寫技術報告與整理論文素材。
-
-# 🛠️ Usage Notes
-
-## 1. 目前開發版的重點
-
-目前最穩定、最常用的是：
-
-- `scripts/bootstrap-dev.sh`
-- `scripts/verify-dev.sh`
-
-因為它們已經把目前的 Phase 1 + Phase 2 開發修正整合起來，尤其包含：
-
-- create-secrets 與 namespace 問題修補
-- operator env 強制覆蓋
-- multi-pool layout 驗證
-- GPU smoke job 驗證
-- Slurm warm-up / flaky query retry
-
-## 2. 常用指令
-
-查看 Pod 狀態：
-
-```bash
-kubectl -n slurm get pods -o wide
-```
-
-查看 operator 日誌：
-
-```bash
-kubectl -n slurm logs deployment/slurm-elastic-operator -f
-```
-
-查看 controller 日誌：
-
-```bash
-kubectl -n slurm logs statefulset/slurm-controller -f
-```
-
-查看 worker pool 伸縮：
-
-```bash
-kubectl -n slurm get statefulset -w
-```
-
-## 3. 清理環境
+### 清理環境
 
 ```bash
 kind delete cluster --name slurm-lab
 ```
 
-# 📊 Evaluation Metrics
+---
 
-本研究預計觀察以下指標：
+## 提交一個 Job 長什麼樣子？
+
+部署完成後，你可以直接 `kubectl exec` 進 login pod 提交任務：
+
+```bash
+kubectl -n slurm exec -it deploy/slurm-login -- bash
+```
+
+寫一個簡單的 job script：
+
+```bash
+cat > /shared/my-job.sbatch << 'EOF'
+#!/bin/bash
+#SBATCH -J my-first-job
+#SBATCH -p debug
+#SBATCH -N 1
+#SBATCH --cpus-per-task=2
+#SBATCH -o /shared/out-%j.txt
+#SBATCH -e /shared/err-%j.txt
+
+echo "Hello from $(hostname)"
+echo "I have $SLURM_CPUS_ON_NODE CPUs"
+sleep 10
+EOF
+
+sbatch /shared/my-job.sbatch
+```
+
+提交後查看狀態，等任務完成再讀取輸出：
+
+```bash
+squeue                          # 查看 queue
+cat /shared/out-<JOBID>.txt     # 讀取輸出（從任何 pod 都能讀）
+```
+
+GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應的 GPU worker 擴充起來：
+
+```bash
+#SBATCH --constraint=gpu-a10
+#SBATCH --gres=gpu:a10:1
+```
+
+---
+
+## 資源分配說明
+
+每台 worker 宣告 `CPUs=4`，採 `select/cons_tres + CR_Core` 消耗式資源模式：
+
+- **CPU：** 多個 job 可以共用同一台 worker（例如兩個各要 2 cores 的 job 會排進同一台 4 cores 的 worker）。
+- **GPU：** 每台 GPU worker 只有 1 張 GPU，為整數消耗，不支援分時共用。
+
+> 注意：目前使用 `TaskPlugin=task/none`，排程層面追蹤 core 數量，但不強制 CPU binding / cgroup 隔離。這在 Kind/Docker 環境下足以驗證排程控制流，但不適合做效能基準測試。
+
+---
+
+## 🛠️ Useful Commands
+
+```bash
+# 查看所有 pod 狀態
+kubectl -n slurm get pods -o wide
+
+# 觀察 worker pool 伸縮
+kubectl -n slurm get statefulset -w
+
+# 查看 Operator 決策日誌（JSON 格式）
+kubectl -n slurm logs deployment/slurm-elastic-operator -f
+
+# 查看 Slurm controller 日誌
+kubectl -n slurm logs statefulset/slurm-controller -f
+```
+
+---
+
+## 設計重點
+
+**為什麼 Slurm node 要預先全部宣告？**
+所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，Operator 只調整 StatefulSet 的 replica 數，而不重寫 Slurm 設定檔。這避免了每次擴縮時 `slurmctld` 重新解析所有 DNS 造成的連鎖延遲。
+
+**為什麼 Operator 不用 Kopf 或 CRD？**
+刻意保持輕量。Operator 是純 Python，直接呼叫 `kubectl` CLI，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。
+
+**Checkpoint Guard 是什麼？**
+在縮容前，Operator 會檢查執行中 job 的 checkpoint 檔案年齡。若 checkpoint 不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容會被阻擋，避免 DDP 訓練進度因節點被回收而遺失。
+
+---
+
+## 📊 Evaluation Metrics
 
 | 指標 | 描述 | 目標 |
-|---|---|---|
-| Provisioning Latency | 從 Job 提交到 Pod Ready 的時間差 | < 30 sec |
-| Recovery Time | 從節點故障到訓練恢復的時間 | < 60 sec |
-| Resource Efficiency | 閒置資源回收速度 | 任務結束後 1 分鐘內釋放 |
-| Scheduling Overhead | Operator 額外 CPU/Mem 成本 | < 5% 總資源 |
+|------|------|------|
+| Provisioning Latency | 從 job 提交到 worker pod ready 的時間 | < 30 秒 |
+| Recovery Time | 節點故障到訓練恢復的時間 | < 60 秒 |
+| Resource Efficiency | 任務結束後閒置資源回收速度 | 任務結束 1 分鐘內釋放 |
+| Scheduling Overhead | Operator 本身的 CPU/Memory 佔用 | < 5% 總資源 |
 
-# 📝 References
+---
+
+## 🧱 Tech Stack
+
+| 類別 | 工具 |
+|------|------|
+| 環境 | Windows 11 + Docker Desktop + Kind |
+| 容器編排 | Kubernetes |
+| HPC 排程器 | Slurm (slurmctld + slurmd) |
+| 節點認證 | Munge |
+| Elastic Operator | Python 3.11 + kubectl CLI |
+| 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
+| DDP 網路 | Multus CNI + secondary NIC (net2) |
+
+---
+
+## 📝 References
 
 - [Slurm Workload Manager Documentation](https://slurm.schedmd.com/)
-- [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
 - [PyTorch Distributed Elastic](https://docs.pytorch.org/docs/stable/distributed.elastic.html)
-- Related Paper: [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
-
-## Multi-pool Slurm config generation
-
-`phase1/scripts/render-slurm-static.py` 會依 `phase1/manifests/worker-pools.json` 生成 `phase1/manifests/slurm-static.yaml`，把各 worker pool 的節點展開為明確的 `NodeName` / `NodeAddr` / `NodeHostname`，避免 ranged FQDN 在 Slurm 解析時造成不穩定行為。
+- [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
+- [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
+- 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
+- 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)

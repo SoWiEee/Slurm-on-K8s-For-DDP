@@ -1,0 +1,25 @@
+# Runtime assets for Phase 2-E MVP cross-network support.
+#
+# Kind already provides the primary management network through kindnet. For the
+# MVP we only attach one additional Multus network for the data plane. This
+# avoids depending on the bridge CNI for a redundant management attachment.
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: slurm-data-net
+  namespace: slurm
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "slurm-data-net",
+      "type": "ptp",
+      "ipMasq": false,
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.20.0/24",
+        "rangeStart": "192.168.20.100",
+        "rangeEnd": "192.168.20.199"
+      }
+    }

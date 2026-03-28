@@ -54,6 +54,11 @@ spec:
               fi
 
               ssh-keygen -A >/dev/null 2>&1 || true
+              if [[ -d /opt/slurm-runtime-src ]]; then
+                install -d -m 0755 /opt/slurm-runtime
+                cp -f /opt/slurm-runtime-src/* /opt/slurm-runtime/ 2>/dev/null || true
+                chmod +x /opt/slurm-runtime/* 2>/dev/null || true
+              fi
               if ! su -s /bin/sh -c '/usr/sbin/munged --syslog' munge; then
                 echo "[login] munged failed to start" >&2
                 ls -ld /var/lib/munge /run/munge /etc/munge /var/log/munge >&2 || true
@@ -77,6 +82,9 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: slurm-ddp-runtime
+              mountPath: /opt/slurm-runtime-src
+              readOnly: true
       volumes:
         - name: slurm-config
           configMap:
@@ -96,6 +104,10 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: slurm-ddp-runtime
+          configMap:
+            name: slurm-ddp-runtime
+            defaultMode: 0755
 ---
 apiVersion: v1
 kind: Service

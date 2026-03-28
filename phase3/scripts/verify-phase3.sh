@@ -52,10 +52,10 @@ kubectl -n "$NAMESPACE" exec statefulset/slurm-controller -- sh -lc \
   'set -eu; mount | grep -E " on /shared (type|)" >/dev/null; ls -la /shared | head'
 
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-login --timeout="$ROLLOUT_TIMEOUT"
 
-for pod in slurm-controller-0 slurm-worker-0; do
+for pod in slurm-controller-0 slurm-worker-cpu-0; do
   echo "[verify] Checking /shared in $pod ..."
   kubectl -n "$NAMESPACE" exec "pod/$pod" -- sh -lc 'test -d /shared && echo OK: /shared exists'
 done
@@ -67,7 +67,7 @@ kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -lc 'mount | grep -E " on 
 
 marker="phase3-$(date +%s)"
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sh -lc "printf '%s\n' '${marker}' > /shared/.phase3-marker"
-kubectl -n "$NAMESPACE" exec pod/slurm-worker-0 -- sh -lc "grep -Fqx '${marker}' /shared/.phase3-marker"
+kubectl -n "$NAMESPACE" exec pod/slurm-worker-cpu-0 -- sh -lc "grep -Fqx '${marker}' /shared/.phase3-marker"
 kubectl -n "$NAMESPACE" exec "pod/${login_pod}" -- sh -lc "grep -Fqx '${marker}' /shared/.phase3-marker"
 
 echo "Phase 3 verification passed: shared RWX volume is mounted across controller/worker/login."
