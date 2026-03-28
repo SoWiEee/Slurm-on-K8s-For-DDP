@@ -104,6 +104,9 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: slurm-ddp-runtime
+              mountPath: /opt/slurm-runtime-src
+              readOnly: true
             - name: shared-storage
               mountPath: /shared
       volumes:
@@ -125,6 +128,10 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: slurm-ddp-runtime
+          configMap:
+            name: slurm-ddp-runtime
+            defaultMode: 0755
         - name: shared-storage
           persistentVolumeClaim:
             claimName: slurm-shared-rwx
@@ -140,6 +147,6 @@ spec:
   selector:
     app: slurm-login
   ports:
-    - name: http
-      port: 80
-      targetPort: 80
+    - name: ssh
+      port: 22
+      targetPort: 22

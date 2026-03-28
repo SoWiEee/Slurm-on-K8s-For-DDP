@@ -62,7 +62,7 @@ if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker >/dev/null 2>&1; then
+if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu >/dev/null 2>&1; then
   echo "Phase 1 resources not found in namespace ${NAMESPACE}. run scripts/bootstrap-dev.sh first." >&2
   exit 1
 fi
@@ -153,11 +153,13 @@ ensure_mount() {
 }
 
 
-ensure_mount statefulset slurm-controller slurm-controller shared-storage slurm-shared-rwx /shared
-ensure_mount statefulset slurm-worker slurm-worker shared-storage slurm-shared-rwx /shared
+ensure_mount statefulset slurm-controller     slurm-controller shared-storage slurm-shared-rwx /shared
+ensure_mount statefulset slurm-worker-cpu     slurm-worker     shared-storage slurm-shared-rwx /shared
+ensure_mount statefulset slurm-worker-gpu-a10 slurm-worker     shared-storage slurm-shared-rwx /shared
+ensure_mount statefulset slurm-worker-gpu-h100 slurm-worker    shared-storage slurm-shared-rwx /shared
 
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
-kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker --timeout="$ROLLOUT_TIMEOUT"
+kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-login --timeout="$ROLLOUT_TIMEOUT"
 
 echo "Phase 3 storage deployment completed."

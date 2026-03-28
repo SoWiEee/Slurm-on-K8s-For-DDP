@@ -6,7 +6,7 @@ NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 
-WORKER_STS=${WORKER_STS:-slurm-worker}
+WORKER_STS=${WORKER_STS:-slurm-worker-cpu}
 CONTROLLER_POD=${CONTROLLER_POD:-slurm-controller-0}
 LOGIN_LABEL_SELECTOR=${LOGIN_LABEL_SELECTOR:-app=slurm-login}
 
@@ -52,9 +52,9 @@ wait_rollouts() {
 mark_missing_nodes_down() {
   log "Marking missing worker nodes DOWN (best-effort)..."
   for n in $(seq 1 $((MAX_WORKERS - 1))); do
-    if ! kubectl -n "${NAMESPACE}" get pod "slurm-worker-${n}" >/dev/null 2>&1; then
+    if ! kubectl -n "${NAMESPACE}" get pod "${WORKER_STS}-${n}" >/dev/null 2>&1; then
       kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
-        "scontrol update NodeName=slurm-worker-${n} State=DOWN Reason='scaledown' || true" >/dev/null 2>&1 || true
+        "scontrol update NodeName=${WORKER_STS}-${n} State=DOWN Reason='scaledown' || true" >/dev/null 2>&1 || true
     fi
   done
   kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'sinfo -N -l || true' || true
@@ -133,20 +133,20 @@ wait_workers_scaled_ready() {
 
 wait_dns_gates_for_worker() {
   local idx="$1"
-  local worker_fqdn="slurm-worker-${idx}.slurm-worker.${NAMESPACE}.svc.cluster.local"
+  local worker_fqdn="${WORKER_STS}-${idx}.${WORKER_STS}.${NAMESPACE}.svc.cluster.local"
   local controller_fqdn="slurm-controller-0.slurm-controller.${NAMESPACE}.svc.cluster.local"
   local deadline ok0 okn
   deadline=$(( $(date +%s) + 120 ))
 
-  log "Waiting for slurm-worker-${idx} pod to be Ready..."
-  kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/slurm-worker-${idx}" --timeout=300s >/dev/null
+  log "Waiting for ${WORKER_STS}-${idx} pod to be Ready..."
+  kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${WORKER_STS}-${idx}" --timeout=300s >/dev/null
 
-  log "Waiting for DNS gates for slurm-worker-${idx}..."
+  log "Waiting for DNS gates for ${WORKER_STS}-${idx}..."
   while true; do
     ok0=no
     okn=no
-    if kubectl -n "${NAMESPACE}" exec pod/slurm-worker-0 -- sh -lc "getent hosts '${worker_fqdn}' >/dev/null" >/dev/null 2>&1; then ok0=yes; fi
-    if kubectl -n "${NAMESPACE}" exec "pod/slurm-worker-${idx}" -- sh -lc "getent hosts '${controller_fqdn}' >/dev/null" >/dev/null 2>&1; then okn=yes; fi
+    if kubectl -n "${NAMESPACE}" exec "pod/${WORKER_STS}-0" -- sh -lc "getent hosts '${worker_fqdn}' >/dev/null" >/dev/null 2>&1; then ok0=yes; fi
+    if kubectl -n "${NAMESPACE}" exec "pod/${WORKER_STS}-${idx}" -- sh -lc "getent hosts '${controller_fqdn}' >/dev/null" >/dev/null 2>&1; then okn=yes; fi
     if [[ "${ok0}" == yes && "${okn}" == yes ]]; then
       log "DNS OK: worker-0 -> ${worker_fqdn}, worker-${idx} -> ${controller_fqdn}"
       return 0
@@ -260,7 +260,7 @@ EOF_TRIG" >/dev/null
   # DNS + slurm reason gates for newly created workers
   for i in $(seq 1 $((TARGET_WORKERS - 1))); do
     wait_dns_gates_for_worker "${i}" || die "DNS gates failed for worker-${i}"
-    wait_slurm_node_reason_ok "slurm-worker-${i}" 120 || die "slurm reason not ok for worker-${i}"
+    wait_slurm_node_reason_ok "${WORKER_STS}-${i}" 120 || die "slurm reason not ok for worker-${i}"
   done
 
   log "Cancelling trigger job (it has served its purpose)..."
