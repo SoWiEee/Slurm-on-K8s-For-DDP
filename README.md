@@ -1,14 +1,12 @@
 # Slurm-on-K8s-For-DDP
 
-Adaptive HPC Scheduling on Cloud Native Infrastructure
+把 HPC 排程器搬進 Kubernetes，讓 AI 訓練任務既能用 Slurm 的精準資源管理，又能享受雲端的彈性伸縮。
 
-> 把 HPC 排程器搬進 Kubernetes，讓 AI 訓練任務既能用 Slurm 的精準資源管理，又能享受雲端的彈性伸縮。
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
+互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 
 ---
 
-## 🔥 Motivation
+# 🔥 Motivation
 
 如果你曾經跑過分散式 AI 訓練，你大概有過這樣的經驗：
 
@@ -16,20 +14,74 @@ Adaptive HPC Scheduling on Cloud Native Infrastructure
 - 任務跑到一半節點掛掉，checkpoint 沒存好，重頭來過。
 - 想擴充節點，卻要等管理員手動改設定。
 
-這些問題的根源在於：**現有工具在「資源彈性」和「排程精準度」之間做了取捨。**
+這些問題的根源在於：現有工具在**資源彈性**和**排程精準度**之間做了取捨。
 
 | 工具 | 擅長 | 不擅長 |
 |------|------|--------|
-| *ubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意 |
+| Kubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意 |
 | Slurm | 批次排程、CPU/GPU 精準分配、叢集治理 | 動態節點、雲端彈性、容錯恢復 |
 
 本專案的目標很直接：**讓兩者合作**。把 Slurm 跑在 Kubernetes 上，用 Kubernetes 的彈性支撐 Slurm 的排程能力，並在此基礎上實作 AI 訓練所需的共享儲存與 checkpoint 容錯。
 
 ---
 
-## 🔄 System Architecture
+# 🚀 Getting Started
 
-用一句話說：**你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。**
+> 環境需求：Windows 11 + Docker Desktop + Kind + kubectl
+
+## 1. 確認工具已安裝
+
+```bash
+docker version
+kind version
+kubectl version --client
+```
+
+## 2. 一鍵部署（Phase 1 + Phase 2）
+
+```bash
+bash scripts/bootstrap-dev.sh
+```
+
+這支腳本會自動完成：建立 Kind 叢集 → 建置 Docker image → 套用所有 manifest → 啟動 Elastic Operator → 設定三個 worker pool 的初始 replica 數。
+
+> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap-dev.sh`
+> 需要完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh`
+
+## 3. 驗證部署
+
+```bash
+bash scripts/verify-dev.sh
+```
+
+驗證流程包含：Pod readiness → Slurm controller ping → CPU pool sbatch smoke test → CPU pool 自動擴縮 → GPU pool 路由驗證。
+看到 `[dev verify] done. phase1 + phase2 checks passed.` 就代表一切正常。
+
+## 4. 部署共享儲存（Phase 3）
+
+```bash
+# 主機端 NFS server（只需執行一次）
+sudo bash phase3/scripts/setup-nfs-server.sh
+
+# 部署 NFS provisioner + 掛載到所有 pod
+NFS_SERVER=<your-ip> NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+
+# 驗證
+bash phase3/scripts/verify-phase3.sh
+bash phase3/scripts/verify-phase3-e2e.sh
+```
+
+## 清理環境
+
+```bash
+kind delete cluster --name slurm-lab
+```
+
+---
+
+# 🔄 System Architecture
+
+用一句話說：你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。
 
 稍微展開一點：
 
@@ -93,7 +145,7 @@ graph TD
 
 ---
 
-## 📘 Development Progress
+# 📘 Development Progress
 
 | Phase | 狀態 | 內容 |
 |-------|------|------|
@@ -102,60 +154,6 @@ graph TD
 | **Phase 2-E**：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | **Phase 3**：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
 | **Phase 4**：評估與報告 | ⏳ 進行中 | 量測 provisioning latency、recovery time、resource efficiency |
-
----
-
-## 🚀 Getting Started
-
-> 環境需求：Windows 11 + Docker Desktop + Kind + kubectl
-
-### 1. 確認工具已安裝
-
-```bash
-docker version
-kind version
-kubectl version --client
-```
-
-### 2. 一鍵部署（Phase 1 + Phase 2）
-
-```bash
-bash scripts/bootstrap-dev.sh
-```
-
-這支腳本會自動完成：建立 Kind 叢集 → 建置 Docker image → 套用所有 manifest → 啟動 Elastic Operator → 設定三個 worker pool 的初始 replica 數。
-
-> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap-dev.sh`
-> 需要完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh`
-
-### 3. 驗證部署
-
-```bash
-bash scripts/verify-dev.sh
-```
-
-驗證流程包含：Pod readiness → Slurm controller ping → CPU pool sbatch smoke test → CPU pool 自動擴縮 → GPU pool 路由驗證。
-看到 `[dev verify] done. phase1 + phase2 checks passed.` 就代表一切正常。
-
-### 4. 部署共享儲存（Phase 3）
-
-```bash
-# 主機端 NFS server（只需執行一次）
-sudo bash phase3/scripts/setup-nfs-server.sh
-
-# 部署 NFS provisioner + 掛載到所有 pod
-NFS_SERVER=<your-ip> NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
-
-# 驗證
-bash phase3/scripts/verify-phase3.sh
-bash phase3/scripts/verify-phase3-e2e.sh
-```
-
-### 清理環境
-
-```bash
-kind delete cluster --name slurm-lab
-```
 
 ---
 
@@ -214,7 +212,7 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 
 ---
 
-## 🛠️ Useful Commands
+# 🛠️ Useful Commands
 
 ```bash
 # 查看所有 pod 狀態
@@ -245,7 +243,7 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 
 ---
 
-## 📊 Evaluation Metrics
+# 📊 Evaluation Metrics
 
 | 指標 | 描述 | 目標 |
 |------|------|------|
@@ -256,7 +254,7 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 
 ---
 
-## 🧱 Tech Stack
+# 🧱 Tech Stack
 
 | 類別 | 工具 |
 |------|------|
@@ -270,11 +268,10 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 
 ---
 
-## 📝 References
+# 📝 References
 
 - [Slurm Workload Manager Documentation](https://slurm.schedmd.com/)
 - [PyTorch Distributed Elastic](https://docs.pytorch.org/docs/stable/distributed.elastic.html)
 - [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
 - [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
 - 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
-- 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
