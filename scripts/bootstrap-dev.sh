@@ -61,6 +61,17 @@ require_tool kind
 require_tool kubectl
 require_tool docker
 
+# Resolve a working Python 3 interpreter.
+# Override with PYTHON=/path/to/python3 if auto-detection fails.
+if [[ -z "${PYTHON:-}" ]]; then
+  for _py in python3 python py; do
+    if command -v "$_py" >/dev/null 2>&1 && "$_py" -c "import sys; sys.exit(0 if sys.version_info>=(3,8) else 1)" 2>/dev/null; then
+      PYTHON="$_py"; break
+    fi
+  done
+  : "${PYTHON:?Cannot find a working Python 3.8+ interpreter. Set PYTHON=/path/to/python3}"
+fi
+
 validate_live_commands() {
   local res="$1"
   local expected="$2"
@@ -154,7 +165,7 @@ if [[ -f phase1/scripts/render-slurm-static.py ]]; then
     log "phase3 NFS PVC detected — rendering with shared storage"
   fi
   render_rc=0
-  python3 phase1/scripts/render-slurm-static.py "${render_flags[@]}" || render_rc=$?
+  "$PYTHON" phase1/scripts/render-slurm-static.py "${render_flags[@]}" || render_rc=$?
   if [[ ! -s phase1/manifests/slurm-static.yaml ]]; then
     echo "[dev bootstrap] ERROR: render script failed and phase1/manifests/slurm-static.yaml is missing or empty" >&2
     exit "${render_rc:-1}"
