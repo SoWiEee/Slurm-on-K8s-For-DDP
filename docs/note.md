@@ -1608,3 +1608,52 @@ File=/dev/null   # Kind 環境模擬，無真實硬體
   → render --with-shared-storage → 仍含 /shared
   → kubectl apply → NFS mount 不遺失
 ```
+
+---
+
+## Phase 3 實際部署踩坑紀錄（2026-03-29 on Windows 11 + WSL2 + Kind）
+
+### 坑 1：NFS_SERVER 誤填網段而非 IP
+
+**現象：** `bootstrap-phase3.sh` 傳入 `NFS_SERVER=172.16.0.0/12`，provisioner pod 卡在 `ContainerCreating`，timeout 300s 失敗。
+
+**原因：** `172.16.0.0/12` 是 CIDR 網段，不是 IP 位址；provisioner Deployment 把它直接填入 `NFS_SERVER` env var，kubelet 嘗試掛載 `172.16.0.0/12:/srv/nfs/k8s` 當然失敗。
+
+**修正：** 在 WSL2 執行 `ip addr show eth0 | grep 'inet '` 取得實際 IP（例如 `172.26.7.207`），傳入 `NFS_SERVER=172.26.7.207`。
+
+### 坑 2：NFS exports 的 `secure` 選項拒絕 Kubernetes 掛載
+
+**現象：** 用正確 IP 重試後，provisioner pod event 顯示：
+```
+MountVolume.SetUp failed for volume "nfs-client-root":
+mount.nfs: access denied by server while mounting 172.26.7.207:/srv/nfs/k8s
+```
+
+**原因：** Linux NFS 預設選項 `secure`，要求客戶端從特權端口（< 1024）發起連線。Kubernetes kubelet 在容器環境（Kind/Docker）中執行 NFS mount 時使用非特權端口，因此被 NFS server 拒絕。
+
+**修正：** 在 WSL2 的 `/etc/exports` 中加上 `insecure`：
+```
+/srv/nfs/k8s 172.16.0.0/12(rw,sync,no_subtree_check,no_root_squash,insecure)
+```
+然後重新載入：`sudo exportfs -arv`
+
+### 確認 NFS 連通性（不依賴 `nc`）
+
+Kind 容器內通常沒有 `nc`，改用 bash `/dev/tcp` 測試：
+```bash
+docker exec slurm-lab-control-plane bash -c \
+  "timeout 3 bash -c 'echo >/dev/tcp/172.26.7.207/2049' && echo OK || echo FAIL"
+```
+
+### 完整 Phase 3 部署指令（WSL2 環境）
+
+```bash
+# 1. 在 WSL2 取得 IP
+WSL2_IP=$(ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+
+# 2. 確認 /etc/exports 有 insecure 選項，重載
+sudo exportfs -arv
+
+# 3. 部署
+NFS_SERVER=${WSL2_IP} NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+```

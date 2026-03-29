@@ -193,8 +193,15 @@ verify_output_hosts() {
   local login_pod="$1" jobid="$2" need="$3"
 
   log "Verifying output exists on shared path: ${SMOKE_DIR}/out-${jobid}.txt"
+  # Retry up to 10s to allow NFS to flush the output file after job completion.
+  local waited=0
+  until kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc \
+      "test -s '${SMOKE_DIR}/out-${jobid}.txt'" 2>/dev/null; do
+    (( waited >= 10 )) && { echo "[e2e][ERROR] out-${jobid}.txt missing or empty after ${waited}s" >&2; exit 1; }
+    sleep 2; waited=$(( waited + 2 ))
+  done
   kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc \
-    "test -s '${SMOKE_DIR}/out-${jobid}.txt' && echo '[e2e] out exists' && sed -n '1,220p' '${SMOKE_DIR}/out-${jobid}.txt'"
+    "echo '[e2e] out exists'; sed -n '1,220p' '${SMOKE_DIR}/out-${jobid}.txt'"
 
   log "Checking output contains >=${need} distinct hostnames (multi-node evidence)..."
   local distinct
@@ -272,9 +279,10 @@ EOF_TRIG" >/dev/null
   [[ -n "${jobid}" ]] || die "failed to submit smoke job"
   log "jobid=${jobid}"
 
-  log "Refreshing slurmctld view (best-effort)..."
-  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'scontrol reconfigure || true; sinfo -N -l || true' || true
-
+  # NOTE: do NOT call `scontrol reconfigure` here.
+  # Reconfigure causes slurmctld to resolve every static node FQDN (including
+  # scaled-to-zero replicas whose DNS does not exist), blocking the daemon for
+  # 30-60 s.  During that window srun cannot dispatch the step and the job fails.
   log "Waiting for job to finish..."
   wait_job_finish "${login_pod}" "${jobid}" 300 || die "job ${jobid} did not finish in time"
 

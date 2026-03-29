@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve a working Python 3 interpreter.
+# Override with PYTHON=/path/to/python3 if auto-detection fails.
+if [[ -z "${PYTHON:-}" ]]; then
+  for _py in python3 python py; do
+    if command -v "$_py" >/dev/null 2>&1 && "$_py" -c "import sys; sys.exit(0 if sys.version_info>=(3,8) else 1)" 2>/dev/null; then
+      PYTHON="$_py"; break
+    fi
+  done
+  : "${PYTHON:?Cannot find a working Python 3.8+ interpreter. Set PYTHON=/path/to/python3}"
+fi
+
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 NAMESPACE=${NAMESPACE:-slurm}
 KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
@@ -86,7 +97,7 @@ done
 # detect the PVC and call render-slurm-static.py --with-shared-storage automatically,
 # so the NFS mount survives any future kubectl apply of slurm-static.yaml.
 echo "Regenerating slurm-static.yaml with --with-shared-storage..."
-python3 phase1/scripts/render-slurm-static.py --with-shared-storage
+"$PYTHON" phase1/scripts/render-slurm-static.py --with-shared-storage
 kubectl apply -f phase1/manifests/slurm-static.yaml
 
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"

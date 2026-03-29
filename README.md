@@ -63,8 +63,8 @@ bash scripts/verify-dev.sh
 # 主機端 NFS server（只需執行一次）
 sudo bash phase3/scripts/setup-nfs-server.sh
 
-# 部署 NFS provisioner + 掛載到所有 pod
-NFS_SERVER=<your-ip> NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+# 在 k8s cluster 部署 NFS provisioner + 掛載到所有 pod
+NFS_SERVER=<nfs-server-ip> NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
 
 # 驗證
 bash phase3/scripts/verify-phase3.sh
