@@ -71,6 +71,8 @@ bash phase3/scripts/verify-phase3.sh
 bash phase3/scripts/verify-phase3-e2e.sh
 ```
 
+> 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
+
 ## 清理環境
 
 ```bash
