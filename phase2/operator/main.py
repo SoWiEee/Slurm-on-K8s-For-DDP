@@ -191,15 +191,23 @@ class SlurmRestClient:
         sig = _b64url(hmac.new(self._jwt_key, signing_input.encode(), hashlib.sha256).digest())
         return f"{signing_input}.{sig}"
 
-    def _get(self, path: str) -> dict:
+    def _get(self, path: str, *, retries: int = 3, backoff: float = 1.0) -> dict:
         url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url)
-        req.add_header("X-SLURM-USER-NAME", self.username)
-        if self._jwt_key is not None:
-            req.add_header("X-SLURM-USER-TOKEN", self._make_token())
-        req.add_header("Accept", "application/json")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read().decode())
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(retries):
+            if attempt:
+                time.sleep(backoff * (2 ** (attempt - 1)))  # 1 s, 2 s
+            try:
+                req = urllib.request.Request(url)
+                req.add_header("X-SLURM-USER-NAME", self.username)
+                if self._jwt_key is not None:
+                    req.add_header("X-SLURM-USER-TOKEN", self._make_token())
+                req.add_header("Accept", "application/json")
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception as exc:
+                last_exc = exc
+        raise last_exc
 
     def ping(self) -> bool:
         try:

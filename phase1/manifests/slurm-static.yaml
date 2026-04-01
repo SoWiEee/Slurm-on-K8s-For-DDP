@@ -174,7 +174,9 @@ spec:
               # slurmrestd needs SLURM_JWT set (from scontrol token) so that its
               # rest_auth/jwt plugin can bootstrap a valid auth context.
               until scontrol ping >/dev/null 2>&1; do sleep 2; done
-              SLURM_JWT=$(scontrol token username=root lifespan=86400 | sed 's/SLURM_JWT=//')                 SLURMRESTD_SECURITY=disable_user_check                 /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
+              # lifespan=315360000 (10 years) avoids the daemon losing its auth
+              # context after the default 24-hour token expiry.
+              SLURM_JWT=$(scontrol token username=root lifespan=315360000 | sed 's/SLURM_JWT=//')                 SLURMRESTD_SECURITY=disable_user_check                 /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
               wait $CTLD_PID
           ports:
             - containerPort: 22
@@ -187,8 +189,8 @@ spec:
             periodSeconds: 10
           livenessProbe:
             exec:
-              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null"]
-            initialDelaySeconds: 20
+              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x slurmrestd >/dev/null"]
+            initialDelaySeconds: 60
             periodSeconds: 20
           volumeMounts:
             - name: slurm-config
