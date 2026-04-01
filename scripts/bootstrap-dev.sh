@@ -116,7 +116,9 @@ operator_force_env() {
     CHECKPOINT_PATH="" \
     MAX_CHECKPOINT_AGE_SECONDS="600" \
     SLURM_REST_URL="http://slurm-restapi.${NAMESPACE}.svc.cluster.local:6820" \
-    SLURM_REST_API_VERSION="v0.0.39" >/dev/null
+    SLURM_REST_API_VERSION="v0.0.37" >/dev/null
+    # SLURM_JWT_KEY_PATH is set in the manifest; omit here to avoid Git Bash
+    # POSIX path conversion (/ → C:/Program Files/Git/) on Windows.
 }
 
 validate_live_operator_config() {

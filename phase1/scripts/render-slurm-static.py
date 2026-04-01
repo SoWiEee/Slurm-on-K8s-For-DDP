@@ -81,6 +81,8 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
         "SlurmdPort=6818",
         "AuthType=auth/munge",
         "CryptoType=crypto/munge",
+        "AuthAltTypes=auth/jwt",
+        "AuthAltParameters=jwt_key=/slurm-secrets/jwt_hs256.key",
     ]
     if gres_types:
         header.append(f"GresTypes={','.join(sorted(gres_types))}")
@@ -115,6 +117,18 @@ def main() -> int:
         "\n        - name: shared-storage\n          persistentVolumeClaim:\n            claimName: slurm-shared-rwx"
         if args.with_shared_storage else ""
     )
+    # JWT key is added to the projected secrets volume so it lands at
+    # /slurm-secrets/jwt_hs256.key — same path referenced in slurm.conf.
+    # This avoids a subPath conflict with the ConfigMap mounted at /etc/slurm.
+    jwt_projected_source = (
+        "\n              - secret:"
+        "\n                  name: slurm-jwt-secret"
+        "\n                  items:"
+        "\n                    - key: jwt_hs256.key"
+        "\n                      path: jwt_hs256.key"
+    )
+    jwt_vm = ""
+    jwt_vol = ""
 
     cfg = json.loads(CFG.read_text())
     slurm_conf, gres_conf = build_slurm_conf(cfg)
@@ -211,8 +225,16 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
-              /usr/sbin/slurmrestd -a rest_auth/local 0.0.0.0:6820 &
-              exec slurmctld -Dvvv
+              exec slurmctld -Dvvv &
+              CTLD_PID=$!
+              # Wait for slurmctld to be ready before starting slurmrestd.
+              # slurmrestd needs SLURM_JWT set (from scontrol token) so that its
+              # rest_auth/jwt plugin can bootstrap a valid auth context.
+              until scontrol ping >/dev/null 2>&1; do sleep 2; done
+              SLURM_JWT=$(scontrol token username=root lifespan=86400 | sed 's/SLURM_JWT=//') \
+                SLURMRESTD_SECURITY=disable_user_check \
+                /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
+              wait $CTLD_PID
           ports:
             - containerPort: 22
             - containerPort: 6817
@@ -232,7 +254,7 @@ spec:
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
-              readOnly: true{shared_vm}
+              readOnly: true{jwt_vm}{shared_vm}
       volumes:
         - name: slurm-config
           configMap:
@@ -251,7 +273,7 @@ spec:
                     - key: id_ed25519
                       path: id_ed25519
                     - key: id_ed25519.pub
-                      path: id_ed25519.pub{shared_vol}
+                      path: id_ed25519.pub{jwt_projected_source}{shared_vol}
 ---""")
     for pool in cfg["workerPools"]:
         docs.append(f"""apiVersion: apps/v1

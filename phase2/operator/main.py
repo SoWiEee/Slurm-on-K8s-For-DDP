@@ -9,6 +9,9 @@ Multi-pool updates:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -19,6 +22,10 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
 @dataclass(frozen=True)
@@ -57,7 +64,10 @@ class Config:
     # HTTP instead of kubectl exec, eliminating fork overhead and exec timeouts.
     # Leave empty to fall back to the legacy kubectl exec path.
     slurm_rest_url: str = os.getenv("SLURM_REST_URL", "")
-    slurm_rest_api_version: str = os.getenv("SLURM_REST_API_VERSION", "v0.0.39")
+    slurm_rest_api_version: str = os.getenv("SLURM_REST_API_VERSION", "v0.0.37")
+    # Path to the HS256 key file used to sign JWT tokens for slurmrestd.
+    # Must match AuthAltParameters=jwt_key in slurm.conf.
+    slurm_jwt_key_path: str = os.getenv("SLURM_JWT_KEY_PATH", "")
 
 
 @dataclass(frozen=True)
@@ -152,17 +162,41 @@ class SlurmRestClient:
 
     _BUSY_STATES = {"allocated", "mixed", "completing"}
 
-    def __init__(self, base_url: str, api_version: str = "v0.0.39",
-                 username: str = "root", timeout: int = 10):
+    def __init__(self, base_url: str, api_version: str = "v0.0.37",
+                 username: str = "root", timeout: int = 10,
+                 jwt_key_path: str = ""):
         self.base_url = base_url.rstrip("/")
         self.api_version = api_version
         self.username = username
         self.timeout = timeout
+        self._jwt_key: bytes | None = None
+        if jwt_key_path:
+            try:
+                with open(jwt_key_path, "rb") as fh:
+                    self._jwt_key = fh.read()
+            except OSError:
+                pass  # ping() will fail → caller falls back to exec
+
+    def _make_token(self, lifetime: int = 3600) -> str:
+        """Generate a HS256 JWT token accepted by slurmrestd -a rest_auth/jwt."""
+        now = int(time.time())
+        header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+        payload = _b64url(json.dumps({
+            "exp": now + lifetime,
+            "iat": now,
+            "iss": "slurmrestd",
+            "sun": self.username,
+        }).encode())
+        signing_input = f"{header}.{payload}"
+        sig = _b64url(hmac.new(self._jwt_key, signing_input.encode(), hashlib.sha256).digest())
+        return f"{signing_input}.{sig}"
 
     def _get(self, path: str) -> dict:
         url = f"{self.base_url}{path}"
         req = urllib.request.Request(url)
         req.add_header("X-SLURM-USER-NAME", self.username)
+        if self._jwt_key is not None:
+            req.add_header("X-SLURM-USER-TOKEN", self._make_token())
         req.add_header("Accept", "application/json")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode())
@@ -516,7 +550,11 @@ class OperatorApp:
         self.client = KubectlClient(cfg)
         self.partition_cfgs = PartitionConfigLoader.load(cfg)
         self.rest = (
-            SlurmRestClient(cfg.slurm_rest_url, api_version=cfg.slurm_rest_api_version)
+            SlurmRestClient(
+                cfg.slurm_rest_url,
+                api_version=cfg.slurm_rest_api_version,
+                jwt_key_path=cfg.slurm_jwt_key_path,
+            )
             if cfg.slurm_rest_url else None
         )
         self.collector = ClusterStateCollector(self.client, self.partition_cfgs, self.rest)
