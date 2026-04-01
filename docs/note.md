@@ -263,62 +263,7 @@ Phase 3 部署後，`/shared` 以 ReadWriteMany 方式同時掛載到：
 
 job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出。
 
-### 已知的 Phase 2 + Phase 3 整合缺口
-
-`bootstrap-phase3.sh` 目前只 patch Phase 1 的單一 worker StatefulSet：
-
-```bash
-ensure_mount statefulset slurm-controller  slurm-controller  ...
-ensure_mount statefulset slurm-worker      slurm-worker      ...   ← Phase 1 名稱
-```
-
-Phase 2 引入多節點池後，worker StatefulSet 名稱已改為：
-- `slurm-worker-cpu`
-- `slurm-worker-gpu-a10`
-- `slurm-worker-gpu-h100`
-
-所以 **Phase 3 bootstrap 跑完後，GPU worker pods 不會掛載 `/shared`**，提交到 GPU pool 的 job 無法寫輸出到共享路徑。
-
-另外，`phase3/manifests/shared-storage.yaml` 重新定義了 `slurm-login` Deployment，但遺漏了 Phase 2-E 加入的 `slurm-ddp-runtime` volume mount。若先部署 Phase 2-E 再部署 Phase 3，login pod 會失去 DDP runtime 環境變數。
-
-### Phase 3 後續計畫
-
-#### 修正：bootstrap-phase3.sh 補齊多節點池
-
-在 `ensure_mount` 呼叫後補上 Phase 2 的三個 pool：
-
-```bash
-ensure_mount statefulset slurm-worker-cpu     slurm-worker  shared-storage slurm-shared-rwx /shared
-ensure_mount statefulset slurm-worker-gpu-a10 slurm-worker  shared-storage slurm-shared-rwx /shared
-ensure_mount statefulset slurm-worker-gpu-h100 slurm-worker shared-storage slurm-shared-rwx /shared
-```
-
-（需先確認每個 StatefulSet 的 container name）
-
-#### 修正：shared-storage.yaml 保留 DDP runtime volume
-
-`slurm-login` Deployment 的 volumes 應補回：
-
-```yaml
-- name: slurm-ddp-runtime
-  configMap:
-    name: slurm-ddp-runtime
-    defaultMode: 0755
-```
-
-以及對應 `volumeMounts`。
-
-或者改為：`bootstrap-phase3.sh` 不重新 apply 完整 Deployment YAML，改用 `ensure_mount` 的 JSON patch 方式把 shared-storage volume 加進現有的 login deployment，避免覆蓋 Phase 2 已有的設定。
-
-#### verify-phase3-e2e.sh 補齊多節點池驗證
-
-目前 e2e 測試使用 `WORKER_STS=slurm-worker`（預設），需要加入對 `slurm-worker-cpu` 的顯式支援。在 Phase 2+3 整合後，驗證腳本應傳入：
-
-```bash
-WORKER_STS=slurm-worker-cpu bash phase3/scripts/verify-phase3-e2e.sh
-```
-
-#### 部署順序建議
+### 部署順序建議
 
 在 Phase 2 + Phase 3 同時啟用時，建議部署順序為：
 
