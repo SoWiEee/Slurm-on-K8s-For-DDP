@@ -1657,3 +1657,198 @@ sudo exportfs -arv
 # 3. 部署
 NFS_SERVER=${WSL2_IP} NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
 ```
+
+---
+
+# 後續改進規劃（Phase 4 / DDP 應用場景）
+
+## 背景與動機
+
+本專案的核心主張是：Kubernetes 擅長彈性伸縮與容器管理，但對 HPC / AI 訓練工作負載的語意支援有限；Slurm 擅長批次排程與叢集治理，但傳統部署偏靜態、對雲端彈性不夠友善。Phase 4 的目標是把這個系統實際用在 **PyTorch DDP 分散式訓練**情境，並補上可觀測性，讓橋接過程可以被量測與展示。
+
+---
+
+## 必做項目
+
+### 1. Slurm REST API 取代 kubectl exec（穩定性關鍵）
+
+**現狀問題：** operator 目前透過 `kubectl exec` 進入 controller pod 執行 `squeue`、`sinfo`、`scontrol`，每次 exec 都有 fork 開銷，遇到 slurmctld 暫時忙碌時直接 timeout，是目前 operator 不穩定的主要根源。
+
+**目標改法：** 在 controller image 啟動 `slurmrestd`，operator 改成呼叫 REST API：
+
+```
+目前：operator → kubectl exec pod/slurm-controller-0 → squeue（每次 exec 有啟動開銷）
+改後：operator → HTTP GET http://slurm-controller:6820/slurm/v0.0.39/jobs → JSON 解析
+```
+
+**參考來源：** `github.com/SlinkyProject/slurm-exporter`（SchedMD 官方 exporter 完全基於此 API）
+
+**收益：**
+- 消除 N+1 exec 問題的根本原因
+- REST API 回應比 exec + CLI parse 快且穩定
+- 同一個 slurmrestd endpoint 可同時供 operator 查詢與 Prometheus scrape，Phase 4 monitoring 不需要額外的 exec
+
+---
+
+### 2. Worker Image 加入 PyTorch（DDP 前置條件）
+
+目前 worker image 只有 Slurm + Munge，要跑 DDP 需要加入 PyTorch：
+
+```dockerfile
+# phase1/docker/worker/Dockerfile 加入
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Kind 環境無真實 GPU，先用 CPU 版本驗證 DDP 控制流
+```
+
+---
+
+### 3. 標準 DDP sbatch 腳本
+
+```bash
+#!/usr/bin/env bash
+#SBATCH -J ddp-train
+#SBATCH -p debug
+#SBATCH -N 2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH -o /shared/ddp-out-%j.txt
+#SBATCH -e /shared/ddp-err-%j.txt
+
+# 從 Slurm 提供的 SLURM_NODELIST 取第一個節點當 rendezvous master
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
+MASTER_PORT=29500
+export MASTER_ADDR MASTER_PORT
+
+srun torchrun \
+  --nnodes=$SLURM_NNODES \
+  --nproc_per_node=1 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+  /shared/train.py \
+  --checkpoint-dir /shared/checkpoints/job-${SLURM_JOB_ID}
+```
+
+**參考來源：** AWS ParallelCluster sbatch 範本（`github.com/aws/aws-parallelcluster`）
+
+---
+
+### 4. SIGTERM → Checkpoint 儲存串接 Checkpoint Guard
+
+**現狀：** checkpoint guard 只檢查 `/shared/checkpoints/latest.pt` 的 mtime，但訓練腳本沒有處理 SIGTERM，scale-down 前節點被直接回收，checkpoint 不一定有被寫入。
+
+**目標改法：** 訓練腳本加 SIGTERM handler：
+
+```python
+import signal, torch, torch.distributed as dist
+
+def save_and_exit(sig, frame):
+    if dist.get_rank() == 0:
+        torch.save({"epoch": epoch, "model": model.state_dict()},
+                   "/shared/checkpoints/latest.pt")
+    dist.barrier()
+    exit(0)
+
+signal.signal(signal.SIGTERM, save_and_exit)
+```
+
+**完整串接流程：**
+```
+Operator 決定 scale-down
+  → kubectl drain（送 SIGTERM 給 slurmd）
+  → slurmd 轉發給訓練 process
+  → SIGTERM handler 寫 checkpoint
+  → checkpoint guard 確認 mtime 夠新
+  → scale-down 執行
+```
+
+**參考來源：** PyTorch Elastic torchelastic (`github.com/pytorch/elastic`) 的 signal handling 模式
+
+---
+
+### 5. Prometheus + Grafana 監控（Phase 4 主體）
+
+詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
+
+| 來源 | 取得方式 | 關鍵指標 |
+|------|---------|---------|
+| slurm-exporter | scrape slurmrestd（REST API） | queue_pending, nodes_idle |
+| kube-state-metrics | K8s 原生 | StatefulSet replicas, Pod ready |
+| operator 自定義 | prometheus_client HTTP server | scale_events, guard_blocks |
+
+**參考來源：** `github.com/SlinkyProject/slurm-exporter`（REST API 驅動）、`github.com/vpenso/prometheus-slurm-exporter`（exec 驅動，較易入門）
+
+---
+
+## 建議加入的改進（可選）
+
+### 6. Job 提交前健康檢查（pre-check）
+
+**參考來源：** Character.ai Slonk（`blog.character.ai/slonk/`）
+
+在 sbatch 腳本開頭加一個 pre-check stage，確認每個分配到的節點 `/shared` 掛載正常後再開始 torchrun：
+
+```bash
+# sbatch 前置 pre-check
+srun bash -c "test -d /shared && echo ok || echo fail" | grep -v ok && exit 1
+```
+
+收益：降低 DDP job 因 NFS 掛載異常或節點網路問題在訓練中途失敗的機率。
+
+---
+
+### 7. Elastic DDP（動態 world size）
+
+**參考來源：** PyTorch Elastic `torchrun --nnodes=min:max`
+
+允許 operator scale-up 後，新節點可以在訓練過程中動態加入（而非只在 job 開始時固定 world size）：
+
+```bash
+torchrun \
+  --nnodes=1:4 \          # 允許 1 到 4 個節點
+  --nproc_per_node=1 \
+  --rdzv_backend=c10d ...
+```
+
+這讓 operator 的 scale-up 決策能更即時反映到訓練效率。
+
+---
+
+### 8. Soperator reconciliation loop 設計參考
+
+**參考來源：** `github.com/nebius/soperator/internal/controller/`
+
+Soperator 在 scale-down 前會確認沒有 RUNNING 狀態的 job 在該節點，再做 StatefulSet 變更。可以參考其 reconciliation loop 設計，加強目前 operator 的 scale-down 安全性，避免 operator 更新或 manifest re-apply 時意外殺掉正在訓練的 job。
+
+---
+
+## 改進優先順序
+
+```
+Phase 4 必做（影響系統穩定性與 DDP 可用性）
+  1. Slurm REST API 取代 kubectl exec
+  2. Worker image 加 PyTorch
+  3. 標準 DDP sbatch 腳本 + train.py
+  4. SIGTERM handler 串接 checkpoint guard
+
+Phase 4 主體（可觀測性 demo）
+  5. Prometheus + Grafana（見 docs/monitoring.md）
+
+可選加分項（提升系統完整度）
+  6. Job 提交前健康檢查（Slonk 模式）
+  7. Elastic DDP（torchrun min:max nodes）
+  8. Soperator reconciliation 安全性參考
+```
+
+---
+
+## 相關開源專案對照
+
+| 改進項目 | 主要參考來源 | 備註 |
+|---------|------------|------|
+| REST API | SlinkyProject/slurm-exporter | SchedMD 官方，生產驗證 |
+| SIGTERM handler | pytorch/elastic | torchelastic 官方模式 |
+| Pre-check | Character.ai Slonk | blog.character.ai/slonk |
+| Scale-down 安全性 | nebius/soperator | Go+Kubebuilder，架構參考 |
+| sbatch + torchrun 整合 | aws/aws-parallelcluster | 業界驗證的環境變數設定 |
+| Prometheus monitoring | vpenso/prometheus-slurm-exporter | exec 版本，入門用 |
+| Prometheus monitoring | SlinkyProject/slurm-exporter | REST API 版本，演進目標 |
