@@ -155,7 +155,52 @@ graph TD
 | **Phase 2**：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
 | **Phase 2-E**：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | **Phase 3**：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
-| **Phase 4**：評估與報告 | ⏳ 進行中 | 量測 provisioning latency、recovery time、resource efficiency |
+| **Phase 4**：可觀測性 | 🔨 規劃中 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
+
+---
+
+## Phase 4：可觀測性（規劃中）
+
+Phase 4 的核心目標是讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
+
+本專案的技術主張是：Slurm 擅長批次排程語意，Kubernetes 擅長彈性伸縮基礎設施，兩者結合可以彌補彼此的不足。Observability 層讓這個橋接過程不只是存在於程式碼中，而是能被觀測、被量測、被展示。
+
+```
+Slurm 世界                     橋接層（Operator）              K8s 世界
+────────────────               ──────────────────              ────────────────
+Queue pending jobs      ──→    scale-up decision        ──→   StatefulSet +1
+Node idle countdown     ──→    scale-down decision       ──→   StatefulSet -1
+Checkpoint age check    ──→    guard block               ──→   scale skipped
+```
+
+**架構概覽：**
+
+```
+slurm-exporter          kube-state-metrics        operator custom metrics
+(sinfo/squeue → /metrics) (Pod/STS states)        (scale events, guard blocks)
+        ↓                        ↓                          ↓
+                        Prometheus
+                            ↓
+                         Grafana
+                   ┌────────────────────────────────┐
+                   │  Bridge Overview Dashboard     │  ← 主 demo 看板
+                   │  Slurm Cluster State Dashboard │
+                   │  K8s Operator Dashboard        │
+                   └────────────────────────────────┘
+```
+
+**部署計畫：**
+
+```bash
+# 部署 Phase 4 監控堆疊（需已完成 Phase 1–3）
+bash phase4/scripts/bootstrap-phase4.sh
+
+# 開啟 Grafana（port-forward）
+kubectl -n monitoring port-forward svc/grafana 3000:3000
+# 瀏覽器打開 http://localhost:3000
+```
+
+詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
 
 ---
 
@@ -267,6 +312,7 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 | Elastic Operator | Python 3.11 + kubectl CLI |
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
 | DDP 網路 | Multus CNI + secondary NIC (net2) |
+| 監控（Phase 4） | Prometheus + Grafana + prometheus-slurm-exporter |
 
 ---
 
@@ -277,3 +323,4 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 - [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
 - [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
 - 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
+- Phase 4 監控實作規格：[`docs/monitoring.md`](docs/monitoring.md)
