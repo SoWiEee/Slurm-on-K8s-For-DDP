@@ -114,7 +114,9 @@ operator_force_env() {
     SCALE_DOWN_COOLDOWN_SECONDS="60" \
     CHECKPOINT_GUARD_ENABLED="true" \
     CHECKPOINT_PATH="" \
-    MAX_CHECKPOINT_AGE_SECONDS="600" >/dev/null
+    MAX_CHECKPOINT_AGE_SECONDS="600" \
+    SLURM_REST_URL="http://slurm-restapi.${NAMESPACE}.svc.cluster.local:6820" \
+    SLURM_REST_API_VERSION="v0.0.39" >/dev/null
 }
 
 validate_live_operator_config() {

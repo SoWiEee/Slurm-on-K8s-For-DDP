@@ -14,6 +14,8 @@ import os
 import pathlib
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -51,6 +53,11 @@ class Config:
     default_scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
     default_checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "")
     default_max_checkpoint_age_seconds: int = int(os.getenv("MAX_CHECKPOINT_AGE_SECONDS", "600"))
+    # Slurm REST API (slurmrestd).  When set, the operator queries jobs/nodes via
+    # HTTP instead of kubectl exec, eliminating fork overhead and exec timeouts.
+    # Leave empty to fall back to the legacy kubectl exec path.
+    slurm_rest_url: str = os.getenv("SLURM_REST_URL", "")
+    slurm_rest_api_version: str = os.getenv("SLURM_REST_API_VERSION", "v0.0.39")
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,79 @@ class KubectlClient:
         )
 
 
+class SlurmRestClient:
+    """HTTP client for slurmrestd running with auth/local.
+
+    slurmrestd must be started in the controller pod with:
+        /usr/sbin/slurmrestd -a rest_auth/local 0.0.0.0:6820
+    and exposed via the slurm-restapi ClusterIP Service on port 6820.
+
+    auth/local trusts the X-SLURM-USER-NAME header — no secrets required.
+    Uses stdlib urllib only; no extra Python dependencies.
+    """
+
+    _BUSY_STATES = {"allocated", "mixed", "completing"}
+
+    def __init__(self, base_url: str, api_version: str = "v0.0.39",
+                 username: str = "root", timeout: int = 10):
+        self.base_url = base_url.rstrip("/")
+        self.api_version = api_version
+        self.username = username
+        self.timeout = timeout
+
+    def _get(self, path: str) -> dict:
+        url = f"{self.base_url}{path}"
+        req = urllib.request.Request(url)
+        req.add_header("X-SLURM-USER-NAME", self.username)
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def ping(self) -> bool:
+        try:
+            self._get(f"/slurm/{self.api_version}/diag")
+            return True
+        except Exception:
+            return False
+
+    def list_jobs(self, partition: str) -> list[dict]:
+        """Return all PENDING and RUNNING jobs in the given partition."""
+        data = self._get(f"/slurm/{self.api_version}/jobs")
+        return [
+            j for j in data.get("jobs", [])
+            if j.get("partition") == partition
+            and j.get("job_state") in ("PENDING", "RUNNING")
+        ]
+
+    def list_nodes(self) -> list[dict]:
+        data = self._get(f"/slurm/{self.api_version}/nodes")
+        return data.get("nodes", [])
+
+    @staticmethod
+    def _node_states(node: dict) -> set[str]:
+        """Normalise state field — can be a list or a single string."""
+        raw = node.get("state", "")
+        if isinstance(raw, list):
+            return {s.lower() for s in raw}
+        return {raw.lower()} if raw else set()
+
+    @staticmethod
+    def _normalize_job(job: dict) -> dict[str, str]:
+        """Map REST API fields to the same dict shape used by exec-based parsing."""
+        features_raw = job.get("features", "")
+        features = ",".join(features_raw) if isinstance(features_raw, list) else str(features_raw or "")
+
+        tres = job.get("tres_per_node", "") or ""
+        if tres in ("N/A", "none", "None"):
+            tres = ""
+
+        return {
+            "NodeList": job.get("nodes", "(null)") or "(null)",
+            "Features": features,
+            "TresPerNode": tres,
+        }
+
+
 class PartitionConfigLoader:
     @staticmethod
     def load(cfg: Config) -> list[PartitionConfig]:
@@ -178,10 +258,12 @@ class PartitionConfigLoader:
 
 
 class ClusterStateCollector:
-    def __init__(self, client: KubectlClient, partition_cfgs: list[PartitionConfig]):
+    def __init__(self, client: KubectlClient, partition_cfgs: list[PartitionConfig],
+                 rest: SlurmRestClient | None = None):
         self.client = client
         self.partition_cfgs = partition_cfgs
         self.pool_order = list(partition_cfgs)
+        self._rest = rest
 
     @staticmethod
     def _parse_kv_line(line: str) -> dict[str, str]:
@@ -232,11 +314,34 @@ class ClusterStateCollector:
         return None
 
     def _jobs_by_pool_and_state(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
-        """Fetch all PENDING and RUNNING jobs for a partition in a single squeue call.
+        """Fetch all PENDING and RUNNING jobs for a partition.
 
+        Uses REST API when available; falls back to a single squeue exec otherwise.
         Returns {worker_statefulset: {"PENDING": [...], "RUNNING": [...]}}.
-        Fields per job: NodeList, Features, TresPerNode — enough for pool classification.
         """
+        if self._rest is not None:
+            return self._jobs_by_pool_and_state_rest(partition)
+        return self._jobs_by_pool_and_state_exec(partition)
+
+    def _jobs_by_pool_and_state_rest(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
+        result: dict[str, dict[str, list[dict[str, str]]]] = {
+            p.worker_statefulset: {"PENDING": [], "RUNNING": []}
+            for p in self.partition_cfgs
+            if p.partition == partition
+        }
+        for job in self._rest.list_jobs(partition):
+            state = job.get("job_state", "")
+            if state not in ("PENDING", "RUNNING"):
+                continue
+            fields = SlurmRestClient._normalize_job(job)
+            pool = self._classify_job(fields)
+            if pool is None:
+                continue
+            bucket = result.setdefault(pool.worker_statefulset, {"PENDING": [], "RUNNING": []})
+            bucket[state].append(fields)
+        return result
+
+    def _jobs_by_pool_and_state_exec(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
         output = self.client.exec_in_controller(
             f"squeue -h -p {partition} -t PENDING,RUNNING -o '%i|%T|%N|%f|%b' || true"
         )
@@ -274,6 +379,22 @@ class ClusterStateCollector:
         return int(payload.get("spec", {}).get("replicas", 0))
 
     def get_busy_nodes(self, partition_cfg: PartitionConfig) -> int:
+        if self._rest is not None:
+            return self._get_busy_nodes_rest(partition_cfg)
+        return self._get_busy_nodes_exec(partition_cfg)
+
+    def _get_busy_nodes_rest(self, partition_cfg: PartitionConfig) -> int:
+        prefix = partition_cfg.worker_statefulset
+        count = 0
+        for node in self._rest.list_nodes():
+            name = node.get("name", "")
+            if not name.startswith(prefix):
+                continue
+            if SlurmRestClient._node_states(node) & SlurmRestClient._BUSY_STATES:
+                count += 1
+        return count
+
+    def _get_busy_nodes_exec(self, partition_cfg: PartitionConfig) -> int:
         prefix = partition_cfg.worker_statefulset
         output = self.client.exec_in_controller(
             rf"sinfo -h -p {partition_cfg.partition} -N -o '%N %T' | awk '$1 ~ /^{prefix}(-|$)/ && $2 ~ /ALLOCATED|MIXED|COMPLETING/ {{count++}} END {{print count+0}}'"
@@ -394,7 +515,11 @@ class OperatorApp:
         self.logger = JsonLogger()
         self.client = KubectlClient(cfg)
         self.partition_cfgs = PartitionConfigLoader.load(cfg)
-        self.collector = ClusterStateCollector(self.client, self.partition_cfgs)
+        self.rest = (
+            SlurmRestClient(cfg.slurm_rest_url, api_version=cfg.slurm_rest_api_version)
+            if cfg.slurm_rest_url else None
+        )
+        self.collector = ClusterStateCollector(self.client, self.partition_cfgs, self.rest)
         self.policy = CheckpointAwareQueuePolicy(cfg.checkpoint_guard_enabled)
         self.actuator = StatefulSetActuator(self.client)
         self.last_scale_up_at: dict[str, float] = {p.worker_statefulset: 0.0 for p in self.partition_cfgs}
@@ -425,12 +550,23 @@ class OperatorApp:
         return None
 
     def run(self) -> None:
+        rest_available = self.rest is not None and self.rest.ping()
         self.logger.emit(
             "startup",
             policy=self.cfg.policy_name,
+            query_mode="rest" if rest_available else "exec",
+            rest_url=self.cfg.slurm_rest_url or None,
             config=asdict(self.cfg),
             partitions=[asdict(p) for p in self.partition_cfgs],
         )
+        if self.rest is not None and not rest_available:
+            self.logger.emit(
+                "error", level="WARN",
+                message="SLURM_REST_URL is set but slurmrestd ping failed; falling back to kubectl exec",
+                rest_url=self.cfg.slurm_rest_url,
+            )
+            self.rest = None
+            self.collector._rest = None
         while True:
             all_states = self.collector.collect_all_partition_states()
             for partition_cfg in self.partition_cfgs:

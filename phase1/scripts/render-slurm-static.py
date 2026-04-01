@@ -139,6 +139,19 @@ spec:
       port: 6817
       targetPort: 6817
 ---""")
+    docs.append("""apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-restapi
+  namespace: slurm
+spec:
+  selector:
+    app: slurm-controller
+  ports:
+    - name: rest
+      port: 6820
+      targetPort: 6820
+---""")
     for pool in cfg["workerPools"]:
         docs.append(f"""apiVersion: v1
 kind: Service
@@ -198,10 +211,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              /usr/sbin/slurmrestd -a rest_auth/local 0.0.0.0:6820 &
               exec slurmctld -Dvvv
           ports:
             - containerPort: 22
             - containerPort: 6817
+            - containerPort: 6820
           readinessProbe:
             exec:
               command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x munged >/dev/null"]
