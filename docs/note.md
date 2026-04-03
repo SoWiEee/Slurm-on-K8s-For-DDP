@@ -277,6 +277,66 @@ job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出。
 
 ---
 
+# Phase 4 Debug Record（2026-04-03）
+
+## A. slurm-exporter 無法連線到 slurmrestd（NetworkPolicy 缺規則）
+
+**症狀：**
+```
+urllib.error.URLError: <urlopen error timed out>
+```
+slurm-exporter 每次 scrape 都超時，所有 Slurm 指標歸零（`slurm_queue_pending=0`、`slurm_nodes_total=0`），但 `/metrics` endpoint 本身可正常被 Prometheus 抓到（`slurm_exporter_scrape_success=0`）。
+
+**根因：**
+
+`phase2/manifests/network-policy.yaml` 的 `allow-controller-ingress` policy 允許的 source pod 清單為：
+```yaml
+values:
+  - slurm-worker-cpu
+  - slurm-worker-gpu-a10
+  - slurm-worker-gpu-h100
+  - slurm-login
+  - slurm-elastic-operator
+```
+缺少 `slurm-exporter`。預設 deny-all ingress policy 因此擋掉了 exporter → slurmrestd（port 6820）的連線。
+
+**修正：**
+
+在 `allow-controller-ingress` 的 values 清單加入 `slurm-exporter`，再執行：
+```bash
+kubectl apply -f phase2/manifests/network-policy.yaml
+kubectl -n slurm rollout restart deployment/slurm-exporter
+```
+
+---
+
+## B. verify-phase4.sh 在無 wget/curl 的 image 裡 exec 失敗
+
+**症狀：**
+
+verify script 對 kube-state-metrics 和 slurm-exporter 的 metrics 檢查全部 FAIL，但 Prometheus 上這兩個 target 都是 UP。
+
+**根因（三個獨立問題）：**
+
+1. **distroless image 無 shell/wget/curl**：`check_metrics_endpoint` 用 `kubectl exec pod -- wget ...` 的方式，但 kube-state-metrics 使用的 image 沒有這些工具，exec 直接失敗。
+
+2. **python:3.11-slim 無 wget/curl**：slurm-exporter image 同樣無 curl/wget。
+
+3. **Windows 環境無 `python3` 指令**：Prometheus target 解析原本用 `python3 -c "..."` 做 JSON 解析，Windows 下指令應為 `py`，導致腳本報錯誤而非解析失敗，造成誤判。
+
+**修正：**
+
+改用 **port-forward + host-side curl** 的方式取代 exec：
+- 每個 metrics 檢查改為：啟動 `kubectl port-forward`，等待 3 秒，用 host 上的 `curl` 抓 `/metrics`，直接 pipe 給 `grep`，完成後 kill port-forward。
+- Prometheus targets 解析從 `python3` JSON 解析改為 `grep -A5 ... | grep '"health":"up"'`，無需任何 Python。
+- 同時修正 kube-state-metrics 的 metric 名稱：實際名稱為 `kube_statefulset_status_replicas`（非 `kube_statefulset_replicas`）。
+
+**另一個隱藏 bug：**
+
+`check_metrics` 函數原本先把 curl 結果存入 bash 變數（`output=$(curl ...)`），再用 `echo "$output" | grep -q`。對於 KSM 的 ~180 KB metrics body，`echo "$output"` 在 bash pipe 中有截斷風險。改為直接 pipe `curl ... | grep -q` 後問題消失。
+
+---
+
 # CPU / GPU 資源分配與多 Job 共用調查（2026-03-28）
 
 1. Job 是否能指定要用多少 CPU 和 GPU？

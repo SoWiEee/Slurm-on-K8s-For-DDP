@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
@@ -99,6 +101,39 @@ class JsonLogger:
 
 
 _COOLDOWN_ANNOTATION = "slurm.k8s/last-scale-up-at"
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics (module-level to survive across OperatorApp restarts)
+# ---------------------------------------------------------------------------
+_SCALE_UP_TOTAL = Counter(
+    "slurm_operator_scale_up_total",
+    "Total scale-up actions executed, by pool",
+    ["pool"],
+)
+_SCALE_DOWN_TOTAL = Counter(
+    "slurm_operator_scale_down_total",
+    "Total scale-down actions executed, by pool",
+    ["pool"],
+)
+_SCALE_SKIPPED_TOTAL = Counter(
+    "slurm_operator_scale_skipped_total",
+    "Total scaling decisions skipped, by pool and reason",
+    ["pool", "reason"],
+)
+_CHECKPOINT_GUARD_BLOCKS_TOTAL = Counter(
+    "slurm_operator_checkpoint_guard_blocks_total",
+    "Times checkpoint guard blocked a scale-down, by pool",
+    ["pool"],
+)
+_POLL_DURATION = Histogram(
+    "slurm_operator_poll_duration_seconds",
+    "Elapsed time for one complete operator poll loop",
+)
+_CURRENT_REPLICAS = Gauge(
+    "slurm_operator_current_replicas",
+    "Current StatefulSet replica count, by pool",
+    ["pool"],
+)
 
 
 def clamp(value: int, low: int, high: int) -> int:
@@ -651,12 +686,15 @@ class OperatorApp:
             )
             self.rest = None
             self.collector._rest = None
+        start_http_server(8000)
         while True:
+            _loop_start = time.time()
             all_states = self.collector.collect_all_partition_states()
             for partition_cfg in self.partition_cfgs:
                 key = partition_cfg.worker_statefulset
                 try:
                     state = all_states[key]
+                    _CURRENT_REPLICAS.labels(pool=key).set(state.current_replicas)
                     checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
                     decision = self.policy.evaluate(partition_cfg, state, checkpoint_age)
 
@@ -684,6 +722,7 @@ class OperatorApp:
                             )
                         except Exception:  # noqa: BLE001
                             pass  # best-effort; in-memory value is still correct for this cycle
+                        _SCALE_UP_TOTAL.labels(pool=key).inc()
                         self.logger.emit(
                             "scale_action",
                             policy=self.cfg.policy_name,
@@ -700,6 +739,7 @@ class OperatorApp:
                     elif decision.action == "scale_down":
                         if cooldown_elapsed >= partition_cfg.scale_down_cooldown:
                             self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
+                            _SCALE_DOWN_TOTAL.labels(pool=key).inc()
                             self.logger.emit(
                                 "scale_action",
                                 policy=self.cfg.policy_name,
@@ -714,6 +754,7 @@ class OperatorApp:
                                 busy_nodes=state.busy_nodes,
                             )
                         else:
+                            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="cooldown").inc()
                             self.logger.emit(
                                 "scale_skipped",
                                 policy=self.cfg.policy_name,
@@ -729,6 +770,15 @@ class OperatorApp:
                                 busy_nodes=state.busy_nodes,
                             )
                     else:
+                        _guard_reasons = (
+                            "checkpoint_unknown_block_scale_down",
+                            "checkpoint_stale_block_scale_down",
+                        )
+                        if decision.reason in _guard_reasons:
+                            _CHECKPOINT_GUARD_BLOCKS_TOTAL.labels(pool=key).inc()
+                            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="checkpoint_guard").inc()
+                        else:
+                            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="no_action").inc()
                         self.logger.emit(
                             "scale_skipped",
                             policy=self.cfg.policy_name,
@@ -745,6 +795,7 @@ class OperatorApp:
                         )
                 except Exception as exc:  # noqa: BLE001
                     self.logger.emit("error", level="ERROR", partition=partition_cfg.partition, statefulset=key, message=str(exc))
+            _POLL_DURATION.observe(time.time() - _loop_start)
             pathlib.Path("/tmp/operator-alive").touch()
             time.sleep(self.cfg.poll_interval)
 

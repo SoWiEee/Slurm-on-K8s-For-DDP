@@ -1,0 +1,656 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  bridge-overview.json: |
+    {
+      "uid": "slurm-bridge-overview",
+      "title": "Slurm\u2194K8s Bridge Overview",
+      "description": "Slurm queue depth, worker replica counts, and scale event rate",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "timepicker": {},
+      "timezone": "browser",
+      "tags": ["slurm", "k8s"],
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Pending Jobs",
+          "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 5 },
+                  { "color": "red", "value": 20 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_queue_pending",
+              "legendFormat": "Pending Jobs",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Running Jobs",
+          "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "blue", "value": 1 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_queue_running",
+              "legendFormat": "Running Jobs",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "CPU Workers Ready",
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 1 },
+                  { "color": "green", "value": 2 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "kube_statefulset_status_replicas_ready{statefulset=\"slurm-worker-cpu\"}",
+              "legendFormat": "CPU Workers Ready",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Scale-Ups 1h",
+          "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 3 },
+                  { "color": "red", "value": 10 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "increase(slurm_operator_scale_up_total[1h])",
+              "legendFormat": "Scale-Ups 1h",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Queue Depth vs Worker Replicas",
+          "gridPos": { "x": 0, "y": 4, "w": 24, "h": 9 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "auto",
+                "spanNulls": false,
+                "axisPlacement": "auto",
+                "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_queue_pending",
+              "legendFormat": "Pending Jobs",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_queue_running",
+              "legendFormat": "Running Jobs",
+              "refId": "B"
+            },
+            {
+              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-cpu\"}",
+              "legendFormat": "CPU Workers",
+              "refId": "C"
+            },
+            {
+              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-gpu-a10\"}",
+              "legendFormat": "GPU A10 Workers",
+              "refId": "D"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Node States",
+          "gridPos": { "x": 0, "y": 13, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "auto",
+                "spanNulls": false,
+                "axisPlacement": "auto",
+                "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_nodes_idle",
+              "legendFormat": "Idle",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_nodes_alloc",
+              "legendFormat": "Allocated",
+              "refId": "B"
+            },
+            {
+              "expr": "slurm_nodes_down",
+              "legendFormat": "Down",
+              "refId": "C"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Scale Events /5m",
+          "gridPos": { "x": 12, "y": 13, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "auto",
+                "spanNulls": false,
+                "axisPlacement": "auto",
+                "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "increase(slurm_operator_scale_up_total[5m])",
+              "legendFormat": "Scale Up /5m",
+              "refId": "A"
+            },
+            {
+              "expr": "increase(slurm_operator_scale_down_total[5m])",
+              "legendFormat": "Scale Down /5m",
+              "refId": "B"
+            }
+          ]
+        }
+      ]
+    }
+
+  operator.json: |
+    {
+      "uid": "slurm-k8s-operator",
+      "title": "K8s Elastic Operator",
+      "description": "Operator scaling decisions, replica counts, poll duration, and skipped decisions",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "timepicker": {},
+      "timezone": "browser",
+      "tags": ["slurm", "operator"],
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Total Scale-Ups",
+          "gridPos": { "x": 0, "y": 0, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 10 },
+                  { "color": "red", "value": 50 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "sum(slurm_operator_scale_up_total)",
+              "legendFormat": "Scale-Ups Total",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Total Scale-Downs",
+          "gridPos": { "x": 8, "y": 0, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 10 },
+                  { "color": "red", "value": 50 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "sum(slurm_operator_scale_down_total)",
+              "legendFormat": "Scale-Downs Total",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Checkpoint Guard Blocks",
+          "gridPos": { "x": 16, "y": 0, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "orange", "value": 1 },
+                  { "color": "red", "value": 10 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "sum(slurm_operator_checkpoint_guard_blocks_total)",
+              "legendFormat": "Checkpoint Guard Blocks",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Replicas by Pool",
+          "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "auto",
+                "spanNulls": false,
+                "axisPlacement": "auto",
+                "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_operator_current_replicas",
+              "legendFormat": "{{pool}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Poll Loop Duration p95",
+          "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "unit": "s",
+              "custom": {
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "auto",
+                "spanNulls": false,
+                "axisPlacement": "auto",
+                "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, rate(slurm_operator_poll_duration_seconds_bucket[5m]))",
+              "legendFormat": "p95 poll duration",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Skipped Decisions /5m",
+          "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "auto",
+                "spanNulls": false,
+                "axisPlacement": "auto",
+                "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "increase(slurm_operator_scale_skipped_total[5m])",
+              "legendFormat": "{{pool}} {{reason}}",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }

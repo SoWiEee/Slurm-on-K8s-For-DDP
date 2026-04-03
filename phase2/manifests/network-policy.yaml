@@ -45,6 +45,7 @@ spec:
                   - slurm-worker-gpu-h100
                   - slurm-login
                   - slurm-elastic-operator
+                  - slurm-exporter
       ports:
         - protocol: TCP
           port: 6817   # slurmctld
