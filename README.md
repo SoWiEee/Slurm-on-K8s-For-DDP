@@ -73,7 +73,7 @@ bash phase3/scripts/verify-phase3-e2e.sh
 
 > 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
 
-## 5. 部署監控（Phase 4）
+## 5. 部署監控驗證（Phase 4）
 
 ```bash
 bash phase4/scripts/bootstrap-phase4.sh
@@ -81,9 +81,11 @@ bash phase4/scripts/bootstrap-phase4.sh
 
 這支腳本會自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana → 套用跨 namespace 的 NetworkPolicy → 等待所有 Pod ready。
 
-部署完成後開啟 Grafana (http://localhost:3000)，查看 Dashboards → Slurm 資料夾 → 選 "Slurm↔K8s Bridge Overview"。有需要 debug 的話可以開啟 Prometheus (http://localhost:9090)。
+- Grafana: http://localhost:3000
+- Prometheus: http://localhost:9090 (for debug)
 
 ```bash
+# 存取 Grafana
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 # 驗證所有元件正常、metrics 可抓
