@@ -6,7 +6,7 @@
 
 ---
 
-# 🔥 Motivation
+# 🌱 Motivation
 
 如果你曾經跑過分散式 AI 訓練，你大概有過這樣的經驗：
 
@@ -103,7 +103,7 @@ kind delete cluster --name slurm-lab
 
 ---
 
-# 🔄 System Architecture
+# 🏗️ System Architecture
 
 用一句話說：你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。
 
@@ -169,7 +169,7 @@ graph TD
 
 ---
 
-# 📘 Development Progress
+# 🎯 Development Progress
 
 | Phase# | 狀態 | 內容 |
 |-------|------|------|
@@ -181,9 +181,9 @@ graph TD
 
 ---
 
-## Phase 4：可觀測性
+## 🔭 Observability
 
-Phase 4 的核心目標是讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
+於 Phase 4 實作監控面板，讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
 
 ```
 Slurm 世界                     橋接層（Operator）              K8s 世界
@@ -193,7 +193,7 @@ Node idle countdown     ──→    scale-down decision       ──→   State
 Checkpoint age check    ──→    guard block               ──→   scale skipped
 ```
 
-**監控架構：**
+### 監控架構
 
 ```
 slurm-exporter              kube-state-metrics        operator /metrics:8000
@@ -256,7 +256,7 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 
 ---
 
-## 資源分配說明
+## 📦 資源分配說明
 
 每台 worker 宣告 `CPUs=4`，採 `select/cons_tres + CR_Core` 消耗式資源模式：
 
@@ -267,9 +267,9 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 
 ---
 
-# 🛠️ Useful Commands
+# ⚡ Useful Commands
 
-### Slurm 叢集
+## Slurm Cluster
 
 ```bash
 # 查看所有 pod 狀態
@@ -292,7 +292,7 @@ kubectl -n slurm get statefulset slurm-worker-cpu \
 kubectl -n slurm exec -it deploy/slurm-login -- bash
 ```
 
-### Phase 4 監控
+## Monitoring
 
 ```bash
 # 開啟 Grafana（admin / admin）
@@ -372,3 +372,4 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 - [Grafana](https://grafana.com/)
 - 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
 - Phase 4 監控實作規格：[`docs/monitoring.md`](docs/monitoring.md)
+- K8s 物件說明：[`docs/cluster.md`](docs/cluster.md)
