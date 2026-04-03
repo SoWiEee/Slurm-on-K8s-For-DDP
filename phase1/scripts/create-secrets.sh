@@ -26,6 +26,7 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 
 need_munge=true
 need_ssh=true
+need_jwt=true
 
 if [[ "$REGENERATE_SECRETS" != "true" ]]; then
   if kubectl -n "$NAMESPACE" get secret slurm-munge-key >/dev/null 2>&1; then
@@ -33,6 +34,9 @@ if [[ "$REGENERATE_SECRETS" != "true" ]]; then
   fi
   if kubectl -n "$NAMESPACE" get secret slurm-ssh-key >/dev/null 2>&1; then
     need_ssh=false
+  fi
+  if kubectl -n "$NAMESPACE" get secret slurm-jwt-secret >/dev/null 2>&1; then
+    need_jwt=false
   fi
 fi
 
@@ -61,6 +65,19 @@ if [[ "$need_ssh" == "true" ]]; then
   log "created secret slurm-ssh-key"
 else
   log "keeping existing secret slurm-ssh-key"
+fi
+
+if [[ "$need_jwt" == "true" ]]; then
+  log "generating JWT HS256 key..."
+  openssl rand 32 > "$WORKDIR/jwt_hs256.key"
+
+  kubectl -n "$NAMESPACE" delete secret slurm-jwt-secret --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" create secret generic slurm-jwt-secret \
+    --from-file=jwt_hs256.key="$WORKDIR/jwt_hs256.key" >/dev/null
+
+  log "created secret slurm-jwt-secret"
+else
+  log "keeping existing secret slurm-jwt-secret"
 fi
 
 log "done"

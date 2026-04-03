@@ -283,7 +283,7 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，Operator 只調整 StatefulSet 的 replica 數，而不重寫 Slurm 設定檔。這避免了每次擴縮時 `slurmctld` 重新解析所有 DNS 造成的連鎖延遲。
 
 **為什麼 Operator 不用 Kopf 或 CRD？**
-刻意保持輕量。Operator 是純 Python，直接呼叫 `kubectl` CLI，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。
+刻意保持輕量。Operator 是純 Python，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。Slurm 狀態查詢（queue、job、node）透過 slurmrestd REST API 進行；StatefulSet replica 調整仍透過 `kubectl patch`。
 
 **Checkpoint Guard 是什麼？**
 在縮容前，Operator 會檢查執行中 job 的 checkpoint 檔案年齡。若 checkpoint 不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容會被阻擋，避免 DDP 訓練進度因節點被回收而遺失。
@@ -309,7 +309,7 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 | 容器編排 | Kubernetes |
 | HPC 排程器 | Slurm (slurmctld + slurmd) |
 | 節點認證 | Munge |
-| Elastic Operator | Python 3.11 + kubectl CLI |
+| Elastic Operator | Python 3.11 + Slurm REST API (slurmrestd) + kubectl CLI |
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
 | DDP 網路 | Multus CNI + secondary NIC (net2) |
 | 監控（Phase 4） | Prometheus + Grafana + prometheus-slurm-exporter |
@@ -322,5 +322,12 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 - [PyTorch Distributed Elastic](https://docs.pytorch.org/docs/stable/distributed.elastic.html)
 - [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
 - [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
+- [Running Slurm on Amazon EKS with Slinky](https://aws.amazon.com/tw/blogs/containers/running-slurm-on-amazon-eks-with-slinky/)
+- [Slinky Project](https://github.com/slinkyproject)
+- [Slonk: Slurm on Kubernetes for ML Research at Character.ai](https://blog.character.ai/slonk/)
+- [Prometheus Slurm Exporter](https://github.com/vpenso/prometheus-slurm-exporter)
+- [AWS ParallelCluster](https://github.com/aws/aws-parallelcluster)
+- [Environment Modules](https://github.com/envmodules/modules)
+- [Grafana](https://grafana.com/)
 - 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
 - Phase 4 監控實作規格：[`docs/monitoring.md`](docs/monitoring.md)

@@ -1,0 +1,113 @@
+# NetworkPolicy for the slurm namespace.
+#
+# Strategy: default-deny all ingress, then open only the documented
+# communication paths. Egress is left unrestricted so pods can reach
+# kube-dns (UDP/TCP 53), the K8s API server, and any external endpoints
+# (NFS, Docker registry) without additional rules.
+#
+# Slurm port reference:
+#   6817 – slurmctld   (workers / login → controller)
+#   6818 – slurmd      (controller / login → workers)
+#   6820 – slurmrestd  (operator → controller REST API)
+#   22   – sshd        (inter-pod SSH used by srun step launch)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: slurm
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# Controller: accept connections from workers, login pod, and operator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-controller-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+                  - slurm-login
+                  - slurm-elastic-operator
+      ports:
+        - protocol: TCP
+          port: 6817   # slurmctld
+        - protocol: TCP
+          port: 6820   # slurmrestd
+        - protocol: TCP
+          port: 22     # SSH
+---
+# Workers: accept connections from controller (step launch) and login (srun).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-worker-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - slurm-worker-cpu
+          - slurm-worker-gpu-a10
+          - slurm-worker-gpu-h100
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-controller
+                  - slurm-login
+      ports:
+        - protocol: TCP
+          port: 6818   # slurmd
+        - protocol: TCP
+          port: 22     # SSH
+---
+# Login: accept SSH from other slurm pods (interactive srun sessions).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-login-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-login
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-controller
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+      ports:
+        - protocol: TCP
+          port: 22

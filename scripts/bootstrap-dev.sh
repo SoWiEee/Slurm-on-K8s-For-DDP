@@ -114,7 +114,11 @@ operator_force_env() {
     SCALE_DOWN_COOLDOWN_SECONDS="60" \
     CHECKPOINT_GUARD_ENABLED="true" \
     CHECKPOINT_PATH="" \
-    MAX_CHECKPOINT_AGE_SECONDS="600" >/dev/null
+    MAX_CHECKPOINT_AGE_SECONDS="600" \
+    SLURM_REST_URL="http://slurm-restapi.${NAMESPACE}.svc.cluster.local:6820" \
+    SLURM_REST_API_VERSION="v0.0.37" >/dev/null
+    # SLURM_JWT_KEY_PATH is set in the manifest; omit here to avoid Git Bash
+    # POSIX path conversion (/ → C:/Program Files/Git/) on Windows.
 }
 
 validate_live_operator_config() {
@@ -256,6 +260,7 @@ kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
 log "applying phase2 operator manifest..."
 kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
+kubectl apply -f phase2/manifests/network-policy.yaml
 operator_force_env
 validate_live_operator_config
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true

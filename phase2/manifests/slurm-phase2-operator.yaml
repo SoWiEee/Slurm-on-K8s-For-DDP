@@ -85,6 +85,17 @@ spec:
               value: ""
             - name: MAX_CHECKPOINT_AGE_SECONDS
               value: "600"
+            - name: SLURM_REST_URL
+              value: "http://slurm-restapi.slurm.svc.cluster.local:6820"
+            - name: SLURM_REST_API_VERSION
+              value: "v0.0.37"
+            - name: SLURM_JWT_KEY_PATH
+              value: "/slurm-jwt/jwt_hs256.key"
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
           livenessProbe:
             exec:
               command:
@@ -96,3 +107,7 @@ spec:
             initialDelaySeconds: 60
             periodSeconds: 30
             failureThreshold: 3
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: slurm-jwt-secret
