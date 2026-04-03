@@ -81,17 +81,16 @@ bash phase4/scripts/bootstrap-phase4.sh
 
 這支腳本會自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana → 套用跨 namespace 的 NetworkPolicy → 等待所有 Pod ready。
 
-部署完成後開啟 Grafana：
+部署完成後開啟 Grafana (http://localhost:3000)，查看 Dashboards → Slurm 資料夾 → 選 "Slurm↔K8s Bridge Overview"。有需要 debug 的話可以開啟 Prometheus (http://localhost:9090)。
 
 ```bash
 kubectl -n monitoring port-forward svc/grafana 3000:3000
-# → 瀏覽器打開 http://localhost:3000（帳密：admin / admin）
-# Dashboards → Slurm 資料夾 → 選 "Slurm↔K8s Bridge Overview"
-```
 
-```bash
 # 驗證所有元件正常、metrics 可抓
 bash phase4/scripts/verify-phase4.sh
+
+# 存取 Prometheus
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
 ```
 
 ## 清理環境
@@ -170,13 +169,13 @@ graph TD
 
 # 📘 Development Progress
 
-| Phase | 狀態 | 內容 |
+| Phase# | 狀態 | 內容 |
 |-------|------|------|
-| **Phase 1**：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge/SSH 認證，靜態節點預宣告 |
-| **Phase 2**：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
-| **Phase 2-E**：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
-| **Phase 3**：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
-| **Phase 4**：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
+| 1：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge/SSH 認證，靜態節點預宣告 |
+| 2：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
+| 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
+| 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
+| 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
 
 ---
 
@@ -207,32 +206,7 @@ slurm-exporter              kube-state-metrics        operator /metrics:8000
                    └──────────────────────────────────┘
 ```
 
-**部署：**
-
-```bash
-# 部署監控堆疊（需已完成 Phase 1 + Phase 2）
-bash phase4/scripts/bootstrap-phase4.sh
-
-# 驗證所有元件與 metrics
-bash phase4/scripts/verify-phase4.sh
-```
-
-**存取 Grafana：**
-
-```bash
-kubectl -n monitoring port-forward svc/grafana 3000:3000
-# → http://localhost:3000  （帳密：admin / admin）
-# Dashboards → Slurm 資料夾
-```
-
-**存取 Prometheus（debug 用）：**
-
-```bash
-kubectl -n monitoring port-forward svc/prometheus 9090:9090
-# → http://localhost:9090
-```
-
-詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
+> 詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
 
 ---
 
