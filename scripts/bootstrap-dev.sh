@@ -260,6 +260,7 @@ kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
 log "applying phase2 operator manifest..."
 kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
+kubectl apply -f phase2/manifests/network-policy.yaml
 operator_force_env
 validate_live_operator_config
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true

@@ -98,6 +98,9 @@ class JsonLogger:
         print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+_COOLDOWN_ANNOTATION = "slurm.k8s/last-scale-up-at"
+
+
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
@@ -133,6 +136,26 @@ class KubectlClient:
     # Backward-compatible alias for older call sites and previously built images.
     def pod_ready(self, pod_name: str) -> bool:
         return self.pod_is_ready(pod_name)
+
+    def get_annotation(self, resource: str, name: str, key: str) -> str | None:
+        """Return the value of a metadata annotation, or None if absent/unreadable."""
+        rc, out, _ = self.try_run([
+            "-n", self.cfg.namespace, "get", resource, name,
+            "-o", "jsonpath={.metadata.annotations}",
+        ])
+        if rc != 0 or not out:
+            return None
+        try:
+            return json.loads(out).get(key)
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+    def set_annotation(self, resource: str, name: str, key: str, value: str) -> None:
+        """Write a metadata annotation onto a resource (creates or overwrites)."""
+        self.run([
+            "-n", self.cfg.namespace, "annotate", resource, name,
+            f"{key}={value}", "--overwrite",
+        ])
 
     def exec_in_controller(self, command: str) -> str:
         return self.run(
@@ -568,7 +591,22 @@ class OperatorApp:
         self.collector = ClusterStateCollector(self.client, self.partition_cfgs, self.rest)
         self.policy = CheckpointAwareQueuePolicy(cfg.checkpoint_guard_enabled)
         self.actuator = StatefulSetActuator(self.client)
-        self.last_scale_up_at: dict[str, float] = {p.worker_statefulset: 0.0 for p in self.partition_cfgs}
+        # Restore cooldown timestamps from StatefulSet annotations so a pod
+        # restart does not reset the cooldown clock and cause an immediate
+        # scale-down that was previously guarded against.
+        self.last_scale_up_at: dict[str, float] = {}
+        for _p in self.partition_cfgs:
+            _raw: str | None = None
+            try:
+                _raw = self.client.get_annotation(
+                    "statefulset", _p.worker_statefulset, _COOLDOWN_ANNOTATION
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.last_scale_up_at[_p.worker_statefulset] = float(_raw) if _raw else 0.0
+            except ValueError:
+                self.last_scale_up_at[_p.worker_statefulset] = 0.0
 
     def _reconfigure_slurm(self) -> None:
         """Avoid periodic reconfigure storms.
@@ -639,6 +677,13 @@ class OperatorApp:
                     if decision.action == "scale_up":
                         self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
                         self.last_scale_up_at[key] = now
+                        try:
+                            self.client.set_annotation(
+                                "statefulset", partition_cfg.worker_statefulset,
+                                _COOLDOWN_ANNOTATION, str(now),
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass  # best-effort; in-memory value is still correct for this cycle
                         self.logger.emit(
                             "scale_action",
                             policy=self.cfg.policy_name,

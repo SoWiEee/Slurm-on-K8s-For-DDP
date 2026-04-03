@@ -28,6 +28,7 @@ docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f phase2/dock
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
 kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
+kubectl apply -f phase2/manifests/network-policy.yaml
 
 # Do NOT apply a partial StatefulSet manifest (will fail validation/update constraints).
 # Scale existing Phase 1 worker StatefulSet in-place so operator can take over from 1 replica.
