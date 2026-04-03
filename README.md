@@ -73,6 +73,27 @@ bash phase3/scripts/verify-phase3-e2e.sh
 
 > 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
 
+## 5. 部署監控（Phase 4）
+
+```bash
+bash phase4/scripts/bootstrap-phase4.sh
+```
+
+這支腳本會自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana → 套用跨 namespace 的 NetworkPolicy → 等待所有 Pod ready。
+
+部署完成後開啟 Grafana：
+
+```bash
+kubectl -n monitoring port-forward svc/grafana 3000:3000
+# → 瀏覽器打開 http://localhost:3000（帳密：admin / admin）
+# Dashboards → Slurm 資料夾 → 選 "Slurm↔K8s Bridge Overview"
+```
+
+```bash
+# 驗證所有元件正常、metrics 可抓
+bash phase4/scripts/verify-phase4.sh
+```
+
 ## 清理環境
 
 ```bash
@@ -155,15 +176,13 @@ graph TD
 | **Phase 2**：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
 | **Phase 2-E**：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | **Phase 3**：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
-| **Phase 4**：可觀測性 | 🔨 規劃中 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
+| **Phase 4**：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
 
 ---
 
-## Phase 4：可觀測性（規劃中）
+## Phase 4：可觀測性
 
 Phase 4 的核心目標是讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
-
-本專案的技術主張是：Slurm 擅長批次排程語意，Kubernetes 擅長彈性伸縮基礎設施，兩者結合可以彌補彼此的不足。Observability 層讓這個橋接過程不只是存在於程式碼中，而是能被觀測、被量測、被展示。
 
 ```
 Slurm 世界                     橋接層（Operator）              K8s 世界
@@ -173,31 +192,44 @@ Node idle countdown     ──→    scale-down decision       ──→   State
 Checkpoint age check    ──→    guard block               ──→   scale skipped
 ```
 
-**架構概覽：**
+**監控架構：**
 
 ```
-slurm-exporter          kube-state-metrics        operator custom metrics
-(sinfo/squeue → /metrics) (Pod/STS states)        (scale events, guard blocks)
-        ↓                        ↓                          ↓
-                        Prometheus
-                            ↓
-                         Grafana
-                   ┌────────────────────────────────┐
-                   │  Bridge Overview Dashboard     │  ← 主 demo 看板
-                   │  Slurm Cluster State Dashboard │
-                   │  K8s Operator Dashboard        │
-                   └────────────────────────────────┘
+slurm-exporter              kube-state-metrics        operator /metrics:8000
+(slurmrestd REST → metrics)  (STS/Pod states)         (scale events, guard blocks)
+        ↓                          ↓                          ↓
+                          Prometheus :9090
+                               ↓
+                            Grafana :3000
+                   ┌──────────────────────────────────┐
+                   │  Slurm↔K8s Bridge Overview       │  ← 主 demo 看板
+                   │  K8s Elastic Operator            │
+                   └──────────────────────────────────┘
 ```
 
-**部署計畫：**
+**部署：**
 
 ```bash
-# 部署 Phase 4 監控堆疊（需已完成 Phase 1–3）
+# 部署監控堆疊（需已完成 Phase 1 + Phase 2）
 bash phase4/scripts/bootstrap-phase4.sh
 
-# 開啟 Grafana（port-forward）
+# 驗證所有元件與 metrics
+bash phase4/scripts/verify-phase4.sh
+```
+
+**存取 Grafana：**
+
+```bash
 kubectl -n monitoring port-forward svc/grafana 3000:3000
-# 瀏覽器打開 http://localhost:3000
+# → http://localhost:3000  （帳密：admin / admin）
+# Dashboards → Slurm 資料夾
+```
+
+**存取 Prometheus（debug 用）：**
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+# → http://localhost:9090
 ```
 
 詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
@@ -261,6 +293,8 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 
 # 🛠️ Useful Commands
 
+### Slurm 叢集
+
 ```bash
 # 查看所有 pod 狀態
 kubectl -n slurm get pods -o wide
@@ -268,11 +302,42 @@ kubectl -n slurm get pods -o wide
 # 觀察 worker pool 伸縮
 kubectl -n slurm get statefulset -w
 
-# 查看 Operator 決策日誌（JSON 格式）
-kubectl -n slurm logs deployment/slurm-elastic-operator -f
+# 查看 Operator 決策日誌（結構化 JSON）
+kubectl -n slurm logs deployment/slurm-elastic-operator -f | python3 -m json.tool
 
 # 查看 Slurm controller 日誌
 kubectl -n slurm logs statefulset/slurm-controller -f
+
+# 查詢 Operator 寫下的 cooldown 時間戳
+kubectl -n slurm get statefulset slurm-worker-cpu \
+  -o jsonpath='{.metadata.annotations.slurm\.k8s/last-scale-up-at}'
+
+# 進 login pod 提交 job
+kubectl -n slurm exec -it deploy/slurm-login -- bash
+```
+
+### Phase 4 監控
+
+```bash
+# 開啟 Grafana（admin / admin）
+kubectl -n monitoring port-forward svc/grafana 3000:3000
+
+# 開啟 Prometheus（raw metrics / 查詢）
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+
+# 直接確認 operator 是否正在輸出 metrics
+kubectl -n slurm port-forward svc/slurm-elastic-operator 8000:8000
+# → curl http://localhost:8000/metrics | grep slurm_operator
+
+# 直接確認 slurm-exporter 是否正在輸出 metrics
+kubectl -n slurm port-forward svc/slurm-exporter 9341:9341
+# → curl http://localhost:9341/metrics | grep slurm_queue
+
+# 查看所有監控元件狀態
+kubectl -n monitoring get pods -o wide
+
+# 查看 slurm-exporter 日誌（確認是否能連到 slurmrestd）
+kubectl -n slurm logs deployment/slurm-exporter --tail=30
 ```
 
 ---
