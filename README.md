@@ -81,8 +81,8 @@ bash phase4/scripts/bootstrap-phase4.sh
 
 這支腳本會自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana → 套用跨 namespace 的 NetworkPolicy → 等待所有 Pod ready。
 
-- Grafana: http://localhost:3000
-- Prometheus: http://localhost:9090 (for debug)
+- Grafana：http://localhost:3000
+- Prometheus：http://localhost:9090 (for debug)
 
 ```bash
 # 存取 Grafana
@@ -181,7 +181,7 @@ graph TD
 
 ---
 
-## 🔭 Observability
+# 🔭 Observability
 
 於 Phase 4 實作監控面板，讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
 
@@ -193,7 +193,7 @@ Node idle countdown     ──→    scale-down decision       ──→   State
 Checkpoint age check    ──→    guard block               ──→   scale skipped
 ```
 
-### 監控架構
+## 監控架構
 
 ```
 slurm-exporter              kube-state-metrics        operator /metrics:8000
@@ -368,8 +368,8 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 - [Slonk: Slurm on Kubernetes for ML Research at Character.ai](https://blog.character.ai/slonk/)
 - [Prometheus Slurm Exporter](https://github.com/vpenso/prometheus-slurm-exporter)
 - [AWS ParallelCluster](https://github.com/aws/aws-parallelcluster)
-- [Environment Modules](https://github.com/envmodules/modules)
 - [Grafana](https://grafana.com/)
+- [Kube State Metrics](https://github.com/kubernetes/kube-state-metrics)
 - 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
 - Phase 4 監控實作規格：[`docs/monitoring.md`](docs/monitoring.md)
 - K8s 物件說明：[`docs/cluster.md`](docs/cluster.md)

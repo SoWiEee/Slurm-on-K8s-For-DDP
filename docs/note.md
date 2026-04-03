@@ -277,66 +277,6 @@ job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出。
 
 ---
 
-# Phase 4 Debug Record（2026-04-03）
-
-## A. slurm-exporter 無法連線到 slurmrestd（NetworkPolicy 缺規則）
-
-**症狀：**
-```
-urllib.error.URLError: <urlopen error timed out>
-```
-slurm-exporter 每次 scrape 都超時，所有 Slurm 指標歸零（`slurm_queue_pending=0`、`slurm_nodes_total=0`），但 `/metrics` endpoint 本身可正常被 Prometheus 抓到（`slurm_exporter_scrape_success=0`）。
-
-**根因：**
-
-`phase2/manifests/network-policy.yaml` 的 `allow-controller-ingress` policy 允許的 source pod 清單為：
-```yaml
-values:
-  - slurm-worker-cpu
-  - slurm-worker-gpu-a10
-  - slurm-worker-gpu-h100
-  - slurm-login
-  - slurm-elastic-operator
-```
-缺少 `slurm-exporter`。預設 deny-all ingress policy 因此擋掉了 exporter → slurmrestd（port 6820）的連線。
-
-**修正：**
-
-在 `allow-controller-ingress` 的 values 清單加入 `slurm-exporter`，再執行：
-```bash
-kubectl apply -f phase2/manifests/network-policy.yaml
-kubectl -n slurm rollout restart deployment/slurm-exporter
-```
-
----
-
-## B. verify-phase4.sh 在無 wget/curl 的 image 裡 exec 失敗
-
-**症狀：**
-
-verify script 對 kube-state-metrics 和 slurm-exporter 的 metrics 檢查全部 FAIL，但 Prometheus 上這兩個 target 都是 UP。
-
-**根因（三個獨立問題）：**
-
-1. **distroless image 無 shell/wget/curl**：`check_metrics_endpoint` 用 `kubectl exec pod -- wget ...` 的方式，但 kube-state-metrics 使用的 image 沒有這些工具，exec 直接失敗。
-
-2. **python:3.11-slim 無 wget/curl**：slurm-exporter image 同樣無 curl/wget。
-
-3. **Windows 環境無 `python3` 指令**：Prometheus target 解析原本用 `python3 -c "..."` 做 JSON 解析，Windows 下指令應為 `py`，導致腳本報錯誤而非解析失敗，造成誤判。
-
-**修正：**
-
-改用 **port-forward + host-side curl** 的方式取代 exec：
-- 每個 metrics 檢查改為：啟動 `kubectl port-forward`，等待 3 秒，用 host 上的 `curl` 抓 `/metrics`，直接 pipe 給 `grep`，完成後 kill port-forward。
-- Prometheus targets 解析從 `python3` JSON 解析改為 `grep -A5 ... | grep '"health":"up"'`，無需任何 Python。
-- 同時修正 kube-state-metrics 的 metric 名稱：實際名稱為 `kube_statefulset_status_replicas`（非 `kube_statefulset_replicas`）。
-
-**另一個隱藏 bug：**
-
-`check_metrics` 函數原本先把 curl 結果存入 bash 變數（`output=$(curl ...)`），再用 `echo "$output" | grep -q`。對於 KSM 的 ~180 KB metrics body，`echo "$output"` 在 bash pipe 中有截斷風險。改為直接 pipe `curl ... | grep -q` 後問題消失。
-
----
-
 # CPU / GPU 資源分配與多 Job 共用調查（2026-03-28）
 
 1. Job 是否能指定要用多少 CPU 和 GPU？
@@ -420,35 +360,7 @@ File=/dev/null   # Kind 環境模擬，無真實硬體
 
 # Phase 4 (DDP)
 
-## 背景與動機
-
-本專案的核心主張是：Kubernetes 擅長彈性伸縮與容器管理，但對 HPC / AI 訓練工作負載的語意支援有限；Slurm 擅長批次排程與叢集治理，但傳統部署偏靜態、對雲端彈性不夠友善。Phase 4 的目標是把這個系統實際用在 **PyTorch DDP 分散式訓練**情境，並補上可觀測性，讓橋接過程可以被量測與展示。
-
----
-
-## 必做項目
-
-### 1. Slurm REST API 取代 kubectl exec（穩定性關鍵）
-
-**現狀問題：** operator 目前透過 `kubectl exec` 進入 controller pod 執行 `squeue`、`sinfo`、`scontrol`，每次 exec 都有 fork 開銷，遇到 slurmctld 暫時忙碌時直接 timeout，是目前 operator 不穩定的主要根源。
-
-**目標改法：** 在 controller image 啟動 `slurmrestd`，operator 改成呼叫 REST API：
-
-```
-目前：operator → kubectl exec pod/slurm-controller-0 → squeue（每次 exec 有啟動開銷）
-改後：operator → HTTP GET http://slurm-controller:6820/slurm/v0.0.39/jobs → JSON 解析
-```
-
-**參考來源：** `github.com/SlinkyProject/slurm-exporter`（SchedMD 官方 exporter 完全基於此 API）
-
-**收益：**
-- 消除 N+1 exec 問題的根本原因
-- REST API 回應比 exec + CLI parse 快且穩定
-- 同一個 slurmrestd endpoint 可同時供 operator 查詢與 Prometheus scrape，Phase 4 monitoring 不需要額外的 exec
-
----
-
-### 2. Worker Image 加入 PyTorch（DDP 前置條件）
+## 1. Worker Image 加入 PyTorch（DDP 前置條件）
 
 目前 worker image 只有 Slurm + Munge，要跑 DDP 需要加入 PyTorch：
 
@@ -460,7 +372,7 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 ---
 
-### 3. 標準 DDP sbatch 腳本
+## 2. 標準 DDP sbatch 腳本
 
 ```bash
 #!/usr/bin/env bash
@@ -490,7 +402,7 @@ srun torchrun \
 
 ---
 
-### 4. SIGTERM → Checkpoint 儲存串接 Checkpoint Guard
+## 3. SIGTERM → Checkpoint 儲存串接 Checkpoint Guard
 
 **現狀：** checkpoint guard 只檢查 `/shared/checkpoints/latest.pt` 的 mtime，但訓練腳本沒有處理 SIGTERM，scale-down 前節點被直接回收，checkpoint 不一定有被寫入。
 
@@ -523,7 +435,7 @@ Operator 決定 scale-down
 
 ---
 
-### 5. Prometheus + Grafana 監控（Phase 4 主體）
+## 4. Prometheus + Grafana 監控
 
 詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
 
@@ -539,7 +451,7 @@ Operator 決定 scale-down
 
 ## 建議加入的改進（可選）
 
-### 6. Job 提交前健康檢查（pre-check）
+### 5. Job 提交前健康檢查（pre-check）
 
 **參考來源：** Character.ai Slonk（`blog.character.ai/slonk/`）
 
@@ -554,7 +466,7 @@ srun bash -c "test -d /shared && echo ok || echo fail" | grep -v ok && exit 1
 
 ---
 
-### 7. Elastic DDP（動態 world size）
+### 6. Elastic DDP（動態 world size）
 
 **參考來源：** PyTorch Elastic `torchrun --nnodes=min:max`
 
@@ -571,7 +483,7 @@ torchrun \
 
 ---
 
-### 8. Soperator reconciliation loop 設計參考
+### 7. Soperator reconciliation loop 設計參考
 
 **參考來源：** `github.com/nebius/soperator/internal/controller/`
 
@@ -610,3 +522,62 @@ Phase 4 主體（可觀測性 demo）
 | sbatch + torchrun 整合 | aws/aws-parallelcluster | 業界驗證的環境變數設定 |
 | Prometheus monitoring | vpenso/prometheus-slurm-exporter | exec 版本，入門用 |
 | Prometheus monitoring | SlinkyProject/slurm-exporter | REST API 版本，演進目標 |
+
+# Phase 4 Debug Record
+
+## A. slurm-exporter 無法連線到 slurmrestd（NetworkPolicy 缺規則）
+
+**症狀：**
+```
+urllib.error.URLError: <urlopen error timed out>
+```
+slurm-exporter 每次 scrape 都超時，所有 Slurm 指標歸零（`slurm_queue_pending=0`、`slurm_nodes_total=0`），但 `/metrics` endpoint 本身可正常被 Prometheus 抓到（`slurm_exporter_scrape_success=0`）。
+
+**根因：**
+
+`phase2/manifests/network-policy.yaml` 的 `allow-controller-ingress` policy 允許的 source pod 清單為：
+```yaml
+values:
+  - slurm-worker-cpu
+  - slurm-worker-gpu-a10
+  - slurm-worker-gpu-h100
+  - slurm-login
+  - slurm-elastic-operator
+```
+缺少 `slurm-exporter`。預設 deny-all ingress policy 因此擋掉了 exporter → slurmrestd（port 6820）的連線。
+
+**修正：**
+
+在 `allow-controller-ingress` 的 values 清單加入 `slurm-exporter`，再執行：
+```bash
+kubectl apply -f phase2/manifests/network-policy.yaml
+kubectl -n slurm rollout restart deployment/slurm-exporter
+```
+
+---
+
+## B. verify-phase4.sh 在無 wget/curl 的 image 裡 exec 失敗
+
+**症狀：**
+
+verify script 對 kube-state-metrics 和 slurm-exporter 的 metrics 檢查全部 FAIL，但 Prometheus 上這兩個 target 都是 UP。
+
+**根因（三個獨立問題）：**
+
+1. **distroless image 無 shell/wget/curl**：`check_metrics_endpoint` 用 `kubectl exec pod -- wget ...` 的方式，但 kube-state-metrics 使用的 image 沒有這些工具，exec 直接失敗。
+
+2. **python:3.11-slim 無 wget/curl**：slurm-exporter image 同樣無 curl/wget。
+
+3. **Windows 環境無 `python3` 指令**：Prometheus target 解析原本用 `python3 -c "..."` 做 JSON 解析，Windows 下指令應為 `py`，導致腳本報錯誤而非解析失敗，造成誤判。
+
+**修正：**
+
+改用 **port-forward + host-side curl** 的方式取代 exec：
+- 每個 metrics 檢查改為：啟動 `kubectl port-forward`，等待 3 秒，用 host 上的 `curl` 抓 `/metrics`，直接 pipe 給 `grep`，完成後 kill port-forward。
+- Prometheus targets 解析從 `python3` JSON 解析改為 `grep -A5 ... | grep '"health":"up"'`，無需任何 Python。
+- 同時修正 kube-state-metrics 的 metric 名稱：實際名稱為 `kube_statefulset_status_replicas`（非 `kube_statefulset_replicas`）。
+
+**另一個隱藏 bug：**
+
+`check_metrics` 函數原本先把 curl 結果存入 bash 變數（`output=$(curl ...)`），再用 `echo "$output" | grep -q`。對於 KSM 的 ~180 KB metrics body，`echo "$output"` 在 bash pipe 中有截斷風險。改為直接 pipe `curl ... | grep -q` 後問題消失。
+
