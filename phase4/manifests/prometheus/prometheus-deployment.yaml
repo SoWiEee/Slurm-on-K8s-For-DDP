@@ -24,6 +24,7 @@ spec:
             - --storage.tsdb.path=/prometheus
             - --web.console.libraries=/usr/share/prometheus/console_libraries
             - --web.console.templates=/usr/share/prometheus/consoles
+            - --web.enable-lifecycle
           ports:
             - name: http
               containerPort: 9090
@@ -44,10 +45,15 @@ spec:
             - name: prometheus-config
               mountPath: /etc/prometheus/prometheus.yml
               subPath: prometheus.yml
+            - name: alert-rules
+              mountPath: /etc/prometheus/rules/
       volumes:
         - name: prometheus-config
           configMap:
             name: prometheus-config
+        - name: alert-rules
+          configMap:
+            name: prometheus-alert-rules
 ---
 apiVersion: v1
 kind: Service

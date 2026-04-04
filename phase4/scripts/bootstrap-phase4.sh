@@ -76,9 +76,16 @@ log "applying kube-state-metrics..."
 kubectl apply -f phase4/manifests/kube-state-metrics/kube-state-metrics.yaml
 
 # ----- prometheus ------------------------------------------------------------
+log "applying prometheus alert rules..."
+kubectl apply -f phase4/manifests/prometheus/alert-rules-cm.yaml
+
 log "applying prometheus config + deployment..."
 kubectl apply -f phase4/manifests/prometheus/prometheus-config.yaml
 kubectl apply -f phase4/manifests/prometheus/prometheus-deployment.yaml
+
+# ----- alertmanager ----------------------------------------------------------
+log "applying alertmanager..."
+kubectl apply -f phase4/manifests/alertmanager/alertmanager.yaml
 
 # ----- grafana ---------------------------------------------------------------
 log "applying grafana provisioning + dashboards + deployment..."
@@ -119,6 +126,9 @@ kubectl -n "$MON_NAMESPACE" rollout status deployment/prometheus --timeout="$ROL
 log "waiting for grafana rollout..."
 kubectl -n "$MON_NAMESPACE" rollout status deployment/grafana --timeout="$ROLLOUT_TIMEOUT"
 
+log "waiting for alertmanager rollout..."
+kubectl -n "$MON_NAMESPACE" rollout status deployment/alertmanager --timeout="$ROLLOUT_TIMEOUT"
+
 # ----- done ------------------------------------------------------------------
 cat <<'EOF'
 
@@ -134,18 +144,23 @@ Access dashboards:
     Dashboards → Slurm folder:
       • Slurm↔K8s Bridge Overview
       • K8s Elastic Operator
+      • SLA & Efficiency
 
-  # Prometheus (debug / raw metrics)
+  # Prometheus (alerts / raw metrics)
   kubectl -n monitoring port-forward svc/prometheus 9090:9090
-  → http://localhost:9090
+  → http://localhost:9090/alerts   ← SLO alert status
 
-  # Verify operator is exposing metrics
+  # Alertmanager (alert routing)
+  kubectl -n monitoring port-forward svc/alertmanager 9093:9093
+  → http://localhost:9093
+
+  # Verify operator metrics
   kubectl -n slurm port-forward svc/slurm-elastic-operator 8000:8000
   → curl http://localhost:8000/metrics | grep slurm_operator
 
-  # Verify slurm-exporter is exposing metrics
+  # Verify slurm-exporter metrics (includes sdiag)
   kubectl -n slurm port-forward svc/slurm-exporter 9341:9341
-  → curl http://localhost:9341/metrics | grep slurm_queue
+  → curl http://localhost:9341/metrics | grep -E 'slurm_(queue|scheduler|backfill)'
 
 =======================================================
 EOF

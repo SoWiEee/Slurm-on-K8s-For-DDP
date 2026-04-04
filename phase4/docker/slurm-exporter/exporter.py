@@ -52,6 +52,27 @@ QUEUE_AVG_WAIT = Gauge(
     "slurm_job_queue_avg_wait_seconds",
     "Mean wait time of all currently PENDING jobs in seconds (0 if none)",
 )
+# Scheduler diagnostics (/diag endpoint)
+SCHED_CYCLE_LAST = Gauge(
+    "slurm_scheduler_cycle_last_seconds",
+    "Duration of the last Slurm scheduler cycle in seconds",
+)
+SCHED_CYCLE_MEAN = Gauge(
+    "slurm_scheduler_cycle_mean_seconds",
+    "Mean Slurm scheduler cycle duration in seconds",
+)
+BACKFILL_CYCLE_LAST = Gauge(
+    "slurm_backfill_cycle_last_seconds",
+    "Duration of the last backfill scheduling cycle in seconds",
+)
+BACKFILL_QUEUE_LENGTH = Gauge(
+    "slurm_backfill_queue_length",
+    "Number of jobs considered by the backfill scheduler in the last cycle",
+)
+BACKFILL_DEPTH_TRY_LAST = Gauge(
+    "slurm_backfill_depth_try_last",
+    "Backfill search depth reached in the last cycle",
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -224,6 +245,45 @@ def scrape(jwt_key: bytes | None) -> None:
     )
 
     SCRAPE_SUCCESS.set(1)
+
+    # --- Scheduler diagnostics (sdiag) ---
+    # Non-fatal: older slurmrestd builds may not support /diag or return different fields.
+    def _us_to_s(v: object) -> float:
+        """Convert microseconds (possibly dict-wrapped) to seconds."""
+        if isinstance(v, dict):
+            v = v.get("number", 0)
+        try:
+            return float(v or 0) / 1_000_000
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _int_field(v: object) -> int:
+        if isinstance(v, dict):
+            v = v.get("number", 0)
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        diag_data = _http_get(f"{base}/diag", jwt_key)
+        # Slurm ≥ 22.05 wraps stats under "statistics"; older versions may use top-level keys
+        stats = diag_data.get("statistics", diag_data)
+        SCHED_CYCLE_LAST.set(_us_to_s(
+            stats.get("schedule_cycle_last") or stats.get("last_cycle", 0)))
+        SCHED_CYCLE_MEAN.set(_us_to_s(
+            stats.get("schedule_cycle_mean") or stats.get("mean_cycle", 0)))
+        BACKFILL_CYCLE_LAST.set(_us_to_s(
+            stats.get("backfill_last_cycle_time") or stats.get("backfill_last_cycle", 0)))
+        BACKFILL_QUEUE_LENGTH.set(_int_field(stats.get("backfill_queue_length", 0)))
+        BACKFILL_DEPTH_TRY_LAST.set(_int_field(
+            stats.get("backfill_last_depth_try") or stats.get("bf_last_depth_try", 0)))
+        log.info(
+            "diag scraped: sched_cycle_last=%.3fs backfill_queue=%d",
+            SCHED_CYCLE_LAST._value.get(), _int_field(stats.get("backfill_queue_length", 0)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("diag scrape failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------

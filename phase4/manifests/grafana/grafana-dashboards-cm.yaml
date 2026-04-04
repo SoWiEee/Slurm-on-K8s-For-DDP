@@ -450,6 +450,99 @@ data:
               "refId": "B"
             }
           ]
+        },
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Slurm Scheduler Cycle Time",
+          "description": "Duration of the last and mean Slurm scheduling cycle. Spikes indicate slurmctld contention — correlates with OperatorPollSlow alert.",
+          "gridPos": { "x": 0, "y": 29, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "line" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 1 },
+                  { "color": "red", "value": 5 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_scheduler_cycle_last_seconds",
+              "legendFormat": "Last Cycle",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_scheduler_cycle_mean_seconds",
+              "legendFormat": "Mean Cycle",
+              "refId": "B"
+            },
+            {
+              "expr": "slurm_backfill_cycle_last_seconds",
+              "legendFormat": "Backfill Last Cycle",
+              "refId": "C"
+            }
+          ]
+        },
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "Backfill Queue & Search Depth",
+          "description": "How many jobs the backfill scheduler evaluated and how deep it searched. Low depth with long queue = backfill is giving up early.",
+          "gridPos": { "x": 12, "y": 29, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_backfill_queue_length",
+              "legendFormat": "Backfill Queue Length",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_backfill_depth_try_last",
+              "legendFormat": "Search Depth",
+              "refId": "B"
+            }
+          ]
         }
       ]
     }

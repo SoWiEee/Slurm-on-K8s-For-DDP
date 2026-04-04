@@ -178,6 +178,7 @@ graph TD
 | 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
+| 5：平台化與高可用 | 📋 規劃中 | Helm Chart、OpenTelemetry 分散式追蹤、Fair-Share 多租戶、Operator HA |
 
 ---
 
@@ -353,7 +354,60 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 | Elastic Operator | Python 3.11 + Slurm REST API (slurmrestd) + kubectl CLI |
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
 | DDP 網路 | Multus CNI + secondary NIC (net2) |
-| 監控（Phase 4） | Prometheus + Grafana + prometheus-slurm-exporter |
+| 監控（Phase 4） | Prometheus + Grafana + slurm-exporter + kube-state-metrics + Alertmanager |
+| 告警（Phase 4） | 8 條 SLO 規則（provisioning latency、queue wait、flapping 等） |
+
+---
+
+# 🔭 Phase 5 Roadmap：平台化與高可用（規劃中）
+
+> Phase 5 的目標是讓這個系統從「可運作的研究原型」演進成「可交付的平台產品」。
+> 以下規劃在 `docs/note.md` 中有完整的技術設計。
+
+## 5-A：Helm Chart 封裝
+
+目前每個 Phase 有獨立的 manifest 資料夾，部署需要依序執行多支 bootstrap 腳本。Helm 讓整個系統可以一條指令完成：
+
+```bash
+helm install slurm-on-k8s ./chart \
+  --set cluster.name=my-lab \
+  --set pools.cpu.maxReplicas=8 \
+  --set pools.gpuA10.maxReplicas=4 \
+  --set monitoring.enabled=true \
+  --set alertmanager.slack.webhookUrl="https://hooks.slack.com/..."
+```
+
+主要收益：環境差異（dev / staging / prod）只需一份 `values.yaml`，消除目前「改完 JSON 還要重新 render manifest」的摩擦。
+
+## 5-B：OpenTelemetry 分散式追蹤
+
+讓一個訓練 job 的完整生命週期變成一條可視化的 Trace：
+
+```
+[sbatch submit] → [pending in queue] → [scale-up decision]
+  → [K8s provisioning] → [slurmd registration] → [DDP torchrun]
+    → [checkpoint write] → [scale-down decision] → [job complete]
+```
+
+每個 span 攜帶 `job_id`、`pool`、`checkpoint_age`、`ddp_rank` 等 attribute，用 Jaeger 或 Grafana Tempo 可視化整條鏈。這是目前所有 Slurm-on-K8s 方案都沒有做到的端到端觀測視角。
+
+## 5-C：Fair-Share 多租戶
+
+支援多個 team / project 共用同一個叢集，搭配 Slurm 的 Fair-Share Scheduler：
+
+- 每個 team 有自己的 Slurm account 和 `shares` 配額
+- 新增 Grafana 面板：per-account queue depth、cumulative CPU-hours、FairShare 分數
+- Operator 可依 account priority 調整各 pool 的 scale-up 優先順序
+
+目標 TA：多個 AI 研究小組共用 GPU 叢集的組織（學術單位、內部平台團隊）。
+
+## 5-D：Operator 高可用（HA）
+
+目前 Operator 是 Single Replica，Pod 重啟會有 15–30 秒的決策空窗。Phase 5 計畫：
+
+- Leader Election via K8s Lease（`coordination.k8s.io/v1`）：多個 Operator Pod 同時運行，只有 leader 執行 scaling loop
+- Cooldown 狀態已透過 StatefulSet annotation 持久化（Phase 2 已完成），重新選主不會重置 cooldown
+- 目標：Zero-downtime Operator 滾動升級
 
 ---
 

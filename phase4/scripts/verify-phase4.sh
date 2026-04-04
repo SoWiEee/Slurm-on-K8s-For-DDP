@@ -52,6 +52,7 @@ log "--- Pod readiness ---"
 check_pod_ready "$MON_NAMESPACE" "app=kube-state-metrics"     "kube-state-metrics"
 check_pod_ready "$MON_NAMESPACE" "app=prometheus"             "prometheus"
 check_pod_ready "$MON_NAMESPACE" "app=grafana"                "grafana"
+check_pod_ready "$MON_NAMESPACE" "app=alertmanager"           "alertmanager"
 check_pod_ready "$NAMESPACE"     "app=slurm-exporter"         "slurm-exporter"
 check_pod_ready "$NAMESPACE"     "app=slurm-elastic-operator" "slurm-elastic-operator"
 
@@ -61,6 +62,7 @@ for svc_check in \
   "${MON_NAMESPACE}/kube-state-metrics" \
   "${MON_NAMESPACE}/prometheus" \
   "${MON_NAMESPACE}/grafana" \
+  "${MON_NAMESPACE}/alertmanager" \
   "${NAMESPACE}/slurm-exporter" \
   "${NAMESPACE}/slurm-elastic-operator"; do
   ns="${svc_check%%/*}"; svc="${svc_check##*/}"
@@ -101,6 +103,39 @@ else
     fi
   done
 fi
+
+# --- Alertmanager health ---
+log "--- Alertmanager ---"
+kubectl -n "$MON_NAMESPACE" port-forward svc/alertmanager 19093:9093 >/dev/null 2>&1 &
+PF_AM=$!
+sleep "$PF_WAIT"
+am_status=$(curl -sf --max-time 5 "http://localhost:19093/-/healthy" 2>/dev/null || true)
+if echo "$am_status" | grep -qi "ok\|healthy\|alive"; then
+  pass "Alertmanager /-/healthy: OK"
+else
+  # Alertmanager returns 200 with empty body on /-/healthy in some versions
+  am_http=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 5 "http://localhost:19093/-/healthy" 2>/dev/null || true)
+  if [[ "$am_http" == "200" ]]; then
+    pass "Alertmanager /-/healthy: HTTP 200"
+  else
+    fail "Alertmanager /-/healthy check failed (status=${am_http:-<no response>})"
+  fi
+fi
+kill "$PF_AM" 2>/dev/null || true
+wait "$PF_AM" 2>/dev/null || true
+
+# Check that Prometheus alert rules loaded — needs a fresh port-forward to Prometheus
+kubectl -n "$MON_NAMESPACE" port-forward svc/prometheus 19091:9090 >/dev/null 2>&1 &
+PF_RULES=$!
+sleep "$PF_WAIT"
+prom_rules=$(curl -sf --max-time 5 "http://localhost:19091/api/v1/rules" 2>/dev/null || true)
+if echo "$prom_rules" | grep -q '"name":"slurm.slo"'; then
+  pass "Prometheus alert rule group 'slurm.slo' loaded"
+else
+  fail "Prometheus alert rule group 'slurm.slo' not found — check alert-rules-cm.yaml applied"
+fi
+kill "$PF_RULES" 2>/dev/null || true
+wait "$PF_RULES" 2>/dev/null || true
 
 # --- Grafana health ---
 log "--- Grafana health ---"
