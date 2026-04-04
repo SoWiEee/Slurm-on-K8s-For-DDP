@@ -9,6 +9,8 @@ RUN apt-get update \
 RUN curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
     && chmod +x /usr/local/bin/kubectl
 
+RUN pip install --no-cache-dir prometheus-client==0.20.0
+
 WORKDIR /app
 COPY phase2/operator/main.py /app/main.py
 

@@ -1,0 +1,126 @@
+# Alertmanager for Phase 4 SLO alerting.
+#
+# The default receiver is "dev-null" — alerts are routed and grouped but not
+# forwarded to any external channel. Replace the receiver definition with
+# slack_configs / email_configs / webhook_configs for production use.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      receiver: dev-null
+      group_by: [alertname, severity, component]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - matchers:
+            - severity = "critical"
+          receiver: dev-null
+          group_wait: 10s
+          repeat_interval: 1h
+        - matchers:
+            - severity = "warning"
+          receiver: dev-null
+          repeat_interval: 2h
+
+    receivers:
+      - name: dev-null
+        # ── Production: replace with real receivers ──────────────────────────
+        # slack_configs:
+        #   - api_url: 'https://hooks.slack.com/services/XXX/YYY/ZZZ'
+        #     channel: '#slurm-alerts'
+        #     title: '[{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}'
+        #     text: '{{ .CommonAnnotations.description }}'
+        # webhook_configs:
+        #   - url: 'http://my-alerting-webhook:5001/alerts'
+        # ─────────────────────────────────────────────────────────────────────
+
+    inhibit_rules:
+      # Suppress warning-level alerts when a critical alert fires for the same component.
+      - source_matchers: [severity = "critical"]
+        target_matchers: [severity = "warning"]
+        equal: [component]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+            - --log.level=info
+          ports:
+            - name: http
+              containerPort: 9093
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9093
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9093
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager/
+            - name: storage
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels:
+    app: alertmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093
+      protocol: TCP
