@@ -117,7 +117,7 @@ fi
 
 dashboards=$(curl -sf --max-time 5 \
   "http://admin:admin@localhost:13000/api/search?type=dash-db" 2>/dev/null || true)
-for uid in slurm-bridge-overview slurm-k8s-operator; do
+for uid in slurm-bridge-overview slurm-k8s-operator slurm-sla-efficiency; do
   if echo "$dashboards" | grep -q "\"uid\":\"${uid}\""; then
     pass "Grafana dashboard '${uid}' provisioned"
   else

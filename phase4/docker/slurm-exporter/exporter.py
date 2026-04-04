@@ -40,9 +40,18 @@ QUEUE_PENDING = Gauge("slurm_queue_pending", "Number of PENDING Slurm jobs")
 QUEUE_RUNNING = Gauge("slurm_queue_running", "Number of RUNNING Slurm jobs")
 NODES_IDLE = Gauge("slurm_nodes_idle", "Number of idle Slurm nodes")
 NODES_ALLOC = Gauge("slurm_nodes_alloc", "Number of allocated/mixed Slurm nodes")
-NODES_DOWN = Gauge("slurm_nodes_down", "Number of down/drain Slurm nodes")
+NODES_DOWN = Gauge("slurm_nodes_down", "Number of down/drain/not-responding Slurm nodes")
+NODES_DRAINING = Gauge("slurm_nodes_draining", "Number of nodes in DRAIN state (accepting no new jobs)")
 NODES_TOTAL = Gauge("slurm_nodes_total", "Total number of Slurm nodes registered")
 SCRAPE_SUCCESS = Gauge("slurm_exporter_scrape_success", "1 if the last scrape succeeded, 0 on error")
+QUEUE_OLDEST_WAIT = Gauge(
+    "slurm_job_queue_oldest_wait_seconds",
+    "Seconds since the oldest PENDING job was submitted (0 if queue is empty)",
+)
+QUEUE_AVG_WAIT = Gauge(
+    "slurm_job_queue_avg_wait_seconds",
+    "Mean wait time of all currently PENDING jobs in seconds (0 if none)",
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -140,6 +149,9 @@ def scrape(jwt_key: bytes | None) -> None:
 
     pending = 0
     running = 0
+    now_ts = time.time()
+    wait_times: list[float] = []
+
     for job in jobs:
         raw_state = job.get("job_state", "")
         # job_state may be a list or a plain string depending on API version
@@ -150,18 +162,36 @@ def scrape(jwt_key: bytes | None) -> None:
 
         if "PENDING" in states:
             pending += 1
+            # Scheduling overhead: time since job was submitted
+            # submit_time is an integer epoch seconds; newer API versions wrap it as {"number": N}
+            st = job.get("submit_time", 0)
+            if isinstance(st, dict):
+                st = st.get("number", 0)
+            try:
+                st = int(st or 0)
+            except (TypeError, ValueError):
+                st = 0
+            if st > 0:
+                wait_times.append(now_ts - st)
         elif "RUNNING" in states:
             running += 1
 
     QUEUE_PENDING.set(pending)
     QUEUE_RUNNING.set(running)
-    log.info("jobs scraped: pending=%d running=%d", pending, running)
+    if wait_times:
+        QUEUE_OLDEST_WAIT.set(max(wait_times))
+        QUEUE_AVG_WAIT.set(sum(wait_times) / len(wait_times))
+    else:
+        QUEUE_OLDEST_WAIT.set(0)
+        QUEUE_AVG_WAIT.set(0)
+    log.info("jobs scraped: pending=%d running=%d oldest_wait=%.1fs",
+             pending, running, max(wait_times) if wait_times else 0.0)
 
     # --- Nodes ---
     nodes_data = _http_get(f"{base}/nodes", jwt_key)
     nodes = nodes_data.get("nodes", [])
 
-    idle = alloc = down = 0
+    idle = alloc = down = draining = 0
     for node in nodes:
         raw_state = node.get("state", "")
         # state may be a list or a plain string
@@ -177,17 +207,20 @@ def scrape(jwt_key: bytes | None) -> None:
         elif state_tokens & _DOWN_STATES:
             down += 1
 
+        # DRAIN is an overlay flag: node accepts no new jobs but may still be running some.
+        # It can co-exist with idle/alloc/down states, so we track it separately.
+        if "drain" in state_tokens:
+            draining += 1
+
     total = len(nodes)
     NODES_IDLE.set(idle)
     NODES_ALLOC.set(alloc)
     NODES_DOWN.set(down)
+    NODES_DRAINING.set(draining)
     NODES_TOTAL.set(total)
     log.info(
-        "nodes scraped: total=%d idle=%d alloc=%d down=%d",
-        total,
-        idle,
-        alloc,
-        down,
+        "nodes scraped: total=%d idle=%d alloc=%d down=%d draining=%d",
+        total, idle, alloc, down, draining,
     )
 
     SCRAPE_SUCCESS.set(1)

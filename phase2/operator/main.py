@@ -134,6 +134,17 @@ _CURRENT_REPLICAS = Gauge(
     "Current StatefulSet replica count, by pool",
     ["pool"],
 )
+_PODS_READY = Gauge(
+    "slurm_operator_pods_ready",
+    "Number of Ready pods in the pool StatefulSet",
+    ["pool"],
+)
+_PROVISIONING_LATENCY = Histogram(
+    "slurm_operator_provisioning_latency_seconds",
+    "Seconds from scale-up decision to all target pods becoming Ready, by pool",
+    ["pool"],
+    buckets=[5, 15, 30, 60, 120, 300, 600],
+)
 
 
 def clamp(value: int, low: int, high: int) -> int:
@@ -191,6 +202,19 @@ class KubectlClient:
             "-n", self.cfg.namespace, "annotate", resource, name,
             f"{key}={value}", "--overwrite",
         ])
+
+    def get_ready_replicas(self, statefulset: str) -> int:
+        """Return the number of Ready replicas for a StatefulSet (0 on error)."""
+        rc, out, _ = self.try_run([
+            "-n", self.cfg.namespace, "get", "statefulset", statefulset,
+            "-o", "jsonpath={.status.readyReplicas}",
+        ])
+        if rc != 0 or not out:
+            return 0
+        try:
+            return int(out)
+        except ValueError:
+            return 0
 
     def exec_in_controller(self, command: str) -> str:
         return self.run(
@@ -630,6 +654,9 @@ class OperatorApp:
         # restart does not reset the cooldown clock and cause an immediate
         # scale-down that was previously guarded against.
         self.last_scale_up_at: dict[str, float] = {}
+        # Track pending provisioning: pool → (scale_up_timestamp, target_replicas).
+        # Cleared once readyReplicas reaches the target; used to emit _PROVISIONING_LATENCY.
+        self._provisioning: dict[str, tuple[float, int]] = {}
         for _p in self.partition_cfgs:
             _raw: str | None = None
             try:
@@ -695,6 +722,16 @@ class OperatorApp:
                 try:
                     state = all_states[key]
                     _CURRENT_REPLICAS.labels(pool=key).set(state.current_replicas)
+
+                    # Pods-ready gauge + provisioning latency tracking
+                    ready = self.client.get_ready_replicas(key)
+                    _PODS_READY.labels(pool=key).set(ready)
+                    if key in self._provisioning:
+                        prov_start, prov_target = self._provisioning[key]
+                        if ready >= prov_target:
+                            _PROVISIONING_LATENCY.labels(pool=key).observe(time.time() - prov_start)
+                            del self._provisioning[key]
+
                     checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
                     decision = self.policy.evaluate(partition_cfg, state, checkpoint_age)
 
@@ -715,6 +752,8 @@ class OperatorApp:
                     if decision.action == "scale_up":
                         self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
                         self.last_scale_up_at[key] = now
+                        # Record provisioning start (overwrite if already tracking a prior scale-up)
+                        self._provisioning[key] = (now, decision.target_replicas)
                         try:
                             self.client.set_annotation(
                                 "statefulset", partition_cfg.worker_statefulset,

@@ -360,6 +360,96 @@ data:
               "refId": "B"
             }
           ]
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Resource Efficiency %",
+          "description": "Fraction of registered Slurm nodes that are actively running jobs. 100% = fully utilised; low values indicate over-provisioning.",
+          "gridPos": { "x": 0, "y": 21, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0, "max": 100,
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 15, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "line" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 30 },
+                  { "color": "green", "value": 70 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_nodes_alloc / clamp_min(slurm_nodes_total, 1) * 100",
+              "legendFormat": "Node Utilization %",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(slurm_operator_pods_ready) / clamp_min(sum(slurm_operator_current_replicas), 1) * 100",
+              "legendFormat": "Pod Ready %",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 9,
+          "type": "timeseries",
+          "title": "Scheduling Overhead (Queue Wait)",
+          "description": "How long PENDING jobs have been waiting. High values suggest the autoscaler is too slow to react or max replicas cap is too low.",
+          "gridPos": { "x": 12, "y": 21, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_job_queue_oldest_wait_seconds",
+              "legendFormat": "Oldest Job Wait",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_job_queue_avg_wait_seconds",
+              "legendFormat": "Avg Job Wait",
+              "refId": "B"
+            }
+          ]
         }
       ]
     }
@@ -649,6 +739,528 @@ data:
               "expr": "increase(slurm_operator_scale_skipped_total[5m])",
               "legendFormat": "{{pool}} {{reason}}",
               "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Provisioning Latency (scale-up → pods Ready)",
+          "description": "How long it takes for pods to become Ready after the operator issues a scale-up patch. p95 is the key SLO indicator.",
+          "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "line+area" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 60 },
+                  { "color": "red", "value": 180 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum(rate(slurm_operator_provisioning_latency_seconds_bucket[10m])) by (le, pool))",
+              "legendFormat": "p50 {{pool}}",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(slurm_operator_provisioning_latency_seconds_bucket[10m])) by (le, pool))",
+              "legendFormat": "p95 {{pool}}",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Pod Ready Ratio by Pool",
+          "description": "readyReplicas / currentReplicas. A dip below 1.0 during a scale-up reveals the provisioning window.",
+          "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0, "max": 1,
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 15, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "line" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_operator_pods_ready / clamp_min(slurm_operator_current_replicas, 1)",
+              "legendFormat": "{{pool}}",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }
+
+  sla-efficiency.json: |
+    {
+      "uid": "slurm-sla-efficiency",
+      "title": "SLA & Efficiency",
+      "description": "End-to-end SLO metrics: resource utilisation, scheduling overhead, provisioning speed, and checkpoint-guard safety rate",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {},
+      "timezone": "browser",
+      "tags": ["slurm", "sla", "efficiency"],
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Resource Efficiency",
+          "description": "Allocated nodes / total nodes. Low value = over-provisioned cluster.",
+          "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "auto", "textMode": "auto", "colorMode": "background",
+            "graphMode": "area", "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent", "min": 0, "max": 100,
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 30 },
+                  { "color": "green", "value": 70 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_nodes_alloc / clamp_min(slurm_nodes_total, 1) * 100",
+              "legendFormat": "Efficiency %",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Oldest Queue Wait",
+          "description": "How long the longest-waiting PENDING job has been queued. Measures scheduling overhead.",
+          "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "auto", "textMode": "auto", "colorMode": "background",
+            "graphMode": "area", "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 60 },
+                  { "color": "red", "value": 300 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_job_queue_oldest_wait_seconds",
+              "legendFormat": "Oldest Wait",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Provisioning Latency p95",
+          "description": "95th percentile time from scale-up decision to all target pods becoming Ready.",
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "auto", "textMode": "auto", "colorMode": "background",
+            "graphMode": "area", "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 60 },
+                  { "color": "red", "value": 180 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(slurm_operator_provisioning_latency_seconds_bucket[1h])) by (le))",
+              "legendFormat": "p95 latency",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Checkpoint Guard Rate",
+          "description": "% of scale-down attempts blocked by checkpoint guard. Higher = training jobs are being actively protected.",
+          "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "orientation": "auto", "textMode": "auto", "colorMode": "background",
+            "graphMode": "area", "justifyMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent", "min": 0, "max": 100,
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "blue", "value": 1 }
+                ]
+              },
+              "mappings": []
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "sum(increase(slurm_operator_checkpoint_guard_blocks_total[1h])) / clamp_min(sum(increase(slurm_operator_scale_down_total[1h])) + sum(increase(slurm_operator_checkpoint_guard_blocks_total[1h])), 1) * 100",
+              "legendFormat": "Guard Rate %",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Resource Efficiency Over Time",
+          "description": "Node utilisation and pod readiness ratio. Ideal: both lines near 100% during job runs, dropping quickly after.",
+          "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent", "min": 0, "max": 100,
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 15, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_nodes_alloc / clamp_min(slurm_nodes_total, 1) * 100",
+              "legendFormat": "Node Utilization %",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(slurm_operator_pods_ready) / clamp_min(sum(slurm_operator_current_replicas), 1) * 100",
+              "legendFormat": "Pod Ready %",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Scheduling Overhead (Queue Wait)",
+          "description": "Time PENDING jobs spend waiting before a worker becomes available. Spikes reveal under-provisioning or slow scale-up.",
+          "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_job_queue_oldest_wait_seconds",
+              "legendFormat": "Oldest Job Wait",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_job_queue_avg_wait_seconds",
+              "legendFormat": "Avg Job Wait",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Provisioning Latency Distribution",
+          "description": "p50/p95 latency from scale-up decision to pods Ready. Directly measures K8s scheduling + container startup speed.",
+          "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "line+area" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 60 },
+                  { "color": "red", "value": 180 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum(rate(slurm_operator_provisioning_latency_seconds_bucket[10m])) by (le, pool))",
+              "legendFormat": "p50 {{pool}}",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(slurm_operator_provisioning_latency_seconds_bucket[10m])) by (le, pool))",
+              "legendFormat": "p95 {{pool}}",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Scale Decision Breakdown /5m",
+          "description": "Every operator decision classified by outcome. The ratio of Blocked:Checkpoint to Scale Down reveals how often the safety guard is actively protecting jobs.",
+          "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 20, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "stacking": { "group": "A", "mode": "normal" },
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "sum(increase(slurm_operator_scale_up_total[5m]))",
+              "legendFormat": "Scale Up",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(increase(slurm_operator_scale_down_total[5m]))",
+              "legendFormat": "Scale Down",
+              "refId": "B"
+            },
+            {
+              "expr": "sum(increase(slurm_operator_scale_skipped_total{reason=\"cooldown\"}[5m]))",
+              "legendFormat": "Blocked: Cooldown",
+              "refId": "C"
+            },
+            {
+              "expr": "sum(increase(slurm_operator_scale_skipped_total{reason=\"checkpoint_guard\"}[5m]))",
+              "legendFormat": "Blocked: Checkpoint Guard",
+              "refId": "D"
+            },
+            {
+              "expr": "sum(increase(slurm_operator_scale_skipped_total{reason=\"no_action\"}[5m]))",
+              "legendFormat": "No Action Needed",
+              "refId": "E"
+            }
+          ]
+        },
+        {
+          "id": 9,
+          "type": "timeseries",
+          "title": "Pod Ready Ratio by Pool",
+          "description": "readyReplicas / currentReplicas per pool. Values < 1.0 indicate pods still initialising — directly correlates with provisioning latency.",
+          "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit", "min": 0, "max": 1,
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 15, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "line" }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_operator_pods_ready / clamp_min(slurm_operator_current_replicas, 1)",
+              "legendFormat": "{{pool}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Node Drain & Down State",
+          "description": "DRAIN = node is being gracefully removed (no new jobs). DOWN = node is unreachable. Useful for correlating with scale-down events and recovery time.",
+          "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "none" },
+            "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineInterpolation": "linear", "lineWidth": 2,
+                "fillOpacity": 10, "gradientMode": "none",
+                "showPoints": "auto", "spanNulls": false,
+                "axisPlacement": "auto", "axisBorderShow": false,
+                "scaleDistribution": { "type": "linear" },
+                "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+                "thresholdsStyle": { "mode": "off" }
+              },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "targets": [
+            {
+              "expr": "slurm_nodes_draining",
+              "legendFormat": "Draining",
+              "refId": "A"
+            },
+            {
+              "expr": "slurm_nodes_down",
+              "legendFormat": "Down",
+              "refId": "B"
             }
           ]
         }
