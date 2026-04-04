@@ -91,6 +91,10 @@ spec:
               value: "v0.0.37"
             - name: SLURM_JWT_KEY_PATH
               value: "/slurm-jwt/jwt_hs256.key"
+          ports:
+            - name: metrics
+              containerPort: 8000
+              protocol: TCP
           volumeMounts:
             - name: slurm-jwt-secret
               mountPath: /slurm-jwt/jwt_hs256.key
@@ -111,3 +115,19 @@ spec:
         - name: slurm-jwt-secret
           secret:
             secretName: slurm-jwt-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-elastic-operator
+  namespace: slurm
+  labels:
+    app: slurm-elastic-operator
+spec:
+  selector:
+    app: slurm-elastic-operator
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

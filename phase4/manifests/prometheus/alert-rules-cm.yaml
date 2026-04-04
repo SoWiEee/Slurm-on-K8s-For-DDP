@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-alert-rules
+  namespace: monitoring
+data:
+  slurm-slo.yml: |
+    groups:
+      - name: slurm.slo
+        # Evaluation matches Prometheus global interval (15s).
+        # "for" durations are intentionally short for a dev environment;
+        # tighten group_wait / repeat_interval in Alertmanager for production.
+        rules:
+
+          # ── Provisioning SLO ─────────────────────────────────────────────────
+          - alert: ProvisioningLatencyHigh
+            expr: >
+              histogram_quantile(0.95,
+                sum(rate(slurm_operator_provisioning_latency_seconds_bucket[10m])) by (le)
+              ) > 180
+            for: 5m
+            labels:
+              severity: warning
+              component: operator
+            annotations:
+              summary: "Scale-up provisioning p95 > 3 minutes"
+              description: >
+                Pods are taking {{ $value | printf "%.0f" }}s (p95) to become Ready after a
+                scale-up. Check for image pull delays or node resource pressure.
+              runbook: "kubectl -n slurm get pods -o wide"
+
+          # ── Scheduling Overhead SLO ──────────────────────────────────────────
+          - alert: QueueWaitTooLong
+            expr: slurm_job_queue_oldest_wait_seconds > 300
+            for: 2m
+            labels:
+              severity: critical
+              component: slurm
+            annotations:
+              summary: "Slurm job has been PENDING for > 5 minutes"
+              description: >
+                The oldest PENDING job has been queued for {{ $value | printf "%.0f" }}s.
+                The autoscaler may have hit maxReplicas or scale-up is silently failing.
+              runbook: "kubectl -n slurm logs deployment/slurm-elastic-operator | grep scale_skipped"
+
+          # ── Resource Efficiency ──────────────────────────────────────────────
+          - alert: ClusterOverProvisioned
+            expr: >
+              slurm_nodes_alloc / clamp_min(slurm_nodes_total, 1) < 0.15
+              and slurm_nodes_total > 1
+            for: 10m
+            labels:
+              severity: info
+              component: slurm
+            annotations:
+              summary: "Cluster utilisation below 15% for 10 minutes"
+              description: >
+                Only {{ $value | humanizePercentage }} of nodes are running jobs.
+                Consider lowering maxReplicas or the scale-down cooldown period.
+
+          # ── Operator Health ──────────────────────────────────────────────────
+          - alert: OperatorPollSlow
+            expr: >
+              histogram_quantile(0.95,
+                rate(slurm_operator_poll_duration_seconds_bucket[5m])
+              ) > 10
+            for: 5m
+            labels:
+              severity: warning
+              component: operator
+            annotations:
+              summary: "Operator poll loop p95 > 10s"
+              description: >
+                The operator loop is taking {{ $value | printf "%.1f" }}s (p95).
+                Scaling reactions will be delayed. Likely cause: slurmctld busy or kubectl exec timeout.
+              runbook: "kubectl -n slurm logs deployment/slurm-elastic-operator | python3 -m json.tool | grep error"
+
+          # ── Slurm Exporter Down ──────────────────────────────────────────────
+          - alert: SlurmExporterDown
+            expr: slurm_exporter_scrape_success == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: monitoring
+            annotations:
+              summary: "slurm-exporter cannot reach slurmrestd"
+              description: >
+                Slurm metrics have been unavailable for at least 1 minute.
+                All queue/node panels will show stale or zero values.
+              runbook: "kubectl -n slurm logs deployment/slurm-exporter --tail=50"
+
+          # ── Scale Flapping ───────────────────────────────────────────────────
+          - alert: ScalingFlapping
+            expr: >
+              (sum(increase(slurm_operator_scale_up_total[10m]))
+               + sum(increase(slurm_operator_scale_down_total[10m]))) > 8
+            for: 0m
+            labels:
+              severity: warning
+              component: operator
+            annotations:
+              summary: "Autoscaler flapping (> 8 scale events in 10m)"
+              description: >
+                Rapid alternating scale-up/down suggests the cooldown period or step sizes
+                need tuning. Review SCALE_DOWN_COOLDOWN_SECONDS and scale step configuration.
+
+          # ── Worker Pods Stuck ────────────────────────────────────────────────
+          - alert: WorkerPodsStuck
+            expr: >
+              sum(slurm_operator_pods_ready) / clamp_min(sum(slurm_operator_current_replicas), 1) < 0.5
+              and sum(slurm_operator_current_replicas) > 1
+            for: 5m
+            labels:
+              severity: warning
+              component: k8s
+            annotations:
+              summary: "Less than 50% of worker pods are Ready"
+              description: >
+                Only {{ $value | humanizePercentage }} of provisioned worker pods are Ready
+                for 5 minutes. Likely a container crash loop or resource exhaustion.
+              runbook: "kubectl -n slurm get pods -o wide"
+
+          # ── Slurm Scheduler Slow ─────────────────────────────────────────────
+          - alert: SlurmSchedulerSlow
+            expr: slurm_scheduler_cycle_last_seconds > 5
+            for: 3m
+            labels:
+              severity: warning
+              component: slurm
+            annotations:
+              summary: "Slurm scheduler cycle > 5 seconds"
+              description: >
+                The last Slurm scheduler cycle took {{ $value | printf "%.1f" }}s.
+                This may cause job dispatch delays. Check slurmctld logs for contention.

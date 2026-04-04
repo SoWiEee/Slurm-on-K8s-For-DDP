@@ -360,35 +360,7 @@ File=/dev/null   # Kind 環境模擬，無真實硬體
 
 # Phase 4 (DDP)
 
-## 背景與動機
-
-本專案的核心主張是：Kubernetes 擅長彈性伸縮與容器管理，但對 HPC / AI 訓練工作負載的語意支援有限；Slurm 擅長批次排程與叢集治理，但傳統部署偏靜態、對雲端彈性不夠友善。Phase 4 的目標是把這個系統實際用在 **PyTorch DDP 分散式訓練**情境，並補上可觀測性，讓橋接過程可以被量測與展示。
-
----
-
-## 必做項目
-
-### 1. Slurm REST API 取代 kubectl exec（穩定性關鍵）
-
-**現狀問題：** operator 目前透過 `kubectl exec` 進入 controller pod 執行 `squeue`、`sinfo`、`scontrol`，每次 exec 都有 fork 開銷，遇到 slurmctld 暫時忙碌時直接 timeout，是目前 operator 不穩定的主要根源。
-
-**目標改法：** 在 controller image 啟動 `slurmrestd`，operator 改成呼叫 REST API：
-
-```
-目前：operator → kubectl exec pod/slurm-controller-0 → squeue（每次 exec 有啟動開銷）
-改後：operator → HTTP GET http://slurm-controller:6820/slurm/v0.0.39/jobs → JSON 解析
-```
-
-**參考來源：** `github.com/SlinkyProject/slurm-exporter`（SchedMD 官方 exporter 完全基於此 API）
-
-**收益：**
-- 消除 N+1 exec 問題的根本原因
-- REST API 回應比 exec + CLI parse 快且穩定
-- 同一個 slurmrestd endpoint 可同時供 operator 查詢與 Prometheus scrape，Phase 4 monitoring 不需要額外的 exec
-
----
-
-### 2. Worker Image 加入 PyTorch（DDP 前置條件）
+## 1. Worker Image 加入 PyTorch（DDP 前置條件）
 
 目前 worker image 只有 Slurm + Munge，要跑 DDP 需要加入 PyTorch：
 
@@ -400,7 +372,7 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 ---
 
-### 3. 標準 DDP sbatch 腳本
+## 2. 標準 DDP sbatch 腳本
 
 ```bash
 #!/usr/bin/env bash
@@ -430,7 +402,7 @@ srun torchrun \
 
 ---
 
-### 4. SIGTERM → Checkpoint 儲存串接 Checkpoint Guard
+## 3. SIGTERM → Checkpoint 儲存串接 Checkpoint Guard
 
 **現狀：** checkpoint guard 只檢查 `/shared/checkpoints/latest.pt` 的 mtime，但訓練腳本沒有處理 SIGTERM，scale-down 前節點被直接回收，checkpoint 不一定有被寫入。
 
@@ -463,7 +435,7 @@ Operator 決定 scale-down
 
 ---
 
-### 5. Prometheus + Grafana 監控（Phase 4 主體）
+## 4. Prometheus + Grafana 監控
 
 詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
 
@@ -479,7 +451,7 @@ Operator 決定 scale-down
 
 ## 建議加入的改進（可選）
 
-### 6. Job 提交前健康檢查（pre-check）
+### 5. Job 提交前健康檢查（pre-check）
 
 **參考來源：** Character.ai Slonk（`blog.character.ai/slonk/`）
 
@@ -494,7 +466,7 @@ srun bash -c "test -d /shared && echo ok || echo fail" | grep -v ok && exit 1
 
 ---
 
-### 7. Elastic DDP（動態 world size）
+### 6. Elastic DDP（動態 world size）
 
 **參考來源：** PyTorch Elastic `torchrun --nnodes=min:max`
 
@@ -511,7 +483,7 @@ torchrun \
 
 ---
 
-### 8. Soperator reconciliation loop 設計參考
+### 7. Soperator reconciliation loop 設計參考
 
 **參考來源：** `github.com/nebius/soperator/internal/controller/`
 
@@ -550,3 +522,311 @@ Phase 4 主體（可觀測性 demo）
 | sbatch + torchrun 整合 | aws/aws-parallelcluster | 業界驗證的環境變數設定 |
 | Prometheus monitoring | vpenso/prometheus-slurm-exporter | exec 版本，入門用 |
 | Prometheus monitoring | SlinkyProject/slurm-exporter | REST API 版本，演進目標 |
+
+# Phase 4 Debug Record
+
+## A. slurm-exporter 無法連線到 slurmrestd（NetworkPolicy 缺規則）
+
+**症狀：**
+```
+urllib.error.URLError: <urlopen error timed out>
+```
+slurm-exporter 每次 scrape 都超時，所有 Slurm 指標歸零（`slurm_queue_pending=0`、`slurm_nodes_total=0`），但 `/metrics` endpoint 本身可正常被 Prometheus 抓到（`slurm_exporter_scrape_success=0`）。
+
+**根因：**
+
+`phase2/manifests/network-policy.yaml` 的 `allow-controller-ingress` policy 允許的 source pod 清單為：
+```yaml
+values:
+  - slurm-worker-cpu
+  - slurm-worker-gpu-a10
+  - slurm-worker-gpu-h100
+  - slurm-login
+  - slurm-elastic-operator
+```
+缺少 `slurm-exporter`。預設 deny-all ingress policy 因此擋掉了 exporter → slurmrestd（port 6820）的連線。
+
+**修正：**
+
+在 `allow-controller-ingress` 的 values 清單加入 `slurm-exporter`，再執行：
+```bash
+kubectl apply -f phase2/manifests/network-policy.yaml
+kubectl -n slurm rollout restart deployment/slurm-exporter
+```
+
+---
+
+## B. verify-phase4.sh 在無 wget/curl 的 image 裡 exec 失敗
+
+**症狀：**
+
+verify script 對 kube-state-metrics 和 slurm-exporter 的 metrics 檢查全部 FAIL，但 Prometheus 上這兩個 target 都是 UP。
+
+**根因（三個獨立問題）：**
+
+1. **distroless image 無 shell/wget/curl**：`check_metrics_endpoint` 用 `kubectl exec pod -- wget ...` 的方式，但 kube-state-metrics 使用的 image 沒有這些工具，exec 直接失敗。
+
+2. **python:3.11-slim 無 wget/curl**：slurm-exporter image 同樣無 curl/wget。
+
+3. **Windows 環境無 `python3` 指令**：Prometheus target 解析原本用 `python3 -c "..."` 做 JSON 解析，Windows 下指令應為 `py`，導致腳本報錯誤而非解析失敗，造成誤判。
+
+**修正：**
+
+改用 **port-forward + host-side curl** 的方式取代 exec：
+- 每個 metrics 檢查改為：啟動 `kubectl port-forward`，等待 3 秒，用 host 上的 `curl` 抓 `/metrics`，直接 pipe 給 `grep`，完成後 kill port-forward。
+- Prometheus targets 解析從 `python3` JSON 解析改為 `grep -A5 ... | grep '"health":"up"'`，無需任何 Python。
+- 同時修正 kube-state-metrics 的 metric 名稱：實際名稱為 `kube_statefulset_status_replicas`（非 `kube_statefulset_replicas`）。
+
+**另一個隱藏 bug：**
+
+`check_metrics` 函數原本先把 curl 結果存入 bash 變數（`output=$(curl ...)`），再用 `echo "$output" | grep -q`。對於 KSM 的 ~180 KB metrics body，`echo "$output"` 在 bash pipe 中有截斷風險。改為直接 pipe `curl ... | grep -q` 後問題消失。
+
+
+---
+
+# Phase 5 技術規劃：平台化與高可用（2026-04-04）
+
+Phase 5 的核心問題是：**如何讓這套系統從研究原型演進成能交付給其他人使用的平台？**
+
+目標受眾（TA）有兩類：
+1. **AI 研究平台工程師**（學術單位、企業內部 MLOps）：需要一鍵部署、多租戶隔離、SLO 告警整合到既有 on-call 流程。
+2. **雲端架構師 / SRE**：需要 HA、可觀測性（traces, not just metrics）、以及能和 Terraform / ArgoCD 整合的 IaC 交付形式。
+
+---
+
+## 5-A：Helm Chart 封裝
+
+### 問題
+目前部署流程是「依序執行多支 bootstrap 腳本，每支腳本依賴前一支的副作用」。這讓：
+- 環境差異（本機 Kind vs. 雲端 EKS）需要修改腳本而非修改參數。
+- 版本升級沒有 rollback 機制。
+- 無法用 ArgoCD / Flux 做 GitOps 管理。
+
+### 設計
+```
+chart/
+  Chart.yaml
+  values.yaml              ← 所有可調參數的預設值
+  values-dev.yaml          ← Kind 本機覆蓋
+  values-prod.yaml         ← EKS / GKE 雲端覆蓋
+  templates/
+    phase1/                ← controller + worker StatefulSets
+    phase2/                ← operator + RBAC
+    phase3/                ← NFS provisioner（可選）
+    phase4/                ← Prometheus + Grafana + Alertmanager（可選）
+    _helpers.tpl           ← 共用 label / name 函數
+```
+
+關鍵 `values.yaml` 參數：
+```yaml
+cluster:
+  name: slurm-lab
+  namespace: slurm
+
+pools:
+  cpu:
+    minReplicas: 1
+    maxReplicas: 4
+    scaleCooldownSeconds: 60
+  gpuA10:
+    minReplicas: 0
+    maxReplicas: 4
+  gpuH100:
+    minReplicas: 0
+    maxReplicas: 2
+
+monitoring:
+  enabled: true
+  grafana:
+    adminPassword: admin
+  alertmanager:
+    slack:
+      webhookUrl: ""        # 留空 = dev-null receiver
+      channel: "#slurm-alerts"
+
+ha:
+  operatorReplicas: 2      # Leader Election 模式
+```
+
+### 目前已有什麼可以直接 Helm 化
+- StatefulSet 的 replica 數、image tag、resource request 已全部從 `worker-pools.json` 派生 → 可改成 `values.yaml`。
+- `PARTITIONS_JSON` env var 已是 JSON 字串，可用 Helm `toJson` filter 注入。
+- Prometheus alert rules ConfigMap 是純 YAML → 直接進 `templates/`。
+
+### 交付形式
+發布到 OCI registry（`ghcr.io/SoWiEee/slurm-on-k8s`），讓使用者可以：
+```bash
+helm repo add slurm-on-k8s https://SoWiEee.github.io/Slurm-on-K8s-For-DDP/charts
+helm install my-cluster slurm-on-k8s/slurm-on-k8s -f my-values.yaml
+```
+
+---
+
+## 5-B：OpenTelemetry 分散式追蹤
+
+### 為什麼 metrics 不夠
+Prometheus 告訴你「現在 p95 provisioning latency 是 45 秒」，但不告訴你：
+- 這 45 秒是花在 K8s 排程（pending pod）、image pull、還是 Slurm node registration？
+- 是某個特定 job 特別慢，還是系統性問題？
+
+OpenTelemetry trace 回答的是「**這一次** job J42 為什麼比較慢」。
+
+### Trace 結構設計
+
+```
+TraceID: job-{SLURM_JOB_ID}
+│
+├── [Span] job_submit
+│     attributes: job_id, partition, user, requested_nodes, requested_cpus
+│
+├── [Span] queue_wait  (start=submit_time, end=scale_up_decision_time)
+│     attributes: pending_jobs_at_submit, pool
+│
+├── [Span] scale_up_decision  (operator)
+│     attributes: from_replicas, to_replicas, reason
+│
+├── [Span] k8s_provisioning  (start=patch_time, end=pods_ready_time)
+│     attributes: pool, target_replicas
+│     → 已有資料來源：slurm_operator_provisioning_latency_seconds histogram
+│
+├── [Span] slurm_node_registration
+│     attributes: node_name, registered_at
+│
+├── [Span] job_running  (start=start_time, end=end_time)
+│     attributes: nodes, cpus, gres
+│
+└── [Span] checkpoint_write  (可選，若 SIGTERM handler 發出)
+      attributes: checkpoint_path, file_size_bytes
+```
+
+### 實作路徑
+1. **Operator 加 OTel SDK**：`opentelemetry-sdk` + `opentelemetry-exporter-otlp`，在 scale_up/scale_down 決策處建立 Span。
+2. **Exporter 加 Span**：每次 slurmrestd 呼叫包在 Span 裡，紀錄 HTTP latency。
+3. **OTel Collector sidecar**：在 monitoring namespace 部署 `otel/opentelemetry-collector`，接收 OTLP，轉發到 Jaeger（dev）或 Grafana Tempo（prod）。
+4. **Grafana Tempo 整合**：已有 Grafana → 加 Tempo datasource → exemplar 連結（從 Prometheus histogram 直接跳到對應 Trace）。
+
+### Exemplar 連結（killer feature）
+Prometheus histogram 支援 exemplar，讓 Grafana 可以：
+- 在 Provisioning Latency p95 的時間軸上，顯示「這個 spike 對應 job-123 的 TraceID」
+- 點一下直接跳到 Jaeger/Tempo 看整條 trace
+
+這是「metrics → traces」的橋接，目前沒有任何 Slurm-on-K8s 方案做到。
+
+---
+
+## 5-C：Fair-Share 多租戶
+
+### 目標 TA
+學術單位、企業 AI 平台：**多個研究小組共用 GPU 叢集，但每組有不同的優先權和配額**。
+
+### Slurm Fair-Share 機制
+Slurm 的 Fair-Share Scheduler 基於每個 account 的累積使用量（`RawUsage`）和配額（`shares`）計算一個優先分數 `FairShare ∈ [0, 1]`：
+```
+FairShare = 1 - (用量 / 配額)
+FairShare 越高 → 優先排程
+```
+
+### 實作計畫
+
+**Slurm 側設定（sacctmgr）：**
+```bash
+sacctmgr add account ai-team1 parent=root fairshare=100
+sacctmgr add account ai-team2 parent=root fairshare=50   # 給 ai-team1 兩倍優先權
+sacctmgr add user team1-user account=ai-team1
+```
+
+**Exporter 新增 metrics（`sshare` REST API）：**
+```
+slurm_account_fairshare{account="ai-team1"}   → 0.83
+slurm_account_raw_usage_cpu_hours{account="ai-team1"}
+slurm_account_pending_jobs{account="ai-team1"}
+```
+
+**Grafana 新 Dashboard「Fair-Share & Accounting」：**
+- Bar gauge: 各 account 的 FairShare 分數（顯示誰快被懲罰了）
+- Stacked area: 各 account 的 CPU-hours 累積使用趨勢
+- 表格: 各 account 目前 pending / running jobs
+
+**Operator 延伸：**
+- Scale-up 時可優先考慮 FairShare 分數高的 pool（通常對應高優先 account）
+- 新指標 `slurm_operator_scale_up_total` 加 `account` label
+
+### TA 的使用場景
+- 大學 AI 系：研究所 A 跑了 3 天的 LLM fine-tuning，FairShare 下降 → 研究所 B 的 job 自動排在前面
+- 企業內部：商業部門（高 shares）的訓練 job 比研究部門優先
+
+---
+
+## 5-D：Operator 高可用（HA）
+
+### 問題
+目前 Operator 是 `replicas: 1`。Pod 重啟（升級、節點驅逐）會造成 15–30 秒的決策空窗：
+- 這段時間 pending jobs 不會觸發 scale-up。
+- 更嚴重的是 scale-down cooldown 計時器在記憶體中，重啟後歸零 → 可能在 cooldown 期間觸發不應該的縮容。
+
+（Cooldown 已用 StatefulSet annotation 持久化，部分緩解第二個問題，但仍有啟動後的第一次 loop 判斷異常視窗。）
+
+### Leader Election 設計
+
+使用 K8s `coordination.k8s.io/v1` Lease 物件做 Leader Election：
+
+```python
+# operator/__init__ 加入
+from kubernetes import client, config
+
+lease_name = "slurm-operator-leader"
+lease_namespace = "slurm"
+
+def acquire_lease() -> bool:
+    """Try to become leader. Return True if successful."""
+    ...
+```
+
+實作上可用 `kubernetes-client/python` 的 `LeaderElector`，或等效的 `kubectl` CLI：
+```bash
+# 現有架構不引入 python k8s client SDK，用 annotation 模擬 lease
+kubectl -n slurm annotate lease slurm-operator-leader \
+  "leader-id=$(hostname)" --overwrite
+```
+
+**狀態機：**
+```
+standby → try_acquire_lease → leader → lost_lease → standby
+                                  ↓
+                           scaling loop runs
+```
+
+**部署設定：**
+```yaml
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # 確保至少一個 leader 在線
+      maxSurge: 1
+```
+
+新指標 `slurm_operator_is_leader{pod="operator-xxx"} = 1/0`，讓 Grafana 可視化哪個 pod 是當前 leader。
+
+### HA 後的 Operator 升級流程
+```
+1. kubectl set image deployment/slurm-elastic-operator ...
+2. 新 Pod 啟動 → standby（等待 lease）
+3. 舊 Pod 正常 shutdown → release lease
+4. 新 Pod 取得 lease → 成為 leader
+5. 零停機升級完成
+```
+
+---
+
+## Phase 5 優先順序
+
+| 項目 | 難度 | TA 價值 | 建議順序 |
+|------|------|---------|---------|
+| Helm Chart | 中 | 所有 TA（部署門檻決定採用率） | 第一 |
+| Fair-Share metrics | 低 | AI 平台 TA（可視化多租戶） | 第二（與 Helm 並行） |
+| Operator HA | 中 | SRE / 生產環境 TA | 第三 |
+| OpenTelemetry | 高 | 所有 TA（差異化觀測） | 第四 |
+
+Helm 和 Fair-Share metrics 可以平行進行（互不依賴），HA 需要先完成 Helm（讓 `replicas` 從 values 控制），OTel 放最後因為需要最多程式碼改動。

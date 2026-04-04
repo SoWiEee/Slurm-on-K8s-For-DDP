@@ -6,7 +6,7 @@
 
 ---
 
-# 🔥 Motivation
+# 🌱 Motivation
 
 如果你曾經跑過分散式 AI 訓練，你大概有過這樣的經驗：
 
@@ -73,6 +73,28 @@ bash phase3/scripts/verify-phase3-e2e.sh
 
 > 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
 
+## 5. 部署監控驗證（Phase 4）
+
+```bash
+bash phase4/scripts/bootstrap-phase4.sh
+```
+
+這支腳本會自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana → 套用跨 namespace 的 NetworkPolicy → 等待所有 Pod ready。
+
+- Grafana：http://localhost:3000
+- Prometheus：http://localhost:9090 (for debug)
+
+```bash
+# 存取 Grafana
+kubectl -n monitoring port-forward svc/grafana 3000:3000
+
+# 驗證所有元件正常、metrics 可抓
+bash phase4/scripts/verify-phase4.sh
+
+# 存取 Prometheus
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+```
+
 ## 清理環境
 
 ```bash
@@ -81,7 +103,7 @@ kind delete cluster --name slurm-lab
 
 ---
 
-# 🔄 System Architecture
+# 🏗️ System Architecture
 
 用一句話說：你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。
 
@@ -147,23 +169,22 @@ graph TD
 
 ---
 
-# 📘 Development Progress
+# 🎯 Development Progress
 
-| Phase | 狀態 | 內容 |
+| Phase# | 狀態 | 內容 |
 |-------|------|------|
-| **Phase 1**：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge/SSH 認證，靜態節點預宣告 |
-| **Phase 2**：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
-| **Phase 2-E**：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
-| **Phase 3**：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
-| **Phase 4**：可觀測性 | 🔨 規劃中 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
+| 1：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge/SSH 認證，靜態節點預宣告 |
+| 2：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
+| 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
+| 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
+| 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
+| 5：平台化與高可用 | 📋 規劃中 | Helm Chart、OpenTelemetry 分散式追蹤、Fair-Share 多租戶、Operator HA |
 
 ---
 
-## Phase 4：可觀測性（規劃中）
+# 🔭 Observability
 
-Phase 4 的核心目標是讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
-
-本專案的技術主張是：Slurm 擅長批次排程語意，Kubernetes 擅長彈性伸縮基礎設施，兩者結合可以彌補彼此的不足。Observability 層讓這個橋接過程不只是存在於程式碼中，而是能被觀測、被量測、被展示。
+於 Phase 4 實作監控面板，讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
 
 ```
 Slurm 世界                     橋接層（Operator）              K8s 世界
@@ -173,34 +194,22 @@ Node idle countdown     ──→    scale-down decision       ──→   State
 Checkpoint age check    ──→    guard block               ──→   scale skipped
 ```
 
-**架構概覽：**
+## 監控架構
 
 ```
-slurm-exporter          kube-state-metrics        operator custom metrics
-(sinfo/squeue → /metrics) (Pod/STS states)        (scale events, guard blocks)
-        ↓                        ↓                          ↓
-                        Prometheus
-                            ↓
-                         Grafana
-                   ┌────────────────────────────────┐
-                   │  Bridge Overview Dashboard     │  ← 主 demo 看板
-                   │  Slurm Cluster State Dashboard │
-                   │  K8s Operator Dashboard        │
-                   └────────────────────────────────┘
+slurm-exporter              kube-state-metrics        operator /metrics:8000
+(slurmrestd REST → metrics)  (STS/Pod states)         (scale events, guard blocks)
+        ↓                          ↓                          ↓
+                          Prometheus :9090
+                               ↓
+                            Grafana :3000
+                   ┌──────────────────────────────────┐
+                   │  Slurm↔K8s Bridge Overview       │  ← 主 demo 看板
+                   │  K8s Elastic Operator            │
+                   └──────────────────────────────────┘
 ```
 
-**部署計畫：**
-
-```bash
-# 部署 Phase 4 監控堆疊（需已完成 Phase 1–3）
-bash phase4/scripts/bootstrap-phase4.sh
-
-# 開啟 Grafana（port-forward）
-kubectl -n monitoring port-forward svc/grafana 3000:3000
-# 瀏覽器打開 http://localhost:3000
-```
-
-詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
+> 詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
 
 ---
 
@@ -248,7 +257,7 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 
 ---
 
-## 資源分配說明
+## 📦 資源分配說明
 
 每台 worker 宣告 `CPUs=4`，採 `select/cons_tres + CR_Core` 消耗式資源模式：
 
@@ -259,7 +268,9 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 
 ---
 
-# 🛠️ Useful Commands
+# ⚡ Useful Commands
+
+## Slurm Cluster
 
 ```bash
 # 查看所有 pod 狀態
@@ -268,11 +279,42 @@ kubectl -n slurm get pods -o wide
 # 觀察 worker pool 伸縮
 kubectl -n slurm get statefulset -w
 
-# 查看 Operator 決策日誌（JSON 格式）
-kubectl -n slurm logs deployment/slurm-elastic-operator -f
+# 查看 Operator 決策日誌（結構化 JSON）
+kubectl -n slurm logs deployment/slurm-elastic-operator -f | python3 -m json.tool
 
 # 查看 Slurm controller 日誌
 kubectl -n slurm logs statefulset/slurm-controller -f
+
+# 查詢 Operator 寫下的 cooldown 時間戳
+kubectl -n slurm get statefulset slurm-worker-cpu \
+  -o jsonpath='{.metadata.annotations.slurm\.k8s/last-scale-up-at}'
+
+# 進 login pod 提交 job
+kubectl -n slurm exec -it deploy/slurm-login -- bash
+```
+
+## Monitoring
+
+```bash
+# 開啟 Grafana（admin / admin）
+kubectl -n monitoring port-forward svc/grafana 3000:3000
+
+# 開啟 Prometheus（raw metrics / 查詢）
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+
+# 直接確認 operator 是否正在輸出 metrics
+kubectl -n slurm port-forward svc/slurm-elastic-operator 8000:8000
+# → curl http://localhost:8000/metrics | grep slurm_operator
+
+# 直接確認 slurm-exporter 是否正在輸出 metrics
+kubectl -n slurm port-forward svc/slurm-exporter 9341:9341
+# → curl http://localhost:9341/metrics | grep slurm_queue
+
+# 查看所有監控元件狀態
+kubectl -n monitoring get pods -o wide
+
+# 查看 slurm-exporter 日誌（確認是否能連到 slurmrestd）
+kubectl -n slurm logs deployment/slurm-exporter --tail=30
 ```
 
 ---
@@ -312,7 +354,60 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 | Elastic Operator | Python 3.11 + Slurm REST API (slurmrestd) + kubectl CLI |
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
 | DDP 網路 | Multus CNI + secondary NIC (net2) |
-| 監控（Phase 4） | Prometheus + Grafana + prometheus-slurm-exporter |
+| 監控（Phase 4） | Prometheus + Grafana + slurm-exporter + kube-state-metrics + Alertmanager |
+| 告警（Phase 4） | 8 條 SLO 規則（provisioning latency、queue wait、flapping 等） |
+
+---
+
+# 🔭 Phase 5 Roadmap：平台化與高可用（規劃中）
+
+> Phase 5 的目標是讓這個系統從「可運作的研究原型」演進成「可交付的平台產品」。
+> 以下規劃在 `docs/note.md` 中有完整的技術設計。
+
+## 5-A：Helm Chart 封裝
+
+目前每個 Phase 有獨立的 manifest 資料夾，部署需要依序執行多支 bootstrap 腳本。Helm 讓整個系統可以一條指令完成：
+
+```bash
+helm install slurm-on-k8s ./chart \
+  --set cluster.name=my-lab \
+  --set pools.cpu.maxReplicas=8 \
+  --set pools.gpuA10.maxReplicas=4 \
+  --set monitoring.enabled=true \
+  --set alertmanager.slack.webhookUrl="https://hooks.slack.com/..."
+```
+
+主要收益：環境差異（dev / staging / prod）只需一份 `values.yaml`，消除目前「改完 JSON 還要重新 render manifest」的摩擦。
+
+## 5-B：OpenTelemetry 分散式追蹤
+
+讓一個訓練 job 的完整生命週期變成一條可視化的 Trace：
+
+```
+[sbatch submit] → [pending in queue] → [scale-up decision]
+  → [K8s provisioning] → [slurmd registration] → [DDP torchrun]
+    → [checkpoint write] → [scale-down decision] → [job complete]
+```
+
+每個 span 攜帶 `job_id`、`pool`、`checkpoint_age`、`ddp_rank` 等 attribute，用 Jaeger 或 Grafana Tempo 可視化整條鏈。這是目前所有 Slurm-on-K8s 方案都沒有做到的端到端觀測視角。
+
+## 5-C：Fair-Share 多租戶
+
+支援多個 team / project 共用同一個叢集，搭配 Slurm 的 Fair-Share Scheduler：
+
+- 每個 team 有自己的 Slurm account 和 `shares` 配額
+- 新增 Grafana 面板：per-account queue depth、cumulative CPU-hours、FairShare 分數
+- Operator 可依 account priority 調整各 pool 的 scale-up 優先順序
+
+目標 TA：多個 AI 研究小組共用 GPU 叢集的組織（學術單位、內部平台團隊）。
+
+## 5-D：Operator 高可用（HA）
+
+目前 Operator 是 Single Replica，Pod 重啟會有 15–30 秒的決策空窗。Phase 5 計畫：
+
+- Leader Election via K8s Lease（`coordination.k8s.io/v1`）：多個 Operator Pod 同時運行，只有 leader 執行 scaling loop
+- Cooldown 狀態已透過 StatefulSet annotation 持久化（Phase 2 已完成），重新選主不會重置 cooldown
+- 目標：Zero-downtime Operator 滾動升級
 
 ---
 
@@ -327,7 +422,8 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 - [Slonk: Slurm on Kubernetes for ML Research at Character.ai](https://blog.character.ai/slonk/)
 - [Prometheus Slurm Exporter](https://github.com/vpenso/prometheus-slurm-exporter)
 - [AWS ParallelCluster](https://github.com/aws/aws-parallelcluster)
-- [Environment Modules](https://github.com/envmodules/modules)
 - [Grafana](https://grafana.com/)
+- [Kube State Metrics](https://github.com/kubernetes/kube-state-metrics)
 - 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
 - Phase 4 監控實作規格：[`docs/monitoring.md`](docs/monitoring.md)
+- K8s 物件說明：[`docs/cluster.md`](docs/cluster.md)
