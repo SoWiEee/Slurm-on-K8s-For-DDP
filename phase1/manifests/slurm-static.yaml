@@ -4,6 +4,18 @@ metadata:
   name: slurm
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurm-ctld-state
+  namespace: slurm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: slurm-controller
@@ -106,6 +118,13 @@ data:
     CryptoType=crypto/munge
     AuthAltTypes=auth/jwt
     AuthAltParameters=jwt_key=/slurm-secrets/jwt_hs256.key
+
+    # Job accounting via slurmdbd (gracefully degrades if slurmdbd is unavailable)
+    AccountingStorageType=accounting_storage/slurmdbd
+    AccountingStorageHost=slurmdbd.slurm.svc.cluster.local
+    AccountingStoragePort=6819
+    JobAcctGatherType=jobacct_gather/linux
+    JobAcctGatherFrequency=30
     GresTypes=gpu
 
     NodeName=slurm-worker-cpu-0 NodeAddr=slurm-worker-cpu-0.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
@@ -198,6 +217,8 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: ctld-state
+              mountPath: /var/spool/slurmctld
       volumes:
         - name: slurm-config
           configMap:
@@ -222,6 +243,9 @@ spec:
                   items:
                     - key: jwt_hs256.key
                       path: jwt_hs256.key
+        - name: ctld-state
+          persistentVolumeClaim:
+            claimName: slurm-ctld-state
 ---
 apiVersion: apps/v1
 kind: StatefulSet

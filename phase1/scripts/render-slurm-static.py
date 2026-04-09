@@ -83,6 +83,13 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
         "CryptoType=crypto/munge",
         "AuthAltTypes=auth/jwt",
         "AuthAltParameters=jwt_key=/slurm-secrets/jwt_hs256.key",
+        "",
+        "# Job accounting via slurmdbd (gracefully degrades if slurmdbd is unavailable)",
+        "AccountingStorageType=accounting_storage/slurmdbd",
+        "AccountingStorageHost=slurmdbd.slurm.svc.cluster.local",
+        "AccountingStoragePort=6819",
+        "JobAcctGatherType=jobacct_gather/linux",
+        "JobAcctGatherFrequency=30",
     ]
     if gres_types:
         header.append(f"GresTypes={','.join(sorted(gres_types))}")
@@ -137,6 +144,20 @@ def main() -> int:
 kind: Namespace
 metadata:
   name: slurm
+---""")
+    # PVC for slurmctld state — persists job queue and node state across pod restarts.
+    # Uses the cluster's default StorageClass (local-path on Kind, gp2 on EKS, etc.).
+    docs.append("""apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurm-ctld-state
+  namespace: slurm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
 ---""")
     docs.append("""apiVersion: v1
 kind: Service
@@ -256,7 +277,9 @@ spec:
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
-              readOnly: true{jwt_vm}{shared_vm}
+              readOnly: true
+            - name: ctld-state
+              mountPath: /var/spool/slurmctld{jwt_vm}{shared_vm}
       volumes:
         - name: slurm-config
           configMap:
@@ -275,7 +298,10 @@ spec:
                     - key: id_ed25519
                       path: id_ed25519
                     - key: id_ed25519.pub
-                      path: id_ed25519.pub{jwt_projected_source}{shared_vol}
+                      path: id_ed25519.pub{jwt_projected_source}
+        - name: ctld-state
+          persistentVolumeClaim:
+            claimName: slurm-ctld-state{shared_vol}
 ---""")
     for pool in cfg["workerPools"]:
         docs.append(f"""apiVersion: apps/v1

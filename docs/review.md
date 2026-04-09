@@ -482,9 +482,9 @@ status reporting、event recording。
 | 優先順序 | 項目 | 影響 | 難度 |
 |---------|------|-----|------|
 | P0 | 修正 SlurmUser=root → slurm user | 安全 | 低 |
-| P0 | StateSaveLocation 掛 PVC | 資料持久性 | 低 |
-| P0 | 縮容前做 drain（搭配 checkpoint guard）| AI job 保護 | 中 |
-| P1 | 部署 slurmdbd + MySQL | Fairshare 前置 | 中 |
+| ~~P0~~ | ~~StateSaveLocation 掛 PVC~~ | ~~資料持久性~~ | ✅ 已完成 |
+| ~~P0~~ | ~~縮容前做 drain（搭配 checkpoint guard）~~ | ~~AI job 保護~~ | ✅ 已完成 |
+| ~~P1~~ | ~~部署 slurmdbd + MySQL~~ | ~~Fairshare 前置~~ | ✅ 已完成 |
 | P1 | resources.requests/limits on worker pods | K8s QoS | 低 |
 | P1 | 加入 PodDisruptionBudget | 縮容安全 | 低 |
 | P1 | JWT token 輪換機制 | 安全 | 中 |

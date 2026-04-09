@@ -45,6 +45,11 @@ kubectl apply -f phase1/manifests/slurm-static.yaml
 if [[ -f phase1/manifests/slurm-login.yaml ]]; then
   kubectl apply -f phase1/manifests/slurm-login.yaml
 fi
+# Deploy accounting stack (MySQL + slurmdbd) if manifest exists.
+if [[ -f phase1/manifests/slurm-accounting.yaml ]]; then
+  echo "[phase1 bootstrap] deploying accounting stack (MySQL + slurmdbd)..."
+  kubectl apply -f phase1/manifests/slurm-accounting.yaml
+fi
 validate_live_command statefulset/slurm-controller
 validate_live_command statefulset/slurm-worker-cpu
 
@@ -66,5 +71,13 @@ for _ in $(seq 1 60); do
   fi
   sleep 2
 done
+
+# Wait for accounting stack if it was deployed.
+if [[ -f phase1/manifests/slurm-accounting.yaml ]]; then
+  echo "[phase1 bootstrap] waiting for MySQL readiness..."
+  kubectl -n "$NAMESPACE" rollout status statefulset/mysql --timeout="$ROLLOUT_TIMEOUT" || true
+  echo "[phase1 bootstrap] waiting for slurmdbd readiness..."
+  kubectl -n "$NAMESPACE" rollout status deployment/slurmdbd --timeout="$ROLLOUT_TIMEOUT" || true
+fi
 
 echo "Phase 1 bootstrap completed."

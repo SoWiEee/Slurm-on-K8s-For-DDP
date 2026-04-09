@@ -148,6 +148,11 @@ _PROVISIONING_LATENCY = Histogram(
     ["pool"],
     buckets=[5, 15, 30, 60, 120, 300, 600],
 )
+_DRAIN_TOTAL = Counter(
+    "slurm_operator_drain_total",
+    "Total drain-then-wait cycles initiated before a scale-down, by pool",
+    ["pool"],
+)
 
 
 def clamp(value: int, low: int, high: int) -> int:
@@ -234,6 +239,29 @@ class K8sClient:
             tty=False,
         )
         return resp.strip() if isinstance(resp, str) else ""
+
+    def drain_slurm_node(self, node_name: str, reason: str = "operator-scale-down") -> None:
+        """Mark a Slurm node DRAIN so no new jobs are scheduled onto it."""
+        self.exec_in_controller(
+            f"scontrol update NodeName={node_name} State=DRAIN Reason='{reason}' || true"
+        )
+
+    def resume_slurm_node(self, node_name: str) -> None:
+        """Clear DRAIN state so the node can accept new jobs again."""
+        self.exec_in_controller(
+            f"scontrol update NodeName={node_name} State=RESUME || true"
+        )
+
+    def get_node_cpu_alloc(self, node_name: str) -> int:
+        """Return the number of CPUs currently allocated on a node (0 = safe to remove)."""
+        output = self.exec_in_controller(
+            f"scontrol show node {node_name} 2>/dev/null"
+            r" | grep -oP 'CPUAlloc=\K[0-9]+' || echo 0"
+        )
+        try:
+            return int(output or "0")
+        except ValueError:
+            return 0
 
 
 class SlurmRestClient:
@@ -647,6 +675,9 @@ class OperatorApp:
         # Track pending provisioning: pool → (scale_up_timestamp, target_replicas).
         # Cleared once readyReplicas reaches the target; used to emit _PROVISIONING_LATENCY.
         self._provisioning: dict[str, tuple[float, int]] = {}
+        # Drain-then-scale: pool → set of node names that have been drained and are
+        # waiting for running jobs to finish before replicas are patched down.
+        self._draining_nodes: dict[str, set[str]] = {}
         for _p in self.partition_cfgs:
             _raw: str | None = None
             try:
@@ -740,6 +771,14 @@ class OperatorApp:
                     )
 
                     if decision.action == "scale_up":
+                        # If nodes were draining for a previous scale-down, cancel
+                        # that drain so they can accept jobs again.
+                        draining = self._draining_nodes.pop(key, set())
+                        for node_name in draining:
+                            try:
+                                self.client.resume_slurm_node(node_name)
+                            except Exception:  # noqa: BLE001
+                                pass
                         self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
                         self.last_scale_up_at[key] = now
                         # Record provisioning start (overwrite if already tracking a prior scale-up)
@@ -766,23 +805,7 @@ class OperatorApp:
                             busy_nodes=state.busy_nodes,
                         )
                     elif decision.action == "scale_down":
-                        if cooldown_elapsed >= partition_cfg.scale_down_cooldown:
-                            self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
-                            _SCALE_DOWN_TOTAL.labels(pool=key).inc()
-                            self.logger.emit(
-                                "scale_action",
-                                policy=self.cfg.policy_name,
-                                partition=partition_cfg.partition,
-                                action="scale_down",
-                                statefulset=partition_cfg.worker_statefulset,
-                                from_replicas=state.current_replicas,
-                                to_replicas=decision.target_replicas,
-                                reason=decision.reason,
-                                pending_jobs=state.pending_jobs,
-                                running_jobs=state.running_jobs,
-                                busy_nodes=state.busy_nodes,
-                            )
-                        else:
+                        if cooldown_elapsed < partition_cfg.scale_down_cooldown:
                             _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="cooldown").inc()
                             self.logger.emit(
                                 "scale_skipped",
@@ -798,6 +821,72 @@ class OperatorApp:
                                 running_jobs=state.running_jobs,
                                 busy_nodes=state.busy_nodes,
                             )
+                        else:
+                            # Drain-then-scale: mark the nodes being removed as
+                            # DRAIN so no new jobs land on them, then wait for
+                            # running jobs to finish before patching replicas.
+                            nodes_to_drain = {
+                                f"{partition_cfg.worker_statefulset}-{i}"
+                                for i in range(decision.target_replicas, state.current_replicas)
+                            }
+                            draining = self._draining_nodes.get(key, set())
+                            new_nodes = nodes_to_drain - draining
+                            for node_name in new_nodes:
+                                try:
+                                    self.client.drain_slurm_node(node_name)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            if new_nodes:
+                                draining = draining | new_nodes
+                                self._draining_nodes[key] = draining
+                                _DRAIN_TOTAL.labels(pool=key).inc()
+                                self.logger.emit(
+                                    "drain_initiated",
+                                    policy=self.cfg.policy_name,
+                                    partition=partition_cfg.partition,
+                                    statefulset=partition_cfg.worker_statefulset,
+                                    draining_nodes=sorted(new_nodes),
+                                    target_replicas=decision.target_replicas,
+                                )
+
+                            # Check if all drained nodes are now idle.
+                            all_idle = all(
+                                self.client.get_node_cpu_alloc(n) == 0
+                                for n in draining
+                            )
+                            if all_idle:
+                                self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
+                                self._draining_nodes.pop(key, None)
+                                _SCALE_DOWN_TOTAL.labels(pool=key).inc()
+                                self.logger.emit(
+                                    "scale_action",
+                                    policy=self.cfg.policy_name,
+                                    partition=partition_cfg.partition,
+                                    action="scale_down",
+                                    statefulset=partition_cfg.worker_statefulset,
+                                    from_replicas=state.current_replicas,
+                                    to_replicas=decision.target_replicas,
+                                    reason=decision.reason,
+                                    pending_jobs=state.pending_jobs,
+                                    running_jobs=state.running_jobs,
+                                    busy_nodes=state.busy_nodes,
+                                )
+                            else:
+                                _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="draining").inc()
+                                self.logger.emit(
+                                    "scale_skipped",
+                                    policy=self.cfg.policy_name,
+                                    partition=partition_cfg.partition,
+                                    action="scale_down",
+                                    statefulset=partition_cfg.worker_statefulset,
+                                    from_replicas=state.current_replicas,
+                                    to_replicas=decision.target_replicas,
+                                    reason="waiting_for_drain",
+                                    draining_nodes=sorted(draining),
+                                    pending_jobs=state.pending_jobs,
+                                    running_jobs=state.running_jobs,
+                                    busy_nodes=state.busy_nodes,
+                                )
                     else:
                         _guard_reasons = (
                             "checkpoint_unknown_block_scale_down",
