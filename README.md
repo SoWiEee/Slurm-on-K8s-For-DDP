@@ -141,14 +141,20 @@ graph TD
         end
 
         NFS["共享儲存 /shared\n(NFS + RWX PVC)"]
+        StatePVC["slurmctld state PVC\n(job queue 持久化)"]
+        slurmdbd["slurmdbd\n(會計 daemon)"]
+        MySQL["MySQL\n(會計資料庫)"]
     end
 
     Operator -->|"監聽 Queue\n決定 replicas"| SlurmCtld
-    Operator -->|kubectl patch| CPU
-    Operator -->|kubectl patch| A10
-    Operator -->|kubectl patch| H100
+    Operator -->|"drain → 等待 → patch"| CPU
+    Operator -->|"drain → 等待 → patch"| A10
+    Operator -->|"drain → 等待 → patch"| H100
     CPU & A10 & H100 -->|掛載| NFS
     Login -->|讀取輸出| NFS
+    SlurmCtld -->|"/var/spool/slurmctld"| StatePVC
+    SlurmCtld -->|"job 會計資料"| slurmdbd
+    slurmdbd -->|"儲存"| MySQL
 
     style Operator fill:#f9f,stroke:#333,stroke-width:2px
     style SlurmCtld fill:#bbf,stroke:#333,stroke-width:2px
@@ -161,10 +167,12 @@ graph TD
 
 | 元件 | 角色 |
 |------|------|
-| `slurm-controller` | 執行 `slurmctld`，負責所有排程決策 |
+| `slurm-controller` | 執行 `slurmctld`，負責所有排程決策；job 狀態存於獨立 PVC（`slurm-ctld-state`），pod 重啟後 queue 不遺失 |
 | `slurm-login` | 使用者入口，提供 `sbatch`、`srun`、`squeue` 等指令 |
 | `slurm-worker-*` | 實際執行計算的節點，分 CPU / GPU-A10 / GPU-H100 三個池 |
-| `slurm-elastic-operator` | 自製 Python Operator，監控 Queue 狀態並動態調整各 pool 的 replicas |
+| `slurm-elastic-operator` | 自製 Python Operator，監控 Queue 狀態並動態調整各 pool 的 replicas；縮容前先 drain 節點，等待 job 完成後才減少 StatefulSet replica |
+| `slurmdbd` | Slurm Database Daemon，將 job 會計紀錄（CPU-hours、用戶統計）持久化到 MySQL，為 Fair-Share 排程提供基礎 |
+| `mysql` | 後端資料庫（StatefulSet），儲存 slurmdbd 的會計資料，使用 5 Gi PVC |
 | NFS + RWX PVC | 跨所有節點的共享磁碟，job 輸出直接寫入 `/shared` |
 
 ---
@@ -173,7 +181,7 @@ graph TD
 
 | Phase# | 狀態 | 內容 |
 |-------|------|------|
-| 1：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge/SSH 認證，靜態節點預宣告 |
+| 1：基礎 Slurm 叢集 | ✅ 完成 | Controller + Worker + Login Pod，Munge 認證，靜態節點預宣告；slurmctld state PVC（job queue 持久化）；slurmdbd + MySQL 會計後端 |
 | 2：彈性 Operator | ✅ 完成 | 多節點池自動擴縮（CPU/GPU 各自獨立）、結構化日誌、Checkpoint-aware 縮容保護 |
 | 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出 |
@@ -289,6 +297,13 @@ kubectl -n slurm logs statefulset/slurm-controller -f
 kubectl -n slurm get statefulset slurm-worker-cpu \
   -o jsonpath='{.metadata.annotations.slurm\.k8s/last-scale-up-at}'
 
+# 查詢 job 會計紀錄（需要 slurmdbd 正常運行）
+kubectl -n slurm exec pod/slurm-controller-0 -- sacct -X --format=JobID,User,State,CPUTime,Start,End
+
+# 確認 slurmdbd / MySQL 狀態
+kubectl -n slurm get pods -l app=slurmdbd
+kubectl -n slurm get pods -l app=mysql
+
 # 進 login pod 提交 job
 kubectl -n slurm exec -it deploy/slurm-login -- bash
 ```
@@ -327,8 +342,17 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 **為什麼 Operator 不用 Kopf 或 CRD？**
 刻意保持輕量。Operator 是純 Python，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。Slurm 狀態查詢（queue、job、node）透過 slurmrestd REST API 進行；StatefulSet replica 調整仍透過 `kubectl patch`。
 
-**Checkpoint Guard 是什麼？**
-在縮容前，Operator 會檢查執行中 job 的 checkpoint 檔案年齡。若 checkpoint 不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容會被阻擋，避免 DDP 訓練進度因節點被回收而遺失。
+**Checkpoint Guard + Drain-then-Scale 是什麼？**
+縮容分兩個階段保護執行中的 AI 訓練任務：
+
+1. **Checkpoint Guard**：若 checkpoint 檔案不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容決策會被阻擋。
+2. **Drain-then-Scale**：通過 Guard 後，Operator 先呼叫 `scontrol update State=DRAIN` 將目標節點標記為不接受新 job，等到 `CPUAlloc == 0`（節點上所有 job 都跑完）才真正減少 StatefulSet replica，避免執行中的訓練被強制中斷。若在 drain 等待期間有新的 scale-up 需求，drain 會自動取消（`State=RESUME`）。
+
+**為什麼 slurmctld 不怕 pod 重啟？**
+`StateSaveLocation`（`/var/spool/slurmctld`）掛載了獨立的 PVC（`slurm-ctld-state`）。controller pod 重啟後，job queue、node 狀態、及會計紀錄指標都會從磁碟還原，不需要重新提交任務。
+
+**slurmdbd 提供什麼？**
+slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是 Phase 5 Fair-Share 多租戶排程的前置條件。
 
 ---
 
@@ -351,7 +375,8 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 | 容器編排 | Kubernetes |
 | HPC 排程器 | Slurm (slurmctld + slurmd) |
 | 節點認證 | Munge |
-| Elastic Operator | Python 3.11 + Slurm REST API (slurmrestd) + kubectl CLI |
+| Elastic Operator | Python 3.11 + Slurm REST API (slurmrestd) + Kubernetes Python SDK |
+| 會計後端 | slurmdbd + MySQL 8.0（job CPU-hours / 使用者統計 / Fair-Share 前置）|
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
 | DDP 網路 | Multus CNI + secondary NIC (net2) |
 | 監控（Phase 4） | Prometheus + Grafana + slurm-exporter + kube-state-metrics + Alertmanager |
