@@ -370,25 +370,34 @@ _JOB_WAIT_TIME = Histogram("slurm_job_wait_seconds", ...,
 
 ## 8. Kubernetes 整合：幾個設計選擇的代價
 
-### 8-A. Operator 使用 subprocess 調用 kubectl CLI
+### 8-A. ~~Operator 使用 subprocess 調用 kubectl CLI~~ ✅ 已修正（2026-04-09）
 
+原本的問題：
 ```python
+# 舊實作
 result = subprocess.run(["kubectl", *args], ...)
 ```
+每次 kubectl 調用是一個 fork + exec，每個 API call 約 50–200 ms overhead，
+且 stdout/stderr parsing 脆弱（格式變化 silent fail）。
 
-每次 kubectl 調用都是一個 fork + exec，有以下問題：
-1. **效能**：每個 API call 約 50–200 ms overhead（kubectl 需要初始化 kubeconfig、建立 TLS）
-2. **錯誤處理**：stdout/stderr parsing 是脆弱的（格式變化會 silent fail）
-3. **可測試性**：subprocess mock 比 SDK mock 複雜
-
-**正確做法：** 使用 [kubernetes Python client](https://github.com/kubernetes-client/python)
+**已修正：** 改用 [kubernetes Python client](https://github.com/kubernetes-client/python)（`kubernetes==30.1.0`）
 ```python
-from kubernetes import client, config
-config.load_incluster_config()
-apps_v1 = client.AppsV1Api()
-apps_v1.patch_namespaced_stateful_set_scale(name, namespace, body)
+# 新實作（phase2/operator/main.py）
+from kubernetes import client as k8s_client, config as k8s_config
+from kubernetes.stream import stream as k8s_stream
+
+class K8sClient:
+    def __init__(self, cfg):
+        k8s_config.load_incluster_config()   # 自動取得 in-cluster ServiceAccount token
+        self._core = k8s_client.CoreV1Api()
+        self._apps = k8s_client.AppsV1Api()
+
+    def patch_replicas(self, statefulset, replicas):
+        self._apps.patch_namespaced_stateful_set(statefulset, namespace, {"spec": {"replicas": replicas}})
 ```
-API 呼叫改為 in-process HTTP，延遲降到 < 5 ms。
+- Dockerfile 同步移除 kubectl binary 下載，映像縮小約 50 MB
+- API 呼叫改為 in-process HTTPS，延遲降到 < 5 ms
+- `exec_in_controller()` 改用 `kubernetes.stream` 取代 subprocess exec
 
 ---
 
@@ -479,7 +488,7 @@ status reporting、event recording。
 | P1 | resources.requests/limits on worker pods | K8s QoS | 低 |
 | P1 | 加入 PodDisruptionBudget | 縮容安全 | 低 |
 | P1 | JWT token 輪換機制 | 安全 | 中 |
-| P2 | 換 kubernetes Python SDK 取代 kubectl subprocess | 效能 | 中 |
+| ~~P2~~ | ~~換 kubernetes Python SDK 取代 kubectl subprocess~~ | ~~效能~~ | ✅ 已完成 |
 | P2 | 加入 MIG partition 支援的 gres.conf 設計 | GPU 利用率 | 高 |
 | P2 | DCGM Exporter + GPU dashboard | 可觀測性 | 中 |
 | P3 | Gang scheduling（Volcano 整合或 Slurm --exclusive） | DDP 效能 | 高 |

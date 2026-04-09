@@ -1,15 +1,6 @@
 FROM python:3.11-slim
 
-ARG KUBECTL_VERSION=v1.30.0
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl bash \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
-    && chmod +x /usr/local/bin/kubectl
-
-RUN pip install --no-cache-dir prometheus-client==0.20.0
+RUN pip install --no-cache-dir prometheus-client==0.20.0 kubernetes==30.1.0
 
 WORKDIR /app
 COPY phase2/operator/main.py /app/main.py

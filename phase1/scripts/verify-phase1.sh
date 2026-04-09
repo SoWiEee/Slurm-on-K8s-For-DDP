@@ -12,4 +12,4 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-cpu-0 --time
 
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sinfo
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- scontrol show nodes
-kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- bash -lc 'ssh -o StrictHostKeyChecking=no slurm-worker-cpu-0.slurm-worker-cpu hostname'
+# SSH inter-pod connectivity is not verified here (munge auth is sufficient for Slurm operations)

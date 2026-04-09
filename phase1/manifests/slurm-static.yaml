@@ -198,8 +198,6 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
-            - name: shared-storage
-              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -224,9 +222,6 @@ spec:
                   items:
                     - key: jwt_hs256.key
                       path: jwt_hs256.key
-        - name: shared-storage
-          persistentVolumeClaim:
-            claimName: slurm-shared-rwx
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -286,8 +281,6 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
-            - name: shared-storage
-              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -307,9 +300,6 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
-        - name: shared-storage
-          persistentVolumeClaim:
-            claimName: slurm-shared-rwx
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -369,8 +359,6 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
-            - name: shared-storage
-              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -390,9 +378,6 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
-        - name: shared-storage
-          persistentVolumeClaim:
-            claimName: slurm-shared-rwx
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -452,8 +437,6 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
-            - name: shared-storage
-              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -473,9 +456,6 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
-        - name: shared-storage
-          persistentVolumeClaim:
-            claimName: slurm-shared-rwx
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -555,8 +535,6 @@ spec:
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
               readOnly: true
-            - name: shared-storage
-              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -580,9 +558,6 @@ spec:
           configMap:
             name: slurm-ddp-runtime
             defaultMode: 0755
-        - name: shared-storage
-          persistentVolumeClaim:
-            claimName: slurm-shared-rwx
 ---
 apiVersion: v1
 kind: Service

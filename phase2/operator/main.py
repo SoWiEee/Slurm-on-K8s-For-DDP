@@ -15,14 +15,17 @@ import hmac
 import json
 import os
 import pathlib
-import subprocess
 import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
+from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
+from kubernetes.client.exceptions import ApiException
+from kubernetes.stream import stream as k8s_stream
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 
@@ -151,84 +154,86 @@ def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-class KubectlClient:
+class K8sClient:
+    """Kubernetes API client using the official Python SDK.
+
+    Uses in-cluster config when running inside a pod, falls back to
+    the local kubeconfig for development.  Replaces the previous
+    KubectlClient that shelled out to the kubectl binary.
+    """
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
-
-    def run(self, args: Iterable[str]) -> str:
-        cmd = ["kubectl", *args]
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return result.stdout.strip()
-
-    def try_run(self, args: Iterable[str]) -> tuple[int, str, str]:
-        cmd = ["kubectl", *args]
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
+        try:
+            k8s_config.load_incluster_config()
+        except k8s_config.ConfigException:
+            k8s_config.load_kube_config()
+        self._core = k8s_client.CoreV1Api()
+        self._apps = k8s_client.AppsV1Api()
 
     def pod_is_ready(self, pod_name: str) -> bool:
-        rc, out, _ = self.try_run(
-            [
-                "-n",
-                self.cfg.namespace,
-                "get",
-                "pod",
-                pod_name,
-                "-o",
-                "jsonpath={.status.conditions[?(@.type==\'Ready\')].status}",
-            ]
-        )
-        return rc == 0 and out == "True"
+        try:
+            pod = self._core.read_namespaced_pod(pod_name, self.cfg.namespace)
+            conditions = pod.status.conditions or []
+            return any(c.type == "Ready" and c.status == "True" for c in conditions)
+        except ApiException:
+            return False
 
-    # Backward-compatible alias for older call sites and previously built images.
+    # Backward-compatible alias.
     def pod_ready(self, pod_name: str) -> bool:
         return self.pod_is_ready(pod_name)
 
     def get_annotation(self, resource: str, name: str, key: str) -> str | None:
         """Return the value of a metadata annotation, or None if absent/unreadable."""
-        rc, out, _ = self.try_run([
-            "-n", self.cfg.namespace, "get", resource, name,
-            "-o", "jsonpath={.metadata.annotations}",
-        ])
-        if rc != 0 or not out:
-            return None
         try:
-            return json.loads(out).get(key)
-        except (json.JSONDecodeError, AttributeError):
+            if resource == "statefulset":
+                obj = self._apps.read_namespaced_stateful_set(name, self.cfg.namespace)
+            else:
+                return None
+            annotations = obj.metadata.annotations or {}
+            return annotations.get(key)
+        except ApiException:
             return None
 
     def set_annotation(self, resource: str, name: str, key: str, value: str) -> None:
         """Write a metadata annotation onto a resource (creates or overwrites)."""
-        self.run([
-            "-n", self.cfg.namespace, "annotate", resource, name,
-            f"{key}={value}", "--overwrite",
-        ])
+        body = {"metadata": {"annotations": {key: value}}}
+        if resource == "statefulset":
+            self._apps.patch_namespaced_stateful_set(name, self.cfg.namespace, body)
 
     def get_ready_replicas(self, statefulset: str) -> int:
         """Return the number of Ready replicas for a StatefulSet (0 on error)."""
-        rc, out, _ = self.try_run([
-            "-n", self.cfg.namespace, "get", "statefulset", statefulset,
-            "-o", "jsonpath={.status.readyReplicas}",
-        ])
-        if rc != 0 or not out:
-            return 0
         try:
-            return int(out)
-        except ValueError:
+            sts = self._apps.read_namespaced_stateful_set(statefulset, self.cfg.namespace)
+            return sts.status.ready_replicas or 0
+        except ApiException:
             return 0
 
+    def get_replicas(self, statefulset: str) -> int:
+        """Return the desired replica count (spec.replicas) for a StatefulSet."""
+        try:
+            sts = self._apps.read_namespaced_stateful_set(statefulset, self.cfg.namespace)
+            return sts.spec.replicas or 0
+        except ApiException:
+            return 0
+
+    def patch_replicas(self, statefulset: str, replicas: int) -> None:
+        """Patch spec.replicas on a StatefulSet via the K8s API."""
+        body = {"spec": {"replicas": replicas}}
+        self._apps.patch_namespaced_stateful_set(statefulset, self.cfg.namespace, body)
+
     def exec_in_controller(self, command: str) -> str:
-        return self.run(
-            [
-                "-n",
-                self.cfg.namespace,
-                "exec",
-                f"pod/{self.cfg.controller_pod}",
-                "--",
-                "bash",
-                "-lc",
-                command,
-            ]
+        resp = k8s_stream(
+            self._core.connect_get_namespaced_pod_exec,
+            self.cfg.controller_pod,
+            self.cfg.namespace,
+            command=["bash", "-lc", command],
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
         )
+        return resp.strip() if isinstance(resp, str) else ""
 
 
 class SlurmRestClient:
@@ -382,7 +387,7 @@ class PartitionConfigLoader:
 
 
 class ClusterStateCollector:
-    def __init__(self, client: KubectlClient, partition_cfgs: list[PartitionConfig],
+    def __init__(self, client: K8sClient, partition_cfgs: list[PartitionConfig],
                  rest: SlurmRestClient | None = None):
         self.client = client
         self.partition_cfgs = partition_cfgs
@@ -496,11 +501,7 @@ class ClusterStateCollector:
         return result
 
     def get_current_replicas(self, statefulset: str) -> int:
-        output = self.client.run(
-            ["-n", self.client.cfg.namespace, "get", "statefulset", statefulset, "-o", "json"]
-        )
-        payload = json.loads(output)
-        return int(payload.get("spec", {}).get("replicas", 0))
+        return self.client.get_replicas(statefulset)
 
     def get_busy_nodes(self, partition_cfg: PartitionConfig) -> int:
         if self._rest is not None:
@@ -615,29 +616,18 @@ class CheckpointAwareQueuePolicy:
 
 
 class StatefulSetActuator:
-    def __init__(self, client: KubectlClient):
+    def __init__(self, client: K8sClient):
         self.client = client
 
     def patch_replicas(self, statefulset: str, replicas: int) -> None:
-        self.client.run(
-            [
-                "-n",
-                self.client.cfg.namespace,
-                "patch",
-                "statefulset",
-                statefulset,
-                "--type=merge",
-                "-p",
-                json.dumps({"spec": {"replicas": replicas}}),
-            ]
-        )
+        self.client.patch_replicas(statefulset, replicas)
 
 
 class OperatorApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.logger = JsonLogger()
-        self.client = KubectlClient(cfg)
+        self.client = K8sClient(cfg)
         self.partition_cfgs = PartitionConfigLoader.load(cfg)
         self.rest = (
             SlurmRestClient(
