@@ -33,7 +33,11 @@ fi
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
 if [[ -f phase1/scripts/render-slurm-static.py ]]; then
-  python3 phase1/scripts/render-slurm-static.py
+  if py -3 phase1/scripts/render-slurm-static.py 2>/dev/null; then
+    true
+  else
+    python3 phase1/scripts/render-slurm-static.py
+  fi
   echo "[phase1 bootstrap] phase1 manifests rendered."
 fi
 validate_rendered_manifest

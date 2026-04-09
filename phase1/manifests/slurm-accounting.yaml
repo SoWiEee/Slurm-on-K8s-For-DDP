@@ -152,6 +152,7 @@ spec:
       labels:
         app: slurmdbd
     spec:
+      hostname: slurmdbd
       containers:
         - name: slurmdbd
           image: slurm-controller:phase1

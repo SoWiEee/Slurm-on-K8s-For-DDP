@@ -550,9 +550,11 @@ class ClusterStateCollector:
     def _get_busy_nodes_exec(self, partition_cfg: PartitionConfig) -> int:
         prefix = partition_cfg.worker_statefulset
         output = self.client.exec_in_controller(
-            rf"sinfo -h -p {partition_cfg.partition} -N -o '%N %T' | awk '$1 ~ /^{prefix}(-|$)/ && $2 ~ /ALLOCATED|MIXED|COMPLETING/ {{count++}} END {{print count+0}}'"
+            rf"sinfo -h -p {partition_cfg.partition} -N -o '%N %T' 2>/dev/null | awk '$1 ~ /^{prefix}(-|$)/ && $2 ~ /ALLOCATED|MIXED|COMPLETING/ {{count++}} END {{print count+0}}'"
         )
-        return int(output or "0")
+        # Take the last non-empty line in case sinfo emits warnings before the count.
+        lines = [l for l in (output or "").splitlines() if l.strip()]
+        return int(lines[-1]) if lines else 0
 
     def get_checkpoint_age_seconds(self, checkpoint_path: str) -> int | None:
         if not checkpoint_path:

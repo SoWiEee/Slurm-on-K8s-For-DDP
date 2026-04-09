@@ -820,6 +820,84 @@ spec:
 
 ---
 
+## P0/P1 改進部署踩坑紀錄（2026-04-09）
+
+### 問題 1：slurmdbd 映像缺少 slurmdbd 套件
+
+**現象：** `slurmdbd` pod CrashLoopBackOff，log 顯示 `/bin/bash: line 23: exec: slurmdbd: not found`。
+
+**原因：** `slurm-accounting.yaml` 使用 `slurm-controller:phase1` 映像跑 slurmdbd，但 controller Dockerfile 只安裝了 `slurmctld`、`slurmd`、`slurmrestd`，沒有裝 `slurmdbd` 套件（Ubuntu 22.04 的 `slurmdbd` 是獨立套件）。
+
+**修法：** `phase1/docker/controller/Dockerfile` 加入 `slurmdbd`，重新 build + kind load。
+
+---
+
+### 問題 2：slurmdbd 啟動後 hostname 不符
+
+**現象：** slurmdbd 啟動後立即 fatal exit：`This host not configured to run SlurmDBD (slurmdbd-xxx != slurmdbd)`。
+
+**原因：** `slurmdbd.conf` 的 `DbdHost=slurmdbd`，但 Deployment pod 的 hostname 是 `slurmdbd-{replicaset}-{random}`（Kubernetes 預設行為）。slurmdbd 在啟動時會驗證 `DbdHost` 是否匹配當前 hostname。
+
+**修法：** `slurm-accounting.yaml` 的 Deployment pod spec 加入 `hostname: slurmdbd`，讓 pod hostname 固定為 `slurmdbd`。
+
+---
+
+### 問題 3：slurmctld 首次啟動 fatal（TRES 缺失）
+
+**現象：** 新叢集第一次啟動時，slurmctld fatal exit：`You are running with a database but for some reason we have no TRES from it`。
+
+**原因：** `slurm.conf` 設定了 `AccountingStorageType=accounting_storage/slurmdbd`，slurmctld 啟動時需要從 slurmdbd 取得 TRES（Trackable RESources）定義。若 slurmdbd 尚未 ready（容器剛建立），且又沒有本地 state file，slurmctld 就會 fatal exit 而非等待。
+
+**修法：** `render-slurm-static.py` 的 controller 啟動腳本加入 wait loop：偵測到 `AccountingStorageType=slurmdbd` 時，先用 bash TCP 連線確認 `slurmdbd.slurm.svc.cluster.local:6819` 可達，再 exec slurmctld。
+
+```bash
+if grep -q 'AccountingStorageType=accounting_storage/slurmdbd' /etc/slurm/slurm.conf; then
+  until (echo >/dev/tcp/slurmdbd.slurm.svc.cluster.local/6819) 2>/dev/null; do sleep 3; done
+fi
+exec slurmctld -Dvvv
+```
+
+---
+
+### 問題 4：operator ValueError — sinfo stderr 混入 stdout
+
+**現象：** operator CrashLoopBackOff，traceback：`ValueError: invalid literal for int() with base 10: 'slurm_load_partitions: Unable to contact slurm controller (connect failure)\n0'`
+
+**原因：** `kubernetes.stream` 的 exec 會將 stderr 和 stdout 合併回傳（`stderr=True, stdout=True`）。`_get_busy_nodes_exec` 的 sinfo 命令因 controller 還沒好而輸出 error 訊息到 stderr，與 awk 的 `0` 結果拼在一起，`int()` 轉換失敗。
+
+**修法：**
+1. sinfo 加 `2>/dev/null` 抑制 stderr。
+2. 結果解析改為取最後一行（`lines[-1]`），即使有前置警告也不影響。
+
+---
+
+### 問題 5：bootstrap 腳本 `python3` 在 Windows 失敗（exit 49）
+
+**現象：** bootstrap-phase1.sh 中 `python3 render-slurm-static.py` 回傳 exit code 49（Windows Store app stub 行為）。
+
+**原因：** Windows 的 `python3` 在沒有安裝 Python 時會打開 Microsoft Store；即使裝了 Python，git bash 下 `python3` 可能不在 PATH。
+
+**修法：** bootstrap 腳本改為先嘗試 `py -3`（Windows py.exe launcher），失敗才 fallback 到 `python3`：
+```bash
+if py -3 phase1/scripts/render-slurm-static.py 2>/dev/null; then
+  true
+else
+  python3 phase1/scripts/render-slurm-static.py
+fi
+```
+
+---
+
+### 問題 6：verify-phase1.sh sinfo 時機太早
+
+**現象：** pod Ready 後立刻 exec sinfo，但 slurmctld 還沒完全啟動，回傳 `Unable to contact slurm controller`。
+
+**原因：** `kubectl wait --for=condition=Ready` 只確認 readinessProbe 通過（`pgrep -x slurmctld`），不保證 slurmctld 已完成初始化並接受連線。
+
+**修法：** 加入 `scontrol ping` 重試等待（最多 90 秒）後再執行 sinfo。
+
+---
+
 ## Phase 5 優先順序
 
 | 項目 | 難度 | TA 價值 | 建議順序 |

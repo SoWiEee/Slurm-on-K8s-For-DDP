@@ -10,6 +10,16 @@ kubectl -n "$NAMESPACE" get pods -o wide
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-controller-0 --timeout=120s
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/slurm-worker-cpu-0 --timeout=120s
 
+# Wait for slurmctld to accept connections (pod Ready != daemon ready).
+echo "waiting for slurmctld to be ready..."
+for _ in $(seq 1 30); do
+  if kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- scontrol ping >/dev/null 2>&1; then
+    break
+  fi
+  sleep 3
+done
+kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- scontrol ping
+
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- sinfo
 kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- scontrol show nodes
 # SSH inter-pod connectivity is not verified here (munge auth is sufficient for Slurm operations)

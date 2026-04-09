@@ -187,6 +187,15 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Wait for slurmdbd if accounting is configured, so slurmctld
+              # does not fatal-exit on first boot due to missing TRES data.
+              if grep -q 'AccountingStorageType=accounting_storage/slurmdbd' /etc/slurm/slurm.conf 2>/dev/null; then
+                echo "[controller] waiting for slurmdbd port 6819..."
+                until (echo >/dev/tcp/slurmdbd.slurm.svc.cluster.local/6819) 2>/dev/null; do
+                  sleep 3
+                done
+                echo "[controller] slurmdbd is up"
+              fi
               exec slurmctld -Dvvv &
               CTLD_PID=$!
               # Wait for slurmctld to be ready before starting slurmrestd.
