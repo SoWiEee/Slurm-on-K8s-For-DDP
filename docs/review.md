@@ -484,23 +484,310 @@ status reporting、event recording。
 
 ---
 
+## 第二輪審查（2026-04-10）— Phase 5 後的新發現
+
+> 評估對象：Phase 1–5 全部實作（含 Lmod、PDB、pmi2、slurmdbd）。
+> 以下 11–20 節為新增問題，業界比較表與優先順序表於後更新。
+
+---
+
+## 11. Pod 資源配置：全部為 BestEffort QoS
+
+### 問題
+
+所有 Pod（controller、worker、login、operator）均未設定 `resources.requests`/`limits`。
+Kubernetes 的 QoS 分為三級：
+
+| QoS 類型 | 條件 | OOM 優先級 |
+|---------|-----|-----------|
+| BestEffort | 無 requests/limits | **最先被殺** |
+| Burstable | 有 requests，limits > requests | 中 |
+| Guaranteed | requests == limits | 最後被殺 |
+
+目前 slurm-controller-0 與 slurm-worker-cpu-0 都是 BestEffort，Node 記憶體壓力時會優先被驅逐，
+導致正在執行的 MPI/DDP job 直接失敗，甚至讓 slurmctld 消失。
+
+### 改進方向
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+```
+
+worker pod 建議 `requests == limits`（Guaranteed）以消除 OOM 風險。
+GPU worker 需加入 `nvidia.com/gpu: 1` resource request（否則 K8s 不會隔離 GPU）。
+
+---
+
+## 12. Worker Pod 缺少 preStop Hook
+
+### 問題
+
+目前 worker Pod 被 K8s 終止（縮容、節點驅逐）時，slurmd 進程直接收到 SIGTERM，
+沒有機會通知 slurmctld 節點正在下線。
+
+Slurm 端的表現：
+- 該節點上的 job 進入 `NODE_FAIL` 狀態
+- slurmctld 可能需要等到 `SlurmdTimeout`（預設 120s）才把節點標為 DOWN
+- 期間不會把 job 重排給其他節點
+
+### 改進方向
+
+在 worker Pod spec 加入 `preStop`：
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - >
+          scontrol update nodename=$(hostname) state=drain reason=k8s-eviction &&
+          sleep 10
+```
+
+搭配 Phase 2 已有的 drain-before-scale，此 hook 處理的是 K8s **直接驅逐**場景（非 operator 縮容）。
+
+---
+
+## 13. Checkpoint Guard 的兩個靜默失效情境
+
+### 13-A. `CHECKPOINT_PATH=""` 讓 guard 變成 no-op
+
+`phase2/operator/main.py` 中：
+
+```python
+CHECKPOINT_ENABLED = os.environ.get("CHECKPOINT_ENABLED", "false").lower() == "true"
+CHECKPOINT_PATH    = os.environ.get("CHECKPOINT_PATH", "")
+```
+
+`slurm-phase2-operator.yaml` 設定了 `CHECKPOINT_ENABLED=true`，但 `CHECKPOINT_PATH` 為空字串。
+進入 checkpoint 檢查邏輯後，`os.path.exists("")` 永遠回傳 False，scale-down 被永久阻擋
+（或依實作直接跳過），使 guard 完全無效。
+
+**修正**：啟動時驗證 `CHECKPOINT_PATH` 非空且路徑存在；或在 guard 函式開頭加入
+`if not CHECKPOINT_PATH: return True  # guard disabled` 並記錄警告。
+
+### 13-B. Job 從未建立 checkpoint 時 scale-down 被永久阻擋
+
+若 DDP job 尚未寫出第一個 checkpoint，guard 看到「檔案不存在 → 視為 stale → 拒絕縮容」，
+導致叢集無法縮回直到 job 完成。這是 guard 設計的隱性假設（job 已有至少一次 checkpoint）。
+
+**改進方向**：加入 job 開始時間判斷——若 job 啟動未超過 `CHECKPOINT_GRACE_SECONDS`（如 300s），
+暫緩 scale-down 但不阻擋；超過 grace period 後才強制要求 checkpoint 存在。
+
+---
+
+## 14. MySQL / slurmdbd 單點故障與無備份
+
+### 問題
+
+- MySQL StatefulSet 只有 1 replica，無法做 failover
+- PVC 損毀（或 `kind delete cluster`）後所有 job accounting 歷史全部遺失
+- 無任何 mysqldump / Velero snapshot 機制
+
+### 業界標準
+
+| 方案 | 說明 |
+|------|-----|
+| MySQL Group Replication | InnoDB HA，3 節點 |
+| Percona XtraDB Cluster | K8s operator 可用 |
+| 定期 CronJob + mysqldump | 最小成本備份 |
+| Velero + CSI snapshot | K8s 原生備份 |
+
+學習環境建議至少加入每日 `CronJob` 執行 `mysqldump`，輸出到另一個 PVC 或 S3。
+
+---
+
+## 15. JWT Token 安全：10 年效期未改進
+
+第一輪審查（§1-C）已標記 JWT `exp` 設定 10 年效期（315360000 秒）。
+截至 Phase 5，`create-secrets.sh` 中的 token 生成邏輯未更新。
+
+```bash
+# 目前
+scontrol token username=slurm lifespan=315360000
+```
+
+**最小修正**：lifespan 改為 `86400`（1 天），搭配 K8s Secret 輪換 CronJob。
+
+---
+
+## 16. Operator 穩定性：缺少熔斷器與就緒探針
+
+### 問題
+
+1. **無熔斷器（Circuit Breaker）**：若 K8s API 短暫不可用，operator 的 while-loop 會持續
+   重試並記錄 error，但不會有 backoff 或暫停。高頻錯誤可能產生大量 log，也可能誤觸
+   rate-limit。
+
+2. **無 readinessProbe**：operator Deployment 沒有就緒探針，Pod 重啟後立刻被視為 Ready，
+   實際上 operator 可能還在初始化 pool state。
+
+### 改進方向
+
+```python
+# 加入 exponential backoff on error
+import time
+backoff = 1
+while True:
+    try:
+        run_loop()
+        backoff = 1
+    except Exception as e:
+        logger.error(e)
+        time.sleep(min(backoff, 60))
+        backoff *= 2
+```
+
+readinessProbe 可用 `/healthz` HTTP endpoint（加入 Flask/aiohttp 輕量伺服器）或 exec 方式檢查 lock file。
+
+---
+
+## 17. Slurm 排程策略未配置
+
+### 問題
+
+目前 `slurm.conf` 中排程相關參數全部使用預設值：
+
+```ini
+SchedulerType=sched/backfill   # 存在，但以下參數未調整
+# MaxTime=INFINITE              # 無執行時間上限
+# 無 QoS 定義
+# 無 Preemption 設定
+# 無 Fairshare 設定
+```
+
+對於 DDP workload 的影響：
+- 一個 job 可佔用所有節點到永遠（MaxTime=INFINITE）
+- 多個 DDP job 同時提交時無 fairshare，先進先贏
+- 無 preemption 機制，高優先 job 無法搶佔低優先 job
+
+### 改進建議
+
+```ini
+# slurm.conf 新增
+MaxJobCount=10000
+DefaultTime=01:00:00
+MaxTime=24:00:00
+
+PriorityType=priority/multifactor
+PriorityWeightFairshare=100000
+PriorityWeightAge=1000
+PriorityDecayHalfLife=1-0
+
+PreemptType=preempt/qos
+PreemptMode=REQUEUE
+```
+
+---
+
+## 18. Lmod 模組設計缺口
+
+### 18-A. 缺少 `conflict` / `prereq` 宣告
+
+目前 `openmpi/4.1.lua` 沒有衝突宣告，使用者可以同時 `module load openmpi/4.1 openmpi/5.0`（未來版本），
+導致 `LD_LIBRARY_PATH` 混亂。
+
+```lua
+-- 建議加入
+conflict("openmpi")      -- 同名模組只能載一個
+conflict("mvapich2")     -- 互斥 MPI 實作
+```
+
+### 18-B. 缺少 Intel MPI / NCCL 模組定義
+
+PyTorch DDP 常用 NCCL 作為 backend，而非 OpenMPI。目前沒有 `nccl` 模組。
+GPU 叢集若要支援 NCCL，需要：
+1. NCCL 安裝到 `/opt/nccl`
+2. `nccl/2.x.lua` 設定 `NCCL_HOME`、`LD_LIBRARY_PATH`
+3. `prereq("cuda/11.8")` 確保 CUDA 模組先載入
+
+### 18-C. 模組檔案在 ConfigMap — 有大小上限
+
+K8s ConfigMap 單一 key 上限 1 MiB，整體 etcd 物件上限約 1.5 MiB。
+若未來加入完整 CUDA toolkit（數百個環境變數設定），可能需要改用 PVC + initContainer 預置模組檔案。
+
+---
+
+## 19. Job 輸出檔案在 Worker 本地 FS
+
+Phase 5 驗證腳本已處理此問題（讀取 worker pod），但這個設計本身是一個功能缺口：
+
+- 使用者在 login pod 執行 `cat /tmp/my-job.out` 時，若 job 跑在 worker-0，檔案不存在
+- job 完成後 worker pod 被縮容 → 輸出檔案永久遺失
+- `srun` 的 stderr/stdout 也同樣問題
+
+**根本修正**：`#SBATCH --output` 應指向共用 NFS 路徑（Phase 3 的 `/shared/jobs/%j.out`），
+而非 worker 本地 `/tmp`。Phase 3 NFS 就是為了解決這個問題。
+
+---
+
+## 20. NetworkPolicy 缺口
+
+### 20-A. 無 Egress 規則
+
+Phase 2-E 的 NetworkPolicy 只定義了 Ingress 規則。Pod 可以對外任意發起連線，包括：
+- worker pod → 外部網路（資料洩漏風險）
+- operator → 任意 K8s namespace（越權存取）
+
+### 20-B. 無 mTLS
+
+Pod 間通訊（slurmctld ↔ slurmd）使用明文 TCP。在 K8s 環境中，建議搭配 Istio/Linkerd sidecar
+提供 mTLS，或至少使用 MUNGE key 做身份驗證（目前已有 MUNGE，但未延伸到 REST API 層）。
+
+---
+
+## 更新後的業界比較表
+
+| 面向 | 本專案（Phase 5） | Volcano (K8s) | Open OnDemand + Slurm | AWS ParallelCluster |
+|------|-----------------|--------------|----------------------|-------------------|
+| Gang Scheduling | ✗ | ✓（原生） | ✗ | ✓（placement groups） |
+| GPU 資源感知 | ✗（/dev/null） | ✓ | ✓ | ✓（NVIDIA GDRCopy） |
+| Fairshare | ✓（slurmdbd 已部署）| ✓（Priority plugin） | ✓ | ✓ |
+| 節點 Drain before scale | ✓（Phase 2） | N/A | ✓ | ✓ |
+| Job accounting | ✓（slurmdbd + MySQL）| ✓ | ✓ | ✓ |
+| HA controller | ✗ | ✓ | ✓ | ✓ |
+| 並行 filesystem | NFS（Phase 3） | 依 StorageClass | Lustre / GPFS | FSx for Lustre |
+| HPC Module 系統 | ✓（Lmod Phase 5）| ✗ | ✓（Environment Modules）| ✓（Lmod） |
+| PodDisruptionBudget | ✓（Phase 5）| N/A | N/A | N/A |
+| 資源 QoS 配置 | ✗（BestEffort） | ✓ | ✓ | ✓ |
+
+---
+
 ## 改進優先順序建議
 
 | 優先順序 | 項目 | 影響 | 難度 |
 |---------|------|-----|------|
 | P0 | 修正 SlurmUser=root → slurm user | 安全 | 低 |
+| P0 | 修正 CHECKPOINT_PATH="" 靜默失效（§13-A） | AI job 保護 | 低 |
 | ~~P0~~ | ~~StateSaveLocation 掛 PVC~~ | ~~資料持久性~~ | ✅ 已完成 |
 | ~~P0~~ | ~~縮容前做 drain（搭配 checkpoint guard）~~ | ~~AI job 保護~~ | ✅ 已完成 |
 | ~~P1~~ | ~~部署 slurmdbd + MySQL~~ | ~~Fairshare 前置~~ | ✅ 已完成 |
-| P1 | resources.requests/limits on worker pods | K8s QoS | 低 |
+| P1 | resources.requests/limits on all pods（§11） | K8s QoS / OOM 保護 | 低 |
 | ~~P1~~ | ~~加入 PodDisruptionBudget~~ | ~~縮容安全~~ | ✅ 已完成 |
-| P1 | JWT token 輪換機制 | 安全 | 中 |
+| P1 | JWT token 輪換機制（§15） | 安全 | 中 |
+| P1 | worker preStop hook for drain（§12） | job 故障恢復 | 低 |
+| P1 | job output 指向 NFS /shared/jobs/（§19） | 使用者體驗 | 低 |
 | ~~P2~~ | ~~換 kubernetes Python SDK 取代 kubectl subprocess~~ | ~~效能~~ | ✅ 已完成 |
+| P2 | operator 熔斷器 + readinessProbe（§16） | 穩定性 | 中 |
+| P2 | slurm.conf MaxTime + QoS + Preemption（§17） | 排程公平性 | 中 |
+| P2 | MySQL CronJob 備份（§14） | 資料持久性 | 低 |
+| P2 | Lmod conflict/prereq + NCCL 模組（§18） | 模組正確性 | 中 |
 | P2 | 加入 MIG partition 支援的 gres.conf 設計 | GPU 利用率 | 高 |
 | P2 | DCGM Exporter + GPU dashboard | 可觀測性 | 中 |
+| P3 | NetworkPolicy Egress 規則（§20） | 安全 | 中 |
+| P3 | Checkpoint grace period 設計（§13-B） | AI job 保護 | 中 |
 | P3 | Gang scheduling（Volcano 整合或 Slurm --exclusive） | DDP 效能 | 高 |
 | P3 | Lustre / BeeGFS 替代 NFS | I/O 效能 | 高 |
 
 ---
 
-*本文件記錄為學習用途的架構審查，供後續 Phase 5+ 設計參考。*
+*本文件記錄為學習用途的架構審查，供後續 Phase 6+ 設計參考。*
+*第一輪審查：2026-04-04（Phase 1–4）；第二輪審查：2026-04-10（Phase 1–5，含 Lmod、PDB、pmi2）。*
