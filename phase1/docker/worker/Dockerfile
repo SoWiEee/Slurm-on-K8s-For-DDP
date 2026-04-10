@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     munge \
     slurmd \
     slurm-client \
+    openmpi-bin \
+    libopenmpi-dev \
     tini \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

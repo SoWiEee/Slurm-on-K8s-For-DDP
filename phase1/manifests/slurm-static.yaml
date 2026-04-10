@@ -97,7 +97,7 @@ data:
   slurm.conf: |
     ClusterName=kind-slurm
     SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)
-    MpiDefault=none
+    MpiDefault=pmi2
     ProctrackType=proctrack/linuxproc
     ReturnToService=2
     SlurmctldPidFile=/var/run/slurmctld.pid
@@ -256,6 +256,17 @@ spec:
           persistentVolumeClaim:
             claimName: slurm-ctld-state
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-controller-pdb
+  namespace: slurm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurm-controller
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -333,6 +344,17 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-worker-cpu-pdb
+  namespace: slurm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: slurm-worker-cpu
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -412,6 +434,17 @@ spec:
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-worker-gpu-a10-pdb
+  namespace: slurm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: slurm-worker-gpu-a10
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -489,6 +522,17 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-worker-gpu-h100-pdb
+  namespace: slurm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: slurm-worker-gpu-h100
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -591,6 +635,17 @@ spec:
           configMap:
             name: slurm-ddp-runtime
             defaultMode: 0755
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-login-pdb
+  namespace: slurm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: slurm-login
 ---
 apiVersion: v1
 kind: Service

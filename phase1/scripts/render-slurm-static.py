@@ -62,7 +62,7 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
     header = [
         "ClusterName=kind-slurm",
         "SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)",
-        "MpiDefault=none",
+        "MpiDefault=pmi2",
         "ProctrackType=proctrack/linuxproc",
         "ReturnToService=2",
         "SlurmctldPidFile=/var/run/slurmctld.pid",
@@ -312,6 +312,18 @@ spec:
           persistentVolumeClaim:
             claimName: slurm-ctld-state{shared_vol}
 ---""")
+    # PDB: prevent voluntary eviction of the single slurmctld pod.
+    docs.append("""apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-controller-pdb
+  namespace: slurm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurm-controller
+---""")
     for pool in cfg["workerPools"]:
         docs.append(f"""apiVersion: apps/v1
 kind: StatefulSet
@@ -390,6 +402,18 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub{shared_vol}
+---""")
+        # PDB: at most 1 worker voluntarily disrupted at a time per pool.
+        docs.append(f"""apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {pool['name']}-pdb
+  namespace: slurm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: {pool['appLabel']}
 ---""")
     docs.append(f"""apiVersion: apps/v1
 kind: Deployment
@@ -492,8 +516,20 @@ spec:
           configMap:
             name: slurm-ddp-runtime
             defaultMode: 0755{shared_vol}
----
-apiVersion: v1
+---""")
+    # PDB: allow at most 1 login pod to be voluntarily disrupted.
+    docs.append("""apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-login-pdb
+  namespace: slurm
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: slurm-login
+---""")
+    docs.append("""apiVersion: v1
 kind: Service
 metadata:
   name: slurm-login

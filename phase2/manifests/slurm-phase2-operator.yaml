@@ -116,6 +116,19 @@ spec:
           secret:
             secretName: slurm-jwt-secret
 ---
+---
+# PDB: keep at least 1 operator pod running during voluntary disruptions.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-elastic-operator-pdb
+  namespace: slurm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurm-elastic-operator
+---
 apiVersion: v1
 kind: Service
 metadata:

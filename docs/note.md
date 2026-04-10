@@ -898,6 +898,79 @@ fi
 
 ---
 
+---
+
+## PDB + MPI 改進踩坑紀錄 (2026-04-10)
+
+### 問題 1：`policy/v1` vs `policy/v1beta1`
+
+**現象：** 在舊版本 Kind（K8s < 1.21）上套用 PDB manifest 時可能遇到 API version 錯誤。
+
+**原因：** `policy/v1beta1/PodDisruptionBudget` 在 K8s 1.25 已刪除；現代版本只剩 `policy/v1`。
+
+**修法：** 本專案 PDB 一律使用 `policy/v1`。若需要支援舊 K8s，改為 `policy/v1beta1`。
+
+**確認版本：** `kubectl api-versions | grep policy`
+
+---
+
+### 問題 2：PDB 與 StatefulSet 縮容的關係
+
+**常見誤解：** 認為 PDB 的 `maxUnavailable: 1` 會阻止 operator 把 replicas 從 4 降到 0。
+
+**實際行為：**
+- StatefulSet `replicas` 調整是 **Desired State**，K8s controller 會逐步刪除 Pod（最高優先）
+- PDB 保護的是 **Voluntary Disruption**（如 `kubectl drain node`、節點升級）
+- operator 調整 replicas = K8s 內部操作，**不受 PDB 約束**
+- 結論：PDB 與 drain-then-scale 並不衝突；PDB 保護的是基礎設施層面，drain 保護的是 job 層面
+
+---
+
+### 問題 3：`MpiDefault=pmi2` 與 `mpi_pmi2.so` plugin 位置
+
+**現象：** 改為 `MpiDefault=pmi2` 後，`srun --mpi=pmi2` job 可能出現 `srun: error: PMI2 not found`。
+
+**原因：** Ubuntu 22.04 的 `slurmd` 套件把 MPI plugin 放在 `/usr/lib/x86_64-linux-gnu/slurm-wlm/`，路徑需在 `PluginDir` 中。
+
+**排查步驟：**
+```bash
+# 在 worker pod 確認 pmi2 plugin 存在
+kubectl -n slurm exec pod/slurm-worker-cpu-0 -- \
+  find /usr/lib -name 'mpi_pmi2.so' 2>/dev/null
+
+# 確認 PluginDir 設定（通常不用手動設）
+kubectl -n slurm exec pod/slurm-controller-0 -- \
+  scontrol show config | grep PluginDir
+```
+
+**實際發現：** Ubuntu 22.04 `slurmd`（Slurm 21.08）內建 PMI2，不需要額外安裝；plugin 會自動在 PluginDir 找到。
+
+---
+
+### 問題 4：sbatch 中 heredoc 的 quoting 陷阱
+
+**現象：** 在 bash 裡用 `echo "$SCRIPT" | sbatch` 提交，bash 展開變數導致 `$SLURM_PROCID` 等在提交端被展開而不是在 worker 端展開。
+
+**原因：** 雙引號 `"$SCRIPT"` 讓 shell 展開變數；要在 worker 才展開，需用單引號或 `cat <<'EOF'`。
+
+**修法：** verify-mpi.sh 使用 `cat <<'EOF'` 寫 batch script 到 pod，確保 `$SLURM_PROCID` 等變數在執行期才展開：
+```bash
+kubectl -n slurm exec pod/slurm-login-xxx -- bash -c "
+cat > /tmp/job.sh <<'INNER'
+#!/bin/bash
+srun --mpi=pmi2 /bin/sh -c 'echo rank:\${SLURM_PROCID}'
+INNER
+sbatch --parsable /tmp/job.sh"
+```
+
+---
+
+### 問題 5：`srun --mpi=pmi2` 在單節點多 task 的行為
+
+**確認：** `--ntasks=2 --nodes=1` 加上 `srun --mpi=pmi2` 可以在同一個 worker pod 啟動兩個 MPI rank，`$SLURM_PROCID` 分別為 0 和 1。這對容器化 HPC 測試是最低門檻的 MPI 驗證方式，不需要 pod 間網路或 InfiniBand。
+
+---
+
 ## Phase 5 優先順序
 
 | 項目 | 難度 | TA 價值 | 建議順序 |

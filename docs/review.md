@@ -170,21 +170,23 @@ SelectTypeParameters=CR_Core
 
 ## 4. 網路效能：DDP 的核心問題
 
-### 4-A. MpiDefault=none — 無法跑任何 MPI/collective 工作負載
+### ~~4-A. MpiDefault=none — 無法跑任何 MPI/collective 工作負載~~ ✅ 已修正（2026-04-10）
+
+已將 `MpiDefault=none` 改為 `MpiDefault=pmi2`（Ubuntu 22.04 Slurm 套件內建支援）。
+Worker image 新增 `openmpi-bin` + `libopenmpi-dev`，可以直接執行 `mpirun`。
 
 ```ini
-MpiDefault=none
+MpiDefault=pmi2
 ```
 
-設為 `none` 代表 Slurm 不為 job 初始化任何 MPI 環境。PyTorch DDP 使用 Gloo/NCCL 可以不透過 MPI，
-但 OpenMPI/MVAPICH 工作負載（大量 HPC 應用）完全無法運行。
+支援的執行模式：
+- `srun --mpi=pmi2 ./my_mpi_program`（Slurm native PMI2，推薦）
+- `mpirun -np N ./my_mpi_program`（OpenMPI，透過 sbatch 提交）
 
-**改進：**
-```ini
-MpiDefault=pmix   # 現代 HPC 標準，支援 PMIx 初始化
-# 或
-MpiDefault=pmi2   # 向下相容
-```
+驗證腳本：`phase1/scripts/verify-mpi.sh`
+
+**注意：** PMIx（更新標準）需要額外安裝 `libpmix-dev`；Ubuntu 22.04 的 Slurm 套件僅保證 PMI2 可用。
+PyTorch DDP 使用 NCCL/Gloo，不需要 MPI，直接透過 `srun` 啟動多個 rank 即可。
 
 ---
 
@@ -401,22 +403,27 @@ class K8sClient:
 
 ---
 
-### 8-B. 沒有 PodDisruptionBudget（PDB）
+### ~~8-B. 沒有 PodDisruptionBudget（PDB）~~ ✅ 已修正（2026-04-10）
 
-縮容時 K8s 可以同時刪除多個 Pod（若 replicas 變化 > 1）。
-若沒有 PDB，可能導致叢集瞬間失去超過一半的 worker，破壞運行中的 DDP job。
+PDB 已加入所有關鍵工作負載（`policy/v1`）：
 
-```yaml
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: slurm-worker-cpu-pdb
-spec:
-  maxUnavailable: 1   # 縮容時每次最多刪一個
-  selector:
-    matchLabels:
-      app: slurm-worker-cpu
-```
+| 資源 | PDB 名稱 | 策略 | 理由 |
+|-----|---------|-----|-----|
+| slurm-controller | slurm-controller-pdb | minAvailable: 1 | controller 不可中斷 |
+| slurm-worker-cpu | slurm-worker-cpu-pdb | maxUnavailable: 1 | 節點維護時最多停1個 |
+| slurm-worker-gpu-a10 | slurm-worker-gpu-a10-pdb | maxUnavailable: 1 | 同上 |
+| slurm-worker-gpu-h100 | slurm-worker-gpu-h100-pdb | maxUnavailable: 1 | 同上 |
+| slurm-login | slurm-login-pdb | maxUnavailable: 1 | 使用者入口可短暫中斷 |
+| slurmdbd | slurmdbd-pdb | minAvailable: 1 | accounting daemon 需持續 |
+| slurm-elastic-operator | slurm-elastic-operator-pdb | minAvailable: 1 | operator 不可停止監控 |
+
+PDB 與 drain-then-scale 分工：
+- **Slurm drain**：防止 Slurm 指派新 job 到目標節點（job 層級）
+- **PDB**：防止 K8s 節點維護（如 `kubectl drain node`）同時驅逐多個 Slurm worker pod（基礎設施層級）
+
+source: `phase1/scripts/render-slurm-static.py`（controller/workers/login），
+`phase1/manifests/slurm-accounting.yaml`（slurmdbd），
+`phase2/manifests/slurm-phase2-operator.yaml`（operator）
 
 ---
 
@@ -486,7 +493,7 @@ status reporting、event recording。
 | ~~P0~~ | ~~縮容前做 drain（搭配 checkpoint guard）~~ | ~~AI job 保護~~ | ✅ 已完成 |
 | ~~P1~~ | ~~部署 slurmdbd + MySQL~~ | ~~Fairshare 前置~~ | ✅ 已完成 |
 | P1 | resources.requests/limits on worker pods | K8s QoS | 低 |
-| P1 | 加入 PodDisruptionBudget | 縮容安全 | 低 |
+| ~~P1~~ | ~~加入 PodDisruptionBudget~~ | ~~縮容安全~~ | ✅ 已完成 |
 | P1 | JWT token 輪換機制 | 安全 | 中 |
 | ~~P2~~ | ~~換 kubernetes Python SDK 取代 kubectl subprocess~~ | ~~效能~~ | ✅ 已完成 |
 | P2 | 加入 MIG partition 支援的 gres.conf 設計 | GPU 利用率 | 高 |

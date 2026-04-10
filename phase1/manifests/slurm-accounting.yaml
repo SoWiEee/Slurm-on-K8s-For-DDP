@@ -229,6 +229,18 @@ spec:
       port: 6819
       targetPort: 6819
 ---
+# PDB: keep at least 1 slurmdbd pod available during node maintenance.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurmdbd-pdb
+  namespace: slurm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurmdbd
+---
 # ---------------------------------------------------------------------------
 # NetworkPolicy
 # ---------------------------------------------------------------------------
