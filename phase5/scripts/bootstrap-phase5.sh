@@ -33,13 +33,14 @@ echo "[phase5] applying lmod modulefile ConfigMaps..."
 kubectl apply -f phase5/manifests/lmod-modulefiles.yaml
 
 # ---------------------------------------------------------------------------
-# 3. Re-render slurm-static.yaml with --with-lmod
+# 3. Re-render slurm-static.yaml with --with-lmod --with-shared-storage
+#    (Phase 5 requires Phase 3 NFS to be deployed for shared job output paths)
 # ---------------------------------------------------------------------------
-echo "[phase5] re-rendering slurm-static.yaml with --with-lmod..."
-if py -3 phase1/scripts/render-slurm-static.py --with-lmod 2>/dev/null; then
+echo "[phase5] re-rendering slurm-static.yaml with --with-lmod --with-shared-storage..."
+if py -3 phase1/scripts/render-slurm-static.py --with-lmod --with-shared-storage 2>/dev/null; then
   true
 else
-  python3 phase1/scripts/render-slurm-static.py --with-lmod
+  python3 phase1/scripts/render-slurm-static.py --with-lmod --with-shared-storage
 fi
 kubectl apply -f phase1/manifests/slurm-static.yaml
 
@@ -70,6 +71,12 @@ for _ in $(seq 1 60); do
   fi
   sleep 3
 done
+
+# ---------------------------------------------------------------------------
+# 6. Ensure shared job output directory exists on NFS
+# ---------------------------------------------------------------------------
+echo "[phase5] ensuring /shared/jobs directory exists..."
+kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- mkdir -p /shared/jobs 2>/dev/null || true
 
 echo ""
 echo "Phase 5 bootstrap complete.  Run: bash phase5/scripts/verify-phase5.sh"

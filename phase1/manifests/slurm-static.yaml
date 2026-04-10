@@ -228,6 +228,8 @@ spec:
               readOnly: true
             - name: ctld-state
               mountPath: /var/spool/slurmctld
+            - name: shared-storage
+              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -255,6 +257,9 @@ spec:
         - name: ctld-state
           persistentVolumeClaim:
             claimName: slurm-ctld-state
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -319,12 +324,23 @@ spec:
               command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
             initialDelaySeconds: 20
             periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
+                    2>/dev/null || true; sleep 10
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -350,6 +366,9 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi
@@ -426,12 +445,23 @@ spec:
               command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
             initialDelaySeconds: 20
             periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
+                    2>/dev/null || true; sleep 10
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -457,6 +487,9 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi
@@ -533,12 +566,23 @@ spec:
               command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
             initialDelaySeconds: 20
             periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
+                    2>/dev/null || true; sleep 10
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -564,6 +608,9 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi
@@ -666,6 +713,8 @@ spec:
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -695,6 +744,9 @@ spec:
           configMap:
             name: slurm-ddp-runtime
             defaultMode: 0755
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi

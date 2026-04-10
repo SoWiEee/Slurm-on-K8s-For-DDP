@@ -44,6 +44,7 @@ class PartitionConfig:
     scale_down_cooldown: int
     checkpoint_path: str = ""
     max_checkpoint_age_seconds: int = 600
+    checkpoint_grace_seconds: int = 0
     match_features: tuple[str, ...] = field(default_factory=tuple)
     match_gres: tuple[str, ...] = field(default_factory=tuple)
     fallback: bool = False
@@ -65,6 +66,7 @@ class Config:
     default_scale_down_cooldown: int = int(os.getenv("SCALE_DOWN_COOLDOWN_SECONDS", "60"))
     default_checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "")
     default_max_checkpoint_age_seconds: int = int(os.getenv("MAX_CHECKPOINT_AGE_SECONDS", "600"))
+    default_checkpoint_grace_seconds: int = int(os.getenv("CHECKPOINT_GRACE_SECONDS", "0"))
     # Slurm REST API (slurmrestd).  When set, the operator queries jobs/nodes via
     # HTTP instead of kubectl exec, eliminating fork overhead and exec timeouts.
     # Leave empty to fall back to the legacy kubectl exec path.
@@ -385,6 +387,7 @@ class PartitionConfigLoader:
                     scale_down_cooldown=cfg.default_scale_down_cooldown,
                     checkpoint_path=cfg.default_checkpoint_path,
                     max_checkpoint_age_seconds=cfg.default_max_checkpoint_age_seconds,
+                    checkpoint_grace_seconds=cfg.default_checkpoint_grace_seconds,
                     fallback=True,
                 )
             ]
@@ -406,6 +409,7 @@ class PartitionConfigLoader:
                     scale_down_cooldown=int(item.get("scale_down_cooldown", 60)),
                     checkpoint_path=item.get("checkpoint_path", ""),
                     max_checkpoint_age_seconds=int(item.get("max_checkpoint_age_seconds", 600)),
+                    checkpoint_grace_seconds=int(item.get("checkpoint_grace_seconds", 0)),
                     match_features=tuple(item.get("match_features", [])),
                     match_gres=tuple(item.get("match_gres", [])),
                     fallback=bool(item.get("fallback", False)),
@@ -612,7 +616,13 @@ class CheckpointAwareQueuePolicy:
     def __init__(self, guard_enabled: bool):
         self.guard_enabled = guard_enabled
 
-    def evaluate(self, partition_cfg: PartitionConfig, state: PartitionState, checkpoint_age_seconds: int | None) -> ScalingDecision:
+    def evaluate(
+        self,
+        partition_cfg: PartitionConfig,
+        state: PartitionState,
+        checkpoint_age_seconds: int | None,
+        missing_since_seconds: float | None = None,
+    ) -> ScalingDecision:
         if state.pending_jobs > 0:
             target = clamp(
                 state.current_replicas + partition_cfg.scale_up_step,
@@ -629,9 +639,18 @@ class CheckpointAwareQueuePolicy:
         )
 
         if candidate_target < state.current_replicas and self.guard_enabled and state.running_jobs > 0:
-            if checkpoint_age_seconds is None:
-                return ScalingDecision(state.current_replicas, "keep", "checkpoint_unknown_block_scale_down")
-            if checkpoint_age_seconds > partition_cfg.max_checkpoint_age_seconds:
+            if not partition_cfg.checkpoint_path:
+                # No checkpoint path configured — guard is effectively disabled for this pool.
+                pass
+            elif checkpoint_age_seconds is None:
+                # Checkpoint file not found. Allow scale-down during the grace period
+                # so jobs that haven't written their first checkpoint yet are not blocked.
+                grace = partition_cfg.checkpoint_grace_seconds
+                if grace > 0 and missing_since_seconds is not None and missing_since_seconds < grace:
+                    pass  # within grace period — allow scale-down
+                else:
+                    return ScalingDecision(state.current_replicas, "keep", "checkpoint_unknown_block_scale_down")
+            elif checkpoint_age_seconds > partition_cfg.max_checkpoint_age_seconds:
                 return ScalingDecision(state.current_replicas, "keep", "checkpoint_stale_block_scale_down")
 
         return self._to_decision(state.current_replicas, candidate_target, "no_pending_jobs")
@@ -680,6 +699,9 @@ class OperatorApp:
         # Drain-then-scale: pool → set of node names that have been drained and are
         # waiting for running jobs to finish before replicas are patched down.
         self._draining_nodes: dict[str, set[str]] = {}
+        # Checkpoint missing-since tracking: pool → timestamp when file was first not found.
+        # Used to implement grace period before blocking scale-down on missing checkpoint.
+        self._checkpoint_missing_since: dict[str, float] = {}
         for _p in self.partition_cfgs:
             _raw: str | None = None
             try:
@@ -736,6 +758,20 @@ class OperatorApp:
             )
             self.rest = None
             self.collector._rest = None
+        # Warn if checkpoint guard is enabled but no path is configured — the guard
+        # will be silently skipped for those pools at runtime.
+        if self.cfg.checkpoint_guard_enabled:
+            for _p in self.partition_cfgs:
+                if not _p.checkpoint_path:
+                    self.logger.emit(
+                        "error", level="WARN",
+                        message=(
+                            f"checkpoint guard enabled but checkpoint_path is empty for pool "
+                            f"'{_p.worker_statefulset}' — guard is effectively disabled for this pool; "
+                            f"set CHECKPOINT_PATH or per-pool checkpoint_path to activate"
+                        ),
+                        pool=_p.worker_statefulset,
+                    )
         start_http_server(8000)
         while True:
             _loop_start = time.time()
@@ -756,7 +792,17 @@ class OperatorApp:
                             del self._provisioning[key]
 
                     checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
-                    decision = self.policy.evaluate(partition_cfg, state, checkpoint_age)
+
+                    # Track when the checkpoint file was first seen as missing so the
+                    # grace period in evaluate() can allow early scale-downs.
+                    if partition_cfg.checkpoint_path and checkpoint_age is None:
+                        self._checkpoint_missing_since.setdefault(key, time.time())
+                    else:
+                        self._checkpoint_missing_since.pop(key, None)
+                    _missing_first = self._checkpoint_missing_since.get(key)
+                    _missing_since = (time.time() - _missing_first) if _missing_first is not None else None
+
+                    decision = self.policy.evaluate(partition_cfg, state, checkpoint_age, _missing_since)
 
                     now = time.time()
                     cooldown_elapsed = now - self.last_scale_up_at[key]

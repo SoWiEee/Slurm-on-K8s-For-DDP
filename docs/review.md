@@ -113,13 +113,17 @@ Phase 3 使用 NFS（`slurm-shared-rwx`，20 Gi）作為共享儲存。
 
 ---
 
-### 2-B. Job 輸出在 Worker 本地 FS，縮容後永久遺失
+### ✅ 2-B. Job 輸出在 Worker 本地 FS — 已修正（Phase 5）
 
-`#SBATCH --output /tmp/job-%j.out` 指向 worker 本地磁碟。
-- 使用者在 login pod 執行 `cat /tmp/job.out` 時，若 job 跑在另一個 worker，找不到檔案
-- Worker pod 被縮容後，輸出檔案永久消失
+原本 `#SBATCH --output /tmp/job-%j.out` 指向 worker 本地磁碟：
+- 使用者在 login pod 執行 `cat /tmp/job.out` 時找不到檔案（job 跑在不同 worker）
+- Worker pod 縮容後輸出檔案永久消失
 
-**改進方向：** 將 `--output` 指向 Phase 3 NFS 共享路徑 `/shared/jobs/%j.out`。
+**解法：**
+1. `bootstrap-phase5.sh` render 時改為 `--with-lmod --with-shared-storage`，掛載 Phase 3 NFS 到所有 pod
+2. `bootstrap-phase5.sh` 啟動後執行 `mkdir -p /shared/jobs` 確保目錄存在
+3. `verify-phase5.sh` batch script 的輸出路徑改為 `/shared/jobs/phase5-verify-%j.{out,err}`
+4. 輸出讀取改從 login pod 讀取（共享 NFS），移除 `job_worker_pod()` worker 發現邏輯
 
 ---
 
@@ -144,43 +148,55 @@ MySQL StatefulSet 只有 1 replica，PVC 損毀或 `kind delete cluster` 後，
 
 ---
 
-### 3-A. Worker Pod 缺少 preStop Hook（K8s 直接驅逐場景）
+### ✅ 3-A. Worker Pod preStop Hook（K8s 直接驅逐場景）— 已修正（Phase 5）
 
 Operator 縮容走 drain 流程，但 K8s 直接驅逐（節點壓力、手動 `kubectl drain node`）
-仍會讓 slurmd 直接收到 SIGTERM，slurmctld 要等 `SlurmdTimeout`（預設 120s）才知道節點下線。
+仍會讓 slurmd 直接收到 SIGTERM，slurmctld 要等 `SlurmdTimeout`（預設 120s）才知道節點下線，
+期間 job 進入 `NODE_FAIL` 且不會被重排。
 
-**改進方向：**
+**解法：** `render-slurm-static.py` 的 worker 容器 spec 加入 `lifecycle.preStop`，所有 worker pool 的 `slurm-static.yaml` 已重新 render：
+
 ```yaml
 lifecycle:
   preStop:
     exec:
-      command: ["/bin/sh", "-c",
-        "scontrol update nodename=$(hostname) state=drain reason=k8s-eviction && sleep 10"]
+      command:
+        - /bin/sh
+        - -c
+        - >-
+          scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
+          2>/dev/null || true; sleep 10
 ```
+
+與 Phase 2 operator drain 分工：
+- **Operator drain**：operator 縮容前主動 drain，等 job 完成後降 replicas
+- **preStop drain**：處理 K8s 直接驅逐（非 operator 觸發）的場景，給 slurmctld 10 秒通知時間
 
 ---
 
-### 3-B. Checkpoint Guard 兩個靜默失效情境
+### ✅ 3-B. Checkpoint Guard 兩個靜默失效情境 — 已修正（Phase 5）
 
 **情境 A — `CHECKPOINT_PATH=""` 讓 guard 變成 no-op：**
 
-```python
-CHECKPOINT_ENABLED = True   # 已設定
-CHECKPOINT_PATH    = ""     # 空字串 → os.path.exists("") 永遠 False
-```
+manifest 設定了 `CHECKPOINT_GUARD_ENABLED=true` 但 `CHECKPOINT_PATH=""`。
+原本 `os.path.exists("")` 永遠 False → `checkpoint_age = None` → guard 阻擋所有縮容。
 
-scale-down 被永久阻擋（或直接跳過），guard 完全無效。
-
-**修正：** 啟動時驗證 `CHECKPOINT_PATH` 非空；或加入
+**解法（`main.py` `CheckpointAwareQueuePolicy.evaluate`）：**
 ```python
-if not CHECKPOINT_PATH: return True  # guard disabled, log warning
+if not partition_cfg.checkpoint_path:
+    pass  # 路徑未設定 — 此 pool 的 guard 視為停用
 ```
+啟動時若 `CHECKPOINT_GUARD_ENABLED=true` 但路徑為空，emit WARN 日誌提示。
 
 **情境 B — Job 尚未寫出 checkpoint 時 scale-down 被永久阻擋：**
 
-Guard 看到「檔案不存在 → 視為 stale → 拒絕縮容」，直到 job 完成都無法縮容。
+Guard 看到「檔案不存在 → 視為 stale → 拒絕縮容」，job 啟動初期（尚未寫出第一個 checkpoint）永遠被阻擋。
 
-**改進方向：** 加入 `CHECKPOINT_GRACE_SECONDS`——job 啟動後 N 秒內不要求 checkpoint 存在。
+**解法（`main.py` + `slurm-phase2-operator.yaml`）：**
+- 新增 `CHECKPOINT_GRACE_SECONDS=300`（manifest 預設值）
+- `OperatorApp` 用 `_checkpoint_missing_since` dict 記錄每個 pool 第一次看到「檔案不存在」的時間
+- 在 grace period 內（`missing_since_seconds < grace`）允許縮容；超過後才阻擋
+- `PartitionConfig` 新增 `checkpoint_grace_seconds`，支援透過 `PARTITIONS_JSON` 對每個 pool 獨立設定
 
 ---
 
@@ -433,7 +449,7 @@ _JOB_WAIT_TIME = Histogram("slurm_job_wait_seconds", ...,
 | ~~P0~~ | ~~StateSaveLocation 掛 PVC~~ | 儲存 | ✅ |
 | ~~P0~~ | ~~縮容前 Drain + Checkpoint Guard~~ | 故障恢復 | ✅ |
 | **P0** | 修正 `SlurmUser=root` | 安全 | 低 |
-| **P0** | 修正 `CHECKPOINT_PATH=""` 靜默失效 | 故障恢復 | 低 |
+| ~~P0~~ | ~~修正 `CHECKPOINT_PATH=""` 靜默失效~~ | ~~故障恢復~~ | ✅ |
 | ~~P1~~ | ~~部署 slurmdbd + MySQL~~ | 儲存 | ✅ |
 | ~~P1~~ | ~~加入 PodDisruptionBudget~~ | K8s 整合 | ✅ |
 | ~~P1~~ | ~~kubectl subprocess → Python SDK~~ | K8s 整合 | ✅ |
@@ -441,8 +457,8 @@ _JOB_WAIT_TIME = Histogram("slurm_job_wait_seconds", ...,
 | ~~P1~~ | ~~Lmod 模組系統~~ | GPU / HPC | ✅ |
 | **P1** | 所有 Pod 加入 resources.requests/limits | K8s 整合 | 低 |
 | **P1** | JWT Token 輪換機制（lifespan → 1 天） | 安全 | 中 |
-| **P1** | Worker preStop hook（Drain on K8s eviction） | 故障恢復 | 低 |
-| **P1** | Job output 指向 NFS `/shared/jobs/%j.out` | 儲存 | 低 |
+| ~~P1~~ | ~~Worker preStop hook（Drain on K8s eviction）~~ | ~~故障恢復~~ | ✅ |
+| ~~P1~~ | ~~Job output 指向 NFS `/shared/jobs/%j.out`~~ | ~~儲存~~ | ✅ |
 | **P2** | slurm.conf QoS + Preemption + MaxTime | 排程 | 中 |
 | **P2** | Fairshare (multifactor priority) 設定 | 排程 | 中 |
 | **P2** | Operator 熔斷器 + readinessProbe | K8s 整合 | 中 |

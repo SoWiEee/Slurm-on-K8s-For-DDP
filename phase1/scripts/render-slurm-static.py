@@ -405,6 +405,15 @@ spec:
               command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
             initialDelaySeconds: 20
             periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
+                    2>/dev/null || true; sleep 10
           volumeMounts:
             - name: slurm-config
               mountPath: /etc/slurm

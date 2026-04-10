@@ -48,12 +48,8 @@ wait_for_job() {
       COMPLETED) return 0 ;;
       FAILED|CANCELLED|TIMEOUT|NODE_FAIL)
         echo "  job $jid ended with state=$state" >&2
-        # Find worker node and show error log
-        local node
-        node=$(kexec pod/slurm-controller-0 -- \
-          sacct -j "$jid" -X -n -P -o "NodeList" 2>/dev/null | tr -d ' \r' | head -1 || echo "")
-        [[ -n "$node" ]] && kexec "pod/$node" -- \
-          bash -c "cat /tmp/phase5-verify-${jid}.err" 2>/dev/null | sed 's/^/  ERR: /' || true
+        kexec "pod/$login_pod" -- \
+          bash -c "cat /shared/jobs/phase5-verify-${jid}.err" 2>/dev/null | sed 's/^/  ERR: /' || true
         return 1 ;;
     esac
     (( $(date +%s) >= deadline )) && { echo "  timed out waiting for job $jid" >&2; return 1; }
@@ -61,14 +57,7 @@ wait_for_job() {
   done
 }
 
-# Determine which worker pod ran a completed job (Slurm node name = pod name).
-# Use -P (parseable) to avoid sacct's fixed-width column truncation.
-job_worker_pod() {
-  local jid="$1"
-  kexec pod/slurm-controller-0 -- \
-    sacct -j "$jid" -X -n -P -o "NodeList" 2>/dev/null \
-    | tr -d ' \r' | head -1
-}
+# (No job_worker_pod helper needed — output goes to shared NFS, readable from any pod.)
 
 # ---------------------------------------------------------------------------
 # 0. Wait for cluster
@@ -173,8 +162,8 @@ BATCH_SCRIPT='#!/bin/bash
 #SBATCH --job-name=phase5-mpi
 #SBATCH --ntasks=2
 #SBATCH --nodes=1
-#SBATCH --output=/tmp/phase5-verify-%j.out
-#SBATCH --error=/tmp/phase5-verify-%j.err
+#SBATCH --output=/shared/jobs/phase5-verify-%j.out
+#SBATCH --error=/shared/jobs/phase5-verify-%j.err
 #SBATCH --time=00:03:00
 
 # Source Lmod so "module" command is available inside the batch job
@@ -199,14 +188,12 @@ echo "  Submitted job $jid"
 wait_for_job "$jid"
 
 # ---------------------------------------------------------------------------
-# 6. Check output  (output file lives on the WORKER pod, not login pod)
+# 6. Check output  (output lives on shared NFS /shared/jobs/ — readable from login pod)
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== [6] Job output ==="
-worker_pod=$(job_worker_pod "$jid")
-echo "  Job ran on pod: ${worker_pod:-unknown}"
-out=$(kexec "pod/$worker_pod" -- \
-  bash -c "cat /tmp/phase5-verify-${jid}.out" 2>/dev/null || echo "")
+out=$(kexec "pod/$login_pod" -- \
+  bash -c "cat /shared/jobs/phase5-verify-${jid}.out" 2>/dev/null || echo "")
 echo "$out" | sed 's/^/  /'
 
 if echo "$out" | grep -q "rank:0" && echo "$out" | grep -q "rank:1"; then
@@ -221,9 +208,9 @@ else
   warn "MPI_HOME not visible inside job — check that lmod.sh is sourced in script"
 fi
 
-# module list output goes to stderr in Lmod; check the .err file on the worker
-err=$(kexec "pod/$worker_pod" -- \
-  bash -c "cat /tmp/phase5-verify-${jid}.err" 2>/dev/null || echo "")
+# module list output goes to stderr in Lmod; read the .err file from shared NFS
+err=$(kexec "pod/$login_pod" -- \
+  bash -c "cat /shared/jobs/phase5-verify-${jid}.err" 2>/dev/null || echo "")
 if echo "$err" | grep -q "Currently Loaded\|openmpi"; then
   pass "module list in job stderr confirms openmpi loaded"
 else
