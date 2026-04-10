@@ -971,6 +971,89 @@ sbatch --parsable /tmp/job.sh"
 
 ---
 
+---
+
+## Phase 5 Lmod 踩坑紀錄 (2026-04-10)
+
+### 問題 1：`/etc/profile.d/slurm-modulepath.sh` 在 sbatch 裡不生效
+
+**現象：** login pod 互動式 shell `module avail` 正常，但 sbatch job 內 `module load` 後 `MPI_HOME` 仍是 NOT_SET。
+
+**原因：**
+- `/etc/profile.d/*.sh` 只在 **login shell** 啟動時自動 source（`bash -l`）
+- Slurm 以非互動、非 login 的 `/bin/bash` 執行 sbatch 腳本
+- 因此 `/etc/profile.d/slurm-modulepath.sh` 完全沒被讀到，`MODULEPATH` 未設定
+- Lmod 找不到 `/opt/modulefiles`，`module load openmpi/4.1` 靜默失敗
+
+**修法：** 改用 Lmod 官方機制，在 Dockerfile 寫入 `/etc/lmod/modulespath`：
+```dockerfile
+RUN mkdir -p /etc/lmod && echo '/opt/modulefiles' > /etc/lmod/modulespath
+```
+Lmod 在每次 `source /etc/profile.d/lmod.sh` 時都會讀這個檔案，不論 shell 類型。
+
+---
+
+### 問題 2：job output 在 worker pod，不在 login pod
+
+**現象：** `cat /tmp/phase5-verify-$jid.out` 在 login pod 找不到檔案。
+
+**原因：** Slurm 的 `--output` 路徑是在**執行 job 的 worker node** 上建立的。
+沒有共享 filesystem（NFS/Lustre），output 不會自動傳回 login node。
+
+**在真實 HPC：** 所有節點共享 NFS，`/home/user/` 或 `/scratch/` 上的 output 到處都能讀。
+
+**本專案修法：** verify 腳本用 `sacct -P -o NodeList` 取得執行 job 的 worker pod 名稱，再 `kubectl exec` 去那個 pod 讀 output：
+```bash
+worker=$(sacct -j $jid -X -n -P -o "NodeList" | tr -d ' \r' | head -1)
+kubectl exec pod/$worker -- bash -c "cat /tmp/output-$jid.out"
+```
+
+---
+
+### 問題 3：sacct NodeList 欄位截斷
+
+**現象：** `sacct -o NodeList` 回傳 `slurm-worker-c+`（18 字元被截斷）。
+
+**原因：** sacct 預設欄位寬度不夠長，`slurm-worker-cpu-0` (18 chars) 超出。
+
+**修法：** 加 `-P`（parseable mode），輸出以 `|` 分隔，無欄位寬度限制：
+```bash
+sacct -j $jid -X -n -P -o "NodeList"
+# 輸出: slurm-worker-cpu-0
+```
+
+---
+
+### 問題 4：Windows Git Bash (MINGW) 路徑自動轉換
+
+**現象：** `kubectl exec pod/xxx -- cat "/tmp/file.txt"` 在 Windows Git Bash 裡執行時，pod 內回傳 `cat: 'C:/Users/.../AppData/Local/Temp/file.txt': No such file or directory`。
+
+**原因：** Git Bash (MINGW) 把 `kubectl` 參數裡的 `/tmp/` 自動轉換成 Windows 暫存目錄路徑，然後 kubectl 把這個 Windows 路徑原封不動送進 Linux pod，pod 裡當然找不到。
+
+**修法：** 設定 `MSYS_NO_PATHCONV=1` 停用路徑轉換：
+```bash
+MSYS_NO_PATHCONV=1 kubectl exec pod/xxx -- cat "/tmp/file.txt"
+```
+
+在 verify 腳本中封裝成 helper：
+```bash
+kexec() { MSYS_NO_PATHCONV=1 kubectl -n "$NAMESPACE" exec "$@"; }
+```
+
+**注意：** 此問題只影響 Windows Git Bash。Linux/macOS 上不存在。
+
+---
+
+### 問題 5：`module list` 輸出在 stderr
+
+**現象：** sbatch job 中執行 `module list`，output file 裡看不到任何 module 資訊。
+
+**原因：** Lmod 設計上把所有通知類輸出（`module list`、`module avail`、load/unload 訊息）送到 **stderr**，stdout 保持乾淨供 job 輸出使用。
+
+**驗證：** 用 `--error` 對應的 `.err` 檔可以看到 `Currently Loaded Modules: 1) openmpi/4.1`。
+
+---
+
 ## Phase 5 優先順序
 
 | 項目 | 難度 | TA 價值 | 建議順序 |

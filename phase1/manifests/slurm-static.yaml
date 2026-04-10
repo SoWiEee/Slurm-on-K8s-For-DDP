@@ -325,6 +325,12 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: modulefile-openmpi
+              mountPath: /opt/modulefiles/openmpi
+            - name: modulefile-python3
+              mountPath: /opt/modulefiles/python3
+            - name: modulefile-cuda
+              mountPath: /opt/modulefiles/cuda
       volumes:
         - name: slurm-config
           configMap:
@@ -344,6 +350,18 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: modulefile-openmpi
+          configMap:
+            name: slurm-modulefile-openmpi
+            optional: true
+        - name: modulefile-python3
+          configMap:
+            name: slurm-modulefile-python3
+            optional: true
+        - name: modulefile-cuda
+          configMap:
+            name: slurm-modulefile-cuda
+            optional: true
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -414,6 +432,12 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: modulefile-openmpi
+              mountPath: /opt/modulefiles/openmpi
+            - name: modulefile-python3
+              mountPath: /opt/modulefiles/python3
+            - name: modulefile-cuda
+              mountPath: /opt/modulefiles/cuda
       volumes:
         - name: slurm-config
           configMap:
@@ -433,6 +457,18 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: modulefile-openmpi
+          configMap:
+            name: slurm-modulefile-openmpi
+            optional: true
+        - name: modulefile-python3
+          configMap:
+            name: slurm-modulefile-python3
+            optional: true
+        - name: modulefile-cuda
+          configMap:
+            name: slurm-modulefile-cuda
+            optional: true
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -503,6 +539,12 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: modulefile-openmpi
+              mountPath: /opt/modulefiles/openmpi
+            - name: modulefile-python3
+              mountPath: /opt/modulefiles/python3
+            - name: modulefile-cuda
+              mountPath: /opt/modulefiles/cuda
       volumes:
         - name: slurm-config
           configMap:
@@ -522,6 +564,18 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: modulefile-openmpi
+          configMap:
+            name: slurm-modulefile-openmpi
+            optional: true
+        - name: modulefile-python3
+          configMap:
+            name: slurm-modulefile-python3
+            optional: true
+        - name: modulefile-cuda
+          configMap:
+            name: slurm-modulefile-cuda
+            optional: true
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -612,6 +666,12 @@ spec:
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
               readOnly: true
+            - name: modulefile-openmpi
+              mountPath: /opt/modulefiles/openmpi
+            - name: modulefile-python3
+              mountPath: /opt/modulefiles/python3
+            - name: modulefile-cuda
+              mountPath: /opt/modulefiles/cuda
       volumes:
         - name: slurm-config
           configMap:
@@ -635,6 +695,18 @@ spec:
           configMap:
             name: slurm-ddp-runtime
             defaultMode: 0755
+        - name: modulefile-openmpi
+          configMap:
+            name: slurm-modulefile-openmpi
+            optional: true
+        - name: modulefile-python3
+          configMap:
+            name: slurm-modulefile-python3
+            optional: true
+        - name: modulefile-cuda
+          configMap:
+            name: slurm-modulefile-cuda
+            optional: true
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

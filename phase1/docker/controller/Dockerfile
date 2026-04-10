@@ -10,9 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     slurm-client \
     slurmrestd \
     slurmdbd \
+    lmod \
     tini \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Register /opt/modulefiles as an Lmod search path.
+RUN mkdir -p /etc/lmod && echo '/opt/modulefiles' > /etc/lmod/modulespath
 
 RUN mkdir -p /var/run/sshd /var/run/munge /var/lib/munge /var/log/munge /var/spool/slurmctld /var/spool/slurmd /etc/slurm /root/.ssh \
     && chown -R munge:munge /var/run/munge /var/lib/munge /var/log/munge \

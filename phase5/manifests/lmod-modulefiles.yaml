@@ -1,0 +1,116 @@
+# Lmod modulefile ConfigMaps for Slurm-on-K8s (Phase 5)
+#
+# Each ConfigMap becomes one module family mounted at:
+#   /opt/modulefiles/<family>/   (e.g. openmpi/, python3/)
+#
+# Workers and the login pod mount these via volumes (see slurm-static.yaml
+# rendered with --with-lmod).  The ConfigMap is declared optional so Phase 1
+# pods start even when this manifest has not been applied.
+#
+# Usage inside a job script (or login shell):
+#   source /etc/profile.d/lmod.sh    # ensure 'module' command is available
+#   module avail                     # list all modules
+#   module load openmpi/4.1          # load OpenMPI
+#   module list                      # show what is loaded
+#   module purge                     # unload everything
+---
+# ---------------------------------------------------------------------------
+# OpenMPI 4.1  (installed via apt openmpi-bin + libopenmpi-dev)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-openmpi
+  namespace: slurm
+data:
+  4.1.lua: |
+    whatis("OpenMPI 4.1 — Message Passing Interface (Ubuntu 22.04 apt package)")
+
+    help([[
+    OpenMPI 4.1 installed via apt (openmpi-bin + libopenmpi-dev).
+
+    Slurm integration:
+      Use 'srun --mpi=pmi2' for native Slurm process launching, or
+      use 'mpirun' directly inside sbatch (--oversubscribe for single-node tests).
+
+    Example job script:
+      #!/bin/bash
+      #SBATCH --ntasks=2 --nodes=1
+      source /etc/profile.d/lmod.sh
+      module load openmpi/4.1
+      srun --mpi=pmi2 ./my_mpi_binary
+    ]])
+
+    -- Ubuntu 22.04: openmpi binaries live in /usr/bin (via alternatives),
+    -- but the openmpi-specific directory has the same binaries + include/lib.
+    local ompi_root = "/usr/lib/x86_64-linux-gnu/openmpi"
+
+    prepend_path("PATH",            ompi_root .. "/bin")
+    prepend_path("LD_LIBRARY_PATH", ompi_root .. "/lib")
+    prepend_path("CPATH",           ompi_root .. "/include")
+    prepend_path("PKG_CONFIG_PATH", ompi_root .. "/lib/pkgconfig")
+
+    setenv("MPI_HOME",   ompi_root)
+    setenv("MPI_RUN",    "mpirun")
+
+    -- Suppress harmless container-specific warnings
+    setenv("OMPI_MCA_btl_base_warn_component_unused", "0")
+    setenv("OMPI_MCA_plm_rsh_no_tree_spawn",          "1")
+
+    -- Tell Slurm which MPI flavour to initialise for srun
+    setenv("SLURM_MPI_TYPE", "pmi2")
+---
+# ---------------------------------------------------------------------------
+# Python 3.10  (Ubuntu 22.04 system Python)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-python3
+  namespace: slurm
+data:
+  3.10.lua: |
+    whatis("Python 3.10 — Ubuntu 22.04 system Python")
+
+    help([[
+    System Python 3.10 (python3 / python3.10).
+    pip packages installed with --user land in ~/.local/lib/python3.10/.
+
+    For isolated environments, prefer:
+      python3 -m venv /path/to/venv && source /path/to/venv/bin/activate
+    ]])
+
+    -- python3 is already in /usr/bin; this module mainly documents the
+    -- version and sets helpful variables for build systems.
+    setenv("PYTHON_VERSION", "3.10")
+    setenv("PYTHON_HOME",    "/usr")
+
+    prepend_path("PATH", "/usr/bin")
+    prepend_path("MANPATH", "/usr/share/man")
+---
+# ---------------------------------------------------------------------------
+# CUDA stub  (no real GPU on Kind; shows the pattern for real clusters)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-modulefile-cuda
+  namespace: slurm
+data:
+  stub.lua: |
+    whatis("CUDA stub — placeholder for GPU clusters")
+
+    help([[
+    This is a stub module for demonstration purposes.
+    On a real GPU node, replace this with a modulefile that sets:
+      CUDA_HOME, PATH (nvcc), LD_LIBRARY_PATH (libcuda, libcudart).
+
+    Example for CUDA 12.1 installed at /usr/local/cuda-12.1:
+      prepend_path("PATH",            "/usr/local/cuda-12.1/bin")
+      prepend_path("LD_LIBRARY_PATH", "/usr/local/cuda-12.1/lib64")
+      setenv("CUDA_HOME", "/usr/local/cuda-12.1")
+    ]])
+
+    -- Advertise that no GPU is available (informational only)
+    setenv("CUDA_VISIBLE_DEVICES", "")
+    setenv("CUDA_MODULE_STUB",     "1")

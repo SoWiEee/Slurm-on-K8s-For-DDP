@@ -112,6 +112,11 @@ def main() -> int:
         action="store_true",
         help="Include /shared NFS volumeMount and PVC volume in all StatefulSets (Phase 3+)",
     )
+    parser.add_argument(
+        "--with-lmod",
+        action="store_true",
+        help="Mount Lmod modulefile ConfigMaps into /opt/modulefiles on worker+login pods (Phase 5+)",
+    )
     args = parser.parse_args()
 
     # Snippets injected into every StatefulSet when --with-shared-storage is set.
@@ -136,6 +141,29 @@ def main() -> int:
     )
     jwt_vm = ""
     jwt_vol = ""
+
+    # Lmod: mount modulefile ConfigMaps into /opt/modulefiles/<family>/.
+    # optional:true so pods start even when the ConfigMap hasn't been applied yet.
+    _lmod_families = [
+        ("openmpi",  "slurm-modulefile-openmpi"),
+        ("python3",  "slurm-modulefile-python3"),
+        ("cuda",     "slurm-modulefile-cuda"),
+    ]
+    if args.with_lmod:
+        lmod_vms = "".join(
+            f"\n            - name: modulefile-{fam}\n              mountPath: /opt/modulefiles/{fam}"
+            for fam, _ in _lmod_families
+        )
+        lmod_vols = "".join(
+            f"\n        - name: modulefile-{fam}"
+            f"\n          configMap:"
+            f"\n            name: {cm}"
+            f"\n            optional: true"
+            for fam, cm in _lmod_families
+        )
+    else:
+        lmod_vms = ""
+        lmod_vols = ""
 
     cfg = json.loads(CFG.read_text())
     slurm_conf, gres_conf = build_slurm_conf(cfg)
@@ -382,7 +410,7 @@ spec:
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
-              readOnly: true{shared_vm}
+              readOnly: true{shared_vm}{lmod_vms}
       volumes:
         - name: slurm-config
           configMap:
@@ -401,7 +429,7 @@ spec:
                     - key: id_ed25519
                       path: id_ed25519
                     - key: id_ed25519.pub
-                      path: id_ed25519.pub{shared_vol}
+                      path: id_ed25519.pub{shared_vol}{lmod_vols}
 ---""")
         # PDB: at most 1 worker voluntarily disrupted at a time per pool.
         docs.append(f"""apiVersion: policy/v1
@@ -492,7 +520,7 @@ spec:
               readOnly: true
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
-              readOnly: true{shared_vm}
+              readOnly: true{shared_vm}{lmod_vms}
       volumes:
         - name: slurm-config
           configMap:
@@ -515,7 +543,7 @@ spec:
         - name: slurm-ddp-runtime
           configMap:
             name: slurm-ddp-runtime
-            defaultMode: 0755{shared_vol}
+            defaultMode: 0755{shared_vol}{lmod_vols}
 ---""")
     # PDB: allow at most 1 login pod to be voluntarily disrupted.
     docs.append("""apiVersion: policy/v1
