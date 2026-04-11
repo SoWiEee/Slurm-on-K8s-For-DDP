@@ -26,7 +26,9 @@ mkdir -p "$NFS_EXPORT_PATH"
 chown nobody:nogroup "$NFS_EXPORT_PATH"
 chmod 0777 "$NFS_EXPORT_PATH"
 
-exports_line="${NFS_EXPORT_PATH} ${NFS_EXPORT_CLIENTS}(rw,sync,no_subtree_check,no_root_squash)"
+# insecure: allow NFS clients connecting from unprivileged ports (>=1024).
+# Required for Kind/Docker containers whose kubelet mounts NFS from non-privileged ports.
+exports_line="${NFS_EXPORT_PATH} ${NFS_EXPORT_CLIENTS}(rw,sync,no_subtree_check,no_root_squash,insecure)"
 
 if ! grep -qE "^\s*${NFS_EXPORT_PATH}\s" /etc/exports; then
   echo "$exports_line" >> /etc/exports
