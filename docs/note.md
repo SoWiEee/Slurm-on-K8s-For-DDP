@@ -337,7 +337,187 @@ File=/dev/null   # Kind 環境模擬，無真實硬體
 - Job A 請求 `--gres=gpu:a10:1` → 佔用整張 GPU
 - Job B 同樣請求 → 必須等 A 結束，或排到另一台 worker
 
-**結論：GPU 不支援多 Job 共用，每台 worker 同時只能跑一個 GPU job。**
+**結論（預設設定）：GPU 不支援多 Job 共用，每台 worker 同時只能跑一個 GPU job。**
+
+---
+
+## GPU 資源共用深度調查（2026-04-11 更新）
+
+### 問題：Job 能否跨多張 GPU 的 Core 分割執行？
+
+用戶場景：
+- GPU0 有 8 個 SM 被 Job A 佔用，GPU0 剩 6 SM 可用
+- GPU1 有 8 個 SM 被 Job B 佔用，GPU1 剩 6 SM 可用
+- Job C 需要 8 SM：能否分配 GPU0 的 4 SM + GPU1 的 4 SM？
+
+**直接答案：不可能。** 這在硬體架構上是根本限制：
+
+> CUDA 的執行模型要求一個 kernel 的所有 thread block 在同一張實體 GPU 的 SM 上執行。沒有任何 NVIDIA 機制（MIG / 時間切片 / MPS）支援將單一 CUDA context 的 SM 跨越兩張物理 GPU 分割。
+
+---
+
+### 三種 GPU 共用機制詳解
+
+#### 1. Time-Slicing（時間切片）
+
+**原理：** CUDA context 在時間維度輪流使用 GPU，類似 CPU 分時多工。
+
+**特性：**
+- 適用 GPU：所有 NVIDIA GPU
+- 隔離程度：**無記憶體隔離**（所有 context 共享 VRAM）
+- 效能：context switch 有開銷，延遲不確定
+- K8s 資源名稱：仍是 `nvidia.com/gpu`，但 replicas > 1
+
+**K8s 設定（GPU Operator）：**
+```yaml
+# ConfigMap：一張 GPU 虛擬成 4 個 K8s 資源
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+data:
+  any: |
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        renameByDefault: false
+        failRequestsGreaterThanOne: false
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 4  # 1 張 GPU 切成 4 份
+```
+```bash
+# 套用到 GPU Operator cluster policy
+kubectl patch clusterpolicies.nvidia.com/cluster-policy \
+  -n gpu-operator --type merge \
+  -p '{"spec": {"devicePlugin": {"config": {"name": "time-slicing-config", "default": "any"}}}}'
+```
+
+**Slurm 整合：**
+```ini
+# gres.conf — 宣告 4 個時間切片 slot
+NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 Count=4 File=/dev/nvidia0
+```
+```bash
+# Job 請求 1 個切片（4 個 job 可同時用同一張 GPU）
+#SBATCH --gres=gpu:a10:1
+```
+
+**適用場景：** 推論服務、開發測試、多個小型訓練任務。**不適合** DDP 訓練（延遲不確定，無記憶體保護）。
+
+---
+
+#### 2. MIG（Multi-Instance GPU）— 硬體分割
+
+**原理：** A100 / H100 / A30 支援在硬體層面將 GPU 切成獨立的 MIG Instance，每個 instance 有專屬 SM、L2 cache、VRAM 帶寬，完全隔離。
+
+**特性：**
+- 適用 GPU：**僅限 A100、H100、A30**
+- 隔離程度：**完整故障隔離 + 記憶體隔離**（最高等級）
+- 每個 instance 在 K8s 暴露為獨立資源名稱
+
+**A100 80GB 常用 Profile：**
+
+| Profile | SM 數量 | VRAM | 每張 GPU 可建 |
+|---------|--------|------|-------------|
+| `1g.10gb` | 1/7 GPU | 10 GB | 最多 7 個 |
+| `2g.20gb` | 2/7 GPU | 20 GB | 最多 3 個 |
+| `3g.40gb` | 3/7 GPU | 40 GB | 最多 2 個 |
+| `4g.40gb` | 4/7 GPU | 40 GB | 1 個 |
+| `7g.80gb` | 完整 GPU | 80 GB | 1 個（無 MIG）|
+
+**K8s + GPU Operator 設定：**
+```yaml
+# 一張 A100：2 個 2g.20gb + 2 個 1g.10gb
+migManager:
+  config:
+    data: |
+      config.yaml: |
+        version: v1
+        mig-configs:
+          custom-mixed:
+          - devices: [0]
+            mig-enabled: true
+            mig-devices:
+              "2g.20gb": 2
+              "1g.10gb": 2
+```
+```bash
+# 節點標記使用 mixed 策略
+kubectl label nodes <node> nvidia.com/mig.config=custom-mixed --overwrite
+```
+
+**K8s 資源名稱（MIG strategy=mixed）：**
+```yaml
+# Pod 請求特定 MIG instance
+resources:
+  limits:
+    nvidia.com/mig-2g.20gb: 1   # 2/7 GPU，20GB VRAM
+```
+
+**Slurm 整合（真實環境）：**
+```ini
+# gres.conf — 每張 A100 宣告多個 MIG instance
+NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=mig-2g.20gb File=/dev/nvidia0,/dev/nvidia1 Count=2
+NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=mig-1g.10gb File=/dev/nvidia2,/dev/nvidia3 Count=2
+```
+```bash
+# Job 請求 MIG profile
+#SBATCH --gres=gpu:mig-2g.20gb:1
+```
+
+**適用場景：** AI 推論微服務（多租戶）、小型訓練任務（GPT-small、BERT-base 等）。**每個 MIG instance 仍是單一物理 GPU 內的 partition，不跨 GPU。**
+
+---
+
+#### 3. MPS（Multi-Process Service）
+
+**原理：** 將多個 CUDA process 合併進同一個 CUDA context，共享 GPU 的 command queue 和 SM，降低 context switch 開銷。
+
+**特性：**
+- 適用 GPU：Volta 以上（V100, A100, H100）
+- SM 可以設定 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 比例分配
+- 部分記憶體隔離（比時間切片好，不如 MIG）
+- 適合延遲敏感的小型推論任務
+
+**MPS 的限制：** 只在一張物理 GPU 內，同樣無法跨 GPU 分割 SM。
+
+---
+
+### 核心結論：為何不能跨 GPU 分配 SM？
+
+```
+實體 GPU 架構：
+
+GPU0 [SM0..SM107]          GPU1 [SM0..SM107]
+┌──────────────────┐        ┌──────────────────┐
+│  SM0  SM1  ...   │        │  SM0  SM1  ...   │
+│  L2 Cache        │        │  L2 Cache        │
+│  HBM (80GB)      │<─PCIe/NVLink─>│  HBM (80GB)      │
+└──────────────────┘        └──────────────────┘
+```
+
+CUDA kernel 的 thread block 需要在同一 SM 上存取共享記憶體（Shared Memory / L1 Cache）。跨越兩張 GPU 意味著：
+1. **無共享記憶體** —— 跨 GPU 只能用 P2P copy（NVLink/PCIe），延遲是 SM 內 shared memory 的 100x 以上
+2. **CUDA 程式模型不支援** —— 沒有 API 可讓一個 kernel 指定「跑在 GPU0 的第 0-3 SM 和 GPU1 的第 0-3 SM」
+
+---
+
+### 「用完碎片化 GPU 資源」的正確方法
+
+| 場景 | 解法 | 支援 GPU |
+|------|------|---------|
+| GPU0 有 25% 閒置 SM，想跑小 job | Time-Slicing（時間輪流）或 MIG 1g.10gb | 全部 / 僅 A100,H100 |
+| 多個小推論任務共用一張 GPU | MPS 或 time-slicing | Volta+ |
+| 需要確保記憶體隔離的多租戶 | MIG | 僅 A100,H100,A30 |
+| DDP 大型訓練用滿全 GPU | 整張 GPU（1 job per GPU）| 全部 |
+| 跨 GPU 的「SM 碎片整合」 | ❌ 硬體不支援 | 無 |
+
+**最接近用戶場景的解法：** 若 A100/H100，將每張 GPU 分割為多個 MIG `1g.10gb` instance，Slurm 以 MIG instance 為單位排程（而非整張 GPU），如此 Job C 可以排進任何有空閒的 MIG instance（可能在 GPU0 或 GPU1），但仍在單張 GPU 內執行，無法橫跨兩張。
+
+---
 
 ## 重要限制：TaskPlugin=task/none
 
@@ -353,7 +533,8 @@ File=/dev/null   # Kind 環境模擬，無真實硬體
 | Job 能指定 GPU 數量？ | ✅ `--gres=gpu:a10:1` |
 | 同一 worker CPU 能讓兩個 job 共用？ | ✅ 排程層面可以（`CR_Core` consumable） |
 | 是否有 CPU 實體隔離？ | ❌ `TaskPlugin=task/none`，無 binding/cgroup |
-| 同一 worker GPU 能讓兩個 job 共用？ | ❌ 每台只有 1 GPU，整數消耗 |
+| 同一 worker GPU 能讓兩個 job 共用？ | ✅ 可透過 Time-Slicing 或 MIG（需真實 GPU） |
+| GPU core 能跨多張 GPU 分割給同一 Job？ | ❌ CUDA 硬體架構根本限制，無法實現 |
 | GPU GRES 是真實硬體？ | ❌ `File=/dev/null`，Kind 環境純排程模擬 |
 
 ---

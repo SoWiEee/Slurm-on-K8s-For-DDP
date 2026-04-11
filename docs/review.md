@@ -288,7 +288,120 @@ PreemptMode=REQUEUE   # 被搶佔 job 重新排隊
 DDP job 需要所有 rank 同時運行。Slurm 原生行為是部分 rank 先佔 GPU、其他等待，
 造成 backfill fragmentation：GPU 被佔用但 job 無法啟動。
 
-**改進方向：** Slurm `--exclusive` 搭配 job array，或整合 Volcano scheduler。
+#### 問題根源
+
+本架構存在兩層 gang scheduling 需求：
+
+| 層次 | 問題 | 後果 |
+|------|------|------|
+| **K8s 層** | Operator scale up N replicas，K8s 可能只排程 M < N 個 Pod（資源不足） | Slurm 以為節點存在，收到 SlurmdTimeout 才知道節點下線 |
+| **Slurm 層** | Slurm `backfill` 可能讓部分 rank 先佔資源 | `srun` step 無法啟動，DDP 進入死鎖等待 |
+
+#### K8s 1.35 原生 Gang Scheduling（Alpha）
+
+Kubernetes 1.35 引入 **Workload API**（`scheduling.k8s.io/v1alpha1`），第一個原生 gang scheduling 方案，需啟用 `GenericWorkload` 與 `GangScheduling` feature gate：
+
+```yaml
+# 1. 建立 Workload（定義 gang 條件）
+apiVersion: scheduling.k8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: ddp-job-42
+  namespace: slurm
+spec:
+  controllerRef:
+    apiGroup: apps
+    kind: StatefulSet
+    name: slurm-worker-gpu-h100
+  podGroups:
+  - name: workers
+    policy:
+      gang:
+        minCount: 4  # 必須 4 個 Pod 同時可排程，否則全部等待
+```
+
+```yaml
+# 2. Pod template 加入 workloadRef
+spec:
+  workloadRef:
+    name: ddp-job-42
+    podGroup: workers
+```
+
+**行為：** Pod 進入 PreEnqueue 等待 minCount 達到 → WaitOnPermit gate 嘗試同時找位置 → 5 分鐘 timeout 後若無法全部排程則退回 unschedulable queue。
+
+> **⚠️ 注意：** K8s 1.35 Gang Scheduling 為 Alpha，預設關閉。Kind 預設使用 K8s 1.29-1.31，需升級 Kind node image 並在 kube-scheduler 啟用 feature gate。
+
+#### 舊有方案：kubernetes-sigs/scheduler-plugins Coscheduling（穩定，適合現有 Kind）
+
+scheduler-plugins 的 `Coscheduling` 插件使用 `PodGroup` CRD，相比 K8s 1.35 Workload API 更成熟：
+
+```yaml
+# PodGroup CRD（scheduler-plugins v0.29+）
+apiVersion: scheduling.sigs.k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: ddp-job-42
+  namespace: slurm
+spec:
+  minMember: 4
+  minResources:
+    cpu: "16"
+    memory: "32Gi"
+  scheduleTimeoutSeconds: 300
+```
+
+```yaml
+# Pod annotation
+metadata:
+  labels:
+    scheduling.sigs.k8s.io/pod-group: ddp-job-42
+```
+
+#### 在本架構的整合策略
+
+Operator 在執行 scale_up 時，在 patch StatefulSet replicas 之前先建立 PodGroup / Workload：
+
+```python
+# phase2/operator/main.py — scale_up 路徑
+def _create_pod_group(self, name: str, namespace: str, min_member: int) -> None:
+    """建立 PodGroup 確保 all-or-nothing 排程。"""
+    body = {
+        "apiVersion": "scheduling.sigs.k8s.io/v1alpha1",
+        "kind": "PodGroup",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {"minMember": min_member, "scheduleTimeoutSeconds": 300},
+    }
+    self.client._custom.create_namespaced_custom_object(
+        "scheduling.sigs.k8s.io", "v1alpha1", namespace, "podgroups", body
+    )
+```
+
+#### Slurm 層的補充措施
+
+K8s gang scheduling 確保「Pod 全部上線」，但 Slurm backfill 仍可能讓部分 rank 先佔 slot。補充方案：
+
+```bash
+# 提交時加 --exclusive 確保節點獨佔，避免 backfill fragmentation
+#SBATCH --exclusive
+#SBATCH --ntasks=4
+#SBATCH --gres=gpu:h100:1
+
+# 或搭配 --wait-all-nodes=1（等所有節點都 ready 才啟動 step）
+#SBATCH --wait-all-nodes=1
+```
+
+#### Kind vs 真實環境實作對照
+
+| 面向 | Kind Lab 建議 | 真實環境建議 |
+|------|-------------|------------|
+| Gang Scheduling 機制 | scheduler-plugins Coscheduling（PodGroup，穩定）| K8s 1.35 Workload API（Alpha）或 Volcano |
+| Feature gate | 不需要（scheduler-plugins 獨立插件）| `--feature-gates=GenericWorkload=true,GangScheduling=true` |
+| Operator 整合 | 新增 `_create_pod_group()` 於 scale_up 路徑 | 同左，或改用 Volcano `Job` CRD 取代 Slurm job 提交 |
+| Slurm 層補充 | `--exclusive` + `--wait-all-nodes=1` | 同左 + `OverSubscribe=NO` partition 設定 |
+| Timeout 處理 | PodGroup scheduleTimeoutSeconds=300 | 同左，搭配 Prometheus alert on pending PodGroup |
+
+**改進方向：** 短期用 `--exclusive` + Slurm `--wait-all-nodes=1` 解決 Slurm 層；中期部署 scheduler-plugins Coscheduling + Operator 整合 PodGroup 建立；長期升級至 K8s 1.35+ 使用原生 Workload API。
 
 ---
 
