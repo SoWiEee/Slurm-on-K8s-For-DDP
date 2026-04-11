@@ -518,6 +518,8 @@ helm install slurm-on-k8s ./chart \
 - [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
 - [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
 - [Running Slurm on Amazon EKS with Slinky](https://aws.amazon.com/tw/blogs/containers/running-slurm-on-amazon-eks-with-slinky/)
+- [Gang Scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/gang-scheduling/)
+- [Workload Aware Scheduling](https://kubernetes.io/blog/2025/12/29/kubernetes-v1-35-introducing-workload-aware-scheduling/)
 - [Slinky Project](https://github.com/slinkyproject)
 - [Slonk: Slurm on Kubernetes for ML Research at Character.ai](https://blog.character.ai/slonk/)
 - [Prometheus Slurm Exporter](https://github.com/vpenso/prometheus-slurm-exporter)
