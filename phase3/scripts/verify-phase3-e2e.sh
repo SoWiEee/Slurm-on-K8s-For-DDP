@@ -49,12 +49,53 @@ wait_rollouts() {
   kubectl -n "${NAMESPACE}" rollout status statefulset/slurm-controller --timeout="${ROLLOUT_TIMEOUT}" >/dev/null
 }
 
+purge_stale_jobs() {
+  # Cancel PENDING/RUNNING jobs, then force-clear COMPLETING jobs that are stuck
+  # on pods that no longer exist.  Slurm won't advance a COMPLETING job unless
+  # the node it ran on reconnects; setting the node to DOWN triggers an immediate
+  # FAILED transition in slurmctld, unblocking the next slurmd registration cycle.
+  log "Cancelling PENDING/RUNNING jobs (best-effort)..."
+  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+    'scancel -u root --state=PENDING --state=RUNNING 2>/dev/null || true'
+  log "Clearing COMPLETING jobs stuck on missing pods..."
+  local stuck_nodes
+  stuck_nodes="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+    "squeue -h -t CG -o '%N' 2>/dev/null | tr ',' '\n' | sort -u" 2>/dev/null || true)"
+  for node in ${stuck_nodes}; do
+    if ! kubectl -n "${NAMESPACE}" get pod "${node}" >/dev/null 2>&1; then
+      log "  Forcing ${node} to DOWN (COMPLETING job, pod gone)..."
+      kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+        "scontrol update NodeName=${node} State=DOWN Reason=cleanup || true" >/dev/null 2>&1 || true
+    fi
+  done
+  # Wait up to 30s for COMPLETING jobs to drain
+  local count=0
+  for _ in $(seq 1 10); do
+    count="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      'squeue -h -t CG -a 2>/dev/null | wc -l' || echo 0)"
+    count="${count//[^0-9]/}"
+    [[ "${count}" -eq 0 ]] && return 0
+    log "  ${count} COMPLETING jobs still in queue, waiting..."
+    sleep 3
+  done
+  log "Warning: ${count} COMPLETING jobs remain after timeout (proceeding anyway)"
+}
+
 mark_missing_nodes_down() {
   log "Marking missing worker nodes DOWN (best-effort)..."
   for n in $(seq 1 $((MAX_WORKERS - 1))); do
     if ! kubectl -n "${NAMESPACE}" get pod "${WORKER_STS}-${n}" >/dev/null 2>&1; then
       kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
         "scontrol update NodeName=${WORKER_STS}-${n} State=DOWN Reason='scaledown' || true" >/dev/null 2>&1 || true
+    fi
+  done
+  # Resume any drained nodes whose pods ARE running (stale drain from previous test runs).
+  # Without this, the operator won't call resume (no scale-up needed) and nodes stay DRAIN forever.
+  log "Resuming stale-drained nodes whose pods are running (best-effort)..."
+  for n in $(seq 0 $((MAX_WORKERS - 1))); do
+    if kubectl -n "${NAMESPACE}" get pod "${WORKER_STS}-${n}" >/dev/null 2>&1; then
+      kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+        "scontrol update NodeName=${WORKER_STS}-${n} State=resume || true" >/dev/null 2>&1 || true
     fi
   done
   kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'sinfo -N -l || true' || true
@@ -157,18 +198,100 @@ wait_dns_gates_for_worker() {
 }
 
 wait_slurm_node_reason_ok() {
+  # Wait until the node is no longer in a drained/down/not-responding state.
+  # We check State (not Reason) because `scontrol update State=RESUME` clears
+  # DRAIN but leaves the Reason field unchanged (it's cosmetic after resume).
+  #
+  # When the node is DRAIN but the pod is Ready, we proactively call
+  # `scontrol update State=resume` on every poll — the operator only resumes
+  # nodes it drained itself (tracked in _draining_nodes), so nodes set DOWN
+  # by this test's setup must be resumed here.
   local nodename="$1" timeout_s="$2"
-  local deadline reason
+  local deadline state reason
   deadline=$(( $(date +%s) + timeout_s ))
   while true; do
+    state="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      "scontrol show node ${nodename} 2>/dev/null | awk -F'State=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
     reason="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
-      "scontrol show node ${nodename} | awk -F'Reason=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
-    if [[ -z "${reason}" ]] || [[ "${reason}" == *"none"* ]]; then
-      log "${nodename} reason ok: none"
+      "scontrol show node ${nodename} 2>/dev/null | awk -F'Reason=' 'NF>1{print \$2; exit}'" 2>/dev/null || true)"
+    # Accept if State doesn't contain DRAIN or DOWN (node is schedulable)
+    if [[ -n "${state}" ]] && ! echo "${state}" | grep -qiE "DRAIN|DOWN"; then
+      log "${nodename} state ok: ${state} (reason: ${reason})"
       return 0
     fi
-    log "${nodename} reason='${reason}' (waiting...)"
+    # Proactively resume: operator won't do it for nodes this test set DOWN.
+    if echo "${state}" | grep -qiE "DRAIN|DOWN"; then
+      log "${nodename} state='${state}' — proactively calling scontrol resume..."
+      kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+        "scontrol update NodeName=${nodename} State=resume || true" >/dev/null 2>&1 || true
+    else
+      log "${nodename} state='${state}' reason='${reason}' (waiting...)"
+    fi
     (( $(date +%s) < deadline )) || return 1
+    sleep 3
+  done
+}
+
+# Wait for slurmd on a node to be heartbeating (State=IDLE without NOT_RESPONDING).
+# sinfo shows "idle*" when NOT_RESPONDING; we need plain "idle" before submitting.
+fix_node_addr() {
+  # After a pod restart slurmctld retains the OLD pod IP in its address cache.
+  # All subsequent outgoing RPCs (PING, TERMINATE_JOB, KILL_JOB) use the stale IP
+  # and fail with "Connection timed out", causing the node to stay NOT_RESPONDING
+  # and COMPLETING jobs to get stuck.
+  # Fix: push the current pod IP into slurmctld with `scontrol update NodeAddr`.
+  local nodename="$1"
+  local pod_ip
+  pod_ip="$(kubectl -n "${NAMESPACE}" get pod "${nodename}" -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+  if [[ -n "${pod_ip}" ]]; then
+    log "Refreshing slurmctld address cache for ${nodename}: NodeAddr=${pod_ip}"
+    kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      "scontrol update NodeName=${nodename} NodeAddr=${pod_ip} 2>&1 || true" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_slurm_node_responding() {
+  # Wait until slurmd on the node is heartbeating (any state without trailing *).
+  # sinfo shows "idle*", "mixed*", etc. when NOT_RESPONDING; without * = slurmd is up.
+  #
+  # Root causes addressed:
+  # 1. Stale IP in slurmctld: on pod restart, slurmctld caches the old pod IP.
+  #    Outgoing RPCs (PING, TERMINATE_JOB) target the old IP → timeout →
+  #    NOT_RESPONDING and stuck COMPLETING.  Fix: update NodeAddr immediately.
+  # 2. NP race at startup: CNI NP is applied a few seconds AFTER slurmd's first
+  #    registration RPC.  The slurmctld back-ping ("registration agent") then
+  #    fails leaving the node in idle*/NOT_RESPONDING.  After 30s we SIGHUP slurmd
+  #    to force a fresh registration once the NP is applied.
+  local nodename="$1" timeout_s="$2"
+  local deadline state elapsed_since_star sighup_sent
+  deadline=$(( $(date +%s) + timeout_s ))
+  elapsed_since_star=0
+  sighup_sent=0
+
+  # Fix stale IP immediately before polling.
+  fix_node_addr "${nodename}"
+
+  while true; do
+    state="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      "sinfo -N -h -n '${nodename}' -o '%T' 2>/dev/null" | tr -d '\r\n' || true)"
+    # Any non-empty state without trailing * means slurmd is responding.
+    if [[ -n "${state}" ]] && [[ "${state}" != *"*" ]]; then
+      log "${nodename} slurmd responding: state=${state}"
+      return 0
+    fi
+    log "${nodename} slurmd not yet responding (state='${state}'), waiting..."
+    (( $(date +%s) < deadline )) || return 1
+    # After 30s stuck in NOT_RESPONDING, SIGHUP slurmd to force re-registration.
+    elapsed_since_star=$(( elapsed_since_star + 3 ))
+    if [[ ${elapsed_since_star} -ge 30 ]] && [[ ${sighup_sent} -eq 0 ]]; then
+      log "${nodename} stuck NOT_RESPONDING for 30s — sending SIGHUP to slurmd (force re-register)..."
+      kubectl -n "${NAMESPACE}" exec "pod/${nodename}" -- bash -lc \
+        'kill -HUP $(pgrep slurmd) 2>/dev/null && echo "SIGHUP sent" || echo "pgrep slurmd failed"' \
+        2>/dev/null || true
+      # Also refresh the IP in case it changed between polling cycles.
+      fix_node_addr "${nodename}"
+      sighup_sent=1
+    fi
     sleep 3
   done
 }
@@ -227,10 +350,18 @@ main() {
   log "Forcing workers to MIN_WORKERS=${MIN_WORKERS} (baseline)..."
   kubectl -n "${NAMESPACE}" scale statefulset/${WORKER_STS} --replicas="${MIN_WORKERS}" >/dev/null
   kubectl -n "${NAMESPACE}" rollout status statefulset/${WORKER_STS} --timeout="${ROLLOUT_TIMEOUT}" >/dev/null
+  # Wait for pods above MIN_WORKERS to fully terminate before touching Slurm node state.
+  # A pod in Terminating still appears in `kubectl get pod`, so mark_missing_nodes_down
+  # would incorrectly resume its Slurm node, making it appear schedulable.
+  log "Waiting for excess worker pods to fully terminate..."
+  for n in $(seq "${MIN_WORKERS}" $((MAX_WORKERS - 1))); do
+    kubectl -n "${NAMESPACE}" wait pod "${WORKER_STS}-${n}" --for=delete --timeout=120s >/dev/null 2>&1 || true
+  done
 
-  log "Refresh slurmctld view (best-effort)..."
-  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'scontrol reconfigure || true; sinfo -N -l || true' || true
+  log "Refresh slurmctld view (best-effort, no reconfigure — reconfigure blocks slurmctld DNS resolution)..."
+  kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc 'sinfo -N -l || true' || true
 
+  purge_stale_jobs
   mark_missing_nodes_down
   write_smoke_sbatch_to_shared
 
@@ -249,8 +380,12 @@ echo trigger-start \$(date)
 sleep 60
 EOF_TRIG" >/dev/null
 
-  trigger_jobid="$(submit_sbatch_jobid "${login_pod}" "${SMOKE_DIR}/trigger.sbatch")"
-  [[ -n "${trigger_jobid}" ]] || die "failed to submit trigger job"
+  # Submit with --hold so the job stays PENDING and never actually starts.
+  # This prevents a COMPLETING state when we scancel later (since it was never RUNNING).
+  # Held jobs are still counted as "pending" by the operator's slurmrestd query, so
+  # the operator will scale up workers in response.
+  trigger_jobid="$(exec_login "sbatch --hold '${SMOKE_DIR}/trigger.sbatch'" 2>/dev/null | awk '{print $NF}')"
+  [[ "${trigger_jobid}" =~ ^[0-9]+$ ]] || die "failed to submit trigger job (got: '${trigger_jobid}')"
   log "trigger_jobid=${trigger_jobid}"
 
   log "Waiting for trigger job to reach PENDING (operator scale-up trigger)..."
@@ -264,14 +399,42 @@ EOF_TRIG" >/dev/null
   fi
   log "Workers scaled and ready."
 
-  # DNS + slurm reason gates for newly created workers
+  # DNS + slurm reason + slurmd heartbeat gates for newly created workers
   for i in $(seq 1 $((TARGET_WORKERS - 1))); do
     wait_dns_gates_for_worker "${i}" || die "DNS gates failed for worker-${i}"
     wait_slurm_node_reason_ok "${WORKER_STS}-${i}" 120 || die "slurm reason not ok for worker-${i}"
+    # Wait for slurmd heartbeat: sinfo shows "idle*" (NOT_RESPONDING) until first heartbeat.
+    # Submitting before this causes srun to fail with "getaddrinfo: Name or service not known".
+    wait_slurm_node_responding "${WORKER_STS}-${i}" 120 || die "slurmd not responding on worker-${i}"
   done
 
   log "Cancelling trigger job (it has served its purpose)..."
   kubectl -n "${NAMESPACE}" exec "pod/${login_pod}" -- bash -lc "scancel ${trigger_jobid} || true" >/dev/null 2>&1 || true
+
+  # Wait for the trigger job to fully leave the queue (COMPLETING → gone).
+  # If the trigger job was RUNNING when cancelled it enters COMPLETING state, which
+  # keeps its nodes in completing*/allocated — blocking the real job from scheduling.
+  log "Waiting for trigger job to fully clear queue..."
+  local cg_wait=0
+  while true; do
+    local cg_count
+    cg_count="$(kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      "squeue -h -j ${trigger_jobid} -o '%T' 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || echo 1)"
+    [[ "${cg_count//[^0-9]/}" -eq 0 ]] && break
+    (( cg_wait < 60 )) || break
+    log "  trigger job still in queue (${cg_count}), waiting..."
+    sleep 3
+    cg_wait=$(( cg_wait + 3 ))
+  done
+  # Also force-DOWN any COMPLETING nodes whose pod is gone (leftover from a previous run).
+  purge_stale_jobs
+
+  # Pause the operator so it cannot scale workers down while the real smoke job runs.
+  # Without this, the operator sees 0 pending jobs (trigger cancelled) and starts a
+  # scale-down, which drains the newly created worker pods and causes the job to get
+  # stuck in COMPLETING (slurmd exits before the epilog can be acknowledged).
+  log "Pausing elastic operator (prevent scale-down during smoke job)..."
+  kubectl -n "${NAMESPACE}" scale deployment/slurm-elastic-operator --replicas=0 >/dev/null 2>&1 || true
 
   log "Submitting REAL multi-node smoke job from login..."
   local jobid
@@ -284,7 +447,14 @@ EOF_TRIG" >/dev/null
   # scaled-to-zero replicas whose DNS does not exist), blocking the daemon for
   # 30-60 s.  During that window srun cannot dispatch the step and the job fails.
   log "Waiting for job to finish..."
-  wait_job_finish "${login_pod}" "${jobid}" 300 || die "job ${jobid} did not finish in time"
+  wait_job_finish "${login_pod}" "${jobid}" 300 || { \
+    kubectl -n "${NAMESPACE}" scale deployment/slurm-elastic-operator --replicas=1 >/dev/null 2>&1 || true; \
+    die "job ${jobid} did not finish in time"; \
+  }
+
+  # Restore the operator now that the smoke job has finished.
+  log "Restoring elastic operator..."
+  kubectl -n "${NAMESPACE}" scale deployment/slurm-elastic-operator --replicas=1 >/dev/null 2>&1 || true
 
   verify_output_hosts "${login_pod}" "${jobid}" "${SMOKE_NODES}"
 

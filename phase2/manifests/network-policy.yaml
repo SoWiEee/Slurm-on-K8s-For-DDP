@@ -253,10 +253,42 @@ spec:
       ports:
         - protocol: TCP
           port: 22
+    # slurmdbd accounting (TCP 6819)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurmdbd
+      ports:
+        - protocol: TCP
+          port: 6819
     # NFS server for /shared RWX volume
     - ports:
         - protocol: TCP
           port: 2049
+---
+# ============================================================
+# EGRESS — slurmdbd
+# Needs: MySQL (TCP 3306)
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-slurmdbd-egress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurmdbd
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mysql
+      ports:
+        - protocol: TCP
+          port: 3306
 ---
 # ============================================================
 # EGRESS — workers
@@ -280,16 +312,15 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # slurmctld + SSH on controller
+    # ALL ports to controller — required for Slurm's fan-out tree RPC.
+    # When slurmctld sends a multi-node REQUEST_PING via the tree protocol, the
+    # receiving slurmd collects sub-tree responses and sends RESPONSE_FORWARD_FAILED
+    # back to the controller on an ephemeral (OS-assigned) source port.  Restricting
+    # to only 6817/22 blocks these ephemeral-port responses, causing NOT_RESPONDING.
     - to:
         - podSelector:
             matchLabels:
               app: slurm-controller
-      ports:
-        - protocol: TCP
-          port: 6817
-        - protocol: TCP
-          port: 22
     # Inter-worker MPI/DDP collective traffic — all ports allowed between workers
     # (NCCL uses ephemeral ports; restricting by port would break collective ops)
     - to:
@@ -331,18 +362,13 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # slurmctld, slurmrestd, SSH on controller
+    # ALL ports to controller — same fan-out RPC reason as workers (see allow-worker-egress).
+    # login also runs scontrol/squeue/sbatch which trigger fan-out pings from slurmctld
+    # that require the login pod to send RESPONSE_FORWARD_FAILED on ephemeral ports.
     - to:
         - podSelector:
             matchLabels:
               app: slurm-controller
-      ports:
-        - protocol: TCP
-          port: 6817
-        - protocol: TCP
-          port: 6820
-        - protocol: TCP
-          port: 22
     # slurmd + SSH on workers
     - to:
         - podSelector:

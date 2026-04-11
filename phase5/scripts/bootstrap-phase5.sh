@@ -76,7 +76,11 @@ done
 # 6. Ensure shared job output directory exists on NFS
 # ---------------------------------------------------------------------------
 echo "[phase5] ensuring /shared/jobs directory exists..."
-kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- mkdir -p /shared/jobs 2>/dev/null || true
+# Wait for the controller pod to be ready before exec-ing into it.
+# The rolling restart above may still be in progress; without this wait the
+# exec silently fails (swallowed by || true) and /shared/jobs is never created.
+kubectl -n "$NAMESPACE" wait pod/slurm-controller-0 --for=condition=Ready --timeout=120s >/dev/null
+kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- mkdir -p /shared/jobs || true
 
 echo ""
 echo "Phase 5 bootstrap complete.  Run: bash phase5/scripts/verify-phase5.sh"

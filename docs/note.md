@@ -940,6 +940,58 @@ kubectl exec pod/$worker -- bash -c "cat /tmp/output-$jid.out"
 
 ---
 
+### 問題 9：Phase 3 E2E — slurmd 在新 pod 啟動後持續 NOT_RESPONDING
+
+**影響範圍：** `verify-phase3-e2e.sh` 的多節點 sbatch 驗證流程。
+
+**現象：** operator 把 worker 從 1 台 scale-up 到 2 台後，`slurm-worker-cpu-1` pod 已 Running，但 `sinfo` 一直顯示 `idle*`（IDLE+NOT_RESPONDING）。SIGHUP 讓它短暫變成 `idle`，但 sbatch job 跑完卻卡在 COMPLETING 數分鐘不離開 queue。
+
+**根因（三層疊加）：**
+
+| 層次 | 現象 | 原因 |
+|------|------|------|
+| 1. NP race | pod 起來後 ~30s 內 `idle*` | CNI NetworkPolicy 比 slurmd 第一次 registration RPC 晚幾秒套用；slurmctld 的 back-ping（registration agent）此時失敗 → NOT_RESPONDING |
+| 2. Slurm 扇出 RPC 使用 ephemeral port | RESPONSE_FORWARD_FAILED，心跳持續失敗 | slurmctld 的 fan-out tree RPC 要求 worker 連回 controller 的**臨時 port**（OS 隨機分配，非 6817）回傳聚合結果。NetworkPolicy `allow-worker-egress` 只開放 6817，其餘封包被 drop |
+| 3. slurmctld IP cache 過期 | TERMINATE_JOB Connection timed out，COMPLETING 永遠不解 | pod 每次重啟取得新 IP（e.g. .44 → .84 → .91），但 slurmctld 把 NodeAddr 解析結果快取在記憶體，不重查 DNS；所有後續 PING/TERMINATE_JOB/KILL_JOB 打到舊 IP |
+
+**診斷方式：**
+```bash
+# 看 slurmctld 在用哪個 IP 連 cpu-1
+kubectl -n slurm logs pod/slurm-controller-0 | grep "connect to.*6818"
+# 對比 pod 實際 IP
+kubectl -n slurm get pod slurm-worker-cpu-1 -o jsonpath='{.status.podIP}'
+
+# 看 slurmd 收到 zero-bytes 與 RESPONSE_FORWARD_FAILED
+kubectl -n slurm logs pod/slurm-worker-cpu-1 | grep -E "Zero Bytes|FORWARD_FAILED|slurm_msg_sendto"
+```
+
+**修法（三步對應三層）：**
+
+1. **NetworkPolicy 放開 worker → controller 所有 port**（解決 ephemeral port 被 block）
+
+   `phase2/manifests/network-policy.yaml` 的 `allow-worker-egress` 和 `allow-login-egress` 中，原本 `ports: [6817, 22]` 改為**不限制 port**（移除 ports 欄位），允許 worker/login 往 controller 送任何 TCP。
+
+2. **SIGHUP 補充 registration**（解決 NP race）
+
+   `verify-phase3-e2e.sh` 的 `wait_slurm_node_responding()` 在 `idle*` 持續 30 秒後，對 worker pod 發 `kill -HUP $(pgrep slurmd)`，觸發 slurmd 重新送 registration RPC；此時 NP 已套用完成，back-ping 成功。
+
+3. **更新 slurmctld 的 NodeAddr**（解決 IP cache 過期）
+
+   在 `wait_slurm_node_responding()` 開始前（以及 SIGHUP 後）執行：
+   ```bash
+   pod_ip=$(kubectl -n slurm get pod slurm-worker-cpu-1 -o jsonpath='{.status.podIP}')
+   kubectl -n slurm exec pod/slurm-controller-0 -- bash -lc \
+     "scontrol update NodeName=slurm-worker-cpu-1 NodeAddr=${pod_ip}"
+   ```
+   強制 slurmctld 更新快取 IP，之後的 PING/TERMINATE_JOB 才能到達新 pod。
+
+**附帶發現：**
+- `sbatch --hold` 讓 trigger job 保持 PENDING 不執行；`scancel` 已 hold 的 job 瞬間消失（無 COMPLETING 殘留），比取消 RUNNING job 乾淨很多。
+- 多節點 job 的 COMPLETING 卡住，主因是 `REQUEST_TERMINATE_JOB`（slurmctld→slurmd:6818）或 `EPILOG_COMPLETE`（slurmd→slurmctld:6817）任一方向失敗，不是 NFS 問題。
+- `scontrol reconfigure` **不應**在 verify 流程呼叫：它會讓 slurmctld 嘗試 DNS resolve 所有靜態節點（包含未部署的 gpu 節點），Block 30–60 秒，導致 operator REST API 回傳空結果，誤觸 scale-down。
+
+---
+
 ## Phase 5 優先順序
 
 | 項目 | 難度 | TA 價值 | 建議順序 |
