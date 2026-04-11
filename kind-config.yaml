@@ -1,0 +1,28 @@
+# Kind cluster configuration for slurm-lab.
+#
+# Usage:
+#   KIND_CONFIG=kind-config.yaml bash scripts/bootstrap-dev.sh
+#   -- or --
+#   kind create cluster --name slurm-lab --config kind-config.yaml
+#
+# Feature gates enabled:
+#   GenericWorkload  — native Workload API (scheduling.k8s.io/v1alpha1)
+#   GangScheduling   — all-or-nothing pod scheduling backed by GenericWorkload
+#
+# Both are Alpha in K8s 1.35.  Kind 0.31.0 defaults to kindest/node:v1.35.0.
+#
+# kubeadm v1beta4 note: extraArgs changed from map[string]string to
+# []NamedArgument in v1beta4; using Kind's top-level featureGates +
+# runtimeConfig fields is the safe, format-agnostic way to pass these flags.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  GenericWorkload: true
+  GangScheduling: true
+runtimeConfig:
+  "scheduling.k8s.io/v1alpha1": "true"
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker

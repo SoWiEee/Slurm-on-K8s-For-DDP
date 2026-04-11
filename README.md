@@ -41,6 +41,8 @@ kubectl version --client
 
 ```bash
 bash scripts/bootstrap-dev.sh
+# active feature gates Workload API (Gang Scheduling)
+KIND_CONFIG=kind-config.yaml bash scripts/bootstrap-dev.sh
 ```
 
 這支腳本會自動完成：建立 Kind 叢集 → 建置 Docker image → 套用所有 manifest → 啟動 Elastic Operator → 設定三個 worker pool 的初始 replica 數。
