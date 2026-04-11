@@ -27,7 +27,7 @@
 
 # 🚀 Getting Started
 
-> 環境需求：Windows 11 + Docker Desktop + Kind + kubectl
+> 環境需求：Windows 11 + Docker Desktop + Kind (v0.31.0 = v1.35.0 K8s) + kubectl
 
 ## 1. 確認工具已安裝
 
