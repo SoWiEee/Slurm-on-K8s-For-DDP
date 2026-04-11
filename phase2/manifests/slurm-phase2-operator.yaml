@@ -102,6 +102,15 @@ spec:
               mountPath: /slurm-jwt/jwt_hs256.key
               subPath: jwt_hs256.key
               readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/operator-ready
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
           livenessProbe:
             exec:
               command:

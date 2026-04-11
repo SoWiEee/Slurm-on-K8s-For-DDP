@@ -155,6 +155,10 @@ _DRAIN_TOTAL = Counter(
     "Total drain-then-wait cycles initiated before a scale-down, by pool",
     ["pool"],
 )
+_CIRCUIT_BREAKER_ERRORS = Gauge(
+    "slurm_operator_consecutive_errors",
+    "Consecutive error count in main poll loop — non-zero means circuit is open",
+)
 
 
 def clamp(value: int, low: int, high: int) -> int:
@@ -702,6 +706,9 @@ class OperatorApp:
         # Checkpoint missing-since tracking: pool → timestamp when file was first not found.
         # Used to implement grace period before blocking scale-down on missing checkpoint.
         self._checkpoint_missing_since: dict[str, float] = {}
+        # Circuit-breaker state: tracks how many consecutive loop-level errors have
+        # occurred so the poll interval backs off exponentially on K8s API outages.
+        self._consecutive_errors: int = 0
         for _p in self.partition_cfgs:
             _raw: str | None = None
             try:
@@ -775,7 +782,29 @@ class OperatorApp:
         start_http_server(8000)
         while True:
             _loop_start = time.time()
-            all_states = self.collector.collect_all_partition_states()
+            try:
+                all_states = self.collector.collect_all_partition_states()
+            except Exception as exc:  # noqa: BLE001  — circuit breaker
+                self._consecutive_errors += 1
+                _sleep = min(2.0 ** min(self._consecutive_errors, 6), 60.0)
+                _CIRCUIT_BREAKER_ERRORS.set(self._consecutive_errors)
+                self.logger.emit(
+                    "error", level="ERROR",
+                    message=f"collect_all_partition_states failed (consecutive={self._consecutive_errors}): {exc}",
+                    consecutive_errors=self._consecutive_errors,
+                    backoff_seconds=_sleep,
+                )
+                pathlib.Path("/tmp/operator-alive").touch()
+                time.sleep(_sleep)
+                continue
+            if self._consecutive_errors > 0:
+                self.logger.emit(
+                    "circuit_closed", level="INFO",
+                    message="operator loop recovered",
+                    previous_consecutive_errors=self._consecutive_errors,
+                )
+                self._consecutive_errors = 0
+                _CIRCUIT_BREAKER_ERRORS.set(0)
             for partition_cfg in self.partition_cfgs:
                 key = partition_cfg.worker_statefulset
                 try:
@@ -963,6 +992,7 @@ class OperatorApp:
                     self.logger.emit("error", level="ERROR", partition=partition_cfg.partition, statefulset=key, message=str(exc))
             _POLL_DURATION.observe(time.time() - _loop_start)
             pathlib.Path("/tmp/operator-alive").touch()
+            pathlib.Path("/tmp/operator-ready").touch()
             time.sleep(self.cfg.poll_interval)
 
 

@@ -250,7 +250,9 @@ flowchart LR
 
 ### 4.3 NetworkPolicy
 
-NetworkPolicy 控制 Pod 接收流量的白名單(Ingress)，而對外連線(Egress)不限制，讓 DNS 和 NFS 掛載正常運作。
+NetworkPolicy 同時控制 Ingress（接收流量）與 Egress（出站流量）：
+- **Ingress**：預設拒絕所有，再依文件化通訊路徑白名單開放
+- **Egress**：預設拒絕所有，再依各 Pod 類型最小化白名單開放（含 DNS、NFS、pod-to-pod）
 
 ```mermaid
 flowchart LR
@@ -260,8 +262,13 @@ flowchart LR
     CPU[slurm-worker-cpu]
     A10[slurm-worker-gpu-a10]
     H100[slurm-worker-gpu-h100]
+    DNS[kube-dns\n:53 UDP/TCP]
+    K8SAPI[K8s API Server\n:443 HTTPS]
+    NFS[NFS Server\n:2049 TCP]
 
-    OPER -- ":6817 :6820" --> CTL
+    OPER -- ":443 K8s API" --> K8SAPI
+    OPER -- ":6820 REST" --> CTL
+
     LOGIN -- ":6817 :6820 :22" --> CTL
     CPU -- ":6817 :22" --> CTL
     A10 -- ":6817 :22" --> CTL
@@ -276,16 +283,42 @@ flowchart LR
 
     CTL -- ":22" --> LOGIN
     CPU -- ":22" --> LOGIN
+    CPU <-- "MPI any port" --> A10
+    CPU <-- "MPI any port" --> H100
+
+    OPER -- ":53" --> DNS
+    CTL -- ":53 :2049" --> DNS
+    CPU -- ":53 :2049" --> NFS
+    LOGIN -- ":53 :2049" --> NFS
 ```
 
-四條 NetworkPolicy 物件：
+十一條 NetworkPolicy 物件：
+
+**Ingress 規則（4 條）：**
 
 | Policy 名稱 | 保護的 Pod | 允許來源 |
 |------------|-----------|---------|
 | `default-deny-ingress` | 全部（`podSelector: {}`） | 預設拒絕所有 ingress |
-| `allow-controller-ingress` | `slurm-controller` | workers, login, operator |
-| `allow-worker-ingress` | 三個 worker pools | controller, login |
+| `allow-controller-ingress` | `slurm-controller` | workers, login, operator（port 6817/6820/22） |
+| `allow-worker-ingress` | 三個 worker pools | controller, login（port 6818/22）；inter-worker MPI（any port） |
 | `allow-login-ingress` | `slurm-login` | controller, workers（僅 port 22） |
+
+**Egress 規則（7 條）：**
+
+| Policy 名稱 | 限制的 Pod | 允許出站目標 |
+|------------|-----------|------------|
+| `default-deny-egress` | 全部（`podSelector: {}`） | 預設拒絕所有 egress |
+| `allow-dns-egress` | 全部 | kube-dns UDP/TCP 53 |
+| `allow-operator-egress` | operator | K8s API TCP 443（any）；controller TCP 6820 |
+| `allow-controller-egress` | controller | workers TCP 6818/22；login TCP 22；NFS TCP 2049 |
+| `allow-worker-egress` | workers | controller TCP 6817/22；inter-worker MPI any port；login TCP 22；NFS TCP 2049 |
+| `allow-login-egress` | login | controller TCP 6817/6820/22；workers TCP 6818/22；NFS TCP 2049 |
+
+> **為什麼 worker inter-worker MPI 允許 any port？**
+> NCCL 和 Gloo 使用 ephemeral port range（通常 1024–65535）進行 collective 通訊（AllReduce、AllGather 等）。若限制特定 port，DDP job 將無法完成 rendezvous。Egress 目標仍嚴格限制在 `slurm` namespace 內的 worker pods，不允許連到外部網路。
+>
+> **為什麼 K8s API egress 用 port 443 而非 podSelector？**
+> K8s API server 在 Kind 中以 host network 運行，不是 `slurm` namespace 的 Pod，無法用 podSelector 匹配。允許 TCP 443 到任意目標，比「任意 egress」更受限，且是 operator in-cluster SDK 的必要條件。
 
 ---
 
