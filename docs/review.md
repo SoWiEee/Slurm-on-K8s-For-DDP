@@ -485,27 +485,15 @@ _JOB_WAIT_TIME = Histogram("slurm_job_wait_seconds", ...,
 
 | 優先 | 項目 | 類別 | 難度 |
 |:---:|------|-----|:---:|
-| ~~P0~~ | ~~StateSaveLocation 掛 PVC~~ | 儲存 | ✅ |
-| ~~P0~~ | ~~縮容前 Drain + Checkpoint Guard~~ | 故障恢復 | ✅ |
 | **P0** | 修正 `SlurmUser=root` | 安全 | 低 |
-| ~~P0~~ | ~~修正 `CHECKPOINT_PATH=""` 靜默失效~~ | ~~故障恢復~~ | ✅ |
-| ~~P1~~ | ~~部署 slurmdbd + MySQL~~ | 儲存 | ✅ |
-| ~~P1~~ | ~~加入 PodDisruptionBudget~~ | K8s 整合 | ✅ |
-| ~~P1~~ | ~~kubectl subprocess → Python SDK~~ | K8s 整合 | ✅ |
-| ~~P1~~ | ~~MpiDefault=pmi2~~ | GPU / HPC | ✅ |
-| ~~P1~~ | ~~Lmod 模組系統~~ | GPU / HPC | ✅ |
 | **P1** | 所有 Pod 加入 resources.requests/limits | K8s 整合 | 低 |
 | **P1** | JWT Token 輪換機制（lifespan → 1 天） | 安全 | 中 |
-| ~~P1~~ | ~~Worker preStop hook（Drain on K8s eviction）~~ | ~~故障恢復~~ | ✅ |
-| ~~P1~~ | ~~Job output 指向 NFS `/shared/jobs/%j.out`~~ | ~~儲存~~ | ✅ |
 | **P2** | slurm.conf QoS + Preemption + MaxTime | 排程 | 中 |
 | **P2** | Fairshare (multifactor priority) 設定 | 排程 | 中 |
-| ~~P2~~ | ~~Operator 熔斷器 + readinessProbe~~ | ~~K8s 整合~~ | ✅ |
 | **P2** | MySQL CronJob 備份 | 儲存 | 低 |
 | **P2** | Lmod conflict/prereq + NCCL 模組 | GPU / HPC | 中 |
 | **P2** | DCGM Exporter + GPU Grafana dashboard | 可觀測性 | 中 |
 | **P2** | gres.conf 真實 GPU 設備（需 NVIDIA GPU Operator）| GPU / HPC | 高 |
-| ~~P3~~ | ~~NetworkPolicy Egress 規則~~ | ~~安全~~ | ✅ |
 | **P3** | Checkpoint Grace Period 設計 | 故障恢復 | 中 |
 | **P3** | Operator Cooldown 持久化（K8s Annotation）| K8s 整合 | 低 |
 | **P3** | Gang Scheduling（Volcano 或 `--exclusive`）| 排程 | 高 |
