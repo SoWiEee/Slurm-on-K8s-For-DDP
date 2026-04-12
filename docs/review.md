@@ -16,7 +16,10 @@
 在學習性原型層次完成度高，但距離可承載真實 PyTorch DDP 工作負載的 AI Infra，
 仍存在 **七大類別**的設計缺口：安全模型、儲存層、故障恢復、排程策略、GPU 管理、K8s 整合、可觀測性。
 
-**Phase 1–6 已解決項目（12 項）：**
+> **「P6」標記說明：** 本文件使用內部追蹤編號 P6，指第二輪評審（2026-04-10）後針對評審意見追加的修正，
+> 這些修正已整合進 Phase 2 的 manifest 與 operator 程式碼，不對應 README 中的獨立 Phase 6。
+
+**已解決項目（15 項）：**
 
 | ✅ 已解決 | 解法簡述 | Phase |
 |---------|---------|-------|
@@ -28,11 +31,13 @@
 | MpiDefault=none 無法跑 MPI | 改為 `MpiDefault=pmi2`，worker 加入 openmpi-bin | P5 |
 | 無 HPC 模組系統 | 部署 Lmod + ConfigMap modulefiles（openmpi/python3/cuda）| P5 |
 | CHECKPOINT_PATH="" 靜默失效 | 空路徑視為 guard 停用 + 啟動 WARN 日誌 | P5 |
-| Worker preStop Hook 缺失 | lifecycle.preStop drain on K8s eviction | P5 |
+| Checkpoint Grace Period 缺失 | `CHECKPOINT_GRACE_SECONDS`，job 啟動初期允許縮容 | P5 |
+| Worker preStop Hook 缺失 | `lifecycle.preStop` drain on K8s eviction | P5 |
 | Job output 在 worker 本地 FS | 輸出路徑改為 `/shared/jobs/` NFS | P5 |
-| NetworkPolicy 缺少 Egress | default-deny-egress + 各 Pod 類型最小化 Egress 白名單 | P6 |
+| NetworkPolicy 缺少 Egress + worker 扇出 RPC 被 block | `default-deny-egress` + 各 Pod 類型最小化 Egress；worker/login→controller 移除埠限制（fan-out RPC 需要臨時埠） | P6 |
 | Operator 無熔斷器與就緒探針 | 指數退避 circuit breaker + `/tmp/operator-ready` readinessProbe | P6 |
 | Operator Cooldown 狀態不持久 | StatefulSet Annotation `slurm.k8s/last-scale-up-at` 持久化，重啟後還原 | P6 |
+| slurmctld IP cache 造成 NOT_RESPONDING / COMPLETING 掛住 | `scontrol update NodeAddr=<pod_ip>` 強制更新快取 IP；驗證腳本 `fix_node_addr()` | P3(E2E) |
 
 ---
 
@@ -98,11 +103,12 @@ Phase 2-E 的 NetworkPolicy 只定義了 Ingress 規則，Pod 可對外任意發
 | `default-deny-egress` | 全部 | 預設拒絕所有 egress |
 | `allow-dns-egress` | 全部 | kube-dns UDP/TCP 53 |
 | `allow-operator-egress` | operator | K8s API (TCP 443) + controller slurmrestd (TCP 6820) |
-| `allow-controller-egress` | controller | workers (TCP 6818/22) + login (TCP 22) + NFS (TCP 2049) |
-| `allow-worker-egress` | workers | controller (TCP 6817/22) + inter-worker MPI（any port）+ login (TCP 22) + NFS (TCP 2049) |
-| `allow-login-egress` | login | controller (TCP 6817/6820/22) + workers (TCP 6818/22) + NFS (TCP 2049) |
+| `allow-controller-egress` | controller | workers (TCP 6818/22) + login (TCP 22) + slurmdbd (TCP 6819) + NFS (TCP 2049) |
+| `allow-worker-egress` | workers | controller（**所有 TCP 埠**）+ inter-worker MPI（any port）+ login (TCP 22) + NFS (TCP 2049) |
+| `allow-login-egress` | login | controller（**所有 TCP 埠**）+ workers (TCP 6818/22) + NFS (TCP 2049) |
+| `allow-slurmdbd-egress` | slurmdbd | MySQL (TCP 3306) |
 
-Workers 的 inter-worker MPI 規則允許所有 port（NCCL/Gloo 使用 ephemeral ports），但出站目標嚴格限制在 `slurm` namespace 內的 worker pods，不允許連到外部網路。
+Workers 的 inter-worker MPI 規則允許所有 port（NCCL/Gloo 使用 ephemeral ports），出站目標嚴格限制在 `slurm` namespace 內的 worker pods。Worker 和 login 往 controller 的出站同樣不設埠限制：Slurm fan-out tree RPC 要求 worker 回傳聚合結果到 controller 的 **OS 隨機臨時埠**（非固定 6817），若限制只允許 6817 會導致 NOT_RESPONDING（Phase 3 E2E 除錯中發現，詳見 `docs/note.md` 問題 9）。
 
 Pod 間通訊（slurmctld ↔ slurmd）仍為明文 TCP，生產環境應搭配 Istio/Linkerd 提供 mTLS。
 
@@ -159,12 +165,13 @@ MySQL StatefulSet 只有 1 replica，PVC 損毀或 `kind delete cluster` 後，
 
 ## 三、故障恢復與可靠性
 
-### ✅ 已解決：縮容 Drain、PodDisruptionBudget、Cooldown 持久化
+### ✅ 已解決：縮容 Drain、PodDisruptionBudget、Cooldown 持久化、slurmctld IP cache
 
 | 項目 | 解法 |
 |-----|-----|
 | Operator 縮容直接殺 Pod，running job 立即失敗 | 縮容前對目標節點執行 `scontrol update state=DRAIN`，等節點 idle 後再降 replicas |
 | K8s 節點維護可能同時驅逐多個 Slurm worker | 加入 7 個 PDB：controller/slurmdbd/operator 用 `minAvailable:1`，worker/login 用 `maxUnavailable:1` |
+| slurmctld 快取舊 pod IP，pod 重啟後 PING/TERMINATE_JOB 打到舊 IP → COMPLETING 永久掛住 | `verify-phase3-e2e.sh` 的 `fix_node_addr()` 呼叫 `scontrol update NodeName=<n> NodeAddr=<new_ip>` 強制更新快取 |
 
 ---
 
@@ -233,13 +240,41 @@ K8s 上需要兩個 controller 共享同一 PVC（`StateSaveLocation`）。
 
 ---
 
-### ✅ 3-D. Operator Cooldown 狀態持久化 — 已修正（Phase 6）
+### ✅ 3-D. Operator Cooldown 狀態持久化 — 已修正（整合至 P2 operator）
 
-**實作方式：** StatefulSet Annotation `slurm.k8s/last-scale-up-at` 持久化每個 pool 的最後 scale-up 時間戳。
+**實作方式：** StatefulSet Annotation `slurm.k8s/last-scale-up-at` 持久化每個 pool 的最後 scale-up 時間戳（`phase2/operator/main.py` 第 108 行定義 `_COOLDOWN_ANNOTATION`）。
 
-- **寫入時機：** 每次 scale-up 成功後，`client.set_annotation("statefulset", sts_name, _COOLDOWN_ANNOTATION, str(now))` 寫入 timestamp（best-effort，失敗不影響 in-memory 值）
+- **寫入時機：** 每次 scale-up 成功後，`client.set_annotation("statefulset", sts_name, _COOLDOWN_ANNOTATION, str(now))` 寫入 Unix epoch float（best-effort，失敗不影響 in-memory 值）
 - **還原時機：** Operator pod 啟動時的 `__init__`，迭代所有 `partition_cfgs`，從各 StatefulSet 的 annotation 讀回 `last_scale_up_at` dict
 - **效果：** Pod 重啟後 cooldown 時鐘不歸零，不會立即觸發不必要的 scale-down
+- **查詢方式：** `kubectl -n slurm get statefulset slurm-worker-cpu -o jsonpath='{.metadata.annotations.slurm\.k8s/last-scale-up-at}'`
+
+---
+
+### ✅ 3-E. slurmctld IP cache 造成 COMPLETING 永久掛住 — 已修正（Phase 3 E2E）
+
+**問題：** Pod 每次重啟取得新 IP，但 slurmctld 把初始 DNS 解析結果快取在記憶體，不重查 DNS。後續所有 `PING` / `TERMINATE_JOB` / `KILL_JOB` RPC 打到舊 IP → TCP timeout → 多節點 job 卡在 COMPLETING 數分鐘不離開 queue。
+
+**診斷指令：**
+```bash
+kubectl -n slurm logs pod/slurm-controller-0 | grep "connect to.*6818"   # 看 slurmctld 用哪個 IP
+kubectl -n slurm get pod slurm-worker-cpu-1 -o jsonpath='{.status.podIP}' # 對比真實 IP
+```
+
+**解法（`phase3/scripts/verify-phase3-e2e.sh`）：**
+```bash
+fix_node_addr() {
+  local nodename="$1"
+  local pod_ip=$(kubectl -n "${NAMESPACE}" get pod "${nodename}" -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+  if [[ -n "${pod_ip}" ]]; then
+    kubectl -n "${NAMESPACE}" exec "pod/${CONTROLLER_POD}" -- bash -lc \
+      "scontrol update NodeName=${nodename} NodeAddr=${pod_ip}" >/dev/null 2>&1 || true
+  fi
+}
+```
+在 `wait_slurm_node_responding()` 開始前及 SIGHUP 後各呼叫一次，強制 slurmctld 更新快取 IP。
+
+**根本限制：** 本修法是 K8s pod IP 不穩定（每次重啟變動）與 Slurm `SlurmctldHost` 靜態 DNS 設計的阻抗失配。真實環境通常使用 Static Pod IP（固定 IP range + 固定 FQDN），不需要此 workaround。
 
 ---
 
@@ -287,13 +322,13 @@ PreemptMode=REQUEUE   # 被搶佔 job 重新排隊
 
 ### 4-D. Gang Scheduling（DDP all-or-nothing 問題）⚠️ 基礎設施就緒，Operator 整合待實作
 
-**現狀（2026-04-11）：**
+**現狀（2026-04-12）：**
 
 | 項目 | 狀態 | 說明 |
 |------|------|------|
-| K8s feature gates 啟用 | ✅ 已完成 | 直接 patch 執行中叢集的靜態 Pod manifest，scheduler + apiserver 均已套用 |
+| K8s feature gates 啟用 | ✅ 已完成 | `kind-config.yaml` 頂層 `featureGates`，重建叢集時自動套用 |
 | `scheduling.k8s.io/v1alpha1` API 可用 | ✅ 已確認 | `kubectl api-resources` 可見 `workloads` resource |
-| `kind-config.yaml` 建立 | ✅ 已完成 | 專案根目錄，供重建叢集時使用 |
+| `kind-config.yaml` 建立 | ✅ 已完成 | 專案根目錄，供重建叢集時使用；以 `KIND_CONFIG=kind-config.yaml bash scripts/bootstrap-dev.sh` 啟用 |
 | Operator `_ensure_workload()` | ❌ 未實作 | `main.py` 無 Workload API 呼叫 |
 | Worker Pod `spec.workloadRef` | ❌ 未設定 | StatefulSet template 無此欄位 |
 | Slurm 層 `--exclusive` / `--wait-all-nodes=1` | ❌ 未加入 | sbatch 範本未包含此旗標 |
@@ -535,7 +570,7 @@ worker pod 建議 `requests == limits`（Guaranteed QoS）。GPU worker 需加 `
 
 ---
 
-### ✅ 6-B. Operator 熔斷器與就緒探針 — 已修正
+### ✅ 6-B. Operator 熔斷器與就緒探針 — 已修正（整合至 P2 operator）
 
 - **無熔斷器**：K8s API 短暫不可用時，while-loop 持續重試產生大量 error log，可能誤觸 rate-limit
 - **無 readinessProbe**：Pod 重啟後立即視為 Ready，但 operator 可能尚在初始化 pool state

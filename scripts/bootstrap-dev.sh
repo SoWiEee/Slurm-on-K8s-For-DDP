@@ -163,7 +163,7 @@ kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 
 log "rendering phase1 manifests (if generator exists)..."
 if [[ -f phase1/scripts/render-slurm-static.py ]]; then
-  render_flags=()
+  render_flags=(--with-lmod)
   if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
     render_flags+=(--with-shared-storage)
     log "phase3 NFS PVC detected — rendering with shared storage"
@@ -190,6 +190,11 @@ log "creating/applying secrets..."
 REGENERATE_SECRETS="$REGENERATE_SECRETS" phase1/scripts/create-secrets.sh "$NAMESPACE"
 log "applying phase1 manifests..."
 kubectl apply -f phase1/manifests/slurm-ddp-runtime.yaml
+# Lmod modulefile ConfigMaps (openmpi, python3, cuda stubs).
+# Declared optional in slurm-static.yaml so pods start even if applied late.
+if [[ -f phase1/manifests/lmod-modulefiles.yaml ]]; then
+  kubectl apply -f phase1/manifests/lmod-modulefiles.yaml
+fi
 
 # Remove obsolete single-pool resources from older layouts.
 kubectl -n "$NAMESPACE" delete statefulset slurm-worker --ignore-not-found=true >/dev/null 2>&1 || true

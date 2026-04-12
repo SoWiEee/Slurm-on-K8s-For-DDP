@@ -43,9 +43,9 @@ Prometheus 收集 + Grafana 呈現
 
 ### 1. prometheus-slurm-exporter
 
-**來源：** [`vpenso/prometheus-slurm-exporter`](https://github.com/vpenso/prometheus-slurm-exporter)（開源）
+**來源：** 自製（`phase4/docker/slurm-exporter/exporter.py`）
 
-**部署方式：** 獨立 Deployment，與 slurm-controller 同 namespace，透過 `kubectl exec` 呼叫 sinfo/squeue/sacct，或直接在 controller pod 內以 sidecar 形式運行。
+**部署方式：** 獨立 Deployment，部署於 `slurm` namespace，透過 Slurm REST API（slurmrestd）取得 job 與 node 狀態，使用 HS256 JWT 進行認證（key 來自 `slurm-jwt-secret`）。
 
 **核心 metrics：**
 
@@ -53,17 +53,24 @@ Prometheus 收集 + Grafana 呈現
 |--------|------|------|
 | `slurm_queue_pending` | Gauge | 目前 PENDING 狀態的 job 數 |
 | `slurm_queue_running` | Gauge | 目前 RUNNING 狀態的 job 數 |
-| `slurm_nodes_alloc` | Gauge | 已分配節點數 |
 | `slurm_nodes_idle` | Gauge | 閒置節點數 |
-| `slurm_nodes_down` | Gauge | DOWN 狀態節點數 |
-| `slurm_nodes_drain` | Gauge | DRAIN 狀態節點數 |
-| `slurm_partition_jobs_pending` | Gauge | 各 partition 的 pending job 數 |
+| `slurm_nodes_alloc` | Gauge | 已分配（allocated/mixed）節點數 |
+| `slurm_nodes_down` | Gauge | DOWN/DRAIN/NOT_RESPONDING 狀態節點數 |
+| `slurm_nodes_draining` | Gauge | DRAIN overlay 節點數（不接受新 job） |
+| `slurm_nodes_total` | Gauge | Slurm 登錄節點總數 |
+| `slurm_job_queue_oldest_wait_seconds` | Gauge | 最久 pending job 的等待秒數 |
+| `slurm_job_queue_avg_wait_seconds` | Gauge | 所有 pending jobs 的平均等待秒數 |
+| `slurm_scheduler_cycle_last_seconds` | Gauge | 最近一次排程 cycle 耗時（秒） |
+| `slurm_scheduler_cycle_mean_seconds` | Gauge | 排程 cycle 平均耗時（秒） |
+| `slurm_backfill_cycle_last_seconds` | Gauge | 最近一次 backfill cycle 耗時（秒） |
+| `slurm_backfill_queue_length` | Gauge | backfill 排程器考慮的 job 數 |
+| `slurm_exporter_scrape_success` | Gauge | 最近一次抓取是否成功（1/0） |
 
 ### 2. kube-state-metrics
 
 **來源：** Kubernetes 官方 [`kubernetes/kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
 
-**部署方式：** 標準 Helm chart，部署於 `monitoring` namespace。
+**部署方式：** 自維護 manifest（`phase4/manifests/kube-state-metrics/kube-state-metrics.yaml`），含 ServiceAccount + ClusterRole + ClusterRoleBinding + Deployment + Service，部署於 `monitoring` namespace。
 
 **使用的 metrics：**
 
@@ -95,24 +102,27 @@ Prometheus 收集 + Grafana 呈現
 
 ```
 phase4/
+├── docker/
+│   └── slurm-exporter/
+│       ├── Dockerfile
+│       └── exporter.py                    # 自製 exporter（Slurm REST API + JWT）
 ├── manifests/
 │   ├── monitoring-namespace.yaml          # namespace: monitoring
+│   ├── network-policy-monitoring.yaml     # monitoring → slurm 跨 namespace scrape
+│   ├── alertmanager/
+│   │   └── alertmanager.yaml              # Deployment + ConfigMap + Service
 │   ├── prometheus/
-│   │   ├── prometheus-rbac.yaml           # ClusterRole + ServiceAccount
-│   │   ├── prometheus-config.yaml         # ConfigMap: scrape configs
+│   │   ├── alert-rules-cm.yaml            # PrometheusRule / alerting rules
+│   │   ├── prometheus-config.yaml         # ConfigMap: scrape configs（含 RBAC）
 │   │   └── prometheus-deployment.yaml     # Deployment + Service
 │   ├── grafana/
 │   │   ├── grafana-deployment.yaml        # Deployment + Service
-│   │   └── grafana-dashboards-cm.yaml     # ConfigMap: dashboard JSON
+│   │   ├── grafana-dashboards-cm.yaml     # ConfigMap: dashboard JSON
+│   │   └── grafana-provisioning-cm.yaml   # ConfigMap: datasource + dashboard 掛載設定
 │   ├── kube-state-metrics/
-│   │   └── kube-state-metrics.yaml        # 或透過 Helm 安裝
+│   │   └── kube-state-metrics.yaml        # Deployment + Service + RBAC
 │   └── slurm-exporter/
-│       ├── slurm-exporter-deployment.yaml
-│       └── slurm-exporter-rbac.yaml       # exec 進 controller 的 RBAC
-├── dashboards/
-│   ├── bridge-overview.json               # 主 demo 看板
-│   ├── slurm-cluster.json                 # Slurm 叢集狀態
-│   └── k8s-operator.json                  # Operator 行為
+│       └── slurm-exporter-deployment.yaml # Deployment + Service（REST API 模式，無需 exec RBAC）
 └── scripts/
     ├── bootstrap-phase4.sh                # 一鍵部署監控堆疊
     └── verify-phase4.sh                   # 驗證 metrics 可正常抓取
@@ -220,19 +230,26 @@ scrape_configs:
 
 ---
 
-## 部署步驟
+## 部署步驟（已完成）
 
 ### bootstrap-phase4.sh 執行內容
 
 ```
 1. 確認 Phase 1–3 已部署（slurm namespace + slurm-controller + slurm-shared-rwx）
 2. 建立 monitoring namespace
-3. 部署 kube-state-metrics（Helm 或 manifest）
-4. 部署 slurm-exporter（需要 exec 進 slurm-controller 的 RBAC）
-5. 套用 prometheus ConfigMap + Deployment + Service
-6. 套用 grafana Deployment + Service + dashboard ConfigMap
-7. 等待所有 Pod ready
-8. 印出 port-forward 指令
+3. 部署 kube-state-metrics（manifest）
+4. 建置 slurm-exporter image → kind load → 部署 Deployment + Service（REST API 模式）
+5. 重建 operator image（加入 prometheus-client）→ kind load → rollout restart
+6. 套用 prometheus ConfigMap + Deployment + Service
+7. 套用 grafana Deployment + Service + dashboard ConfigMap
+8. 套用跨 namespace NetworkPolicy（monitoring → slurm scrape）
+9. 等待所有 Pod ready
+10. 印出 port-forward 指令
+```
+
+```bash
+bash phase4/scripts/bootstrap-phase4.sh   # 一鍵部署
+bash phase4/scripts/verify-phase4.sh      # 驗證（所有 metrics endpoint 可抓）
 ```
 
 ### 存取方式
@@ -249,9 +266,9 @@ kubectl -n monitoring port-forward svc/prometheus 9090:9090
 
 ---
 
-## 與現有 Operator 的整合
+## 與現有 Operator 的整合（已完成）
 
-`phase2/operator/main.py` 需要加入：
+`phase2/operator/main.py` 已加入 `prometheus_client` 整合：
 
 ```python
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
@@ -267,7 +284,7 @@ current_replicas = Gauge('slurm_operator_current_replicas', '...', ['pool'])
 start_http_server(8000)
 ```
 
-對應的 `phase2/manifests/slurm-phase2-operator.yaml` 需要加入：
+`phase2/manifests/slurm-phase2-operator.yaml` 已包含：
 
 ```yaml
 ports:
@@ -276,7 +293,13 @@ ports:
     protocol: TCP
 ```
 
-並加入對應 Service，讓 Prometheus 可以 scrape。
+並已加入對應 Service（`slurm-elastic-operator` port 8000），讓 Prometheus 可以 scrape。
+
+**驗證方式：**
+```bash
+kubectl -n slurm port-forward svc/slurm-elastic-operator 8000:8000
+curl http://localhost:8000/metrics | grep slurm_operator
+```
 
 ---
 

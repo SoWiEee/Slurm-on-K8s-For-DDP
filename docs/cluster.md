@@ -11,7 +11,7 @@
 5. [Phase 3 — 共享 NFS 儲存](#5-phase-3--共享-nfs-儲存)
 6. [跨 Phase 的網路流量圖](#6-跨-phase-的網路流量圖)
 7. [跨 Phase 的 Volume 掛載總覽](#7-跨-phase-的-volume-掛載總覽)
-8. [Phase 4 規劃中的物件（DDP + 監控）](#8-phase-4-規劃中的物件ddp--監控)
+8. [Phase 4 監控架構（已部署）](#8-phase-4-監控架構已部署)
 9. [常用 kubectl 指令速查](#9-常用-kubectl-指令速查)
 
 ---
@@ -24,11 +24,11 @@
 - Kubernetes 負責容器生命週期（Pod 的啟動、重啟、縮放）
 - Elastic Operator 作為橋樑，監看 Slurm 的佇列，動態調整 Pod 數量
 - NFS Shared Storage 讓所有 Pod 讀寫同一個檔案系統，job 輸出才看得到
+- Prometheus + Grafana 視覺化整個 Slurm ↔ K8s 橋接過程
 
 ```mermaid
 graph TD
-    subgraph "你的 Windows 機器"
-        DD[Docker Desktop]
+    subgraph "你的 Windows 機器（WSL2）"
         NFS_HOST[NFS Server\n/srv/nfs/k8s]
     end
 
@@ -41,9 +41,16 @@ graph TD
             CTL[slurm-controller\nPod]
             LOGIN[slurm-login\nPod]
             OPER[slurm-elastic-operator\nPod]
+            SEXP[slurm-exporter\nPod]
             CPU[slurm-worker-cpu-0..3\nStatefulSet]
             A10[slurm-worker-gpu-a10-0..3\nStatefulSet]
             H100[slurm-worker-gpu-h100-0..3\nStatefulSet]
+        end
+
+        subgraph "monitoring namespace"
+            PROM[Prometheus\n:9090]
+            GRAF[Grafana\n:3000]
+            KSM[kube-state-metrics]
         end
     end
 
@@ -51,26 +58,31 @@ graph TD
     PROV -- 動態 provision PV --> CTL
     PROV -- 動態 provision PV --> LOGIN
     PROV -- 動態 provision PV --> CPU
-    OPER -- "REST API\n:6820" --> CTL
+    OPER -- "REST API :6820" --> CTL
     OPER -- "patch replicas" --> CPU
     OPER -- "patch replicas" --> A10
     OPER -- "patch replicas" --> H100
     LOGIN -- "sbatch / srun" --> CTL
+    PROM -- scrape --> SEXP
+    PROM -- scrape --> KSM
+    PROM -- scrape --> OPER
+    GRAF -- query --> PROM
 ```
 
 ---
 
 ## 2. Namespace 佈局
 
-整個系統使用兩個 namespace：
+整個系統使用三個 namespace：
 
 | Namespace | 用途 | 誰建立 |
 |-----------|------|--------|
-| `slurm` | 所有 Slurm 相關的 Pod、Service、ConfigMap、Secret | Phase 1 bootstrap |
+| `slurm` | 所有 Slurm 相關的 Pod、Service、ConfigMap、Secret、NetworkPolicy | Phase 1 bootstrap |
 | `nfs-provisioner` | NFS subdir external provisioner（動態 PV 供應商） | Phase 3 bootstrap |
+| `monitoring` | Prometheus、Grafana、kube-state-metrics | Phase 4 bootstrap |
 
 > **為什麼要分 Namespace？**
-> Namespace 是 K8s 的隔離邊界。NetworkPolicy、RBAC 都以 namespace 為範圍。把 provisioner 獨立出去，避免它的 RBAC 污染 `slurm` namespace 的最小權限原則。
+> Namespace 是 K8s 的隔離邊界。NetworkPolicy、RBAC 都以 namespace 為範圍。把 provisioner 和監控元件獨立出去，避免其 RBAC 污染 `slurm` namespace 的最小權限原則。跨 namespace 的 scrape 流量（Prometheus → slurm-exporter）透過 NetworkPolicy 明確開放。
 
 ---
 
@@ -221,13 +233,17 @@ flowchart TD
 
 | 變數 | 說明 |
 |------|------|
-| `PARTITIONS_JSON` | 各 pool 的縮放策略（min/max replicas、cooldown、feature 對應） |
+| `PARTITIONS_JSON` | 各 pool 的縮放策略（min/max replicas、cooldown、feature 對應、checkpoint_grace_seconds） |
 | `SLURM_REST_URL` | `http://slurm-restapi.slurm.svc.cluster.local:6820` |
-| `CHECKPOINT_GUARD_ENABLED` | 啟用 scale-down 前的 checkpoint 保護 |
+| `CHECKPOINT_GUARD_ENABLED` | 啟用 scale-down 前的 checkpoint 保護（`CHECKPOINT_PATH=""` 時自動停用） |
+| `CHECKPOINT_GRACE_SECONDS` | job 啟動初期允許縮容的 grace period 秒數（預設 0） |
 | `SLURM_JWT_KEY_PATH` | JWT 金鑰路徑（從 `slurm-jwt-secret` 掛載） |
 
 Cooldown 持久化機制：
 Operator 在 scale_up 成功後，會把時間戳寫到 StatefulSet 的 annotation `slurm.k8s/last-scale-up-at`（Unix epoch float）。Operator Pod 重啟時從 annotation 恢復，避免冷卻時間歸零後立即 scale-down。
+
+Circuit breaker：
+當 REST API 或 kubectl exec 連續失敗時，Operator 以指數退避（最長 60s）暫停 poll loop，防止錯誤 log 爆炸。`/tmp/operator-alive` 持續更新以維持 livenessProbe。第一次成功完整 poll 後寫入 `/tmp/operator-ready`（readinessProbe 依此判斷 Pod 就緒）。
 
 ### 4.2 RBAC
 
@@ -269,10 +285,10 @@ flowchart LR
     OPER -- ":443 K8s API" --> K8SAPI
     OPER -- ":6820 REST" --> CTL
 
-    LOGIN -- ":6817 :6820 :22" --> CTL
-    CPU -- ":6817 :22" --> CTL
-    A10 -- ":6817 :22" --> CTL
-    H100 -- ":6817 :22" --> CTL
+    LOGIN -- "all TCP" --> CTL
+    CPU -- "all TCP" --> CTL
+    A10 -- "all TCP" --> CTL
+    H100 -- "all TCP" --> CTL
 
     CTL -- ":6818 :22" --> CPU
     CTL -- ":6818 :22" --> A10
@@ -310,10 +326,13 @@ flowchart LR
 | `default-deny-egress` | 全部（`podSelector: {}`） | 預設拒絕所有 egress |
 | `allow-dns-egress` | 全部 | kube-dns UDP/TCP 53 |
 | `allow-operator-egress` | operator | K8s API TCP 443（any）；controller TCP 6820 |
-| `allow-controller-egress` | controller | workers TCP 6818/22；login TCP 22；NFS TCP 2049 |
-| `allow-worker-egress` | workers | controller TCP 6817/22；inter-worker MPI any port；login TCP 22；NFS TCP 2049 |
-| `allow-login-egress` | login | controller TCP 6817/6820/22；workers TCP 6818/22；NFS TCP 2049 |
+| `allow-controller-egress` | controller | workers TCP 6818/22；login TCP 22；slurmdbd TCP 6819；NFS TCP 2049 |
+| `allow-worker-egress` | workers | controller（**所有 TCP 埠**）；inter-worker MPI any port；login TCP 22；NFS TCP 2049 |
+| `allow-login-egress` | login | controller（**所有 TCP 埠**）；workers TCP 6818/22；NFS TCP 2049 |
 
+> **為什麼 worker / login → controller 允許所有 TCP 埠？**
+> Slurm 的 fan-out tree RPC 協定：slurmctld 向多節點廣播 `REQUEST_PING` 時，worker 必須把子樹回應（`RESPONSE_FORWARD_FAILED`）送回 controller 的**臨時埠**（OS 隨機分配，非固定 6817）。若只允許 6817，這些回應封包會被 NetworkPolicy drop，導致節點持續顯示 `idle*`（NOT_RESPONDING）。因此 worker 和 login 往 controller 的出站流量不設埠限制（出站目標仍嚴格限制在 controller pod）。
+>
 > **為什麼 worker inter-worker MPI 允許 any port？**
 > NCCL 和 Gloo 使用 ephemeral port range（通常 1024–65535）進行 collective 通訊（AllReduce、AllGather 等）。若限制特定 port，DDP job 將無法完成 rendezvous。Egress 目標仍嚴格限制在 `slurm` namespace 內的 worker pods，不允許連到外部網路。
 >
@@ -452,12 +471,15 @@ flowchart TD
 | `slurm-ddp-runtime` | ConfigMap (`slurm-ddp-runtime`) | — | — | `/opt/slurm-runtime-src` ✓ |
 | `shared-storage` | PVC (`slurm-shared-rwx`) | `/shared` ✓ | `/shared` ✓ | `/shared` ✓ |
 | `slurm-jwt-secret` | Secret（operator 專用） | — | — | `/slurm-jwt/` ✓（operator） |
+| `slurm-modulefile-openmpi` | ConfigMap（Phase 1 整合） | — | `/opt/modulefiles/openmpi` ✓ | `/opt/modulefiles/openmpi` ✓ |
+| `slurm-modulefile-python3` | ConfigMap（Phase 1 整合） | — | `/opt/modulefiles/python3` ✓ | `/opt/modulefiles/python3` ✓ |
+| `slurm-modulefile-cuda` | ConfigMap（Phase 1 整合） | — | `/opt/modulefiles/cuda` ✓ | `/opt/modulefiles/cuda` ✓ |
 
 ---
 
-## 8. Phase 4 規劃中的物件（DDP + 監控）
+## 8. Phase 4 監控架構（已部署）
 
-以下是尚未實作、在 `docs/note.md` Phase 4 計畫中的 K8s 物件。
+Phase 4 已完成部署，新增 `monitoring` namespace 並引入以下元件。詳細規格見 [`docs/monitoring.md`](monitoring.md)。
 
 ```mermaid
 flowchart LR
@@ -482,17 +504,24 @@ flowchart LR
     CM_PROM --> PROM
 ```
 
-**Phase 4 計畫新增的 K8s 物件列表：**
+**Phase 4 新增的 K8s 物件：**
 
-| 物件 | 類型 | 說明 |
-|------|------|------|
-| `prometheus` | Deployment | 集中收集 metrics，scrape 三個 endpoint |
-| `grafana` | Deployment | 視覺化 dashboard，看 scale events / queue depth |
-| `slurm-exporter` | Deployment | 把 slurmrestd REST 回應轉成 Prometheus metrics |
-| `kube-state-metrics` | Deployment | 暴露 StatefulSet replicas、Pod ready 等 K8s 原生指標 |
-| `prometheus-config` | ConfigMap | Prometheus scrape target 設定 |
-| `prometheus-svc` | Service | 暴露 :9090 給 Grafana 查詢 |
-| `grafana-svc` | Service | 暴露 :3000 給瀏覽器存取 |
+| 物件 | 類型 | Namespace | 說明 |
+|------|------|-----------|------|
+| `prometheus` | Deployment | monitoring | 集中收集 metrics，scrape 三個 endpoint |
+| `grafana` | Deployment | monitoring | 視覺化 dashboard（Slurm↔K8s Bridge Overview 等三個看板） |
+| `slurm-exporter` | Deployment | slurm | 把 slurmrestd REST 回應轉成 Prometheus metrics（port 9341） |
+| `kube-state-metrics` | Deployment | monitoring | 暴露 StatefulSet replicas、Pod ready 等 K8s 原生指標 |
+| `prometheus-config` | ConfigMap | monitoring | Prometheus scrape target 設定 |
+| `prometheus` | Service | monitoring | 暴露 :9090 給 Grafana 查詢 |
+| `grafana` | Service | monitoring | 暴露 :3000 給瀏覽器存取 |
+
+**存取方式：**
+```bash
+kubectl -n monitoring port-forward svc/grafana 3000:3000     # Grafana（admin/admin）
+kubectl -n monitoring port-forward svc/prometheus 9090:9090  # Prometheus
+bash phase4/scripts/verify-phase4.sh                         # 驗證所有 metrics endpoint
+```
 
 ---
 
@@ -560,11 +589,28 @@ kind delete cluster --name slurm-lab
 | `slurm-elastic-operator` | Role | 2 | pods/exec + statefulsets |
 | `slurm-elastic-operator` | RoleBinding | 2 | SA → Role |
 | `default-deny-ingress` | NetworkPolicy | 2 | 拒絕所有 ingress（白名單起點） |
-| `allow-controller-ingress` | NetworkPolicy | 2 | controller 白名單 |
-| `allow-worker-ingress` | NetworkPolicy | 2 | worker 白名單 |
-| `allow-login-ingress` | NetworkPolicy | 2 | login 白名單 |
+| `allow-controller-ingress` | NetworkPolicy | 2 | controller ingress 白名單（6817/6820/22） |
+| `allow-worker-ingress` | NetworkPolicy | 2 | worker ingress 白名單（6818/22 + inter-worker any port） |
+| `allow-login-ingress` | NetworkPolicy | 2 | login ingress 白名單（22） |
+| `default-deny-egress` | NetworkPolicy | 2 | 拒絕所有 egress（白名單起點） |
+| `allow-dns-egress` | NetworkPolicy | 2 | 所有 Pod → kube-dns UDP/TCP 53 |
+| `allow-operator-egress` | NetworkPolicy | 2 | operator → K8s API (443) + controller (6820) |
+| `allow-controller-egress` | NetworkPolicy | 2 | controller → workers (6818/22) + login (22) + NFS (2049) |
+| `allow-worker-egress` | NetworkPolicy | 2 | worker → controller（所有埠）+ inter-worker（所有埠）+ login (22) + NFS (2049) |
+| `allow-login-egress` | NetworkPolicy | 2 | login → controller（所有埠）+ workers (6818/22) + NFS (2049) |
+| `allow-slurmdbd-egress` | NetworkPolicy | 2 | slurmdbd → MySQL (3306) |
 | `slurm-shared-rwx` | PersistentVolumeClaim | 3 | 20Gi RWX 共享儲存 |
 | `slurm-shared-nfs` | StorageClass | 3 | NFS dynamic provisioner |
+
+### `monitoring` namespace
+
+| 名稱 | Kind | Phase | 說明 |
+|------|------|-------|------|
+| `prometheus` | Deployment | 4 | Prometheus 主程序，scrape 三個 target |
+| `grafana` | Deployment | 4 | Grafana（Bridge Overview、Slurm State、Operator 三看板） |
+| `kube-state-metrics` | Deployment | 4 | K8s 原生 StatefulSet/Pod 狀態指標 |
+| `prometheus` | Service | 4 | :9090 ClusterIP |
+| `grafana` | Service | 4 | :3000 ClusterIP |
 
 ### `nfs-provisioner` namespace
 

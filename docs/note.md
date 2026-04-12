@@ -362,11 +362,11 @@ Phase 3 **已完成實作**，並非只有設計：
 | `phase3/manifests/shared-storage.yaml` | StorageClass `slurm-shared-nfs` + PVC `slurm-shared-rwx`（20Gi RWX） |
 | `phase3/scripts/bootstrap-phase3.sh` | 部署 provisioner → 建立 PVC → patch controller/worker/login 加入 `/shared` mount |
 | `phase3/scripts/verify-phase3.sh` | 驗證 PVC Bound + `/shared` 掛載在所有 pod 上 |
-| `phase3/scripts/verify-phase3-e2e.sh` | **完整 e2e 測試**：login 提交 `sbatch -o /shared/out-%j.txt`，等待完成，從 login 讀回輸出驗證 |
+| `phase3/scripts/verify-phase3-e2e.sh` | **完整 e2e 測試**：operator scale-up → login 提交多節點 `sbatch` → 等待 job COMPLETING → 從 login 讀回 `/shared/` 輸出驗證 |
 
 Phase 3 部署後，`/shared` 以 ReadWriteMany 方式同時掛載到：
 - `slurm-controller-0`
-- `slurm-worker-0`（以及所有副本）
+- `slurm-worker-cpu-*`（以及所有副本）
 - `slurm-login`
 
 使用者只需在 job script 加入：
@@ -376,7 +376,14 @@ Phase 3 部署後，`/shared` 以 ReadWriteMany 方式同時掛載到：
 #SBATCH --error=/shared/err-%j.txt
 ```
 
-job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出。
+job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出（因共享 NFS，任何 pod 均可讀）。
+
+**E2E 測試說明：** `verify-phase3-e2e.sh` 驗證的是多節點場景下的完整生命週期：
+1. 暫停 operator → 提交帶 `--hold` 的觸發 job（確保 cpu-1 不立即被搶）
+2. 恢復 operator → scale-up 到 2 台 worker
+3. 等待 cpu-1 變 `idle`（含 fix_node_addr 修正 IP cache + SIGHUP fallback）
+4. 取消 trigger job → 提交真實 2 節點 smoke job（operator 繼續暫停，避免縮容干擾）
+5. 等待 job 完成，從 login pod 讀取 `/shared/` 輸出驗證每台 worker 的 hostname
 
 ### 部署順序建議
 
@@ -384,19 +391,21 @@ job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出。
 
 ```
 1. bash scripts/bootstrap-dev.sh          # Phase 1 + Phase 2
-2. sudo bash phase3/scripts/setup-nfs-server.sh  # 主機端 NFS（一次性）
-3. NFS_SERVER=<ip> bash phase3/scripts/bootstrap-phase3.sh
+2. sudo bash phase3/scripts/setup-nfs-server.sh  # 主機端 NFS（一次性，在 WSL2 執行）
+3. NFS_SERVER=<wsl2-ip> bash phase3/scripts/bootstrap-phase3.sh
 4. bash phase3/scripts/verify-phase3.sh
-5. WORKER_STS=slurm-worker-cpu bash phase3/scripts/verify-phase3-e2e.sh
+5. bash phase3/scripts/verify-phase3-e2e.sh  # WORKER_STS 預設 slurm-worker-cpu
 ```
 
 ---
 
-# Phase 4 (DDP)
+# Phase 4 (DDP + 可觀測性)
+
+Phase 4 已完成可觀測性部分（Prometheus + Grafana，詳見下方第 4 節）。DDP 工作負載部分為設計規格與 TODO，待未來整合。
 
 ## 1. Worker Image 加入 PyTorch（DDP 前置條件）
 
-目前 worker image 只有 Slurm + Munge，要跑 DDP 需要加入 PyTorch：
+目前 worker image 只有 Slurm + Munge + OpenMPI（Phase 5 已加入），要跑 DDP 還需要加入 PyTorch：
 
 ```dockerfile
 # phase1/docker/worker/Dockerfile 加入
@@ -469,15 +478,23 @@ Operator 決定 scale-down
 
 ---
 
-## 4. Prometheus + Grafana 監控
+## 4. Prometheus + Grafana 監控（已完成，Phase 4）
 
 詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
 
 | 來源 | 取得方式 | 關鍵指標 |
 |------|---------|---------|
-| slurm-exporter | scrape slurmrestd（REST API） | queue_pending, nodes_idle |
+| slurm-exporter | scrape slurmrestd（REST API） | queue_pending, nodes_idle, nodes_alloc |
 | kube-state-metrics | K8s 原生 | StatefulSet replicas, Pod ready |
-| operator 自定義 | prometheus_client HTTP server | scale_events, guard_blocks |
+| operator 自定義 | prometheus_client HTTP server（port 8000） | scale_up/down_total, guard_blocks, poll_duration |
+
+Phase 4 已部署 Prometheus + Grafana + slurm-exporter + kube-state-metrics。Grafana 提供三個看板：
+- **Bridge Overview**：視覺化 Slurm queue depth 與 K8s StatefulSet replicas 的聯動關係
+- **Slurm Cluster State**：node states 圓餅圖、各 partition queue depth 時序
+- **K8s Operator**：scale event timeline、poll duration histogram、guard block 計數
+
+**部署：** `bash phase4/scripts/bootstrap-phase4.sh`  
+**驗證：** `bash phase4/scripts/verify-phase4.sh`
 
 **參考來源：** `github.com/SlinkyProject/slurm-exporter`（REST API 驅動）、`github.com/vpenso/prometheus-slurm-exporter`（exec 驅動，較易入門）
 
@@ -932,11 +949,19 @@ Lmod 在每次 `source /etc/profile.d/lmod.sh` 時都會讀這個檔案，不論
 
 **在真實 HPC：** 所有節點共享 NFS，`/home/user/` 或 `/scratch/` 上的 output 到處都能讀。
 
-**本專案修法：** verify 腳本用 `sacct -P -o NodeList` 取得執行 job 的 worker pod 名稱，再 `kubectl exec` 去那個 pod 讀 output：
+**最終解法（Phase 5 NFS 整合）：** `bootstrap-phase5.sh` 掛載 Phase 3 NFS 到所有 Pod，並確保 `/shared/jobs/` 目錄存在。job script 輸出路徑改為：
+```bash
+#SBATCH --output=/shared/jobs/phase5-verify-%j.out
+#SBATCH --error=/shared/jobs/phase5-verify-%j.err
+```
+所有節點共享同一 NFS，login pod 可直接 `cat /shared/jobs/<outfile>` 取得輸出。
+
+**臨時替代方案（NFS 未就緒時）：** verify 腳本用 `sacct -P -o NodeList` 取得執行 job 的 worker pod 名稱，再 `kubectl exec` 去那個 pod 讀 output：
 ```bash
 worker=$(sacct -j $jid -X -n -P -o "NodeList" | tr -d ' \r' | head -1)
 kubectl exec pod/$worker -- bash -c "cat /tmp/output-$jid.out"
 ```
+此方案在 Phase 5 NFS 整合後已不需要，保留供除錯參考。
 
 ---
 

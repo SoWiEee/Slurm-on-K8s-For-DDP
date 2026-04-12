@@ -96,8 +96,8 @@ done
 # This is persistent: subsequent bootstrap-dev.sh or bootstrap-phase2.sh re-runs will
 # detect the PVC and call render-slurm-static.py --with-shared-storage automatically,
 # so the NFS mount survives any future kubectl apply of slurm-static.yaml.
-echo "Regenerating slurm-static.yaml with --with-shared-storage..."
-"$PYTHON" phase1/scripts/render-slurm-static.py --with-shared-storage
+echo "Regenerating slurm-static.yaml with --with-lmod --with-shared-storage..."
+"$PYTHON" phase1/scripts/render-slurm-static.py --with-lmod --with-shared-storage
 kubectl apply -f phase1/manifests/slurm-static.yaml
 
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"

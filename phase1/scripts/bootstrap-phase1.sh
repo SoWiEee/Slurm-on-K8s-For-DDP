@@ -33,10 +33,15 @@ fi
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 
 if [[ -f phase1/scripts/render-slurm-static.py ]]; then
-  if py -3 phase1/scripts/render-slurm-static.py 2>/dev/null; then
+  render_flags=(--with-lmod)
+  if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
+    render_flags+=(--with-shared-storage)
+    echo "[phase1 bootstrap] phase3 NFS PVC detected — rendering with shared storage"
+  fi
+  if py -3 phase1/scripts/render-slurm-static.py "${render_flags[@]}" 2>/dev/null; then
     true
   else
-    python3 phase1/scripts/render-slurm-static.py
+    python3 phase1/scripts/render-slurm-static.py "${render_flags[@]}"
   fi
   echo "[phase1 bootstrap] phase1 manifests rendered."
 fi
@@ -48,6 +53,11 @@ kubectl apply -f phase1/manifests/slurm-ddp-runtime.yaml
 kubectl apply -f phase1/manifests/slurm-static.yaml
 if [[ -f phase1/manifests/slurm-login.yaml ]]; then
   kubectl apply -f phase1/manifests/slurm-login.yaml
+fi
+# Lmod modulefile ConfigMaps (openmpi, python3, cuda stubs)
+# Declared optional in slurm-static.yaml so pods start even before this apply.
+if [[ -f phase1/manifests/lmod-modulefiles.yaml ]]; then
+  kubectl apply -f phase1/manifests/lmod-modulefiles.yaml
 fi
 # Deploy accounting stack (MySQL + slurmdbd) if manifest exists.
 if [[ -f phase1/manifests/slurm-accounting.yaml ]]; then
