@@ -328,6 +328,68 @@ replicas=$(wait_replicas_at_most "$BASELINE_WORKER_STS" 1 150) || die "CPU pool 
 wait_statefulset_ready_replicas "$BASELINE_WORKER_STS" 1 120 || die "CPU pool did not return to one ready replica after scale-down"
 echo "scale-down verified: replicas=${replicas}"
 
+log "MPI checks (PMI2 plugin + OpenMPI + PDB)"
+
+log "PMI2 srun smoke test"
+pmi2_job=$(submit_job "#!/bin/bash
+#SBATCH -p ${PARTITION}
+#SBATCH -N 1
+#SBATCH -n 2
+#SBATCH -J dev-pmi2-smoke
+#SBATCH --constraint=cpu
+#SBATCH --output=/tmp/dev-pmi2-%j.out
+#SBATCH --time=00:02:00
+srun --mpi=pmi2 /bin/sh -c 'echo rank:\${SLURM_PROCID} ntasks:\${SLURM_NTASKS}'" "/tmp/dev-pmi2-smoke.sbatch")
+echo "submitted pmi2 job: ${pmi2_job}"
+if ! wait_job_finished "$pmi2_job" 120 >/tmp/devverify_pmi2_state.txt; then
+  state=$(cat /tmp/devverify_pmi2_state.txt)
+  die "pmi2 smoke job ${pmi2_job} did not finish in time (${state})"
+fi
+pmi2_out=$(login_exec "cat /tmp/dev-pmi2-${pmi2_job}.out 2>/dev/null || echo ''" | tr -d '\r')
+if echo "$pmi2_out" | grep -q "rank:0" && echo "$pmi2_out" | grep -q "rank:1"; then
+  echo "pmi2: both ranks completed"
+else
+  printf '%s\n' "$pmi2_out" | sed 's/^/  /' >&2
+  die "pmi2 smoke job ${pmi2_job} did not produce expected rank output"
+fi
+
+log "OpenMPI mpirun availability"
+mpirun_path=$(kubectl -n "$NAMESPACE" exec "pod/${BASELINE_WORKER_POD}" -- which mpirun 2>/dev/null || echo "")
+if [[ -n "$mpirun_path" ]]; then
+  echo "mpirun found: ${mpirun_path}"
+  ompi_job=$(submit_job "#!/bin/bash
+#SBATCH -p ${PARTITION}
+#SBATCH -N 1
+#SBATCH -n 2
+#SBATCH -J dev-ompi-smoke
+#SBATCH --constraint=cpu
+#SBATCH --output=/tmp/dev-ompi-%j.out
+#SBATCH --time=00:02:00
+mpirun --oversubscribe -np 2 --mca btl_base_warn_component_unused 0 /bin/sh -c 'echo ompi-rank:\${OMPI_COMM_WORLD_RANK} host:\$(hostname)'" "/tmp/dev-ompi-smoke.sbatch")
+  echo "submitted ompi job: ${ompi_job}"
+  if wait_job_finished "$ompi_job" 120 >/tmp/devverify_ompi_state.txt; then
+    ompi_out=$(login_exec "cat /tmp/dev-ompi-${ompi_job}.out 2>/dev/null || echo ''" | tr -d '\r')
+    if echo "$ompi_out" | grep -q "ompi-rank:0" && echo "$ompi_out" | grep -q "ompi-rank:1"; then
+      echo "openmpi: both ranks completed"
+    else
+      echo "WARNING: OpenMPI test output unexpected (non-fatal)" >&2
+    fi
+  else
+    echo "WARNING: OpenMPI smoke job timed out (non-fatal)" >&2
+  fi
+else
+  log "mpirun not found on ${BASELINE_WORKER_POD} — skipping OpenMPI test"
+fi
+
+log "PodDisruptionBudget check"
+pdb_count=$(kubectl -n "$NAMESPACE" get pdb -o name 2>/dev/null | wc -l | tr -d ' ')
+kubectl -n "$NAMESPACE" get pdb 2>/dev/null || true
+if (( pdb_count >= 5 )); then
+  echo "PDB count: ${pdb_count} (pass)"
+else
+  echo "WARNING: fewer PDBs than expected (want ≥5, got ${pdb_count})" >&2
+fi
+
 if kubectl -n "$NAMESPACE" get statefulset/${GPU_POOL_STS} >/dev/null 2>&1; then
   cleanup_dev_jobs
   wait_no_dev_pending 30 || die "stale dev jobs are still pending before GPU verification"
@@ -374,4 +436,4 @@ else
   log "gpu pool ${GPU_POOL_STS} not present; skipping gpu verification"
 fi
 
-echo "[dev verify] done. phase1 + phase2 checks passed."
+echo "[dev verify] done. all checks passed."

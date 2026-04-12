@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify-phase5.sh — verify Lmod module loading and MPI job submission
+# verify-lmod.sh — verify Lmod module loading and MPI job submission
 #
 # Flow:
 #   1. Check lmod is installed on the login pod
