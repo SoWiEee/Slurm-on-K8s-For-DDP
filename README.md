@@ -245,6 +245,8 @@ graph TD
     style NFS fill:#bfb,stroke:#333,stroke-width:2px
 ```
 
+[booth](assets/architecture.jpg)
+
 <img width="2604" height="1484" alt="System Overview" src="https://github.com/user-attachments/assets/79b3b075-5d92-4545-adbf-89bfc14bbb4f" />
 
 ### 主要元件說明
