@@ -6,8 +6,8 @@
 #               • DNS (kube-dns UDP/TCP 53) — all pods
 #               • operator  → K8s API (TCP 443) + controller slurmrestd (TCP 6820)
 #               • controller→ workers (TCP 6818/22) + login (TCP 22) + NFS (TCP 2049)
-#               • workers   → controller (TCP 6817/22) + inter-worker MPI (any port)
-#                             + login (TCP 22) + NFS (TCP 2049)
+#               • workers   → controller (any port) + inter-worker MPI (any port)
+#                             + login (any port, srun step I/O callback) + NFS (TCP 2049)
 #               • login     → controller (TCP 6817/6820/22) + workers (TCP 6818/22)
 #                             + NFS (TCP 2049)
 #
@@ -157,7 +157,10 @@ spec:
 # ============================================================
 # INGRESS — login
 # ============================================================
-# Login: accept SSH from other slurm pods (interactive srun sessions).
+# Login: accept connections from other slurm pods.
+# ALL ports are allowed from workers because srun step I/O requires slurmd to
+# connect back to the srun process on an ephemeral OS-assigned port (e.g. 58670).
+# Restricting to port 22 only would cause "step aborted before completely launched".
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -170,16 +173,21 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # ALL ports from workers — srun step I/O callback on ephemeral ports
     - from:
         - podSelector:
             matchExpressions:
               - key: app
                 operator: In
                 values:
-                  - slurm-controller
                   - slurm-worker-cpu
                   - slurm-worker-gpu-a10
                   - slurm-worker-gpu-h100
+    # SSH from controller
+    - from:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
       ports:
         - protocol: TCP
           port: 22
@@ -332,14 +340,13 @@ spec:
                   - slurm-worker-cpu
                   - slurm-worker-gpu-a10
                   - slurm-worker-gpu-h100
-    # SSH to login (srun I/O forwarding)
+    # ALL ports to login — srun step I/O callback on ephemeral ports.
+    # srun step I/O requires slurmd to connect back to the srun listener on an
+    # ephemeral OS-assigned port; restricting to port 22 blocks step output.
     - to:
         - podSelector:
             matchLabels:
               app: slurm-login
-      ports:
-        - protocol: TCP
-          port: 22
     # NFS server for /shared RWX volume
     - ports:
         - protocol: TCP
