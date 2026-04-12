@@ -51,12 +51,12 @@ KIND_CONFIG=kind-config.yaml bash scripts/bootstrap.sh
 `scripts/bootstrap.sh` 自動完成以下步驟：
 
 1. 建立 Kind 叢集（若不存在）
-2. 建置 `slurm-controller:phase1`、`slurm-worker:phase1` Docker image（從 `docker/`），並 load 進 Kind
+2. 建置 `slurm-controller:latest`、`slurm-worker:latest` Docker image（從 `docker/`），並 load 進 Kind
 3. 執行 `scripts/render-core.py` 生成 `manifests/core/slurm-static.yaml`（自動偵測 NFS PVC）
 4. 建立 Munge/SSH/JWT secrets（`scripts/create-secrets.sh`）
 5. 套用 `manifests/core/` 所有資源（StatefulSet、Service、ConfigMap、DDP runtime、Lmod modulefiles）
 6. 等待 controller rollout 完成，確認 `slurmctld` 可 ping
-7. 建置 `slurm-elastic-operator:phase2` image，套用 `manifests/operator/` 與 `manifests/networking/`
+7. 建置 `slurm-elastic-operator:latest` image，套用 `manifests/operator/` 與 `manifests/networking/`
 8. 設定三個 worker pool 的 `PARTITIONS_JSON` 環境變數
 9. 縮放 cpu pool → 1 replica，GPU pool → 0 replica（初始狀態）
 
@@ -276,37 +276,6 @@ graph TD
 
 ---
 
-# 🔭 Observability
-
-於 Phase 4 實作監控面板，讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
-
-```
-Slurm 世界                     橋接層（Operator）              K8s 世界
-────────────────               ──────────────────              ────────────────
-Queue pending jobs      ──→    scale-up decision        ──→   StatefulSet +1
-Node idle countdown     ──→    scale-down decision       ──→   StatefulSet -1
-Checkpoint age check    ──→    guard block               ──→   scale skipped
-```
-
-## 監控架構
-
-```
-slurm-exporter              kube-state-metrics        operator /metrics:8000
-(slurmrestd REST → metrics)  (STS/Pod states)         (scale events, guard blocks)
-        ↓                          ↓                          ↓
-                          Prometheus :9090
-                               ↓
-                            Grafana :3000
-                   ┌──────────────────────────────────┐
-                   │  Slurm↔K8s Bridge Overview       │  ← 主 demo 看板
-                   │  K8s Elastic Operator            │
-                   └──────────────────────────────────┘
-```
-
-> 詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
-
----
-
 ## 提交一個 Job 長什麼樣子？
 
 部署完成後，你可以直接 `kubectl exec` 進 login pod 提交任務：
@@ -348,17 +317,6 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 #SBATCH --constraint=gpu-a10
 #SBATCH --gres=gpu:a10:1
 ```
-
----
-
-## 📦 資源分配說明
-
-每台 worker 宣告 `CPUs=4`，採 `select/cons_tres + CR_Core` 消耗式資源模式：
-
-- **CPU：** 多個 job 可以共用同一台 worker（例如兩個各要 2 cores 的 job 會排進同一台 4 cores 的 worker）。
-- **GPU：** 每台 GPU worker 只有 1 張 GPU，為整數消耗，不支援分時共用。
-
-> 注意：目前使用 `TaskPlugin=task/none`，排程層面追蹤 core 數量，但不強制 CPU binding / cgroup 隔離。這在 Kind/Docker 環境下足以驗證排程控制流，但不適合做效能基準測試。
 
 ---
 
@@ -417,31 +375,6 @@ kubectl -n monitoring get pods -o wide
 # 查看 slurm-exporter 日誌（確認是否能連到 slurmrestd）
 kubectl -n slurm logs deployment/slurm-exporter --tail=30
 ```
-
----
-
-## 設計重點
-
-**為什麼 Slurm node 要預先全部宣告？**
-所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，Operator 只調整 StatefulSet 的 replica 數，而不重寫 Slurm 設定檔。這避免了每次擴縮時 `slurmctld` 重新解析所有 DNS 造成的連鎖延遲。
-
-**為什麼 Operator 不用 Kopf 或 CRD？**
-刻意保持輕量。Operator 是純 Python，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。Slurm 狀態查詢（queue、job、node）透過 slurmrestd REST API 進行；StatefulSet replica 調整仍透過 `kubectl patch`。
-
-**Checkpoint Guard + Drain-then-Scale 是什麼？**
-縮容分兩個階段保護執行中的 AI 訓練任務：
-
-1. **Checkpoint Guard**：若 checkpoint 檔案不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容決策會被阻擋。`CHECKPOINT_PATH=""` 時自動停用（避免靜默 block）；`CHECKPOINT_GRACE_SECONDS` 允許 job 啟動初期尚未寫出 checkpoint 時仍可縮容（grace period 內不阻擋）。
-2. **Drain-then-Scale**：通過 Guard 後，Operator 先呼叫 `scontrol update State=DRAIN` 將目標節點標記為不接受新 job，等到 `CPUAlloc == 0`（節點上所有 job 都跑完）才真正減少 StatefulSet replica，避免執行中的訓練被強制中斷。若在 drain 等待期間有新的 scale-up 需求，drain 會自動取消（`State=RESUME`）。
-
-**Operator Cooldown 如何在 Pod 重啟後存活？**
-每次 scale-up 成功後，Operator 把時間戳寫入 StatefulSet annotation `slurm.k8s/last-scale-up-at`。Pod 重啟時從 annotation 還原 cooldown 計時，避免重啟後立即觸發錯誤的縮容。
-
-**為什麼 slurmctld 不怕 pod 重啟？**
-`StateSaveLocation`（`/var/spool/slurmctld`）掛載了獨立的 PVC（`slurm-ctld-state`）。controller pod 重啟後，job queue、node 狀態、及會計紀錄指標都會從磁碟還原，不需要重新提交任務。
-
-**slurmdbd 提供什麼？**
-slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是 Phase 5 Fair-Share 多租戶排程的前置條件。
 
 ---
 

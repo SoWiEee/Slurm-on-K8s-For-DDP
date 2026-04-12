@@ -3,7 +3,7 @@
     "name": "slurm-controller",
     "service": "slurm-controller",
     "replicas": 1,
-    "image": "slurm-controller:phase1"
+    "image": "slurm-controller:latest"
   },
   "workerPools": [
     {
@@ -11,7 +11,7 @@
       "service": "slurm-worker-cpu",
       "appLabel": "slurm-worker-cpu",
       "workerClass": "cpu-standard",
-      "image": "slurm-worker:phase1",
+      "image": "slurm-worker:latest",
       "maxNodes": 4,
       "replicas": 1,
       "cpus": 4,
@@ -29,7 +29,7 @@
       "service": "slurm-worker-gpu-a10",
       "appLabel": "slurm-worker-gpu-a10",
       "workerClass": "gpu-a10",
-      "image": "slurm-worker:phase1",
+      "image": "slurm-worker:latest",
       "maxNodes": 4,
       "replicas": 0,
       "cpus": 4,
@@ -50,7 +50,7 @@
       "service": "slurm-worker-gpu-h100",
       "appLabel": "slurm-worker-gpu-h100",
       "workerClass": "gpu-h100",
-      "image": "slurm-worker:phase1",
+      "image": "slurm-worker:latest",
       "maxNodes": 4,
       "replicas": 0,
       "cpus": 4,

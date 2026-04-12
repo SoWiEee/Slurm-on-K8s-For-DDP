@@ -114,7 +114,7 @@ graph TD
 | 欄位 | 值 |
 |------|-----|
 | Replicas | 1（固定，不縮放） |
-| Image | `slurm-controller:phase1` |
+| Image | `slurm-controller:latest` |
 | 主要程序 | `slurmctld`（排程控制器）+ `slurmrestd`（REST API）+ `slurmdbd`（accounting） |
 | 容器 Port | 6817 (slurmctld), 6820 (slurmrestd), 22 (SSH) |
 | Readiness Probe | `pgrep -x slurmctld && pgrep -x munged` |
@@ -127,7 +127,7 @@ graph TD
 | 欄位 | 值 |
 |------|-----|
 | Replicas | 執行時 1–4（由 Operator 動態調整） |
-| Image | `slurm-worker:phase1` |
+| Image | `slurm-worker:latest` |
 | 主要程序 | `slurmd`（工作節點 daemon） |
 | 容器 Port | 6818 (slurmd), 22 (SSH) |
 | Slurm Features | `cpu`（讓 job 用 `--constraint=cpu` 指定） |
@@ -137,7 +137,7 @@ graph TD
 | 欄位 | 值 |
 |------|-----|
 | Replicas | 執行時 0–4（有需求才拉起） |
-| Image | `slurm-worker:phase1` |
+| Image | `slurm-worker:latest` |
 | Slurm Features | `gpu,gpu-a10` |
 | Slurm GRES | `gpu:a10:1`（Kind 環境用 `/dev/null` 模擬） |
 
@@ -150,7 +150,7 @@ graph TD
 | 欄位 | 值 |
 |------|-----|
 | Replicas | 1 |
-| Image | `slurm-worker:phase1`（借用 worker image） |
+| Image | `slurm-worker:latest`（借用 worker image） |
 | 用途 | 使用者透過 `kubectl exec` 進入此 Pod 提交 `sbatch` / `srun` |
 | 主要程序 | `munged` + `sshd`（無 slurmd） |
 | 特別掛載 | `slurm-ddp-runtime` ConfigMap → `/opt/slurm-runtime-src` |
@@ -162,7 +162,7 @@ graph TD
 
 | 欄位 | 值 |
 |------|-----|
-| Image | `slurm-exporter:phase4` |
+| Image | `slurm-exporter:latest` |
 | 主要程序 | `docker/slurm-exporter/exporter.py`（自製 REST API exporter） |
 | Port | 9341（Prometheus scrape） |
 | 用途 | 把 slurmrestd job/node 資料轉換成 Prometheus metrics |

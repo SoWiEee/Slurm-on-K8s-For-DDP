@@ -155,7 +155,7 @@ spec:
       hostname: slurmdbd
       containers:
         - name: slurmdbd
-          image: slurm-controller:phase1
+          image: slurm-controller:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash

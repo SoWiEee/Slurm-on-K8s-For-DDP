@@ -1,8 +1,8 @@
-# Runtime assets for Phase 2-E MVP cross-network support.
+# Multus NetworkAttachmentDefinition for the DDP data plane (ptp mode, Kind-compatible).
 #
-# Kind already provides the primary management network through kindnet. For the
-# MVP we only attach one additional Multus network for the data plane. This
-# avoids depending on the bridge CNI for a redundant management attachment.
+# Kind provides the primary management network via kindnet. This adds a single
+# secondary NIC for DDP / MPI east-west traffic, avoiding bridge CNI dependency.
+# Requires Multus CNI to be installed before applying.
 ---
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition

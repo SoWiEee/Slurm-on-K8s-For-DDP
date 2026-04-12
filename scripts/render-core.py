@@ -255,7 +255,7 @@ spec:
     spec:
       containers:
         - name: slurm-controller
-          image: slurm-controller:phase1
+          image: slurm-controller:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -469,7 +469,7 @@ spec:
     spec:
       containers:
         - name: slurm-login
-          image: slurm-worker:phase1
+          image: slurm-worker:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash

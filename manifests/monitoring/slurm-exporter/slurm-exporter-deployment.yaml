@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: slurm-exporter
-          image: slurm-exporter:phase4
+          image: slurm-exporter:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: SLURM_REST_URL

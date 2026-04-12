@@ -53,12 +53,12 @@ fi
 # ----- build images ---------------------------------------------------------
 log "building slurm-exporter image..."
 docker build "${build_flags[@]}" \
-  -t slurm-exporter:phase4 \
+  -t slurm-exporter:latest \
   -f docker/slurm-exporter/Dockerfile \
   docker/slurm-exporter
 
 log "loading slurm-exporter image to kind..."
-kind load docker-image slurm-exporter:phase4 --name "$CLUSTER_NAME"
+kind load docker-image slurm-exporter:latest --name "$CLUSTER_NAME"
 
 log "rebuilding operator image (adds prometheus-client)..."
 docker build "${build_flags[@]}" \

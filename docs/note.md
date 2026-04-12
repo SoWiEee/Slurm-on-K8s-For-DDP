@@ -8,7 +8,7 @@
 
 - 建立 Slurm Controller / Worker 映像。
 - 在 Kind 部署靜態 Slurm 叢集。
--  讓 Pod 間具備 SSH 互通與 Munge 認證。
+- 讓 Pod 間具備 SSH 互通與 Munge 認證。
 
 ## Debug Record
 
@@ -65,261 +65,6 @@ NO NETWORK ADDRESS FOUND
 
 - validation 不能用 partition name 當唯一鍵。
 - 要接受「同一 partition 對應多個 worker pool」。
-
-## 目前限制
-
-### 1. 這不是「開箱即用的真雙網」，而是以 repo 現況為基礎的最小可用落地版
-
-因為你目前用的是 kind，原生不會自己給第二張 Pod NIC。真正要讓 runtime 出現雙網，還需要：
-
-- Multus CNI
-- `NetworkAttachmentDefinition`
-- cluster node 內對應 bridge / IPAM 可正常工作
-
-### 2. operator 目前還沒有用 topology 自動決定某個 job 要走哪張 NIC
-
-也就是說，Phase 2-E 目前完成的是：
-
-- 網路拓撲建模
-- workload placement 規劃
-- runtime 驗證 scaffolding
-
-下一步若要更深入，才是：
-
-- 將 `data interface` 寫入 worker 啟動流程
-- 讓 DDP / MPI workload 明確選用 `net2`
-- 將 checkpoint / shared storage traffic 與 control traffic 分離
-
-# Job-Hardware Mapping
-
-本節為 **AI/HPC Infra 視角的完整評審**，涵蓋 Slurm + K8s 雙層資源模型的分配語意、實際邊界、以及 Kind 模擬環境與真實 GPU 叢集的差距。
-
-## 資源模型概覽
-
-本 repo 採用 **Slurm-on-K8s 雙層架構**，每個 worker node 是一個 K8s Pod，Slurm 把整個 Pod 視為一台 node：
-
-```
-Slurm Layer  ←─ 排程、配置記帳（CR_Core、GRES）
-     ↓
-K8s Layer    ←─ 容器資源請求（requests/limits）、device plugin
-     ↓
-Hardware     ←─ 實體 CPU cores、GPU SM + VRAM
-```
-
-關鍵設定（`slurm.conf`）：
-
-| 參數 | 值 | 意義 |
-|------|----|------|
-| `SelectType` | `select/cons_tres` | CPU/GPU 皆以 consumable resource 模式分配 |
-| `SelectTypeParameters` | `CR_Core` | Slurm 以 core 為單位追蹤 CPU 消耗 |
-| `TaskPlugin` | `task/none` | **無 cgroup/CPU binding**，排程計帳但不強制隔離 |
-| `GresTypes` | `gpu` | GPU 宣告為 GRES |
-
-每台 worker 宣告：CPU worker → `CPUs=4`；GPU worker → `CPUs=4` + `Gres=gpu:<type>:1`
-
----
-
-## CPU Job 分配
-
-### 排程語意：同一 worker 可容納多個 job
-
-`cons_tres` + `CR_Core` 使 Slurm 以 core 為單位消耗 CPU slot。同一台 node 的 CPU slot 可由多個 job 分攤，只要總需求不超過宣告量。這是 HPC 常見的 **bin-packing** 行為，無需 `OverSubscribe`。
-
-> `OverSubscribe` 是讓多個 job「共用同一批 CPU」（超賣）；**bin-packing 是不同 job 用不同 CPU slot**，兩個概念不同。
-
-### 分配範例（CPUs=4 的 cpu-worker）
-
-| Job | 請求 | 分配在同一 worker？ | 說明 |
-|-----|------|-------------------|------|
-| A `--cpus-per-task=2` | 2 cores | ✅ | 佔用 slot 0-1 |
-| B `--cpus-per-task=2` | 2 cores | ✅ 與 A 共存 | 佔用 slot 2-3，worker 滿載 |
-| C `--cpus-per-task=1` | 1 core | ❌ 排到其他 worker | worker 已滿，Slurm 等待或排第二台 |
-
-更複雜的例子——4 個 job 競搶 2 台 worker（各 CPUs=4）：
-
-```
-Worker-0 [4 slots]         Worker-1 [4 slots]
-┌─────────────────┐        ┌─────────────────┐
-│ Job A (2 cores) │        │ Job C (3 cores) │
-│ Job B (2 cores) │        │ Job D (1 core)  │
-└─────────────────┘        └─────────────────┘
-  bin-packed: 100%            bin-packed: 100%
-```
-
-Job A、B 同時跑在 Worker-0；Job C、D 同時跑在 Worker-1。Slurm 的 backfill scheduler 會盡量填滿 slot。
-
-### 邊界：隔離層缺失
-
-`TaskPlugin=task/none` + `ProctrackType=proctrack/linuxproc` 表示：
-
-- Slurm **記帳**說分給 Job A 2 cores，但 OS 不會強制 Job A 只跑在那 2 顆上
-- 若應用程式內部開 `OMP_NUM_THREADS=16`，它可能吃掉 Worker 上所有 CPU，影響同 worker 的 Job B
-- **效能隔離在 Kind 環境是虛的**，僅排程語意層面有效
-
-真實 HPC 環境通常改用 `TaskPlugin=task/cgroup`，搭配 `CgroupAutomount=yes`，OS 層級強制 CPU pinning。
-
----
-
-## GPU Job 分配
-
-### 預設模型：整卡獨占
-
-每台 GPU worker 宣告 `Gres=gpu:a10:1`（1 張）或 `Gres=gpu:h100:1`（1 張）。GRES 是整數消耗，無分數分配：
-
-```
-Job A: --gres=gpu:a10:1  →  佔用整張 A10，該 worker GRES=0
-Job B: --gres=gpu:a10:1  →  必須等 A 結束，或排到另一台 gpu-a10-worker
-```
-
-Kind 環境下 GPU worker 宣告 `File=/dev/null`，排程帳本上是 1 個 GPU slot，但實際上不存在硬體。
-
-### 分配範例
-
-場景：2 台 A10 GPU worker + 3 個 GPU job
-
-| Job | 請求 | 分配結果 |
-|-----|------|---------|
-| A `--gres=gpu:a10:1 -N 1` | 1 A10 | → worker-gpu-a10-0，整張 A10 獨占 |
-| B `--gres=gpu:a10:1 -N 1` | 1 A10 | → worker-gpu-a10-1，整張 A10 獨占 |
-| C `--gres=gpu:a10:1 -N 1` | 1 A10 | → Pending，等 A 或 B 釋放 |
-
-多節點 DDP job：
-
-```bash
-#SBATCH --gres=gpu:h100:1
-#SBATCH -N 4          # 需要 4 台 H100 worker
-#SBATCH --ntasks-per-node=1
-```
-
-Slurm 要求同時有 4 台 `gpu-h100` worker 都空閒。這正是 Gang Scheduling 解決的問題——若只有 3 台空閒，K8s 1.35 原生 `GangScheduling` 會讓 4 個 worker Pod 要嘛全部調度，要嘛全不調度，避免佔著資源等人。
-
-### GPU 共用機制（進階）
-
-若要讓多個 job 共用同一張 GPU，需要額外機制：
-
-#### Time-Slicing（時間切片）
-
-CUDA context 輪流使用 GPU，類似 CPU 分時多工。
-
-- 適用：**所有 NVIDIA GPU**
-- 隔離：**無記憶體隔離**（所有 context 共享 VRAM），context switch 有開銷
-- K8s 設定：GPU Operator ConfigMap 把 1 張 GPU 虛擬成 N 份 `nvidia.com/gpu`
-
-```yaml
-# ConfigMap：1 張 A10 虛擬成 4 份
-sharing:
-  timeSlicing:
-    resources:
-    - name: nvidia.com/gpu
-      replicas: 4
-```
-
-```ini
-# gres.conf（Slurm 端）
-NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 Count=4 File=/dev/nvidia0
-```
-
-4 個 job 可同時各請求 `--gres=gpu:a10:1`，時間輪流使用同一張 GPU。**不適合 DDP 訓練**（延遲不可預測、無記憶體保護）。
-
-#### MIG（Multi-Instance GPU）— 硬體分割
-
-A100 / H100 / A30 支援在**硬體層**將 GPU 切成獨立 instance，各有專屬 SM、L2 cache、VRAM 帶寬，完全隔離。
-
-| Profile | SM | VRAM | 每張 A100 80GB 可建 |
-|---------|----|------|-------------------|
-| `1g.10gb` | 1/7 GPU | 10 GB | 最多 7 個 |
-| `2g.20gb` | 2/7 GPU | 20 GB | 最多 3 個 |
-| `3g.40gb` | 3/7 GPU | 40 GB | 最多 2 個 |
-| `7g.80gb` | 完整 GPU | 80 GB | 1 個（無分割）|
-
-```ini
-# gres.conf（MIG 模式）
-NodeName=slurm-worker-gpu-h100-0 Name=gpu Type=mig-2g.20gb Count=3
-NodeName=slurm-worker-gpu-h100-0 Name=gpu Type=mig-1g.10gb Count=1
-```
-
-Job 請求 `--gres=gpu:mig-2g.20gb:1`，排到任何有空閒 MIG instance 的 node。**僅限 A100/H100/A30；最細粒度 1/7 GPU，仍不能跨 GPU。**
-
-#### MPS（Multi-Process Service）
-
-多個 CUDA process 合併進同一 CUDA context，共享 command queue 和 SM，減少 context switch 開銷。SM 可設 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 比例。適合延遲敏感的小型推論，但無完整記憶體隔離。
-
-### 核心限制：為何不能跨 GPU 分割 SM？
-
-用戶場景：GPU0 剩 4 SM 閒置、GPU1 剩 4 SM 閒置，Job C 需要 8 SM，能否合用？
-
-**直接答案：不可能。** 硬體架構根本限制：
-
-```
-GPU0 [SM0..SM107]           GPU1 [SM0..SM107]
-┌──────────────────┐               ┌──────────────────┐
-│  SM0  SM1  ...   │               │  SM0  SM1  ...   │
-│  L2 Cache        │               │  L2 Cache        │
-│  HBM (80 GB)     │<─PCIe/NVLink─>│  HBM (80 GB)     │
-└──────────────────┘               └──────────────────┘
-```
-
-1. **無跨 GPU 共享記憶體**：CUDA thread block 必須在同一張 GPU 的 SM 上存取 Shared Memory / L1 cache；跨 GPU 只能用 P2P copy（NVLink/PCIe），延遲是 SM 內 shared memory 的 100 倍以上
-2. **CUDA 程式模型不支援**：沒有 API 可讓一個 kernel 跑在「GPU0 SM 0-3 + GPU1 SM 0-3」上
-3. MIG / Time-Slicing / MPS 都是**單一 GPU 內**的分割，無法橫跨兩張
-
-「用完碎片化 GPU 資源」的正確方法：
-
-| 場景 | 解法 | 支援 GPU |
-|------|------|---------|
-| GPU0 有 25% 閒置，想跑小 job | Time-Slicing 或 MIG `1g.10gb` | 全部 / 僅 A100,H100 |
-| 多推論任務共用一張 GPU | MPS 或 time-slicing | Volta+ |
-| 多租戶需記憶體隔離 | MIG | 僅 A100,H100,A30 |
-| DDP 大型訓練 | 整張 GPU（1 job per GPU）| 全部 |
-| 跨 GPU SM 碎片整合 | ❌ 硬體不支援 | 無 |
-
----
-
-## AI/HPC Infra 專家評審
-
-### 實作設計是否妥當？
-
-| 面向 | 評估 | 說明 |
-|------|------|------|
-| CPU consumable resource 模型 | ✅ 正確 | `cons_tres` + `CR_Core` 是 HPC 業界標準做法 |
-| GPU 整卡獨占預設 | ✅ 合理 | DDP 訓練場景下整卡獨占是正確的起點 |
-| `TaskPlugin=task/none` | ⚠️ 可接受於模擬 | Kind 環境做驗證可以，**不能用於效能測試或多租戶** |
-| GPU GRES `File=/dev/null` | ✅ Kind 環境唯一可行方案 | 排程邏輯可驗證，硬體部分需真實環境補齊 |
-| 無 GPU sharing 機制 | ✅ DDP 場景下正確 | DDP 不應 time-slice；加 GPU sharing 反而造成干擾 |
-
-**整體評語：** 以驗證排程控制流為目標，目前設計選擇是合理的。主要缺口在隔離層（`task/none`）和 Kind GPU 模擬的不完整性，這兩個缺口在設計文件中已有明確說明，不是未知風險。
-
-### Kind 環境 vs 真實環境差距
-
-| 項目 | Kind 環境 | 真實 GPU 叢集 |
-|------|----------|-------------|
-| GPU 裝置 | `/dev/null`（純排程帳本） | NVIDIA device plugin，實際 GPU 分配 |
-| CPU 隔離 | 無（task/none） | task/cgroup + cpuset 強制 binding |
-| GPU sharing | 不可用 | Time-Slicing / MIG / MPS（按需啟用）|
-| 記憶體限制 | Slurm 記帳但不強制 | cgroup v2 memory.max 強制 OOM |
-| NCCL / collective | CPU 模擬 | NVLink / RDMA InfiniBand |
-
-### 若要部署真實環境，建議的改動順序
-
-1. **換掉 `TaskPlugin=task/none`** → `task/cgroup`，配合 `CgroupPlugin=cgroup/v2`
-2. **部署 NVIDIA GPU Operator**，device plugin 取代 `/dev/null` 模擬
-3. **視 GPU 型號選 sharing 策略**：A100/H100 → MIG；一般推論服務 → time-slicing
-4. **Slurm `gres.conf` 對齊實際 MIG partition**，`File=` 指向真實 `/dev/nvidia*`
-5. **Gang Scheduling** → 啟用 K8s 1.35 `GangScheduling` feature gate（本 repo 已完成）
-
----
-
-## 快速查詢表
-
-| 問題 | 答案 |
-|------|------|
-| Job 能指定 CPU 數量？ | ✅ `--cpus-per-task`、`--ntasks` |
-| Job 能指定 GPU 型號和數量？ | ✅ `--gres=gpu:a10:1` |
-| 同一 CPU worker 能跑多個 job？ | ✅ 排程層（`CR_Core` bin-packing） |
-| CPU 有實體隔離？ | ❌ `task/none`，無 binding/cgroup（Kind 限制） |
-| 同一張 GPU 能讓多個 job 共用？ | ✅ 可透過 time-slicing 或 MIG（需真實 GPU + 額外設定） |
-| GPU core 能跨多張 GPU 分割給同一 job？ | ❌ CUDA 硬體架構根本限制 |
-| Kind 環境的 GPU GRES 是真實硬體？ | ❌ `File=/dev/null`，純排程模擬 |
 
 # Phase 3
 
@@ -852,7 +597,7 @@ spec:
 
 **現象：** `slurmdbd` pod CrashLoopBackOff，log 顯示 `/bin/bash: line 23: exec: slurmdbd: not found`。
 
-**原因：** `slurm-accounting.yaml` 使用 `slurm-controller:phase1` 映像跑 slurmdbd，但 controller Dockerfile 只安裝了 `slurmctld`、`slurmd`、`slurmrestd`，沒有裝 `slurmdbd` 套件（Ubuntu 22.04 的 `slurmdbd` 是獨立套件）。
+**原因：** `slurm-accounting.yaml` 使用 `slurm-controller:latest` 映像跑 slurmdbd，但 controller Dockerfile 只安裝了 `slurmctld`、`slurmd`、`slurmrestd`，沒有裝 `slurmdbd` 套件（Ubuntu 22.04 的 `slurmdbd` 是獨立套件）。
 
 **修法：** `docker/controller/Dockerfile` 加入 `slurmdbd`，重新 build + kind load。
 
@@ -956,13 +701,6 @@ Lmod 在每次 `source /etc/profile.d/lmod.sh` 時都會讀這個檔案，不論
 ```
 所有節點共享同一 NFS，login pod 可直接 `cat /shared/jobs/<outfile>` 取得輸出。
 
-**臨時替代方案（NFS 未就緒時）：** verify 腳本用 `sacct -P -o NodeList` 取得執行 job 的 worker pod 名稱，再 `kubectl exec` 去那個 pod 讀 output：
-```bash
-worker=$(sacct -j $jid -X -n -P -o "NodeList" | tr -d ' \r' | head -1)
-kubectl exec pod/$worker -- bash -c "cat /tmp/output-$jid.out"
-```
-此方案在 Phase 5 NFS 整合後已不需要，保留供除錯參考。
-
 ---
 
 ### 問題 9：Phase 3 E2E — slurmd 在新 pod 啟動後持續 NOT_RESPONDING
@@ -1017,7 +755,7 @@ kubectl -n slurm logs pod/slurm-worker-cpu-1 | grep -E "Zero Bytes|FORWARD_FAILE
 
 ---
 
-## Phase 5 優先順序
+## Phase 5 建議優先順序
 
 | 項目 | 難度 | TA 價值 | 建議順序 |
 |------|------|---------|---------|
@@ -1027,3 +765,257 @@ kubectl -n slurm logs pod/slurm-worker-cpu-1 | grep -E "Zero Bytes|FORWARD_FAILE
 | OpenTelemetry | 高 | 所有 TA（差異化觀測） | 第四 |
 
 Helm 和 Fair-Share metrics 可以平行進行（互不依賴），HA 需要先完成 Helm（讓 `replicas` 從 values 控制），OTel 放最後因為需要最多程式碼改動。
+
+---
+
+## 設計重點
+
+**為什麼 Slurm node 要預先全部宣告？**
+所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，Operator 只調整 StatefulSet 的 replica 數，而不重寫 Slurm 設定檔。這避免了每次擴縮時 `slurmctld` 重新解析所有 DNS 造成的連鎖延遲。
+
+**為什麼 Operator 不用 Kopf 或 CRD？**
+刻意保持輕量。Operator 是純 Python，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。Slurm 狀態查詢（queue、job、node）透過 slurmrestd REST API 進行；StatefulSet replica 調整仍透過 `kubectl patch`。
+
+**Checkpoint Guard + Drain-then-Scale 是什麼？**
+縮容分兩個階段保護執行中的 AI 訓練任務：
+
+1. **Checkpoint Guard**：若 checkpoint 檔案不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容決策會被阻擋。`CHECKPOINT_PATH=""` 時自動停用（避免靜默 block）；`CHECKPOINT_GRACE_SECONDS` 允許 job 啟動初期尚未寫出 checkpoint 時仍可縮容（grace period 內不阻擋）。
+2. **Drain-then-Scale**：通過 Guard 後，Operator 先呼叫 `scontrol update State=DRAIN` 將目標節點標記為不接受新 job，等到 `CPUAlloc == 0`（節點上所有 job 都跑完）才真正減少 StatefulSet replica，避免執行中的訓練被強制中斷。若在 drain 等待期間有新的 scale-up 需求，drain 會自動取消（`State=RESUME`）。
+
+**Operator Cooldown 如何在 Pod 重啟後存活？**
+每次 scale-up 成功後，Operator 把時間戳寫入 StatefulSet annotation `slurm.k8s/last-scale-up-at`。Pod 重啟時從 annotation 還原 cooldown 計時，避免重啟後立即觸發錯誤的縮容。
+
+**為什麼 slurmctld 不怕 pod 重啟？**
+`StateSaveLocation`（`/var/spool/slurmctld`）掛載了獨立的 PVC（`slurm-ctld-state`）。controller pod 重啟後，job queue、node 狀態、及會計紀錄指標都會從磁碟還原，不需要重新提交任務。
+
+**slurmdbd 提供什麼？**
+slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是 Phase 5 Fair-Share 多租戶排程的前置條件。
+
+# Job-Hardware Mapping
+
+## 📦 資源模型概覽
+
+本 repo 採用 **Slurm-on-K8s 雙層架構**，每個 worker node 是一個 K8s Pod，Slurm 把整個 Pod 視為一台 node：
+
+```
+Slurm Layer  ←─ 排程、配置記帳（CR_Core、GRES）
+     ↓
+K8s Layer    ←─ 容器資源請求（requests/limits）、device plugin
+     ↓
+Hardware     ←─ 實體 CPU cores、GPU SM + VRAM
+```
+
+關鍵設定（`slurm.conf`）：
+
+| 參數 | 值 | 意義 |
+|------|----|------|
+| `SelectType` | `select/cons_tres` | CPU/GPU 皆以 consumable resource 模式分配 |
+| `SelectTypeParameters` | `CR_Core` | Slurm 以 core 為單位追蹤 CPU 消耗 |
+| `TaskPlugin` | `task/none` | **無 cgroup/CPU binding**，排程計帳但不強制隔離 |
+| `GresTypes` | `gpu` | GPU 宣告為 GRES |
+
+每台 worker 宣告：CPU worker → `CPUs=4`；GPU worker → `CPUs=4` + `Gres=gpu:<type>:1`
+
+---
+
+## CPU Job 分配
+
+### 排程語意：同一 worker 可容納多個 job
+
+`cons_tres` + `CR_Core` 使 Slurm 以 core 為單位消耗 CPU slot。同一台 node 的 CPU slot 可由多個 job 分攤，只要總需求不超過宣告量。這是 HPC 常見的 **bin-packing** 行為，無需 `OverSubscribe`。
+
+> `OverSubscribe` 是讓多個 job「共用同一批 CPU」（超賣）；**bin-packing 是不同 job 用不同 CPU slot**，兩個概念不同。
+
+### 分配範例（CPUs=4 的 cpu-worker）
+
+| Job | 請求 | 分配在同一 worker？ | 說明 |
+|-----|------|-------------------|------|
+| A `--cpus-per-task=2` | 2 cores | ✅ | 佔用 slot 0-1 |
+| B `--cpus-per-task=2` | 2 cores | ✅ 與 A 共存 | 佔用 slot 2-3，worker 滿載 |
+| C `--cpus-per-task=1` | 1 core | ❌ 排到其他 worker | worker 已滿，Slurm 等待或排第二台 |
+
+更複雜的例子——4 個 job 競搶 2 台 worker（各 CPUs=4）：
+
+```
+Worker-0 [4 slots]         Worker-1 [4 slots]
+┌─────────────────┐        ┌─────────────────┐
+│ Job A (2 cores) │        │ Job C (3 cores) │
+│ Job B (2 cores) │        │ Job D (1 core)  │
+└─────────────────┘        └─────────────────┘
+  bin-packed: 100%            bin-packed: 100%
+```
+
+Job A、B 同時跑在 Worker-0；Job C、D 同時跑在 Worker-1。Slurm 的 backfill scheduler 會盡量填滿 slot。
+
+### 邊界：隔離層缺失
+
+`TaskPlugin=task/none` + `ProctrackType=proctrack/linuxproc` 表示：
+
+- Slurm **記帳**說分給 Job A 2 cores，但 OS 不會強制 Job A 只跑在那 2 顆上
+- 若應用程式內部開 `OMP_NUM_THREADS=16`，它可能吃掉 Worker 上所有 CPU，影響同 worker 的 Job B
+- **效能隔離在 Kind 環境是虛的**，僅排程語意層面有效
+
+真實 HPC 環境通常改用 `TaskPlugin=task/cgroup`，搭配 `CgroupAutomount=yes`，OS 層級強制 CPU pinning。
+
+---
+
+## GPU Job 分配
+
+### 預設模型：整卡獨占
+
+每台 GPU worker 宣告 `Gres=gpu:a10:1`（1 張）或 `Gres=gpu:h100:1`（1 張）。GRES 是整數消耗，無分數分配：
+
+```
+Job A: --gres=gpu:a10:1  →  佔用整張 A10，該 worker GRES=0
+Job B: --gres=gpu:a10:1  →  必須等 A 結束，或排到另一台 gpu-a10-worker
+```
+
+Kind 環境下 GPU worker 宣告 `File=/dev/null`，排程帳本上是 1 個 GPU slot，但實際上不存在硬體。
+
+### 分配範例
+
+場景：2 台 A10 GPU worker + 3 個 GPU job
+
+| Job | 請求 | 分配結果 |
+|-----|------|---------|
+| A `--gres=gpu:a10:1 -N 1` | 1 A10 | → worker-gpu-a10-0，整張 A10 獨占 |
+| B `--gres=gpu:a10:1 -N 1` | 1 A10 | → worker-gpu-a10-1，整張 A10 獨占 |
+| C `--gres=gpu:a10:1 -N 1` | 1 A10 | → Pending，等 A 或 B 釋放 |
+
+多節點 DDP job：
+
+```bash
+#SBATCH --gres=gpu:h100:1
+#SBATCH -N 4          # 需要 4 台 H100 worker
+#SBATCH --ntasks-per-node=1
+```
+
+Slurm 要求同時有 4 台 `gpu-h100` worker 都空閒。這正是 Gang Scheduling 解決的問題——若只有 3 台空閒，K8s 1.35 原生 `GangScheduling` 會讓 4 個 worker Pod 要嘛全部調度，要嘛全不調度，避免佔著資源等人。
+
+### GPU 共用機制（進階）
+
+若要讓多個 job 共用同一張 GPU，需要額外機制：
+
+#### Time-Slicing（時間切片）
+
+CUDA context 輪流使用 GPU，類似 CPU 分時多工。
+
+- 適用：**所有 NVIDIA GPU**
+- 隔離：**無記憶體隔離**（所有 context 共享 VRAM），context switch 有開銷
+- K8s 設定：GPU Operator ConfigMap 把 1 張 GPU 虛擬成 N 份 `nvidia.com/gpu`
+
+```yaml
+# ConfigMap：1 張 A10 虛擬成 4 份
+sharing:
+  timeSlicing:
+    resources:
+    - name: nvidia.com/gpu
+      replicas: 4
+```
+
+```ini
+# gres.conf（Slurm 端）
+NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 Count=4 File=/dev/nvidia0
+```
+
+4 個 job 可同時各請求 `--gres=gpu:a10:1`，時間輪流使用同一張 GPU。**不適合 DDP 訓練**（延遲不可預測、無記憶體保護）。
+
+#### MIG（Multi-Instance GPU）— 硬體分割
+
+A100 / H100 / A30 支援在**硬體層**將 GPU 切成獨立 instance，各有專屬 SM、L2 cache、VRAM 帶寬，完全隔離。
+
+| Profile | SM | VRAM | 每張 A100 80GB 可建 |
+|---------|----|------|-------------------|
+| `1g.10gb` | 1/7 GPU | 10 GB | 最多 7 個 |
+| `2g.20gb` | 2/7 GPU | 20 GB | 最多 3 個 |
+| `3g.40gb` | 3/7 GPU | 40 GB | 最多 2 個 |
+| `7g.80gb` | 完整 GPU | 80 GB | 1 個（無分割）|
+
+```ini
+# gres.conf（MIG 模式）
+NodeName=slurm-worker-gpu-h100-0 Name=gpu Type=mig-2g.20gb Count=3
+NodeName=slurm-worker-gpu-h100-0 Name=gpu Type=mig-1g.10gb Count=1
+```
+
+Job 請求 `--gres=gpu:mig-2g.20gb:1`，排到任何有空閒 MIG instance 的 node。**僅限 A100/H100/A30；最細粒度 1/7 GPU，仍不能跨 GPU。**
+
+#### MPS（Multi-Process Service）
+
+多個 CUDA process 合併進同一 CUDA context，共享 command queue 和 SM，減少 context switch 開銷。SM 可設 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 比例。適合延遲敏感的小型推論，但無完整記憶體隔離。
+
+### 核心限制：為何不能跨 GPU 分割 SM？
+
+用戶場景：GPU0 剩 4 SM 閒置、GPU1 剩 4 SM 閒置，Job C 需要 8 SM，能否合用？
+
+**直接答案：不可能。** 硬體架構根本限制：
+
+```
+  GPU0 [SM0..SM107]                  GPU1 [SM0..SM107]
+┌──────────────────┐               ┌──────────────────┐
+│  SM0  SM1  ...   │               │  SM0  SM1  ...   │
+│  L2 Cache        │               │  L2 Cache        │
+│  HBM (80 GB)     │<─PCIe/NVLink─>│  HBM (80 GB)     │
+└──────────────────┘               └──────────────────┘
+```
+
+1. **無跨 GPU 共享記憶體**：CUDA thread block 必須在同一張 GPU 的 SM 上存取 Shared Memory / L1 cache；跨 GPU 只能用 P2P copy（NVLink/PCIe），延遲是 SM 內 shared memory 的 100 倍以上
+2. **CUDA 程式模型不支援**：沒有 API 可讓一個 kernel 跑在「GPU0 SM 0-3 + GPU1 SM 0-3」上
+3. MIG / Time-Slicing / MPS 都是**單一 GPU 內**的分割，無法橫跨兩張
+
+「用完碎片化 GPU 資源」的正確方法：
+
+| 場景 | 解法 | 支援 GPU |
+|------|------|---------|
+| GPU0 有 25% 閒置，想跑小 job | Time-Slicing 或 MIG `1g.10gb` | 全部 / 僅 A100,H100 |
+| 多推論任務共用一張 GPU | MPS 或 time-slicing | Volta+ |
+| 多租戶需記憶體隔離 | MIG | 僅 A100,H100,A30 |
+| DDP 大型訓練 | 整張 GPU（1 job per GPU）| 全部 |
+| 跨 GPU SM 碎片整合 | ❌ 硬體不支援 | 無 |
+
+---
+
+## AI/HPC Infra Review
+
+### 實作設計是否妥當？
+
+| 面向 | 評估 | 說明 |
+|------|------|------|
+| CPU consumable resource 模型 | ✅ 正確 | `cons_tres` + `CR_Core` 是 HPC 業界標準做法 |
+| GPU 整卡獨占預設 | ✅ 合理 | DDP 訓練場景下整卡獨占是正確的起點 |
+| `TaskPlugin=task/none` | ⚠️ 可接受於模擬 | Kind 環境做驗證可以，**不能用於效能測試或多租戶** |
+| GPU GRES `File=/dev/null` | ✅ Kind 環境唯一可行方案 | 排程邏輯可驗證，硬體部分需真實環境補齊 |
+| 無 GPU sharing 機制 | ✅ DDP 場景下正確 | DDP 不應 time-slice；加 GPU sharing 反而造成干擾 |
+
+**整體評語：** 以驗證排程控制流為目標，目前設計選擇是合理的。主要缺口在隔離層（`task/none`）和 Kind GPU 模擬的不完整性，這兩個缺口在設計文件中已有明確說明，不是未知風險。
+
+### Kind 環境 vs 真實環境差距
+
+| 項目 | Kind 環境 | 真實 GPU 叢集 |
+|------|----------|-------------|
+| GPU 裝置 | `/dev/null`（純排程帳本） | NVIDIA device plugin，實際 GPU 分配 |
+| CPU 隔離 | 無（task/none） | task/cgroup + cpuset 強制 binding |
+| GPU sharing | 不可用 | Time-Slicing / MIG / MPS（按需啟用）|
+| 記憶體限制 | Slurm 記帳但不強制 | cgroup v2 memory.max 強制 OOM |
+| NCCL / collective | CPU 模擬 | NVLink / RDMA InfiniBand |
+
+### 若要部署真實環境，建議的改動順序
+
+1. 換掉 `TaskPlugin=task/none` → `task/cgroup`，配合 `CgroupPlugin=cgroup/v2`
+2. 部署 NVIDIA GPU Operator，device plugin 取代 `/dev/null` 模擬
+3. 視 GPU 型號選 sharing 策略：A100/H100 → MIG；一般推論服務 → time-slicing
+4. Slurm `gres.conf` 對齊實際 MIG partition，`File=` 指向真實 `/dev/nvidia*`
+5. Gang Scheduling → 啟用 K8s 1.35 `GangScheduling` feature gate（已完成）
+
+---
+
+## 快速查詢表
+
+| 問題 | 答案 |
+|------|------|
+| Job 能指定 CPU 數量？ | ✅ `--cpus-per-task`、`--ntasks` |
+| Job 能指定 GPU 型號和數量？ | ✅ `--gres=gpu:a10:1` |
+| 同一 CPU worker 能跑多個 job？ | ✅ 排程層（`CR_Core` bin-packing） |
+| CPU 有實體隔離？ | ❌ `task/none`，無 binding/cgroup（Kind 限制） |
+| 同一張 GPU 能讓多個 job 共用？ | ✅ 可透過 time-slicing 或 MIG（需真實 GPU + 額外設定） |
+| GPU core 能跨多張 GPU 分割給同一 job？ | ❌ CUDA 硬體架構根本限制 |
+| Kind 環境的 GPU GRES 是真實硬體？ | ❌ `File=/dev/null`，純排程模擬 |

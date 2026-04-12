@@ -4,15 +4,10 @@ metadata:
   name: slurm-topology
   namespace: slurm
   labels:
-    phase: phase2-e
     topology-role: dual-subnet
-  annotations:
-    slurm.dev/description: "Phase 2-E dual-subnet topology for single-cluster deployment"
 data:
   topology.json: |
     {
-      "schemaVersion": "phase2-e-v1",
-      "description": "Single Kubernetes cluster with kindnet as the primary management network and a Multus-backed data subnet for Slurm-on-K8s.",
       "networkPlanes": [
         {
           "name": "management",
@@ -57,7 +52,7 @@ data:
         {
           "name": "cpu-standard",
           "description": "CPU-only worker pool for general MPI / batch jobs.",
-          "image": "slurm-worker:phase1",
+          "image": "slurm-worker:latest",
           "resources": {
             "requests": {"cpu": "4", "memory": "4Gi"},
             "limits": {"cpu": "4", "memory": "4Gi"}
@@ -69,7 +64,7 @@ data:
         {
           "name": "gpu-a10",
           "description": "GPU worker pool matched by --gres=gpu:a10:* or --constraint=gpu-a10.",
-          "image": "slurm-worker:phase1",
+          "image": "slurm-worker:latest",
           "resources": {
             "requests": {"cpu": "8", "memory": "32Gi"},
             "limits": {"cpu": "8", "memory": "32Gi"}
@@ -81,7 +76,7 @@ data:
         {
           "name": "gpu-h100",
           "description": "GPU worker pool matched by --gres=gpu:h100:* or --constraint=gpu-h100.",
-          "image": "slurm-worker:phase1",
+          "image": "slurm-worker:latest",
           "resources": {
             "requests": {"cpu": "16", "memory": "64Gi"},
             "limits": {"cpu": "16", "memory": "64Gi"}

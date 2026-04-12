@@ -153,13 +153,13 @@ if [[ "$DOCKER_BUILD_NO_CACHE" == "true" ]]; then
   build_flags+=(--no-cache)
 fi
 
-log "building phase1 images..."
-docker build "${build_flags[@]}" -t slurm-controller:phase1 docker/controller
-docker build "${build_flags[@]}" -t slurm-worker:phase1 docker/worker
+log "building core images..."
+docker build "${build_flags[@]}" -t slurm-controller:latest docker/controller
+docker build "${build_flags[@]}" -t slurm-worker:latest docker/worker
 
-log "loading phase1 images to kind..."
-kind load docker-image slurm-controller:phase1 --name "$CLUSTER_NAME"
-kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
+log "loading core images to kind..."
+kind load docker-image slurm-controller:latest --name "$CLUSTER_NAME"
+kind load docker-image slurm-worker:latest --name "$CLUSTER_NAME"
 
 log "rendering core manifests (if generator exists)..."
 if [[ -f scripts/render-core.py ]]; then
@@ -258,10 +258,10 @@ log "waiting for baseline worker rollout (${baseline_worker_sts})..."
 rollout_or_dump "statefulset/${baseline_worker_sts}"
 
 log "building operator image..."
-docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f docker/operator/Dockerfile .
+docker build "${build_flags[@]}" -t slurm-elastic-operator:latest -f docker/operator/Dockerfile .
 
 log "loading operator image to kind..."
-kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
+kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
 
 log "applying operator manifest..."
 kubectl apply -f manifests/operator/slurm-elastic-operator.yaml

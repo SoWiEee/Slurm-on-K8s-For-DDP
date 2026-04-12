@@ -1,15 +1,13 @@
-# Phase 4：可觀測性實作規格
+# 🔭 Observability Spec
 
-## 動機
-
-本專案的核心主張是：Slurm 的批次排程語意 + Kubernetes 的彈性伸縮基礎設施，可以彌補彼此的不足。Phase 4 的目標是讓這個橋接過程**可以被觀測、被量測、被展示**。
+本專案的核心主張是：Slurm 的批次排程語意 + Kubernetes 的彈性伸縮基礎設施，可以彌補彼此的不足。Phase 4 的目標是讓這個橋接過程**可以被觀測、被量測、被展示**。因此實作監控面板，讓「Slurm 語意驅動 K8s 行為」這件事變得可視化，例如：
 
 ```
 Slurm 語意（queue / node states）
         ↓  Operator 橋接
 K8s 行為（StatefulSet replicas / Pod lifecycle）
         ↓
-Prometheus 收集 + Grafana 呈現
+Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 ```
 
 ---
@@ -305,8 +303,6 @@ curl http://localhost:8000/metrics | grep slurm_operator
 
 ## 相關文件
 
-- Phase 4 進度追蹤：README.md § Development Progress
-- Operator 設計：`docs/note.md` § Operator 與部署流程改進
 - prometheus-slurm-exporter：https://github.com/vpenso/prometheus-slurm-exporter
 - kube-state-metrics：https://github.com/kubernetes/kube-state-metrics
 - prometheus_client（Python）：https://github.com/prometheus/client_python

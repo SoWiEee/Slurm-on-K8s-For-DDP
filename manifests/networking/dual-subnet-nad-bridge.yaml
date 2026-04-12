@@ -1,8 +1,7 @@
-# Phase 2-E example secondary networks for a single-cluster dual-subnet demo.
+# Alternative Multus NAD using bridge CNI instead of ptp.
 #
-# This file assumes Multus CNI is already installed in the cluster.
-# On a plain kind cluster, these CRDs will not work until Multus is installed.
-# The chosen CNI here is bridge + host-local so the demo can stay inside a single node.
+# Use this instead of dual-subnet-nad.yaml if your environment requires bridge mode.
+# Requires Multus CNI to be installed before applying.
 ---
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
