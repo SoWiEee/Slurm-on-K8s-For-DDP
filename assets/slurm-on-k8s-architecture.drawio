@@ -1,0 +1,201 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="tI6HObzJ5QflH8vI29uz" name="第 1 页">
+    <mxGraphModel dx="1657" dy="972" grid="0" gridSize="10" guides="1" tooltips="0" connect="0" arrows="0" fold="0" page="0" pageScale="1" pageWidth="1654" pageHeight="1350" background="#F2EFE8" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="border" parent="1" style="rounded=0;arcSize=3;fillColor=none;strokeColor=#B9B3AB;strokeWidth=1.5;pointerEvents=0;" value="" vertex="1">
+          <mxGeometry height="1038" width="1614" x="20" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;overflow=hidden;fontStyle=1;fontSize=32;fontColor=#1F1F1C;" value="叢集架構" vertex="1">
+          <mxGeometry height="52" width="1400" x="80" y="35" as="geometry" />
+        </mxCell>
+        <mxCell id="g_kind" parent="1" style="rounded=1;fillColor=#F6F4EE;strokeColor=#B9B3AB;strokeWidth=1.5;dashed=1;dashPattern=6 6;fontSize=16;fontColor=#7A756E;html=1;verticalAlign=top;spacingTop=10;arcSize=2;" value="&lt;font style=&quot;font-size: 18px;&quot;&gt;Kind Cluster（slurm-lab）&lt;/font&gt;" vertex="1">
+          <mxGeometry height="726" width="1590" x="30" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="g_slurm" parent="1" style="rounded=1;whiteSpace=wrap;arcSize=4;fillColor=#FAF8F4;strokeColor=#8C867F;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#5F5A54;swimlane;startSize=63;horizontal=1;html=1;" value="&lt;font style=&quot;font-size: 22px;&quot;&gt;namespace: slurm&lt;/font&gt;" vertex="1">
+          <mxGeometry height="649" width="960" x="58" y="142" as="geometry" />
+        </mxCell>
+        <mxCell id="n_controller" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#E6E2DA;strokeColor=#8C867F;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-controller&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;StatefulSet × 1&lt;/i&gt;&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;slurmctld | slurmrestd&lt;/i&gt;" vertex="1">
+          <mxGeometry height="100" width="240" x="38" y="114" as="geometry" />
+        </mxCell>
+        <mxCell id="n_login" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EAF4FB;strokeColor=#6FA8D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-login&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;Deployment × 1&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="132" x="27" y="397" as="geometry" />
+        </mxCell>
+        <mxCell id="n_slurmdbd" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EAF4FB;strokeColor=#6FA8D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurmdbd&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;Deployment × 1&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="132" x="159" y="397" as="geometry" />
+        </mxCell>
+        <mxCell id="n_mysql" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EAF4FB;strokeColor=#6FA8D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="mysql&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;StatefulSet × 1&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="133" x="158.5" y="539" as="geometry" />
+        </mxCell>
+        <mxCell id="n_operator" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#D7E6DC;strokeColor=#7FB08F;strokeWidth=2;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-elastic-operator&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;Deployment × 1&lt;/i&gt;&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;Slurm &amp;harr; K8s 橋接&lt;/i&gt;" vertex="1">
+          <mxGeometry height="100" width="260" x="649" y="114" as="geometry" />
+        </mxCell>
+        <mxCell id="n_exporter" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EAF4FB;strokeColor=#6FA8D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-exporter&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;Deployment × 1&lt;/i&gt;&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;REST → Prometheus&lt;/i&gt;" vertex="1">
+          <mxGeometry height="90" width="260" x="336" y="119" as="geometry" />
+        </mxCell>
+        <mxCell id="g_workers" parent="g_slurm" style="rounded=1;fillColor=#F0EDE6;strokeColor=#B9B3AB;strokeWidth=1.5;dashed=1;dashPattern=6 6;fontSize=16;fontColor=#7A756E;html=1;verticalAlign=top;spacingTop=10;" value="&lt;font style=&quot;font-size: 18px;&quot;&gt;Worker Pools（彈性伸縮）&lt;/font&gt;" vertex="1">
+          <mxGeometry height="170" width="628" x="315" y="416" as="geometry" />
+        </mxCell>
+        <mxCell id="n_worker_h100" parent="g_slurm" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#E6E2DA;strokeColor=#8C867F;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-worker-gpu-h100&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;StatefulSet 0–4&lt;/i&gt;" vertex="1">
+          <mxGeometry height="50.900000000000006" width="200" x="726" y="474.0005135208959" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="g_slurm" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7FB08F;strokeWidth=1.8;rounded=1;" target="n_worker_h100" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="874" y="215" />
+              <mxPoint x="874" y="383" />
+              <mxPoint x="764" y="383" />
+            </Array>
+            <mxPoint x="874" y="215" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="g_slurm" source="n_controller" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#9A948C;strokeWidth=1.6;rounded=1;fontSize=13;exitX=0.561;exitY=0.995;exitDx=0;exitDy=0;exitPerimeter=0;" target="n_slurmdbd" value="accounting">
+          <mxGeometry relative="1" x="0.6137" y="2" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="173" y="229" />
+              <mxPoint x="172" y="229" />
+              <mxPoint x="172" y="314" />
+              <mxPoint x="225" y="314" />
+            </Array>
+            <mxPoint x="160" y="229" as="sourcePoint" />
+            <mxPoint x="225" y="397" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="g_monitoring" parent="1" style="rounded=1;whiteSpace=wrap;arcSize=4;fillColor=#FAF8F4;strokeColor=#8C867F;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#5F5A54;swimlane;startSize=63;horizontal=1;html=1;" value="&lt;font style=&quot;font-size: 22px;&quot;&gt;namespace: monitoring&lt;/font&gt;" vertex="1">
+          <mxGeometry height="357" width="527" x="1053" y="142" as="geometry" />
+        </mxCell>
+        <mxCell id="n_prometheus" parent="g_monitoring" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#E6E2DA;strokeColor=#8C867F;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="Prometheus&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;:9090&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="190" x="40" y="129" as="geometry" />
+        </mxCell>
+        <mxCell id="n_grafana" parent="g_monitoring" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EEEAF9;strokeColor=#9A90D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="Grafana&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;:3000&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="150" x="357" y="129" as="geometry" />
+        </mxCell>
+        <mxCell id="n_ksm" parent="g_monitoring" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EAF4FB;strokeColor=#6FA8D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="kube-state-metrics&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;:8080&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="200" x="35" y="265" as="geometry" />
+        </mxCell>
+        <mxCell id="n_alertmanager" parent="g_monitoring" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#F3E4DA;strokeColor=#C88E6A;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="Alertmanager&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;:9093&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="152" x="356" y="265" as="geometry" />
+        </mxCell>
+        <mxCell id="g_nfs_prov" parent="1" style="rounded=1;whiteSpace=wrap;arcSize=4;fillColor=#FAF8F4;strokeColor=#8C867F;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#5F5A54;swimlane;startSize=63;horizontal=1;html=1;" value="&lt;font style=&quot;font-size: 22px;&quot;&gt;namespace: nfs-provisioner&lt;/font&gt;" vertex="1">
+          <mxGeometry height="189" width="524" x="1053" y="527" as="geometry" />
+        </mxCell>
+        <mxCell id="n_nfs_prov" parent="g_nfs_prov" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#EAF4FB;strokeColor=#6FA8D6;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="nfs-subdir-provisioner&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;Deployment × 1&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="230" x="170" y="90" as="geometry" />
+        </mxCell>
+        <mxCell id="g_windows" parent="1" style="rounded=1;whiteSpace=wrap;arcSize=4;fillColor=#F3E4DA;strokeColor=#C88E6A;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#5F5A54;swimlane;startSize=63;horizontal=1;html=1;" value="&lt;font style=&quot;font-size: 22px;&quot;&gt;Windows 主機（WSL2）&lt;/font&gt;" vertex="1">
+          <mxGeometry height="179" width="430" x="1123" y="848" as="geometry" />
+        </mxCell>
+        <mxCell id="n_nfs_server" parent="g_windows" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#F3E4DA;strokeColor=#C88E6A;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="NFS Server&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;/srv/nfs/k8s&lt;/i&gt;" vertex="1">
+          <mxGeometry height="70" width="190" x="120" y="81" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="n_login" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7A756E;strokeWidth=1.8;rounded=1;fontSize=13;" target="n_controller" value="sbatch / srun :6817">
+          <mxGeometry relative="1" x="-0.6126" y="-8" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="151" y="455" />
+              <mxPoint x="205" y="455" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="n_operator" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7A756E;strokeWidth=1.8;rounded=1;fontSize=13;entryX=0.84;entryY=0.993;entryDx=0;entryDy=0;entryPerimeter=0;exitX=0.161;exitY=1.001;exitDx=0;exitDy=0;exitPerimeter=0;" target="n_controller" value="REST API :6820">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="749" y="392" />
+              <mxPoint x="297" y="392" />
+              <mxPoint x="297" y="355" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="n_operator" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7FB08F;strokeWidth=1.8;rounded=1;fontSize=13;exitX=0.405;exitY=0.986;exitDx=0;exitDy=0;exitPerimeter=0;" target="n_worker_cpu" value="patch replicas">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="812" y="452" />
+              <mxPoint x="631" y="452" />
+              <mxPoint x="631" y="525" />
+              <mxPoint x="467" y="525" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="n_operator" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7FB08F;strokeWidth=1.8;rounded=1;" target="n_worker_a10" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="880" y="488" />
+              <mxPoint x="681" y="488" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="n_exporter" style="endArrow=open;edgeStyle=orthogonalEdgeStyle;strokeColor=#9A948C;strokeWidth=1.6;rounded=0;dashPattern=6 6;fontSize=13;entryX=0.608;entryY=-0.018;entryDx=0;entryDy=0;entryPerimeter=0;exitX=0.392;exitY=-0.006;exitDx=0;exitDy=0;exitPerimeter=0;" target="n_controller" value="metrics :6820">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="496" y="231" />
+              <mxPoint x="242" y="231" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="n_slurmdbd" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#9A948C;strokeWidth=1.6;rounded=1;fontSize=13;" target="n_mysql" value=":3306">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="n_prometheus" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7FB08F;strokeWidth=1.8;rounded=1;fontSize=13;" target="n_exporter" value="scrape :9341">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1183" y="230" />
+              <mxPoint x="559" y="230" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="n_prometheus" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7FB08F;strokeWidth=1.8;rounded=1;fontSize=13;entryX=1.001;entryY=0.504;entryDx=0;entryDy=0;entryPerimeter=0;" target="n_operator" value="scrape :8000">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="982" y="306" />
+              <mxPoint x="962" y="307" />
+            </Array>
+            <mxPoint x="963" y="312" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="n_prometheus" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7FB08F;strokeWidth=1.8;rounded=1;fontSize=13;" target="n_ksm" value="scrape :8080">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="n_prometheus" style="endArrow=open;edgeStyle=orthogonalEdgeStyle;strokeColor=#C88E6A;strokeWidth=1.6;rounded=0;dashPattern=6 6;fontSize=13;curved=1;entryX=-0.014;entryY=0.506;entryDx=0;entryDy=0;entryPerimeter=0;" target="n_alertmanager" value="alerts">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1319" y="306" />
+              <mxPoint x="1319" y="442" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="1" source="n_grafana" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#7A756E;strokeWidth=1.8;rounded=1;fontSize=13;" target="n_prometheus" value="query :9090">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" edge="1" parent="1" source="n_nfs_server" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#C88E6A;strokeWidth=1.8;rounded=1;dashed=1;dashPattern=6 6;fontSize=13;" target="n_nfs_prov" value="NFS mount">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" parent="1" source="n_nfs_prov" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#9A948C;strokeWidth=1.6;rounded=1;dashed=1;dashPattern=6 6;fontSize=13;" target="n_worker_cpu" value="PVC /shared">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="481" y="705" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e16" edge="1" parent="1" source="n_nfs_prov" style="endArrow=open;endSize=14;edgeStyle=orthogonalEdgeStyle;strokeColor=#9A948C;strokeWidth=1.6;rounded=1;dashed=1;dashPattern=6 6;fontSize=13;" target="n_controller" value="PVC ctld-state">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1270" y="762" />
+              <mxPoint x="366" y="762" />
+              <mxPoint x="366" y="321" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n_worker_a10" parent="1" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#E6E2DA;strokeColor=#8C867F;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-worker-gpu-a10&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;StatefulSet 0–4&lt;/i&gt;" vertex="1">
+          <mxGeometry height="50.900000000000006" width="200" x="584" y="615.8528571428571" as="geometry" />
+        </mxCell>
+        <mxCell id="n_worker_cpu" parent="1" style="rounded=1;whiteSpace=wrap;arcSize=10;fillColor=#E6E2DA;strokeColor=#8C867F;strokeWidth=1.8;fontColor=#2D2B28;fontSize=16;html=1;" value="slurm-worker-cpu&lt;br&gt;&lt;i style=&quot;font-size:13px&quot;&gt;StatefulSet 1–4&lt;/i&gt;" vertex="1">
+          <mxGeometry height="50.900000000000006" width="200" x="384" y="615.85" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
