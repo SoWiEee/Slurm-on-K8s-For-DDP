@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# bootstrap-phase4.sh — Deploy the Phase 4 monitoring stack
+# bootstrap-monitoring.sh — Deploy the monitoring stack (Prometheus + Grafana + exporters)
 #
-# Prerequisites: Phase 1 + Phase 2 deployed (Phase 3 optional but recommended).
+# Prerequisites: core cluster deployed (bootstrap.sh); NFS storage optional but recommended.
 # What this script does:
 #   1. Verify prerequisites
 #   2. Build and load slurm-exporter image into Kind
@@ -22,7 +22,7 @@ KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
 
-log() { echo "[phase4 bootstrap] $*"; }
+log() { echo "[bootstrap-monitoring] $*"; }
 
 if ! kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$"; then
   echo "kubectl context ${KUBE_CONTEXT} not found" >&2
@@ -34,13 +34,13 @@ kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 # ----- prerequisites --------------------------------------------------------
 log "checking prerequisites..."
 if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu >/dev/null 2>&1; then
-  echo "Phase 1 resources not found in namespace ${NAMESPACE}." >&2
-  echo "Run scripts/bootstrap-dev.sh first." >&2
+  echo "Cluster resources not found in namespace ${NAMESPACE}." >&2
+  echo "Run scripts/bootstrap.sh first." >&2
   exit 1
 fi
 if ! kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator >/dev/null 2>&1; then
-  echo "Phase 2 operator not found in namespace ${NAMESPACE}." >&2
-  echo "Run scripts/bootstrap-dev.sh first." >&2
+  echo "Operator not found in namespace ${NAMESPACE}." >&2
+  echo "Run scripts/bootstrap.sh first." >&2
   exit 1
 fi
 log "prerequisites OK."
@@ -54,8 +54,8 @@ fi
 log "building slurm-exporter image..."
 docker build "${build_flags[@]}" \
   -t slurm-exporter:phase4 \
-  -f phase4/docker/slurm-exporter/Dockerfile \
-  phase4/docker/slurm-exporter
+  -f docker/slurm-exporter/Dockerfile \
+  docker/slurm-exporter
 
 log "loading slurm-exporter image to kind..."
 kind load docker-image slurm-exporter:phase4 --name "$CLUSTER_NAME"
@@ -63,47 +63,47 @@ kind load docker-image slurm-exporter:phase4 --name "$CLUSTER_NAME"
 log "rebuilding operator image (adds prometheus-client)..."
 docker build "${build_flags[@]}" \
   -t slurm-elastic-operator:phase2 \
-  -f phase2/docker/operator/Dockerfile .
+  -f docker/operator/Dockerfile .
 
 log "loading operator image to kind..."
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
 # ----- monitoring namespace + kube-state-metrics ----------------------------
 log "applying monitoring namespace..."
-kubectl apply -f phase4/manifests/monitoring-namespace.yaml
+kubectl apply -f manifests/monitoring/monitoring-namespace.yaml
 
 log "applying kube-state-metrics..."
-kubectl apply -f phase4/manifests/kube-state-metrics/kube-state-metrics.yaml
+kubectl apply -f manifests/monitoring/kube-state-metrics/kube-state-metrics.yaml
 
 # ----- prometheus ------------------------------------------------------------
 log "applying prometheus alert rules..."
-kubectl apply -f phase4/manifests/prometheus/alert-rules-cm.yaml
+kubectl apply -f manifests/monitoring/prometheus/alert-rules-cm.yaml
 
 log "applying prometheus config + deployment..."
-kubectl apply -f phase4/manifests/prometheus/prometheus-config.yaml
-kubectl apply -f phase4/manifests/prometheus/prometheus-deployment.yaml
+kubectl apply -f manifests/monitoring/prometheus/prometheus-config.yaml
+kubectl apply -f manifests/monitoring/prometheus/prometheus-deployment.yaml
 
 # ----- alertmanager ----------------------------------------------------------
 log "applying alertmanager..."
-kubectl apply -f phase4/manifests/alertmanager/alertmanager.yaml
+kubectl apply -f manifests/monitoring/alertmanager/alertmanager.yaml
 
 # ----- grafana ---------------------------------------------------------------
 log "applying grafana provisioning + dashboards + deployment..."
-kubectl apply -f phase4/manifests/grafana/grafana-provisioning-cm.yaml
-kubectl apply -f phase4/manifests/grafana/grafana-dashboards-cm.yaml
-kubectl apply -f phase4/manifests/grafana/grafana-deployment.yaml
+kubectl apply -f manifests/monitoring/grafana/grafana-provisioning-cm.yaml
+kubectl apply -f manifests/monitoring/grafana/grafana-dashboards-cm.yaml
+kubectl apply -f manifests/monitoring/grafana/grafana-deployment.yaml
 
 # ----- slurm-exporter (in slurm namespace) -----------------------------------
 log "applying slurm-exporter..."
-kubectl apply -f phase4/manifests/slurm-exporter/slurm-exporter-deployment.yaml
+kubectl apply -f manifests/monitoring/slurm-exporter/slurm-exporter-deployment.yaml
 
 # ----- network policies (allow prometheus → slurm namespace) -----------------
 log "applying monitoring network policies..."
-kubectl apply -f phase4/manifests/network-policy-monitoring.yaml
+kubectl apply -f manifests/networking/network-policy-monitoring.yaml
 
 # ----- update operator manifest (adds metrics port + service) ----------------
 log "applying updated operator manifest (metrics port + service)..."
-kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
+kubectl apply -f manifests/operator/slurm-elastic-operator.yaml
 
 # ----- restart operator so new image (with prometheus-client) is used --------
 log "restarting operator deployment..."

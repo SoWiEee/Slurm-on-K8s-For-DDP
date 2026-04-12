@@ -5,9 +5,9 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-CFG = ROOT / "phase1" / "manifests" / "worker-pools.json"
-OUT = ROOT / "phase1" / "manifests" / "slurm-static.yaml"
+ROOT = Path(__file__).resolve().parents[1]
+CFG = ROOT / "manifests" / "core" / "worker-pools.json"
+OUT = ROOT / "manifests" / "core" / "slurm-static.yaml"
 
 
 def indent(text: str, n: int) -> str:
@@ -110,12 +110,12 @@ def main() -> int:
     parser.add_argument(
         "--with-shared-storage",
         action="store_true",
-        help="Include /shared NFS volumeMount and PVC volume in all StatefulSets (Phase 3+)",
+        help="Include /shared NFS volumeMount and PVC volume in all StatefulSets",
     )
     parser.add_argument(
         "--with-lmod",
         action="store_true",
-        help="Mount Lmod modulefile ConfigMaps into /opt/modulefiles on worker+login pods (Phase 5+)",
+        help="Mount Lmod modulefile ConfigMaps into /opt/modulefiles on worker+login pods",
     )
     args = parser.parse_args()
 

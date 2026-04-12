@@ -11,7 +11,7 @@ FORCE_RECREATE=${FORCE_RECREATE:-false}
 REGENERATE_SECRETS=${REGENERATE_SECRETS:-false}
 
 log() {
-  echo "[dev bootstrap] $*"
+  echo "[bootstrap] $*"
 }
 
 require_tool() {
@@ -21,7 +21,7 @@ require_tool() {
 rollout_or_dump() {
   local kindname="$1"
   if ! kubectl -n "$NAMESPACE" rollout status "$kindname" --timeout="$ROLLOUT_TIMEOUT"; then
-    echo "[dev bootstrap] rollout failed for $kindname, collecting diagnostics..." >&2
+    echo "[bootstrap] rollout failed for $kindname, collecting diagnostics..." >&2
     kubectl -n "$NAMESPACE" get all -o wide >&2 || true
     kubectl -n "$NAMESPACE" describe "$kindname" >&2 || true
     kubectl -n "$NAMESPACE" describe pods >&2 || true
@@ -48,7 +48,7 @@ wait_slurm_ready() {
       break
     fi
     if (( $(date +%s) >= deadline )); then
-      echo "[dev bootstrap] slurmctld did not become responsive in time" >&2
+      echo "[bootstrap] slurmctld did not become responsive in time" >&2
       kubectl -n "$NAMESPACE" logs "pod/${controller_pod}" --tail=200 >&2 || true
       exit 1
     fi
@@ -79,15 +79,15 @@ validate_live_commands() {
   local live
   live=$(kubectl -n "$NAMESPACE" get "$res" -o jsonpath='{.spec.template.spec.containers[0].command[0]}' 2>/dev/null || true)
   if [[ "$live" != "$expected" ]]; then
-    echo "[dev bootstrap] ERROR: live $res container command[0]='$live' expected '$expected'" >&2
+    echo "[bootstrap] ERROR: live $res container command[0]='$live' expected '$expected'" >&2
     kubectl -n "$NAMESPACE" get "$res" -o yaml >&2 || true
     exit 1
   fi
 }
 
 validate_rendered_manifest() {
-  if ! grep -q '^\s*command:$' phase1/manifests/slurm-static.yaml; then
-    echo "[dev bootstrap] ERROR: rendered slurm-static.yaml does not contain explicit command blocks" >&2
+  if ! grep -q '^\s*command:$' manifests/core/slurm-static.yaml; then
+    echo "[bootstrap] ERROR: rendered slurm-static.yaml does not contain explicit command blocks" >&2
     exit 1
   fi
 }
@@ -126,7 +126,7 @@ validate_live_operator_config() {
   local part_json
   part_json=$(kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value}' 2>/dev/null || true)
   if [[ -z "$part_json" ]]; then
-    echo "[dev bootstrap] ERROR: live slurm-elastic-operator deployment does not contain PARTITIONS_JSON" >&2
+    echo "[bootstrap] ERROR: live slurm-elastic-operator deployment does not contain PARTITIONS_JSON" >&2
     kubectl -n "$NAMESPACE" get deployment slurm-elastic-operator -o yaml >&2 || true
     exit 1
   fi
@@ -154,46 +154,46 @@ if [[ "$DOCKER_BUILD_NO_CACHE" == "true" ]]; then
 fi
 
 log "building phase1 images..."
-docker build "${build_flags[@]}" -t slurm-controller:phase1 phase1/docker/controller
-docker build "${build_flags[@]}" -t slurm-worker:phase1 phase1/docker/worker
+docker build "${build_flags[@]}" -t slurm-controller:phase1 docker/controller
+docker build "${build_flags[@]}" -t slurm-worker:phase1 docker/worker
 
 log "loading phase1 images to kind..."
 kind load docker-image slurm-controller:phase1 --name "$CLUSTER_NAME"
 kind load docker-image slurm-worker:phase1 --name "$CLUSTER_NAME"
 
-log "rendering phase1 manifests (if generator exists)..."
-if [[ -f phase1/scripts/render-slurm-static.py ]]; then
+log "rendering core manifests (if generator exists)..."
+if [[ -f scripts/render-core.py ]]; then
   render_flags=(--with-lmod)
   if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
     render_flags+=(--with-shared-storage)
-    log "phase3 NFS PVC detected — rendering with shared storage"
+    log "NFS PVC detected — rendering with shared storage"
   fi
   render_rc=0
-  "$PYTHON" phase1/scripts/render-slurm-static.py "${render_flags[@]}" || render_rc=$?
-  if [[ ! -s phase1/manifests/slurm-static.yaml ]]; then
-    echo "[dev bootstrap] ERROR: render script failed and phase1/manifests/slurm-static.yaml is missing or empty" >&2
+  "$PYTHON" scripts/render-core.py "${render_flags[@]}" || render_rc=$?
+  if [[ ! -s manifests/core/slurm-static.yaml ]]; then
+    echo "[bootstrap] ERROR: render script failed and manifests/core/slurm-static.yaml is missing or empty" >&2
     exit "${render_rc:-1}"
   fi
-  if ! grep -q '^kind: StatefulSet$' phase1/manifests/slurm-static.yaml; then
-    echo "[dev bootstrap] ERROR: rendered slurm-static.yaml looks incomplete" >&2
+  if ! grep -q '^kind: StatefulSet$' manifests/core/slurm-static.yaml; then
+    echo "[bootstrap] ERROR: rendered slurm-static.yaml looks incomplete" >&2
     exit 1
   fi
   if [[ ${render_rc:-0} -ne 0 ]]; then
-    echo "[dev bootstrap] warning: render script exited with code ${render_rc}, but output file exists; continuing"
+    echo "[bootstrap] warning: render script exited with code ${render_rc}, but output file exists; continuing"
   fi
-  log "phase1 manifests rendered."
+  log "core manifests rendered."
 fi
 
 validate_rendered_manifest
 
 log "creating/applying secrets..."
-REGENERATE_SECRETS="$REGENERATE_SECRETS" phase1/scripts/create-secrets.sh "$NAMESPACE"
-log "applying phase1 manifests..."
-kubectl apply -f phase1/manifests/slurm-ddp-runtime.yaml
+REGENERATE_SECRETS="$REGENERATE_SECRETS" scripts/create-secrets.sh "$NAMESPACE"
+log "applying core manifests..."
+kubectl apply -f manifests/core/slurm-ddp-runtime.yaml
 # Lmod modulefile ConfigMaps (openmpi, python3, cuda stubs).
 # Declared optional in slurm-static.yaml so pods start even if applied late.
-if [[ -f phase1/manifests/lmod-modulefiles.yaml ]]; then
-  kubectl apply -f phase1/manifests/lmod-modulefiles.yaml
+if [[ -f manifests/core/lmod-modulefiles.yaml ]]; then
+  kubectl apply -f manifests/core/lmod-modulefiles.yaml
 fi
 
 # Remove obsolete single-pool resources from older layouts.
@@ -211,9 +211,9 @@ if [[ "$FORCE_RECREATE" == "true" ]]; then
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true >/dev/null 2>&1 || true
 fi
 
-kubectl apply -f phase1/manifests/slurm-static.yaml
-if [[ -f phase1/manifests/slurm-login.yaml ]]; then
-  kubectl apply -f phase1/manifests/slurm-login.yaml
+kubectl apply -f manifests/core/slurm-static.yaml
+if [[ -f manifests/core/slurm-login.yaml ]]; then
+  kubectl apply -f manifests/core/slurm-login.yaml
 fi
 
 validate_live_commands statefulset/slurm-controller /bin/bash
@@ -257,15 +257,15 @@ wait_slurm_ready "$controller_pod"
 log "waiting for baseline worker rollout (${baseline_worker_sts})..."
 rollout_or_dump "statefulset/${baseline_worker_sts}"
 
-log "building phase2 operator image..."
-docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f phase2/docker/operator/Dockerfile .
+log "building operator image..."
+docker build "${build_flags[@]}" -t slurm-elastic-operator:phase2 -f docker/operator/Dockerfile .
 
-log "loading phase2 image to kind..."
+log "loading operator image to kind..."
 kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
 
-log "applying phase2 operator manifest..."
-kubectl apply -f phase2/manifests/slurm-phase2-operator.yaml
-kubectl apply -f phase2/manifests/network-policy.yaml
+log "applying operator manifest..."
+kubectl apply -f manifests/operator/slurm-elastic-operator.yaml
+kubectl apply -f manifests/networking/network-policy.yaml
 operator_force_env
 validate_live_operator_config
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
@@ -282,9 +282,9 @@ rollout_or_dump "statefulset/${baseline_worker_sts}"
 if kubectl -n "$NAMESPACE" get deployment slurm-login >/dev/null 2>&1; then
   rollout_or_dump deployment/slurm-login
   if ! kubectl -n "$NAMESPACE" exec deploy/slurm-login -- bash -lc 'scontrol ping >/dev/null 2>&1'; then
-    echo "[dev bootstrap] warning: slurm-login cannot yet reach slurmctld" >&2
+    echo "[bootstrap] warning: slurm-login cannot yet reach slurmctld" >&2
     kubectl -n "$NAMESPACE" logs deploy/slurm-login --tail=100 >&2 || true
   fi
 fi
 
-log "done. phase1 + phase2 deployed on context: ${KUBE_CONTEXT}"
+log "done. cluster deployed on context: ${KUBE_CONTEXT}"

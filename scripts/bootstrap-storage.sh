@@ -26,10 +26,10 @@ NFS_SERVER is required.
 
 Examples:
   # If your Kind/Docker can resolve it (often works on Docker Desktop):
-  NFS_SERVER=host.docker.internal NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+  NFS_SERVER=host.docker.internal NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
 
   # Or use an IP reachable from Kind containers:
-  NFS_SERVER=192.168.x.y NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+  NFS_SERVER=192.168.x.y NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
 USAGE
   exit 1
 fi
@@ -47,19 +47,19 @@ if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
 fi
 
 if ! kubectl -n "$NAMESPACE" get statefulset slurm-controller slurm-worker-cpu >/dev/null 2>&1; then
-  echo "Phase 1 resources not found in namespace ${NAMESPACE}. run scripts/bootstrap-dev.sh first." >&2
+  echo "Cluster resources not found in namespace ${NAMESPACE}. run scripts/bootstrap.sh first." >&2
   exit 1
 fi
 
 rendered_manifest=$(mktemp)
 trap 'rm -f "$rendered_manifest"' EXIT
 
-sed -e "s|__NFS_SERVER__|${NFS_SERVER}|g"     -e "s|__NFS_PATH__|${NFS_PATH}|g"     phase3/manifests/nfs-subdir-provisioner.tmpl.yaml > "$rendered_manifest"
+sed -e "s|__NFS_SERVER__|${NFS_SERVER}|g"     -e "s|__NFS_PATH__|${NFS_PATH}|g"     manifests/storage/nfs-subdir-provisioner.tmpl.yaml > "$rendered_manifest"
 
 kubectl apply -f "$rendered_manifest"
 kubectl -n "$PROVISIONER_NAMESPACE" rollout status deployment/nfs-subdir-external-provisioner --timeout="$ROLLOUT_TIMEOUT"
 
-kubectl apply -f phase3/manifests/shared-storage.yaml
+kubectl apply -f manifests/storage/shared-storage.yaml
 
 # NOTE: PVC "Bound" is a phase (status.phase), not a Condition, so `kubectl wait --for=condition=Bound pvc/...`
 # can time out even when the PVC is already Bound. Use a polling loop on .status.phase instead.
@@ -93,16 +93,16 @@ while true; do
 done
 
 # Regenerate slurm-static.yaml with the /shared NFS volume baked in, then apply it.
-# This is persistent: subsequent bootstrap-dev.sh or bootstrap-phase2.sh re-runs will
-# detect the PVC and call render-slurm-static.py --with-shared-storage automatically,
-# so the NFS mount survives any future kubectl apply of slurm-static.yaml.
+# This is persistent: subsequent bootstrap.sh re-runs will detect the PVC and call
+# render-core.py --with-shared-storage automatically, so the NFS mount survives any
+# future kubectl apply of slurm-static.yaml.
 echo "Regenerating slurm-static.yaml with --with-lmod --with-shared-storage..."
-"$PYTHON" phase1/scripts/render-slurm-static.py --with-lmod --with-shared-storage
-kubectl apply -f phase1/manifests/slurm-static.yaml
+"$PYTHON" scripts/render-core.py --with-lmod --with-shared-storage
+kubectl apply -f manifests/core/slurm-static.yaml
 
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-controller --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status statefulset/slurm-worker-cpu --timeout="$ROLLOUT_TIMEOUT"
 kubectl -n "$NAMESPACE" rollout status deployment/slurm-login --timeout="$ROLLOUT_TIMEOUT"
 
-echo "Phase 3 storage deployment completed."
+echo "Storage deployment completed."
 echo "NFS_SERVER=${NFS_SERVER}, NFS_PATH=${NFS_PATH}"

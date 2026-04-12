@@ -88,7 +88,7 @@ graph TD
 
 ## 3. Phase 1 — 靜態 Slurm 叢集
 
-Phase 1 建立基本的 Slurm 叢集骨架。所有物件定義在 `phase1/manifests/slurm-static.yaml`（由 `phase1/scripts/render-slurm-static.py` 生成）。
+Phase 1 建立基本的 Slurm 叢集骨架。所有物件定義在 `manifests/core/slurm-static.yaml`（由 `scripts/render-core.py` 生成）。
 
 ### 3.1 Workloads
 
@@ -181,7 +181,7 @@ slurm-worker-cpu-0.slurm-worker-cpu.slurm.svc.cluster.local
 
 ### 3.4 Secrets
 
-Secrets 由 `phase1/scripts/create-secrets.sh` 在本機生成並上傳到 K8s。
+Secrets 由 `scripts/create-secrets.sh` 在本機生成並上傳到 K8s。
 
 | Secret 名稱 | 內容 | 用途 |
 |------------|------|------|
@@ -202,7 +202,7 @@ Phase 2 加入 Python Operator，讓叢集能根據 Slurm 佇列自動縮放 wor
 | 欄位 | 值 |
 |------|-----|
 | Image | `slurm-elastic-operator:phase2` |
-| 主要程序 | `phase2/operator/main.py`（Python polling loop） |
+| 主要程序 | `operator/main.py`（Python polling loop） |
 | Poll 間隔 | 15 秒（`POLL_INTERVAL_SECONDS`） |
 | 查詢方式 | slurmrestd REST API（失敗時 fallback 到 kubectl exec） |
 
@@ -520,7 +520,7 @@ flowchart LR
 ```bash
 kubectl -n monitoring port-forward svc/grafana 3000:3000     # Grafana（admin/admin）
 kubectl -n monitoring port-forward svc/prometheus 9090:9090  # Prometheus
-bash phase4/scripts/verify-phase4.sh                         # 驗證所有 metrics endpoint
+bash scripts/verify-monitoring.sh                            # 驗證所有 metrics endpoint
 ```
 
 ---
@@ -554,7 +554,7 @@ kubectl -n slurm get pvc slurm-shared-rwx
 kubectl -n nfs-provisioner get pods
 
 # 強制重跑全部部署
-bash scripts/bootstrap-dev.sh
+bash scripts/bootstrap.sh
 
 # 刪除叢集重來
 kind delete cluster --name slurm-lab
