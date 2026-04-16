@@ -3,8 +3,5 @@ Dockerfile text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
-/phase1/scripts/*.sh linguist-vendored
-/phase2/scripts/*.sh linguist-vendored
-/phase3/scripts/*.sh linguist-vendored
-/phase4/scripts/*.sh linguist-vendored
+
 /scripts/*.sh linguist-vendored

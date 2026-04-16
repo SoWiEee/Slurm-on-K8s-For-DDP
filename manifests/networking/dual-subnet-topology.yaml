@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-topology
+  namespace: slurm
+  labels:
+    topology-role: dual-subnet
+data:
+  topology.json: |
+    {
+      "networkPlanes": [
+        {
+          "name": "management",
+          "attachment": "kindnet-primary",
+          "subnet": "10.244.0.0/24",
+          "purpose": ["slurm-control", "ssh", "kubectl", "health-check"]
+        },
+        {
+          "name": "data",
+          "attachment": "slurm-data-net",
+          "subnet": "192.168.20.0/24",
+          "purpose": ["ddp", "mpi", "checkpoint-io", "east-west-worker-traffic"]
+        }
+      ],
+      "podRoles": [
+        {
+          "name": "controller",
+          "workloads": ["slurm-controller"],
+          "networks": ["management"],
+          "reason": "Keep Slurm control traffic on the default primary pod network provided by kindnet."
+        },
+        {
+          "name": "operator",
+          "workloads": ["slurm-elastic-operator"],
+          "networks": ["management"],
+          "reason": "Operator talks to Kubernetes and Slurm control plane only, so the primary kindnet attachment is sufficient."
+        },
+        {
+          "name": "login",
+          "workloads": ["slurm-login"],
+          "networks": ["management", "data"],
+          "reason": "Login node keeps its primary kindnet path for control-plane access and gets a secondary data-plane NIC for diagnostics and launch wrappers."
+        },
+        {
+          "name": "worker",
+          "workloads": ["slurm-worker-cpu", "slurm-worker-gpu-a10", "slurm-worker-gpu-h100"],
+          "networks": ["management", "data"],
+          "reason": "Workers keep the primary kindnet path for slurmd and add a secondary data path for DDP/MPI/checkpoint flows."
+        }
+      ],
+      "workerClasses": [
+        {
+          "name": "cpu-standard",
+          "description": "CPU-only worker pool for general MPI / batch jobs.",
+          "image": "slurm-worker:latest",
+          "resources": {
+            "requests": {"cpu": "4", "memory": "4Gi"},
+            "limits": {"cpu": "4", "memory": "4Gi"}
+          },
+          "slurmFeatures": ["cpu", "baseline"],
+          "gres": [],
+          "preferredDataInterface": "net2"
+        },
+        {
+          "name": "gpu-a10",
+          "description": "GPU worker pool matched by --gres=gpu:a10:* or --constraint=gpu-a10.",
+          "image": "slurm-worker:latest",
+          "resources": {
+            "requests": {"cpu": "8", "memory": "32Gi"},
+            "limits": {"cpu": "8", "memory": "32Gi"}
+          },
+          "slurmFeatures": ["gpu", "gpu-a10"],
+          "gres": ["gpu", "gpu:a10:1"],
+          "preferredDataInterface": "net2"
+        },
+        {
+          "name": "gpu-h100",
+          "description": "GPU worker pool matched by --gres=gpu:h100:* or --constraint=gpu-h100.",
+          "image": "slurm-worker:latest",
+          "resources": {
+            "requests": {"cpu": "16", "memory": "64Gi"},
+            "limits": {"cpu": "16", "memory": "64Gi"}
+          },
+          "slurmFeatures": ["gpu", "gpu-h100"],
+          "gres": ["gpu", "gpu:h100:1"],
+          "preferredDataInterface": "net2"
+        }
+      ],
+      "nodeSets": [
+        {
+          "name": "cpu-workers",
+          "workerClass": "cpu-standard",
+          "partition": "debug",
+          "statefulset": "slurm-worker-cpu",
+          "serviceName": "slurm-worker-cpu",
+          "nodeNamePrefix": "slurm-worker-cpu",
+          "minReplicas": 1,
+          "maxReplicas": 4,
+          "scaleUpStep": 1,
+          "scaleDownStep": 1,
+          "scaleDownCooldownSeconds": 60,
+          "checkpointPath": "",
+          "maxCheckpointAgeSeconds": 600,
+          "networks": ["management", "data"]
+        },
+        {
+          "name": "gpu-a10-workers",
+          "workerClass": "gpu-a10",
+          "partition": "debug",
+          "statefulset": "slurm-worker-gpu-a10",
+          "serviceName": "slurm-worker-gpu-a10",
+          "nodeNamePrefix": "slurm-worker-gpu-a10",
+          "minReplicas": 0,
+          "maxReplicas": 4,
+          "scaleUpStep": 1,
+          "scaleDownStep": 1,
+          "scaleDownCooldownSeconds": 120,
+          "checkpointPath": "",
+          "maxCheckpointAgeSeconds": 600,
+          "networks": ["management", "data"]
+        },
+        {
+          "name": "gpu-h100-workers",
+          "workerClass": "gpu-h100",
+          "partition": "debug",
+          "statefulset": "slurm-worker-gpu-h100",
+          "serviceName": "slurm-worker-gpu-h100",
+          "nodeNamePrefix": "slurm-worker-gpu-h100",
+          "minReplicas": 0,
+          "maxReplicas": 4,
+          "scaleUpStep": 1,
+          "scaleDownStep": 1,
+          "scaleDownCooldownSeconds": 120,
+          "checkpointPath": "",
+          "maxCheckpointAgeSeconds": 600,
+          "networks": ["management", "data"]
+        }
+      ],
+      "verifyTargets": {
+        "runtimePods": ["slurm-login", "slurm-worker-cpu", "slurm-worker-gpu-a10", "slurm-worker-gpu-h100"],
+        "requiredNetworkInterfaces": ["eth0", "net2"],
+        "expectedAttachments": ["slurm-data-net"]
+      }
+    }

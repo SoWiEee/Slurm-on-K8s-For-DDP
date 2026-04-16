@@ -1,0 +1,397 @@
+# NetworkPolicy for the slurm namespace.
+#
+# Strategy:
+#   Ingress — default-deny all, then whitelist documented communication paths.
+#   Egress  — default-deny all, then whitelist only what each pod type needs:
+#               • DNS (kube-dns UDP/TCP 53) — all pods
+#               • operator  → K8s API (TCP 443) + controller slurmrestd (TCP 6820)
+#               • controller→ workers (TCP 6818/22) + login (TCP 22) + NFS (TCP 2049)
+#               • workers   → controller (any port) + inter-worker MPI (any port)
+#                             + login (any port, srun step I/O callback) + NFS (TCP 2049)
+#               • login     → controller (TCP 6817/6820/22) + workers (TCP 6818/22)
+#                             + NFS (TCP 2049)
+#
+# Slurm port reference:
+#   6817 – slurmctld   (workers / login → controller)
+#   6818 – slurmd      (controller / login → workers)
+#   6820 – slurmrestd  (operator → controller REST API)
+#   22   – sshd        (inter-pod SSH used by srun step launch)
+#
+# NFS port reference:
+#   2049 – nfsd        (all Slurm pods → NFS server for /shared RWX volume)
+#
+# K8s API server (TCP 443) is accessed by the operator via the in-cluster
+# ServiceAccount; the endpoint is a ClusterIP (not a pod), so an ipBlock is
+# not practical — we allow port 443 to any destination instead.
+---
+# ============================================================
+# INGRESS — default deny
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: slurm
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# ============================================================
+# EGRESS — default deny
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: slurm
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# ============================================================
+# DNS egress — all slurm pods may query kube-dns
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: slurm
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# ============================================================
+# INGRESS — controller
+# ============================================================
+# Controller: accept connections from workers, login pod, and operator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-controller-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+                  - slurm-login
+                  - slurm-elastic-operator
+                  - slurm-exporter
+      ports:
+        - protocol: TCP
+          port: 6817   # slurmctld
+        - protocol: TCP
+          port: 6820   # slurmrestd
+        - protocol: TCP
+          port: 22     # SSH
+---
+# ============================================================
+# INGRESS — workers
+# ============================================================
+# Workers: accept connections from controller (step launch) and login (srun).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-worker-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - slurm-worker-cpu
+          - slurm-worker-gpu-a10
+          - slurm-worker-gpu-h100
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-controller
+                  - slurm-login
+                  # Allow inter-worker MPI/DDP collective traffic
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+      ports:
+        - protocol: TCP
+          port: 6818   # slurmd
+        - protocol: TCP
+          port: 22     # SSH
+    # Inter-worker MPI on high ports (NCCL/Gloo ephemeral range)
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+---
+# ============================================================
+# INGRESS — login
+# ============================================================
+# Login: accept connections from other slurm pods.
+# ALL ports are allowed from workers because srun step I/O requires slurmd to
+# connect back to the srun process on an ephemeral OS-assigned port (e.g. 58670).
+# Restricting to port 22 only would cause "step aborted before completely launched".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-login-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-login
+  policyTypes:
+    - Ingress
+  ingress:
+    # ALL ports from workers — srun step I/O callback on ephemeral ports
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+    # SSH from controller
+    - from:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 22
+---
+# ============================================================
+# EGRESS — operator
+# Needs: K8s API server (SDK calls + pod exec streaming) + slurmrestd
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-operator-egress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-elastic-operator
+  policyTypes:
+    - Egress
+  egress:
+    # K8s API server — ClusterIP in the default namespace resolves to the
+    # control-plane host; allow HTTPS to any destination (port 443).
+    - ports:
+        - protocol: TCP
+          port: 443
+    # slurmrestd on the controller pod (HTTP, via slurm-restapi ClusterIP)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 6820
+---
+# ============================================================
+# EGRESS — controller
+# Needs: slurmd on workers, SSH to login, NFS
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-controller-egress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-controller
+  policyTypes:
+    - Egress
+  egress:
+    # slurmd + SSH on workers (step launch, job I/O)
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+      ports:
+        - protocol: TCP
+          port: 6818
+        - protocol: TCP
+          port: 22
+    # SSH to login (srun interactive sessions)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-login
+      ports:
+        - protocol: TCP
+          port: 22
+    # slurmdbd accounting (TCP 6819)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurmdbd
+      ports:
+        - protocol: TCP
+          port: 6819
+    # NFS server for /shared RWX volume
+    - ports:
+        - protocol: TCP
+          port: 2049
+---
+# ============================================================
+# EGRESS — slurmdbd
+# Needs: MySQL (TCP 3306)
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-slurmdbd-egress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurmdbd
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mysql
+      ports:
+        - protocol: TCP
+          port: 3306
+---
+# ============================================================
+# EGRESS — workers
+# Needs: slurmctld on controller, inter-worker MPI (any port),
+#        SSH to login, NFS
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-worker-egress
+  namespace: slurm
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - slurm-worker-cpu
+          - slurm-worker-gpu-a10
+          - slurm-worker-gpu-h100
+  policyTypes:
+    - Egress
+  egress:
+    # ALL ports to controller — required for Slurm's fan-out tree RPC.
+    # When slurmctld sends a multi-node REQUEST_PING via the tree protocol, the
+    # receiving slurmd collects sub-tree responses and sends RESPONSE_FORWARD_FAILED
+    # back to the controller on an ephemeral (OS-assigned) source port.  Restricting
+    # to only 6817/22 blocks these ephemeral-port responses, causing NOT_RESPONDING.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+    # Inter-worker MPI/DDP collective traffic — all ports allowed between workers
+    # (NCCL uses ephemeral ports; restricting by port would break collective ops)
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+    # ALL ports to login — srun step I/O callback on ephemeral ports.
+    # srun step I/O requires slurmd to connect back to the srun listener on an
+    # ephemeral OS-assigned port; restricting to port 22 blocks step output.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-login
+    # NFS server for /shared RWX volume
+    - ports:
+        - protocol: TCP
+          port: 2049
+---
+# ============================================================
+# EGRESS — login
+# Needs: slurmctld + slurmrestd + SSH on controller,
+#        slurmd + SSH on workers, NFS
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-login-egress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurm-login
+  policyTypes:
+    - Egress
+  egress:
+    # ALL ports to controller — same fan-out RPC reason as workers (see allow-worker-egress).
+    # login also runs scontrol/squeue/sbatch which trigger fan-out pings from slurmctld
+    # that require the login pod to send RESPONSE_FORWARD_FAILED on ephemeral ports.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+    # slurmd + SSH on workers
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - slurm-worker-cpu
+                  - slurm-worker-gpu-a10
+                  - slurm-worker-gpu-h100
+      ports:
+        - protocol: TCP
+          port: 6818
+        - protocol: TCP
+          port: 22
+    # NFS server for /shared RWX volume
+    - ports:
+        - protocol: TCP
+          port: 2049

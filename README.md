@@ -38,101 +38,84 @@ kind version
 kubectl version --client
 ```
 
-## 2. 一鍵部署（Phase 1 + Phase 2）
+## 2. 一鍵部署（核心叢集）
 
 ```bash
-bash scripts/bootstrap-dev.sh
+bash scripts/bootstrap.sh
 
 # 啟用 K8s 1.35 Gang Scheduling 基礎設施（Alpha feature gates）
 # 注意：目前只啟用 K8s 層 feature gates；Operator 整合（_ensure_workload）尚未實作
-KIND_CONFIG=kind-config.yaml bash scripts/bootstrap-dev.sh
+KIND_CONFIG=kind-config.yaml bash scripts/bootstrap.sh
 ```
 
-`scripts/bootstrap-dev.sh` 是 Phase 1 + Phase 2 的**整合部署腳本**，自動完成以下步驟：
+`scripts/bootstrap.sh` 自動完成以下步驟：
 
 1. 建立 Kind 叢集（若不存在）
-2. 建置 `slurm-controller:phase1`、`slurm-worker:phase1` Docker image，並 load 進 Kind
-3. 執行 `render-slurm-static.py` 生成 `phase1/manifests/slurm-static.yaml`（自動偵測 Phase 3 NFS PVC）
-4. 建立 Munge/SSH/JWT secrets（`phase1/scripts/create-secrets.sh`）
-5. 套用 Phase 1 manifests（StatefulSet、Service、ConfigMap、DDP runtime）
+2. 建置 `slurm-controller:latest`、`slurm-worker:latest` Docker image（從 `docker/`），並 load 進 Kind
+3. 執行 `scripts/render-core.py` 生成 `manifests/core/slurm-static.yaml`（自動偵測 NFS PVC）
+4. 建立 Munge/SSH/JWT secrets（`scripts/create-secrets.sh`）
+5. 套用 `manifests/core/` 所有資源（StatefulSet、Service、ConfigMap、DDP runtime、Lmod modulefiles）
 6. 等待 controller rollout 完成，確認 `slurmctld` 可 ping
-7. 建置 `slurm-elastic-operator:phase2` image，套用 operator manifest 與 NetworkPolicy
+7. 建置 `slurm-elastic-operator:latest` image，套用 `manifests/operator/` 與 `manifests/networking/`
 8. 設定三個 worker pool 的 `PARTITIONS_JSON` 環境變數
 9. 縮放 cpu pool → 1 replica，GPU pool → 0 replica（初始狀態）
 
-> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap-dev.sh`  
-> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap-dev.sh`  
-> 此腳本不呼叫 `phase1/scripts/bootstrap-phase1.sh` 或 `phase2/scripts/bootstrap-phase2.sh`；各 phase 腳本供單獨除錯使用。
+> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap.sh`  
+> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap.sh`
 
 ## 3. 驗證部署
 
 ```bash
-bash scripts/verify-dev.sh
+bash scripts/verify.sh
 ```
 
-`scripts/verify-dev.sh` 是 Phase 1 + Phase 2 的**整合驗證腳本**，依序執行：
+依序執行：Pod readiness → slurmctld ping → srun 單節點 → sbatch CPU smoke test → operator scale-up/scale-down → GPU pool 路由驗證。
 
-1. **Pod readiness** — 等待 controller-0、worker-cpu-0、operator、login pod 全部 Ready
-2. **Slurm controller ping** — 從 login pod 執行 `scontrol ping` 確認 slurmctld 回應
-3. **srun 單節點互動式** — `srun -N1 -n1 --constraint=cpu hostname`，確認節點回應正確
-4. **sbatch CPU smoke test** — 提交 `sleep 20` job，等待進入 RUNNING 並確認跑在 cpu pool
-5. **Phase 2 scale-up/scale-down** — 提交需要 2 節點的 job，觀察 operator scale-up；取消後等待 scale-down
-6. **GPU pool 路由驗證** — 提交帶 `--gres=gpu:a10:1` 的 job，觀察 operator scale-up gpu-a10 pool
-
-看到 `[dev verify] done. phase1 + phase2 checks passed.` 就代表一切正常。
-
-## 4. 部署共享儲存（Phase 3）
+## 4. 部署共享儲存
 
 ```bash
-# 主機端 NFS server（只需執行一次）
-sudo bash phase3/scripts/setup-nfs-server.sh
+# 主機端 NFS server（只需執行一次，在 WSL2 跑）
+sudo bash scripts/setup-nfs-server.sh
 
-# 在 k8s cluster 部署 NFS provisioner + 掛載到所有 pod
-NFS_SERVER=<nfs-server-ip> NFS_PATH=/srv/nfs/k8s bash phase3/scripts/bootstrap-phase3.sh
+# 在 K8s 叢集部署 NFS provisioner + 掛載到所有 pod
+NFS_SERVER=<nfs-server-ip> NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
 
 # 驗證
-bash phase3/scripts/verify-phase3.sh
-bash phase3/scripts/verify-phase3-e2e.sh
+bash scripts/verify-storage.sh
+bash scripts/verify-storage-e2e.sh
 ```
 
 > 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
 
 > WSL2 的 IP 可以用 `hostname -I` 得知，Windows 每次開機都會變。
 
-## 5. 部署監控驗證（Phase 4）
+## 5. 部署監控
 
 ```bash
-bash phase4/scripts/bootstrap-phase4.sh
+bash scripts/bootstrap-monitoring.sh
 ```
 
-這支腳本會自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana → 套用跨 namespace 的 NetworkPolicy → 等待所有 Pod ready。
-
-- Grafana：http://localhost:3000
-- Prometheus：http://localhost:9090 (for debug)
+自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana + Alertmanager → 套用跨 namespace NetworkPolicy → 等待所有 Pod ready。
 
 ```bash
-# 存取 Grafana
+# 存取 Grafana（admin / admin）
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 # 驗證所有元件正常、metrics 可抓
-bash phase4/scripts/verify-phase4.sh
+bash scripts/verify-monitoring.sh
 
-# 存取 Prometheus
+# 存取 Prometheus（debug）
 kubectl -n monitoring port-forward svc/prometheus 9090:9090
 ```
 
-## 6. Lmod 模組系統（已整合至 Phase 1）
+## 6. Lmod 模組系統（已整合至核心）
 
-Lmod 已整合至 Phase 1，叢集一啟動即具備真實 HPC 的 `module load` 體驗：進 login pod 後可用 `module avail`、`module load`、`module purge`，與台灣超算（TWCC/NCHC）等平台操作方式完全一致。
+Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`bootstrap.sh` 執行完畢後即可使用 `module load`。Modulefile 定義在 `manifests/core/lmod-modulefiles.yaml`，以 ConfigMap 管理。
 
-- `lmod` 已包含在 Phase 1 Dockerfile（controller + worker）
-- Modulefile ConfigMap（`phase1/manifests/lmod-modulefiles.yaml`）在 `bootstrap-dev.sh` 中自動 apply
-- `render-slurm-static.py` 預設帶 `--with-lmod`，volume mount 已渲染進 manifest
-
-Phase 5 bootstrap 僅需執行一次（用於確保 NFS job 輸出路徑存在），**前提是 Phase 3 已部署**：
+執行一次以確保 NFS job 輸出路徑存在（**需先完成 §4**）：
 
 ```bash
-bash phase5/scripts/bootstrap-phase5.sh
+bash scripts/bootstrap-lmod.sh
 ```
 
 **部署後的操作體驗：**
@@ -179,7 +162,7 @@ sbatch /tmp/my-mpi-job.sh
 **驗證（12 個 check 全通過）：**
 
 ```bash
-bash phase5/scripts/verify-phase5.sh
+bash scripts/verify-lmod.sh
 ```
 
 驗證項目包含：Lmod 安裝確認 → `module avail` 顯示三個模組 → `module load` 設定 MPI_HOME → `module purge` 清除環境 → sbatch 提交雙 task MPI job → 確認 rank:0 / rank:1 在 job 內正確執行。
@@ -192,7 +175,7 @@ bash phase5/scripts/verify-phase5.sh
 | `python3/3.10` | 系統 Python 3.10，設定 PYTHON_HOME |
 | `cuda/stub` | CUDA 佔位模組，示範 GPU 叢集的 modulefile 結構 |
 
-> 自訂模組只需編輯 `phase1/manifests/lmod-modulefiles.yaml` 並 `kubectl apply`，**不需要重建 image**，數秒內生效。
+> 自訂模組只需編輯 `manifests/core/lmod-modulefiles.yaml` 並 `kubectl apply`，**不需要重建 image**，數秒內生效。
 
 ---
 
@@ -262,6 +245,8 @@ graph TD
     style NFS fill:#bfb,stroke:#333,stroke-width:2px
 ```
 
+
+![image](assets/architecture.jpg)
 <img width="2604" height="1484" alt="System Overview" src="https://github.com/user-attachments/assets/79b3b075-5d92-4545-adbf-89bfc14bbb4f" />
 
 ### 主要元件說明
@@ -290,37 +275,6 @@ graph TD
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
 | 5：Lmod 整合完成 | ✅ 完成 | Lmod 整合至 Phase 1（images + modulefile ConfigMap + `--with-lmod` render）；Phase 5 bootstrap 僅負責確保 `/shared/jobs/` 目錄存在；Worker preStop Hook；job 輸出路徑整合 NFS `/shared/jobs/` |
 | 5+：平台化與高可用 | 📋 規劃中 | Helm Chart、OpenTelemetry 分散式追蹤、Fair-Share 多租戶、Operator HA；Gang Scheduling 基礎設施（K8s feature gate）已就緒，Operator 整合待實作 |
-
----
-
-# 🔭 Observability
-
-於 Phase 4 實作監控面板，讓「Slurm 語意驅動 K8s 行為」這件事變得可視化。
-
-```
-Slurm 世界                     橋接層（Operator）              K8s 世界
-────────────────               ──────────────────              ────────────────
-Queue pending jobs      ──→    scale-up decision        ──→   StatefulSet +1
-Node idle countdown     ──→    scale-down decision       ──→   StatefulSet -1
-Checkpoint age check    ──→    guard block               ──→   scale skipped
-```
-
-## 監控架構
-
-```
-slurm-exporter              kube-state-metrics        operator /metrics:8000
-(slurmrestd REST → metrics)  (STS/Pod states)         (scale events, guard blocks)
-        ↓                          ↓                          ↓
-                          Prometheus :9090
-                               ↓
-                            Grafana :3000
-                   ┌──────────────────────────────────┐
-                   │  Slurm↔K8s Bridge Overview       │  ← 主 demo 看板
-                   │  K8s Elastic Operator            │
-                   └──────────────────────────────────┘
-```
-
-> 詳細實作規格請見 [`docs/monitoring.md`](docs/monitoring.md)。
 
 ---
 
@@ -365,17 +319,6 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 #SBATCH --constraint=gpu-a10
 #SBATCH --gres=gpu:a10:1
 ```
-
----
-
-## 📦 資源分配說明
-
-每台 worker 宣告 `CPUs=4`，採 `select/cons_tres + CR_Core` 消耗式資源模式：
-
-- **CPU：** 多個 job 可以共用同一台 worker（例如兩個各要 2 cores 的 job 會排進同一台 4 cores 的 worker）。
-- **GPU：** 每台 GPU worker 只有 1 張 GPU，為整數消耗，不支援分時共用。
-
-> 注意：目前使用 `TaskPlugin=task/none`，排程層面追蹤 core 數量，但不強制 CPU binding / cgroup 隔離。這在 Kind/Docker 環境下足以驗證排程控制流，但不適合做效能基準測試。
 
 ---
 
@@ -434,31 +377,6 @@ kubectl -n monitoring get pods -o wide
 # 查看 slurm-exporter 日誌（確認是否能連到 slurmrestd）
 kubectl -n slurm logs deployment/slurm-exporter --tail=30
 ```
-
----
-
-## 設計重點
-
-**為什麼 Slurm node 要預先全部宣告？**
-所有節點在 `slurm.conf` 裡預先定義到 `maxNodes`，Operator 只調整 StatefulSet 的 replica 數，而不重寫 Slurm 設定檔。這避免了每次擴縮時 `slurmctld` 重新解析所有 DNS 造成的連鎖延遲。
-
-**為什麼 Operator 不用 Kopf 或 CRD？**
-刻意保持輕量。Operator 是純 Python，沒有自訂 CRD、沒有 webhook，部署門檻低，邏輯一眼就能看懂。Slurm 狀態查詢（queue、job、node）透過 slurmrestd REST API 進行；StatefulSet replica 調整仍透過 `kubectl patch`。
-
-**Checkpoint Guard + Drain-then-Scale 是什麼？**
-縮容分兩個階段保護執行中的 AI 訓練任務：
-
-1. **Checkpoint Guard**：若 checkpoint 檔案不存在或超過 `MAX_CHECKPOINT_AGE_SECONDS`（預設 10 分鐘），縮容決策會被阻擋。`CHECKPOINT_PATH=""` 時自動停用（避免靜默 block）；`CHECKPOINT_GRACE_SECONDS` 允許 job 啟動初期尚未寫出 checkpoint 時仍可縮容（grace period 內不阻擋）。
-2. **Drain-then-Scale**：通過 Guard 後，Operator 先呼叫 `scontrol update State=DRAIN` 將目標節點標記為不接受新 job，等到 `CPUAlloc == 0`（節點上所有 job 都跑完）才真正減少 StatefulSet replica，避免執行中的訓練被強制中斷。若在 drain 等待期間有新的 scale-up 需求，drain 會自動取消（`State=RESUME`）。
-
-**Operator Cooldown 如何在 Pod 重啟後存活？**
-每次 scale-up 成功後，Operator 把時間戳寫入 StatefulSet annotation `slurm.k8s/last-scale-up-at`。Pod 重啟時從 annotation 還原 cooldown 計時，避免重啟後立即觸發錯誤的縮容。
-
-**為什麼 slurmctld 不怕 pod 重啟？**
-`StateSaveLocation`（`/var/spool/slurmctld`）掛載了獨立的 PVC（`slurm-ctld-state`）。controller pod 重啟後，job queue、node 狀態、及會計紀錄指標都會從磁碟還原，不需要重新提交任務。
-
-**slurmdbd 提供什麼？**
-slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是 Phase 5 Fair-Share 多租戶排程的前置條件。
 
 ---
 

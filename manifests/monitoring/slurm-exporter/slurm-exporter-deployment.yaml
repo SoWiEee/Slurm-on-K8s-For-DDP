@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-exporter
+  namespace: slurm
+  labels:
+    app: slurm-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-exporter
+  template:
+    metadata:
+      labels:
+        app: slurm-exporter
+    spec:
+      containers:
+        - name: slurm-exporter
+          image: slurm-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SLURM_REST_URL
+              value: "http://slurm-restapi.slurm.svc.cluster.local:6820"
+            - name: SLURM_REST_API_VERSION
+              value: "v0.0.37"
+            - name: SLURM_JWT_KEY_PATH
+              value: "/slurm-jwt/jwt_hs256.key"
+            - name: SCRAPE_INTERVAL_SECONDS
+              value: "15"
+          ports:
+            - name: http-metrics
+              containerPort: 9341
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9341
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9341
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: slurm-jwt-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-exporter
+  namespace: slurm
+  labels:
+    app: slurm-exporter
+spec:
+  type: ClusterIP
+  selector:
+    app: slurm-exporter
+  ports:
+    - name: http-metrics
+      port: 9341
+      targetPort: 9341
+      protocol: TCP

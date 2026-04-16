@@ -1,0 +1,287 @@
+# Slurm accounting stack: MySQL + slurmdbd
+#
+# Deployment order:
+#   1. MySQL StatefulSet (port 3306)  — creates slurm_acct_db on first boot
+#   2. slurmdbd Deployment (port 6819) — waits for MySQL, then starts
+#   3. slurmctld (already running) reconnects automatically once slurmdbd is up
+#
+# For dev/Kind the default StorageClass (local-path) backs the MySQL PVC.
+# slurmdbd.conf stores the DB password in plaintext — acceptable for dev;
+# use Vault / Sealed Secrets in production.
+---
+# ---------------------------------------------------------------------------
+# MySQL
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slurm-mysql-secret
+  namespace: slurm
+type: Opaque
+stringData:
+  root-password: "slurmrootpw"
+  slurm-password: "slurmpassword"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-initdb
+  namespace: slurm
+data:
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS slurm_acct_db;
+    CREATE USER IF NOT EXISTS 'slurm'@'%' IDENTIFIED BY 'slurmpassword';
+    GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'%';
+    FLUSH PRIVILEGES;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: slurm
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: slurm-mysql-secret
+                  key: root-password
+            - name: MYSQL_DATABASE
+              value: slurm_acct_db
+            - name: MYSQL_USER
+              value: slurm
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: slurm-mysql-secret
+                  key: slurm-password
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 9
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: initdb
+          configMap:
+            name: mysql-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: slurm
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+# ---------------------------------------------------------------------------
+# slurmdbd
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurmdbd-config
+  namespace: slurm
+data:
+  slurmdbd.conf: |
+    AuthType=auth/munge
+    DbdAddr=slurmdbd.slurm.svc.cluster.local
+    DbdHost=slurmdbd
+    DbdPort=6819
+    SlurmUser=root
+    StorageType=accounting_storage/mysql
+    StorageHost=mysql.slurm.svc.cluster.local
+    StoragePort=3306
+    StoragePass=slurmpassword
+    StorageUser=slurm
+    StorageLoc=slurm_acct_db
+    LogFile=/var/log/slurm/slurmdbd.log
+    PidFile=/var/run/slurmdbd.pid
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurmdbd
+  namespace: slurm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurmdbd
+  template:
+    metadata:
+      labels:
+        app: slurmdbd
+    spec:
+      hostname: slurmdbd
+      containers:
+        - name: slurmdbd
+          image: slurm-controller:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              # Munge setup
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge \
+                        /var/log/slurm /var/run /etc/slurm
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              # Copy slurmdbd.conf with correct permissions (0600 required by slurmdbd)
+              cp /slurmdbd-config/slurmdbd.conf /etc/slurm/slurmdbd.conf
+              chmod 0600 /etc/slurm/slurmdbd.conf
+              # Wait for MySQL to accept connections (bash built-in TCP check)
+              echo "waiting for mysql..."
+              until (echo >/dev/tcp/mysql.slurm.svc.cluster.local/3306) 2>/dev/null; do
+                sleep 3
+              done
+              echo "mysql is up, starting slurmdbd"
+              exec slurmdbd -D -vvv
+          ports:
+            - containerPort: 6819
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmdbd >/dev/null"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmdbd >/dev/null"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+            - name: slurmdbd-config
+              mountPath: /slurmdbd-config
+              readOnly: true
+      volumes:
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: slurm-munge-key
+                  items:
+                    - key: munge.key
+                      path: munge.key
+        - name: slurmdbd-config
+          configMap:
+            name: slurmdbd-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurmdbd
+  namespace: slurm
+spec:
+  selector:
+    app: slurmdbd
+  ports:
+    - name: slurmdbd
+      port: 6819
+      targetPort: 6819
+---
+# PDB: keep at least 1 slurmdbd pod available during node maintenance.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurmdbd-pdb
+  namespace: slurm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurmdbd
+---
+# ---------------------------------------------------------------------------
+# NetworkPolicy
+# ---------------------------------------------------------------------------
+# Allow slurmctld and slurmdbd to talk to each other on port 6819
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-slurmdbd-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: slurmdbd
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 6819
+---
+# Allow slurmdbd to reach MySQL on port 3306
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-mysql-ingress
+  namespace: slurm
+spec:
+  podSelector:
+    matchLabels:
+      app: mysql
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: slurmdbd
+      ports:
+        - protocol: TCP
+          port: 3306
