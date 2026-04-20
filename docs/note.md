@@ -943,6 +943,310 @@ Job 請求 `--gres=gpu:mig-2g.20gb:1`，排到任何有空閒 MIG instance 的 n
 
 多個 CUDA process 合併進同一 CUDA context，共享 command queue 和 SM，減少 context switch 開銷。SM 可設 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 比例。適合延遲敏感的小型推論，但無完整記憶體隔離。
 
+---
+
+### GPU MPS 完整實作指南（2026）
+
+#### MPS 運作原理 vs Time-Slicing
+
+| 維度 | Time-Slicing | MPS | MIG |
+|------|-------------|-----|-----|
+| 機制 | 多個 CUDA context 輪流使用 GPU（OS 時間片） | 所有 process 共用**同一個** CUDA context，SM 並行執行 | 硬體切分 GPU 為獨立 instance |
+| 並行度 | 無（序列執行） | **高**（多 process 真正同時跑在 SM 上） | 有（instance 間獨立） |
+| 記憶體隔離 | ❌（VRAM 共享，無 fence） | ❌（一個 OOM 可能拖垮其他 process） | ✅（各 instance VRAM 隔離） |
+| context switch overhead | 高（µs 級別） | **極低**（無 context switch） | 無（instance 獨立） |
+| SM 配額控制 | ❌ | ✅ `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` | ✅（profile 固定） |
+| 支援 GPU | 全部 NVIDIA | Volta+ (V100, A100, H100) | A100/H100/A30 only |
+| 最佳場景 | 開發/測試（多種工作負載測試） | **小型推論服務（多 replica 共用一張 GPU）** | 多租戶（需記憶體隔離）|
+
+**MPS 適合的場景：**
+- 多個小型推論 server（LLM serving、image classification）並排在同一張 GPU
+- 批次推論（offline batch inference），task 間可共享 SM bandwidth
+- HPC 中「多個小 job 同時提交到同一張 GPU」的 throughput 最大化
+
+**MPS 不適合的場景：**
+- PyTorch DDP 訓練（DDP 本身已充分利用整張 GPU，加 MPS 只增加風險）
+- 需要記憶體安全隔離的多租戶（用 MIG 替代）
+- 不同 Linux 用戶共用同一張 GPU（每個 Linux 用戶只能有一個 MPS server）
+
+---
+
+#### 實作架構：MPS Control Daemon
+
+MPS 架構由三個元件組成：
+
+```
+┌──────────────────────────────────────────────┐
+│  K8s Node (GPU 主機)                          │
+│                                               │
+│  ┌──────────────────┐                        │
+│  │  MPS Control     │  nvidia-cuda-mps-      │
+│  │  Daemon          │  control -d            │
+│  │  (DaemonSet)     │                        │
+│  └────────┬─────────┘                        │
+│           │ UNIX socket (/tmp/nvidia-mps/)   │
+│  ┌────────┴─────────┐  ┌──────────────────┐  │
+│  │  Worker Pod A    │  │  Worker Pod B    │  │
+│  │  (slurmd + job)  │  │  (slurmd + job)  │  │
+│  │  MPS Client      │  │  MPS Client      │  │
+│  └──────────────────┘  └──────────────────┘  │
+└──────────────────────────────────────────────┘
+```
+
+Worker pod 透過掛載 `/tmp/nvidia-mps` socket 目錄，成為 MPS Control Daemon 的客戶端，所有 CUDA 呼叫由 MPS Server 統一代理分發到 GPU SM。
+
+---
+
+#### 實作路徑 A：GPU Operator MPS（推薦，K8s-native）
+
+**適用：** 部署了 NVIDIA GPU Operator 的正式叢集。
+
+**步驟一：建立 MPS ConfigMap**
+
+```yaml
+# mps-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mps-config
+  namespace: gpu-operator
+data:
+  any: |
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      mps:
+        renameByDefault: false
+        resources:
+        - name: nvidia.com/gpu
+          replicas: 4   # 1 張 GPU 切成 4 個 MPS slot
+```
+
+**步驟二：套用並 patch ClusterPolicy**
+
+```bash
+kubectl create -n gpu-operator -f mps-config.yaml
+kubectl patch clusterpolicies.nvidia.com/cluster-policy \
+  -n gpu-operator --type merge \
+  -p '{"spec": {"devicePlugin": {"config": {"name": "mps-config", "default": "any"}}}}'
+```
+
+GPU Operator 會自動：
+1. 在每個 GPU 節點部署 MPS Control Daemon（`nvidia-mps-control` 容器）
+2. Device plugin 把 `nvidia.com/gpu: 4` 暴露給 K8s scheduler（原本 1 張 GPU，現在可分配 4 個 slot）
+3. Worker pod 獲得 MPS socket 自動注入，無需手動掛載
+
+**步驟三：Slurm gres.conf 同步**
+
+```ini
+# gres.conf — 對應 GPU Operator 的 replicas: 4
+NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 Count=4 File=/dev/nvidia0
+```
+
+Slurm 現在知道每台 A10 worker 有 4 個 GPU slot，4 個 job 可同時請求 `--gres=gpu:a10:1`（每個實際對應 25% SM）。
+
+---
+
+#### 實作路徑 B：Slurm Prolog/Epilog MPS（進階，SM 精細控制）
+
+**適用：** 需要讓 Slurm 直接管理 MPS Server 生命週期、按 job 動態調整 SM 百分比。
+
+**步驟一：MPS DaemonSet（在 GPU K8s 節點上啟動 Control Daemon）**
+
+```yaml
+# mps-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-mps-daemon
+  namespace: slurm
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-mps-daemon
+  template:
+    metadata:
+      labels:
+        app: nvidia-mps-daemon
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      hostIPC: true              # 必須：MPS 透過共享記憶體通訊
+      hostPID: true
+      containers:
+      - name: mps-control
+        image: nvidia/cuda:12.3-base-ubuntu22.04
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -c
+        - |
+          nvidia-cuda-mps-control -d
+          # 持續保活；MPS daemon 以 background process 執行
+          tail -f /dev/null
+        env:
+        - name: CUDA_MPS_PIPE_DIRECTORY
+          value: /tmp/nvidia-mps
+        - name: CUDA_MPS_LOG_DIRECTORY
+          value: /tmp/nvidia-log
+        volumeMounts:
+        - name: mps-socket
+          mountPath: /tmp/nvidia-mps
+        - name: mps-log
+          mountPath: /tmp/nvidia-log
+      volumes:
+      - name: mps-socket
+        hostPath:
+          path: /tmp/nvidia-mps
+          type: DirectoryOrCreate
+      - name: mps-log
+        hostPath:
+          path: /tmp/nvidia-log
+          type: DirectoryOrCreate
+```
+
+**步驟二：Worker pod 掛載 MPS socket**
+
+在 `render-core.py`（或 `slurm-static.yaml`）的 GPU worker template 加入：
+
+```yaml
+# GPU worker StatefulSet volumeMounts
+volumeMounts:
+- name: mps-socket
+  mountPath: /tmp/nvidia-mps
+volumes:
+- name: mps-socket
+  hostPath:
+    path: /tmp/nvidia-mps
+
+# 必要的安全設定
+securityContext:
+  capabilities:
+    add: ["IPC_LOCK"]
+```
+
+```yaml
+# Pod spec 層級
+spec:
+  hostIPC: true    # 安全警告：允許 pod 存取 host IPC namespace
+```
+
+> ⚠️ **安全注意：** `hostIPC: true` 讓 pod 可以存取 host 上的所有共享記憶體。在多租戶環境中應搭配 NetworkPolicy + PodSecurityPolicy（或 Admission Controller）限制只有 GPU worker pod 才能申請此權限。
+
+**步驟三：Slurm gres.conf 定義 MPS resource**
+
+```ini
+# gres.conf — 宣告 GPU 和 MPS 兩個 GRES 類型
+NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 File=/dev/nvidia0 Count=1
+NodeName=slurm-worker-gpu-a10-0 Name=mps Count=100  # 100 代表 100%，可分成任意份
+```
+
+**步驟四：slurm.conf 加入 MPS GresTypes**
+
+```ini
+GresTypes=gpu,mps
+```
+
+**步驟五：Prolog/Epilog 腳本（自動啟停 MPS）**
+
+```bash
+# /etc/slurm/prolog.d/99-mps-start.sh
+#!/bin/bash
+# 僅在 job 有 GRES mps 時執行
+if [[ -z "${CUDA_VISIBLE_DEVICES}" ]]; then exit 0; fi
+
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+
+# 啟動 MPS server（以 job user 身份，確保 user-level MPS 限制）
+nvidia-cuda-mps-control -d
+echo "set_active_thread_percentage ${CUDA_MPS_ACTIVE_THREAD_PERCENTAGE:-100}" | \
+  nvidia-cuda-mps-control
+```
+
+```bash
+# /etc/slurm/epilog.d/99-mps-stop.sh
+#!/bin/bash
+if [[ -z "${CUDA_VISIBLE_DEVICES}" ]]; then exit 0; fi
+
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+echo quit | nvidia-cuda-mps-control
+```
+
+**步驟六：Job 提交語法**
+
+```bash
+# 請求 MPS 資源：佔用 25% SM
+#SBATCH --gres=mps:25
+#SBATCH --gres=gpu:a10:1    # 指定使用 A10 GPU
+
+# 或透過環境變數設定（Slurm 會自動從 gres 比例換算）
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25
+```
+
+---
+
+#### 本架構的實作建議
+
+| 部署環境 | 推薦路徑 | 理由 |
+|---------|---------|------|
+| Kind（本機開發） | ❌ 不適用 | Kind 無真實 GPU，MPS 無意義 |
+| 小型 GPU 叢集（NVIDIA GPU Operator 已部署） | **路徑 A（GPU Operator MPS）** | 配置簡單，GPU Operator 處理 daemon 生命週期 |
+| 大型 HPC GPU 叢集（需精細 SM 控制） | **路徑 B（Slurm Prolog）** | 可按 job 動態調整 SM 百分比，符合 HPC 多租戶管理習慣 |
+| 混合推論+訓練叢集 | **路徑 A + 分 partition** | 推論 partition 啟用 MPS，訓練 partition 整卡獨占 |
+
+**對 operator/main.py 的影響：**
+
+若採用路徑 A（GPU Operator replicas: 4），Slurm 端 `gres.conf` 把 Count 從 1 改為 4，`PARTITIONS_JSON` 裡的 pool 設定需同步更新：
+
+```json
+{
+  "name": "gpu-a10-workers",
+  "match_gres": "gpu:a10",
+  "gres_per_node": "gpu:a10:4"   // 從 1 改為 4
+}
+```
+
+Operator 的縮放邏輯不需修改（依然看 `PENDING` job 數和 `idle` node 數），只是每台 worker 能承載的 GPU job 數從 1 增加為 4。
+
+**對 Slurm 設定的影響：**
+
+```python
+# render-core.py 的 worker node 宣告
+# 開啟 MPS 後，Count 要對應 replicas 數
+f"NodeName={name} CPUs={cpus} RealMemory={mem} Gres=gpu:{gtype}:{mps_replicas} State=FUTURE"
+```
+
+---
+
+#### 監控 MPS 使用狀況
+
+```bash
+# 在 MPS Daemon 所在 pod 或 host 執行
+echo "get_server_list" | nvidia-cuda-mps-control    # 查看活躍 server
+echo "get_client_list" | nvidia-cuda-mps-control    # 查看連線的 client
+
+# 查看 GPU 利用率（多個 MPS process 應能同時看到 SM 使用）
+nvidia-smi dmon -s u
+
+# 用 DCGM 追蹤 MPS 下的 per-process GPU 使用（需 DCGM Exporter）
+dcgmi group -c mps-jobs --default
+dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
+```
+
+---
+
+#### 參考來源
+
+- [Slurm GRES MPS 官方文件](https://slurm.schedmd.com/gres.html) — `GresTypes=gpu,mps` 設定與 Prolog 行為
+- [GPU Slicing in CycleCloud Slurm with CUDA MPS](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/gpu-slicing-in-cyclecloud-slurm-with-cuda-multi-process-service-mps/4365999) — Microsoft Azure HPC，Slurm Prolog/Epilog 實戰
+- [GKE MPS 實作](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nvidia-mps-gpus) — `hostIPC: true` 要求和 Google 自訂 GPU stack
+- [SURF MPS for Slurm GitHub](https://github.com/basvandervlies/surf_slurm_mps) — 荷蘭國家超算中心的 MPS Prolog/Epilog 完整實作
+- [NVIDIA GPU Operator MPS 文件](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html) — ClusterPolicy ConfigMap `sharing.mps` 設定
+- [MIG vs Time-Slicing vs MPS 比較](https://www.kubenatives.com/p/mig-vs-time-slicing-vs-mps-which) — 三種機制的適用場景分析
+
 ### 核心限制：為何不能跨 GPU 分割 SM？
 
 用戶場景：GPU0 剩 4 SM 閒置、GPU1 剩 4 SM 閒置，Job C 需要 8 SM，能否合用？
