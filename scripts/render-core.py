@@ -15,7 +15,7 @@ def indent(text: str, n: int) -> str:
     return "\n".join(pad + line if line else line for line in text.splitlines())
 
 
-def build_slurm_conf(cfg: dict) -> tuple[str, str]:
+def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
     node_lines: list[str] = []
     gres_lines: list[str] = []
     partition_nodes: list[str] = []
@@ -55,8 +55,16 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
             for g in gres:
                 parts = g.split(":")
                 if len(parts) >= 2:
+                    # real_gpu: point at the actual device file so Slurm can
+                    # verify the device exists at job launch.  The NVIDIA
+                    # device plugin injects /dev/nvidia0 (CUDA_VISIBLE_DEVICES
+                    # remaps it to index 0 regardless of physical slot).
+                    # Kind/dev: use /dev/null as a placeholder for scheduling.
+                    device_file = "/dev/nvidia0" if real_gpu else "/dev/null"
+                    count = parts[2] if len(parts) >= 3 else "1"
                     gres_lines.append(
-                        f"NodeName={node_name} Name={parts[0]} Type={parts[1]} File=/dev/null"
+                        f"NodeName={node_name} Name={parts[0]} Type={parts[1]}"
+                        f" Count={count} File={device_file}"
                     )
 
     header = [
@@ -71,8 +79,11 @@ def build_slurm_conf(cfg: dict) -> tuple[str, str]:
         "SlurmUser=root",
         "StateSaveLocation=/var/spool/slurmctld",
         "SwitchType=switch/none",
-        "TaskPlugin=task/none",
-        "SchedulerType=sched/backfill",
+        # real_gpu enables cgroup isolation so Slurm can enforce CPU/GPU limits.
+        # Kind uses task/none because cgroup v2 is not reliably available inside
+        # Docker-in-Docker (Kind node containers are not full VMs).
+        *(["TaskPlugin=task/cgroup", "CgroupPlugin=cgroup/v2"] if real_gpu
+          else ["TaskPlugin=task/none"]),
         "MailProg=/usr/bin/true",
         "SelectType=select/cons_tres",
         "SelectTypeParameters=CR_Core",
@@ -117,7 +128,28 @@ def main() -> int:
         action="store_true",
         help="Mount Lmod modulefile ConfigMaps into /opt/modulefiles on worker+login pods",
     )
+    parser.add_argument(
+        "--real-gpu",
+        action="store_true",
+        help=(
+            "Real GPU mode (Linux host with NVIDIA device plugin). "
+            "Sets gres.conf File=/dev/nvidia0, TaskPlugin=task/cgroup, "
+            "and adds nvidia.com/gpu resource limits to GPU worker pods."
+        ),
+    )
+    parser.add_argument(
+        "--with-mps",
+        action="store_true",
+        help=(
+            "Add MPS socket mount (/tmp/nvidia-mps) and hostIPC:true to GPU worker pods. "
+            "Requires --real-gpu and the MPS DaemonSet to be deployed separately. "
+            "See manifests/gpu/mps-daemonset.yaml."
+        ),
+    )
     args = parser.parse_args()
+    if args.with_mps and not args.real_gpu:
+        print("--with-mps requires --real-gpu", file=sys.stderr)
+        return 1
 
     # Snippets injected into every StatefulSet when --with-shared-storage is set.
     # The PVC claimName must match what phase3/manifests/shared-storage.yaml creates.
@@ -166,7 +198,7 @@ def main() -> int:
         lmod_vols = ""
 
     cfg = json.loads(CFG.read_text())
-    slurm_conf, gres_conf = build_slurm_conf(cfg)
+    slurm_conf, gres_conf = build_slurm_conf(cfg, real_gpu=args.real_gpu)
     docs: list[str] = []
     docs.append("""apiVersion: v1
 kind: Namespace
@@ -353,6 +385,35 @@ spec:
       app: slurm-controller
 ---""")
     for pool in cfg["workerPools"]:
+        is_gpu_pool = any(g.startswith("gpu") for g in pool.get("gres", []))
+        # GPU resource limits: injected when --real-gpu and pool has GPU GRES.
+        # The NVIDIA device plugin exposes nvidia.com/gpu; the count comes from
+        # the first "gpu:*:N" entry in the pool's gres list.
+        gpu_count = "1"
+        if is_gpu_pool and args.real_gpu:
+            for g in pool.get("gres", []):
+                parts = g.split(":")
+                if parts[0] == "gpu" and len(parts) >= 3:
+                    gpu_count = parts[2]
+                    break
+        gpu_resources = (
+            f"\n          resources:\n            limits:\n              nvidia.com/gpu: \"{gpu_count}\""
+            f"\n            requests:\n              nvidia.com/gpu: \"{gpu_count}\""
+            if is_gpu_pool and args.real_gpu else ""
+        )
+        # MPS socket mount: shared directory used by the MPS control daemon.
+        mps_vm = (
+            "\n            - name: mps-socket\n              mountPath: /tmp/nvidia-mps"
+            if is_gpu_pool and args.with_mps else ""
+        )
+        mps_vol = (
+            "\n        - name: mps-socket\n          hostPath:\n            path: /tmp/nvidia-mps\n            type: DirectoryOrCreate"
+            if is_gpu_pool and args.with_mps else ""
+        )
+        mps_host_ipc = (
+            "\n      hostIPC: true"
+            if is_gpu_pool and args.with_mps else ""
+        )
         docs.append(f"""apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -369,11 +430,11 @@ spec:
       labels:
         app: {pool['appLabel']}
         worker-class: {pool['workerClass']}
-    spec:
+    spec:{mps_host_ipc}
       containers:
         - name: slurm-worker
           image: {pool['image']}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: IfNotPresent{gpu_resources}
           command:
             - /bin/bash
             - -lc
@@ -419,7 +480,7 @@ spec:
               mountPath: /etc/slurm
             - name: slurm-secrets
               mountPath: /slurm-secrets
-              readOnly: true{shared_vm}{lmod_vms}
+              readOnly: true{shared_vm}{lmod_vms}{mps_vm}
       volumes:
         - name: slurm-config
           configMap:
@@ -438,7 +499,7 @@ spec:
                     - key: id_ed25519
                       path: id_ed25519
                     - key: id_ed25519.pub
-                      path: id_ed25519.pub{shared_vol}{lmod_vols}
+                      path: id_ed25519.pub{shared_vol}{lmod_vols}{mps_vol}
 ---""")
         # PDB: at most 1 worker voluntarily disrupted at a time per pool.
         docs.append(f"""apiVersion: policy/v1

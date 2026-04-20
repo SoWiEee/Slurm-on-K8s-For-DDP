@@ -6,9 +6,16 @@ KIND_CONFIG=${KIND_CONFIG:-}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
 NAMESPACE=${NAMESPACE:-slurm}
-KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
+# K8S_RUNTIME: "kind" (default, Windows/Mac dev) or "k3s" (Linux GPU host).
+# k3s skips kind cluster creation and uses containerd import for images.
+K8S_RUNTIME=${K8S_RUNTIME:-kind}
+KUBE_CONTEXT=${KUBE_CONTEXT:-$([[ "$K8S_RUNTIME" == "k3s" ]] && echo "default" || echo "kind-${CLUSTER_NAME}")}
 FORCE_RECREATE=${FORCE_RECREATE:-false}
 REGENERATE_SECRETS=${REGENERATE_SECRETS:-false}
+# Set REAL_GPU=true on Linux hosts with NVIDIA GPU + device plugin.
+REAL_GPU=${REAL_GPU:-false}
+# Set WITH_MPS=true to add MPS socket mounts to GPU worker pods (requires REAL_GPU=true).
+WITH_MPS=${WITH_MPS:-false}
 
 log() {
   echo "[bootstrap] $*"
@@ -57,9 +64,11 @@ wait_slurm_ready() {
 }
 
 log "validating tools..."
-require_tool kind
 require_tool kubectl
 require_tool docker
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  require_tool kind
+fi
 
 # Resolve a working Python 3 interpreter.
 # Override with PYTHON=/path/to/python3 if auto-detection fails.
@@ -157,9 +166,13 @@ log "building core images..."
 docker build "${build_flags[@]}" -t slurm-controller:latest docker/controller
 docker build "${build_flags[@]}" -t slurm-worker:latest docker/worker
 
-log "loading core images to kind..."
-kind load docker-image slurm-controller:latest --name "$CLUSTER_NAME"
-kind load docker-image slurm-worker:latest --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "loading core images to kind..."
+  kind load docker-image slurm-controller:latest --name "$CLUSTER_NAME"
+  kind load docker-image slurm-worker:latest --name "$CLUSTER_NAME"
+else
+  log "k3s runtime — skipping kind image load (images pulled directly by containerd)"
+fi
 
 log "rendering core manifests (if generator exists)..."
 if [[ -f scripts/render-core.py ]]; then
@@ -167,6 +180,14 @@ if [[ -f scripts/render-core.py ]]; then
   if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
     render_flags+=(--with-shared-storage)
     log "NFS PVC detected — rendering with shared storage"
+  fi
+  if [[ "$REAL_GPU" == "true" ]]; then
+    render_flags+=(--real-gpu)
+    log "REAL_GPU=true — enabling GPU resources and cgroup task plugin"
+  fi
+  if [[ "$WITH_MPS" == "true" ]]; then
+    render_flags+=(--with-mps)
+    log "WITH_MPS=true — enabling hostIPC and MPS socket mounts on GPU workers"
   fi
   render_rc=0
   "$PYTHON" scripts/render-core.py "${render_flags[@]}" || render_rc=$?

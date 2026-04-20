@@ -1,0 +1,94 @@
+# NVIDIA MPS Control Daemon — DaemonSet
+#
+# Runs nvidia-cuda-mps-control on every GPU node so that worker pods can
+# connect to MPS as clients via the shared UNIX socket at /tmp/nvidia-mps.
+#
+# Requirements:
+#   - GPU node has NVIDIA driver + Container Toolkit installed
+#   - Worker pods rendered with --real-gpu --with-mps (mounts /tmp/nvidia-mps)
+#   - K8s admission must allow privileged + hostIPC pods in the slurm namespace
+#
+# Apply: kubectl apply -f manifests/gpu/mps-daemonset.yaml
+#
+# Verify:
+#   kubectl -n slurm exec <mps-daemon-pod> -- bash -c \
+#     'echo get_server_list | nvidia-cuda-mps-control'
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-mps-daemon
+  namespace: slurm
+  labels:
+    app: nvidia-mps-daemon
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-mps-daemon
+  template:
+    metadata:
+      labels:
+        app: nvidia-mps-daemon
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # MPS control daemon communicates with clients via POSIX shared memory
+      # and UNIX domain sockets; hostIPC is required.
+      hostIPC: true
+      hostPID: true
+      containers:
+        - name: mps-control
+          image: nvidia/cuda:12.3.1-base-ubuntu22.04
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+              export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
+              mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+              # Stop any stale daemon from a previous pod restart.
+              echo quit | nvidia-cuda-mps-control 2>/dev/null || true
+              # Start MPS control daemon in background; it manages the MPS server.
+              nvidia-cuda-mps-control -d
+              echo "[mps-daemon] started. socket: $CUDA_MPS_PIPE_DIRECTORY"
+              # Keep the container alive so K8s doesn't restart it.
+              # The MPS control daemon is a background process.
+              while true; do
+                if ! pgrep -x nvidia-cuda-mps- >/dev/null 2>&1; then
+                  echo "[mps-daemon] MPS process died; restarting..." >&2
+                  nvidia-cuda-mps-control -d
+                fi
+                sleep 30
+              done
+          env:
+            - name: CUDA_MPS_PIPE_DIRECTORY
+              value: /tmp/nvidia-mps
+            - name: CUDA_MPS_LOG_DIRECTORY
+              value: /tmp/nvidia-mps-log
+          volumeMounts:
+            - name: mps-socket
+              mountPath: /tmp/nvidia-mps
+            - name: mps-log
+              mountPath: /tmp/nvidia-mps-log
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: mps-socket
+          hostPath:
+            path: /tmp/nvidia-mps
+            type: DirectoryOrCreate
+        - name: mps-log
+          hostPath:
+            path: /tmp/nvidia-mps-log
+            type: DirectoryOrCreate
