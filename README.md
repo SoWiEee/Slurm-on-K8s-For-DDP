@@ -423,71 +423,34 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 # 🔭 Phase 5 Roadmap：批次 AI 工作平台
 
-> Phase 5 的目標是讓這個系統從「可運作的基礎設施原型」演進成「真正可以讓多位使用者提交 AI job 的共用平台」。  
-> 核心方向：**多人可用（Multi-user）→ 工作負載完整（Workloads）→ 可觀測（Observability）→ 易部署（Packaging）**
+> Phase 5 的目標是讓這個系統從「可運作的基礎設施原型」演進成「能讓使用者直接提交各種 AI job 的批次運算平台」。  
+> 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為後續擴充方向。  
+> 開發順序：**易部署 → 可觀測 → 工作負載完整 → 真實登入體驗**
 
-## 5-A：SSH Gateway — 讓使用者真正能登入
+## 5-A：Helm Chart 封裝 — 讓部署可重複
 
-**現狀問題：** 目前 login node 只能透過 `kubectl exec` 進入，使用者需要有 kubectl 權限。這不是一個真實平台的使用方式。
+**現狀問題：** 多支 bootstrap 腳本需依序執行，各 Phase 的 manifest 散落在不同子目錄，環境差異（k3s vs. Kind）靠環境變數控制，容易出錯。
 
-**目標：** 使用者用 `ssh user@<host> -p 2222` 直接登入 login pod，就像登入 NCHC 一樣。
-
-```
-使用者電腦 → SSH :2222 → NodePort Service → slurm-login pod
-                                               ├── sbatch / squeue / sinfo
-                                               └── /shared/（NFS 掛載）
-```
-
-**需要做的事：**
-- `slurm-login` Service 改為 NodePort，開放 SSH port（2222）
-- Login pod 加入 `openssh-server`，支援 SSH key 認證
-- 建立使用者帳號腳本（`scripts/add-user.sh`）：同時在 Linux 和 Slurm (`sacctmgr`) 建立帳號
-
-## 5-B：Fair-Share 多租戶 — 讓多人共用不互搶
-
-**現狀問題：** 所有 job 都用同一個 Slurm 帳號，沒有配額、沒有公平性，誰先提交誰先跑。
-
-**目標：** 每位使用者有自己的 Slurm account，系統根據歷史使用量動態調整優先順序，用得多的人暫時降權。
+**目標：** 整個平台一條指令完成部署，參數集中在 `values.yaml`。
 
 ```bash
-# 新增使用者（admin 操作）
-sacctmgr add account labA shares=100
-sacctmgr add user alice account=labA
-
-# 使用者提交 job 時自動套用帳號
-sbatch --account=labA my_job.sh
-
-# 查看各帳號的 Fair-Share 分數
-sshare -a
+helm install slurm-platform ./chart \
+  --set cluster.name=my-lab \
+  --set pools.cpu.maxReplicas=4 \
+  --set pools.gpu.rtx5070.maxReplicas=1 \
+  --set pools.gpu.rtx4080.maxReplicas=1 \
+  --set mps.enabled=true \
+  --set monitoring.enabled=true
 ```
 
 **需要做的事：**
-- `slurm.conf` 開啟 `PriorityType=priority/multifactor`、`PriorityWeightFairshare=100000`
-- 初始化腳本 `scripts/setup-accounts.sh`：建立預設帳號與配額
-- Grafana 新增面板：per-account pending jobs、cumulative GPU-hours、FairShare 分數
+- 將 `manifests/` 各子目錄轉為 Helm subchart（phase1–4 各為 subchart，可選啟用）
+- `worker-pools.json` 變成 `values.yaml` 的一部分，消除 `render-core.py` 與 manifest 的雙重維護
+- `render-core.py` 改為 Helm pre-install hook 或直接改寫為 Helm template
 
-## 5-C：工作負載模板 — 讓使用者知道能做什麼
+## 5-B：OpenTelemetry 分散式追蹤 — 讓 job 生命週期可視化
 
-**現狀問題：** 使用者登入後不知道怎麼提交有意義的 AI job，缺乏範例。
-
-**目標：** NFS 上預放一組 `/shared/templates/` job 腳本，使用者 cp 過去修改參數就能用。
-
-| 模板 | GRES 設定 | 說明 |
-|------|----------|------|
-| `batch_infer.sh` | `--gres=mps:25` | 批次文字推論，MPS 並行，4 個 job 共用 GPU |
-| `hpo_array.sh` | `--array=1-16 --gres=mps:25` | 超參數搜尋，16 組實驗並行 |
-| `finetune_lora.sh` | `--gres=gpu:rtx4080:1` | LoRA fine-tuning，獨佔整張卡，結果存 `/shared/checkpoints/` |
-| `preprocess.sh` | `--cpus-per-task=8` | 資料前處理，純 CPU，與 GPU job 並行 |
-| `ddp_2gpu.sh` | `--nodes=2 --gres=gpu:1` | 雙 GPU DDP 訓練 |
-
-**需要做的事：**
-- 新增 `templates/` 目錄，放 5 種 sbatch 模板
-- `bootstrap-lmod.sh` 順帶把模板 cp 到 `/shared/templates/`
-- Login pod 的 MOTD 顯示模板位置和使用說明
-
-## 5-D：OpenTelemetry 分散式追蹤 — 讓 job 生命週期可視化
-
-**目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓管理者清楚看到瓶頸在哪裡。
+**目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓使用者清楚看到時間花在哪裡（排隊、K8s 啟動、實際執行）。
 
 ```
 [sbatch submit] → [pending in queue] → [Operator scale-up decision]
@@ -495,33 +458,49 @@ sshare -a
     → [checkpoint write] → [Operator scale-down] → [job complete]
 ```
 
-每個 span 攜帶 `job_id`、`pool`、`account`、`gres` 等 attribute，用 Grafana Tempo 可視化。  
-這是目前所有 Slurm-on-K8s 開源方案都沒有做到的端到端觀測視角。
+每個 span 攜帶 `job_id`、`pool`、`gres`、`provisioning_latency` 等 attribute，用 Grafana Tempo 可視化。這是目前所有 Slurm-on-K8s 開源方案都沒有做到的端到端觀測視角。
 
 **需要做的事：**
-- Operator 加入 OpenTelemetry SDK，在 `scale_action`、`loop_observation` 事件上建立 span
+- Operator 加入 `opentelemetry-sdk`，在 `scale_action`、`loop_observation` 事件上建立 span
 - 部署 Grafana Tempo（加入 `manifests/monitoring/`）
-- Prometheus → Tempo exemplar 連結，讓 metrics 和 trace 互通
+- Prometheus histogram exemplar → Tempo 連結，從 latency spike 直接跳到對應 trace
 
-## 5-E：Helm Chart 封裝 — 讓部署可重複
+## 5-C：工作負載模板 — 讓使用者開箱即用
 
-**目標：** 目前多支 bootstrap 腳本依序執行容易出錯，Helm 讓整個平台一條指令完成。
+**目標：** NFS 上預放一組 `/shared/templates/` job 腳本，使用者 cp 過去改參數就能跑，涵蓋平台支援的五種典型 AI 工作。
 
-```bash
-helm install slurm-platform ./chart \
-  --set cluster.name=my-lab \
-  --set pools.cpu.maxReplicas=8 \
-  --set pools.gpu.rtx5070.maxReplicas=1 \
-  --set pools.gpu.rtx4080.maxReplicas=1 \
-  --set mps.enabled=true \
-  --set monitoring.enabled=true \
-  --set multiTenant.enabled=true
+| 模板 | GRES 設定 | 展示的系統能力 |
+|------|----------|--------------|
+| `01_preprocess.sh` | `--cpus-per-task=8` | CPU pool 獨立 autoscale，與 GPU job 並行不干擾 |
+| `02_batch_infer.sh` | `--gres=mps:25` | MPS 多工，同一張 GPU 跑 4 個推論 job |
+| `03_hpo_array.sh` | `--array=1-8 --gres=mps:25` | Job array + MPS，8 組超參數實驗並行 |
+| `04_finetune_lora.sh` | `--gres=gpu:rtx4080:1` | 整卡獨佔 + checkpoint guard 縮容保護 |
+| `05_ddp_2gpu.sh` | `--nodes=2 --gres=gpu:1` | 跨 worker pod 的 2-GPU DDP 訓練 |
+
+**需要做的事：**
+- 新增 `templates/` 目錄，放 5 支含詳細註解的 sbatch 腳本
+- `bootstrap-lmod.sh` 結尾加一步：把 `templates/` cp 到 `/shared/templates/`
+- Login pod 的 `/etc/motd` 顯示平台說明與模板位置
+
+## 5-D：SSH Login — 讓使用者直接登入
+
+**現狀問題：** 目前登入 login node 需要執行 `kubectl exec`，使用者必須先安裝 kubectl 並取得 kubeconfig。
+
+**目標：** 使用者用標準 SSH 直接進入 login pod，不需要知道 K8s 的存在。
+
+```
+使用者電腦 → ssh -p 2222 user@<k3s-host-ip>
+                  ↓
+           NodePort :2222 → slurm-login pod
+                              ├── sbatch / squeue / sinfo
+                              └── /shared/（NFS 掛載，模型 + 輸出共用）
 ```
 
 **需要做的事：**
-- 將 `manifests/` 各子目錄轉為 Helm subchart
-- `worker-pools.json` 變成 `values.yaml` 的一部分
-- `render-core.py` 改寫為 Helm template（或保留為 pre-install hook）
+- `docker/login/Dockerfile` 加入 `openssh-server`，設定 SSH key 認證（禁用密碼登入）
+- `slurm-login` Service 改為 NodePort，固定 port 2222
+- `scripts/bootstrap.sh` 加入 SSH host key 初始化步驟
+- 後續（多租戶時）：`scripts/add-user.sh` 同時在 Linux 和 Slurm（`sacctmgr`）建帳號
 
 ---
 
