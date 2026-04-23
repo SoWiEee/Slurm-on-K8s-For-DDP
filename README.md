@@ -28,7 +28,7 @@
 
 # 🚀 Getting Started
 
-> 環境需求：Windows 11 + Docker Desktop + Kind (v0.31.0 = v1.35.0 K8s) + kubectl
+> 環境需求：Linux + K3s
 
 ## 1. 確認工具已安裝
 
@@ -247,7 +247,8 @@ graph TD
 
 
 ![image](assets/architecture.jpg)
-<img width="2604" height="1484" alt="System Overview" src="https://github.com/user-attachments/assets/79b3b075-5d92-4545-adbf-89bfc14bbb4f" />
+
+> 最新架構圖請看 [`architecture.html`](assets/architecture.html)
 
 ### 主要元件說明
 
