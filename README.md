@@ -1,28 +1,38 @@
-# Slurm-on-K8s-For-DDP
+# Slurm-on-K8s
 
-把 HPC 排程器搬進 Kubernetes，讓 AI 訓練任務既能用 Slurm 的精準資源管理，又能享受雲端的彈性伸縮。
+把 HPC 排程器搬進 Kubernetes，打造一個可讓多位使用者共用 CPU + GPU 硬體資源的批次 AI 工作平台。
 
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
+- 應用方向評估：[`docs/impl_dir.md`](docs/impl_dir.md)
 
 ---
 
 # 🌱 Motivation
 
-如果你曾經跑過分散式 AI 訓練，你大概有過這樣的經驗：
+一台有 CPU 和 GPU 的機器，同時有多種 AI 工作要跑——模型推論、超參數搜尋、fine-tuning、資料前處理。  
+沒有好的排程系統時，會發生：
 
-- 租了 8 張 GPU，但模型訓練只用了一半，剩下的資源就這樣閒著。
-- 任務跑到一半節點掛掉，checkpoint 沒存好，重頭來過。
-- 想擴充節點，卻要等管理員手動改設定。
+- GPU 跑推論時大量閒置（utilization < 20%），同一張卡只讓一個 process 用。
+- 多人共用一台主機互相搶資源，沒有隊列、沒有隔離、先到先得。
+- Fine-tuning 跑到一半機器重啟，checkpoint 沒存好，重頭來過。
+- 工作量少的時候，worker 進程還是佔著資源不釋放。
 
 這些問題的根源在於：現有工具在**資源彈性**和**排程精準度**之間做了取捨。
 
 | 工具 | 擅長 | 不擅長 |
 |------|------|--------|
-| Kubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意 |
-| Slurm | 批次排程、CPU/GPU 精準分配、叢集治理 | 動態節點、雲端彈性、容錯恢復 |
+| Kubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意（CPU affinity、GPU GRES、MPS 分配） |
+| Slurm | 批次排程、CPU/GPU 精準分配、叢集治理、多使用者隊列 | 動態節點、雲端彈性、容錯恢復 |
 
-本專案的目標很直接：**讓兩者合作**。把 Slurm 跑在 Kubernetes 上，用 Kubernetes 的彈性支撐 Slurm 的排程能力，並在此基礎上實作 AI 訓練所需的共享儲存與 checkpoint 容錯。
+本專案的目標很直接：**讓兩者合作**。把 Slurm 跑在 Kubernetes 上，用 K8s 的彈性伸縮撐起 Slurm 的排程能力，解決硬體資源分配的核心問題：
+
+- **利用率**：透過 Slurm MPS（`--gres=mps:25`）讓多個 AI job 共用同一張 GPU 的 SM，utilization 從 < 20% 提升至 70%+
+- **隔離性**：CPU pool 和 GPU pool 獨立 autoscale，不同類型的工作互不競爭
+- **彈性**：沒有 job 時 worker pod 自動縮回 0；job 進 queue 時 Operator 自動擴出對應節點
+- **容錯**：Checkpoint-aware 縮容保護，確保 fine-tuning job 不被中途打斷；NFS PVC 讓結果跨節點持久化
+
+使用者只需要 SSH 進 login node，用熟悉的 `sbatch` 提交工作，不需要知道底層 K8s 的存在。
 
 ---
 
@@ -411,55 +421,107 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 ---
 
-# 🔭 Phase 5 Roadmap：平台化與高可用
+# 🔭 Phase 5 Roadmap：批次 AI 工作平台
 
-> Phase 5 的目標是讓這個系統從「可運作的研究原型」演進成「可交付的平台產品」。
-> Lmod 模組系統已完成（見 Getting Started §6）；以下為後續規劃，詳細技術設計見 `docs/note.md`。
+> Phase 5 的目標是讓這個系統從「可運作的基礎設施原型」演進成「真正可以讓多位使用者提交 AI job 的共用平台」。  
+> 核心方向：**多人可用（Multi-user）→ 工作負載完整（Workloads）→ 可觀測（Observability）→ 易部署（Packaging）**
 
-## 5-A：Helm Chart 封裝
+## 5-A：SSH Gateway — 讓使用者真正能登入
 
-目前每個 Phase 有獨立的 manifest 資料夾，部署需要依序執行多支 bootstrap 腳本。Helm 讓整個系統可以一條指令完成：
+**現狀問題：** 目前 login node 只能透過 `kubectl exec` 進入，使用者需要有 kubectl 權限。這不是一個真實平台的使用方式。
+
+**目標：** 使用者用 `ssh user@<host> -p 2222` 直接登入 login pod，就像登入 NCHC 一樣。
+
+```
+使用者電腦 → SSH :2222 → NodePort Service → slurm-login pod
+                                               ├── sbatch / squeue / sinfo
+                                               └── /shared/（NFS 掛載）
+```
+
+**需要做的事：**
+- `slurm-login` Service 改為 NodePort，開放 SSH port（2222）
+- Login pod 加入 `openssh-server`，支援 SSH key 認證
+- 建立使用者帳號腳本（`scripts/add-user.sh`）：同時在 Linux 和 Slurm (`sacctmgr`) 建立帳號
+
+## 5-B：Fair-Share 多租戶 — 讓多人共用不互搶
+
+**現狀問題：** 所有 job 都用同一個 Slurm 帳號，沒有配額、沒有公平性，誰先提交誰先跑。
+
+**目標：** 每位使用者有自己的 Slurm account，系統根據歷史使用量動態調整優先順序，用得多的人暫時降權。
 
 ```bash
-helm install slurm-on-k8s ./chart \
+# 新增使用者（admin 操作）
+sacctmgr add account labA shares=100
+sacctmgr add user alice account=labA
+
+# 使用者提交 job 時自動套用帳號
+sbatch --account=labA my_job.sh
+
+# 查看各帳號的 Fair-Share 分數
+sshare -a
+```
+
+**需要做的事：**
+- `slurm.conf` 開啟 `PriorityType=priority/multifactor`、`PriorityWeightFairshare=100000`
+- 初始化腳本 `scripts/setup-accounts.sh`：建立預設帳號與配額
+- Grafana 新增面板：per-account pending jobs、cumulative GPU-hours、FairShare 分數
+
+## 5-C：工作負載模板 — 讓使用者知道能做什麼
+
+**現狀問題：** 使用者登入後不知道怎麼提交有意義的 AI job，缺乏範例。
+
+**目標：** NFS 上預放一組 `/shared/templates/` job 腳本，使用者 cp 過去修改參數就能用。
+
+| 模板 | GRES 設定 | 說明 |
+|------|----------|------|
+| `batch_infer.sh` | `--gres=mps:25` | 批次文字推論，MPS 並行，4 個 job 共用 GPU |
+| `hpo_array.sh` | `--array=1-16 --gres=mps:25` | 超參數搜尋，16 組實驗並行 |
+| `finetune_lora.sh` | `--gres=gpu:rtx4080:1` | LoRA fine-tuning，獨佔整張卡，結果存 `/shared/checkpoints/` |
+| `preprocess.sh` | `--cpus-per-task=8` | 資料前處理，純 CPU，與 GPU job 並行 |
+| `ddp_2gpu.sh` | `--nodes=2 --gres=gpu:1` | 雙 GPU DDP 訓練 |
+
+**需要做的事：**
+- 新增 `templates/` 目錄，放 5 種 sbatch 模板
+- `bootstrap-lmod.sh` 順帶把模板 cp 到 `/shared/templates/`
+- Login pod 的 MOTD 顯示模板位置和使用說明
+
+## 5-D：OpenTelemetry 分散式追蹤 — 讓 job 生命週期可視化
+
+**目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓管理者清楚看到瓶頸在哪裡。
+
+```
+[sbatch submit] → [pending in queue] → [Operator scale-up decision]
+  → [K8s pod provisioning] → [slurmd registration] → [job execution]
+    → [checkpoint write] → [Operator scale-down] → [job complete]
+```
+
+每個 span 攜帶 `job_id`、`pool`、`account`、`gres` 等 attribute，用 Grafana Tempo 可視化。  
+這是目前所有 Slurm-on-K8s 開源方案都沒有做到的端到端觀測視角。
+
+**需要做的事：**
+- Operator 加入 OpenTelemetry SDK，在 `scale_action`、`loop_observation` 事件上建立 span
+- 部署 Grafana Tempo（加入 `manifests/monitoring/`）
+- Prometheus → Tempo exemplar 連結，讓 metrics 和 trace 互通
+
+## 5-E：Helm Chart 封裝 — 讓部署可重複
+
+**目標：** 目前多支 bootstrap 腳本依序執行容易出錯，Helm 讓整個平台一條指令完成。
+
+```bash
+helm install slurm-platform ./chart \
   --set cluster.name=my-lab \
   --set pools.cpu.maxReplicas=8 \
-  --set pools.gpuA10.maxReplicas=4 \
+  --set pools.gpu.rtx5070.maxReplicas=1 \
+  --set pools.gpu.rtx4080.maxReplicas=1 \
+  --set mps.enabled=true \
   --set monitoring.enabled=true \
-  --set alertmanager.slack.webhookUrl="https://hooks.slack.com/..."
+  --set multiTenant.enabled=true
 ```
 
-主要收益：環境差異（dev / staging / prod）只需一份 `values.yaml`，消除目前「改完 JSON 還要重新 render manifest」的摩擦。
-
-## 5-B：OpenTelemetry 分散式追蹤
-
-讓一個訓練 job 的完整生命週期變成一條可視化的 Trace：
-
-```
-[sbatch submit] → [pending in queue] → [scale-up decision]
-  → [K8s provisioning] → [slurmd registration] → [DDP torchrun]
-    → [checkpoint write] → [scale-down decision] → [job complete]
-```
-
-每個 span 攜帶 `job_id`、`pool`、`checkpoint_age`、`ddp_rank` 等 attribute，用 Jaeger 或 Grafana Tempo 可視化整條鏈。這是目前所有 Slurm-on-K8s 方案都沒有做到的端到端觀測視角。
-
-## 5-C：Fair-Share 多租戶
-
-支援多個 team / project 共用同一個叢集，搭配 Slurm 的 Fair-Share Scheduler：
-
-- 每個 team 有自己的 Slurm account 和 `shares` 配額
-- 新增 Grafana 面板：per-account queue depth、cumulative CPU-hours、FairShare 分數
-- Operator 可依 account priority 調整各 pool 的 scale-up 優先順序
-
-目標 TA：多個 AI 研究小組共用 GPU 叢集的組織（學術單位、內部平台團隊）。
-
-## 5-D：Operator 高可用（HA）
-
-目前 Operator 是 Single Replica，Pod 重啟會有 15–30 秒的決策空窗。Phase 5 計畫：
-
-- Leader Election via K8s Lease（`coordination.k8s.io/v1`）：多個 Operator Pod 同時運行，只有 leader 執行 scaling loop
-- Cooldown 狀態已透過 StatefulSet annotation 持久化（Phase 2 已完成），重新選主不會重置 cooldown
-- 目標：Zero-downtime Operator 滾動升級
+**需要做的事：**
+- 將 `manifests/` 各子目錄轉為 Helm subchart
+- `worker-pools.json` 變成 `values.yaml` 的一部分
+- `render-core.py` 改寫為 Helm template（或保留為 pre-install hook）
 
 ---
 
