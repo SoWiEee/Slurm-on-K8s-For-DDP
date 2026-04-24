@@ -4,7 +4,8 @@
 
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
-- 應用方向評估：[`docs/impl_dir.md`](docs/impl_dir.md)
+
+> 目前正在遷移階段，到 Linux 後記得跑一次 `python scripts/render-core.py --real-gpu --with-mps` 重新生成 `slurm-static.yaml`。
 
 ---
 
