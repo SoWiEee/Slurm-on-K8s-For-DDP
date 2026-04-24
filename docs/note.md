@@ -223,45 +223,110 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 - `worker-pools.json` 改完還需要手動跑 `render-core.py`，manifest 和設定雙重維護。
 - 無法用 ArgoCD / Flux 做 GitOps，無版本 rollback 機制。
 
-### 設計
+### 設計方向
+
+**Monolithic chart + Helm template 直接生成 slurm.conf**
+
+不拆 subchart。monitoring / storage 用 `enabled` flag 控制是否渲染。`render-core.py` 完全廢棄，slurm.conf 和 gres.conf 由 `_helpers.tpl` 中的 Go template function 從 `values.yaml` 的 `pools` 列表產生。
+
+### Chart 目錄結構
+
 ```
 chart/
   Chart.yaml
-  values.yaml              ← 所有可調參數的預設值（取代 worker-pools.json）
-  values-dev.yaml          ← Kind 本機（REAL_GPU=false）覆蓋
-  values-k3s.yaml          ← Linux k3s（REAL_GPU=true, MPS=true）覆蓋
+  values.yaml              ← 預設值（Kind 開發環境基準）
+  values-dev.yaml          ← Kind override（無 GPU，placeholder device）
+  values-k3s.yaml          ← k3s override（real GPU、MPS enabled）
   templates/
-    phase1/                ← controller + worker StatefulSets
-    phase2/                ← operator + RBAC
-    phase3/                ← NFS provisioner（可選）
-    phase4/                ← Prometheus + Grafana + Alertmanager（可選）
-    _helpers.tpl           ← 共用 label / name 函數
+    _helpers.tpl            ← label 函數 + slurm.conf/gres.conf 產生函數
+    namespace.yaml
+    configmap.yaml          ← slurm-config（slurm.conf + gres.conf）
+    controller.yaml         ← controller StatefulSet + Service + PDB
+    workers.yaml            ← range pools → 每個 pool 的 StatefulSet + Service + PDB
+    operator.yaml           ← operator Deployment + RBAC + PARTITIONS_JSON
+    pvc.yaml                ← ctld-state PVC
+    login.yaml              ← login Deployment + Service + PDB
+    monitoring.yaml         ← {{- if .Values.monitoring.enabled }} Prometheus + Grafana
+    storage.yaml            ← {{- if .Values.storage.enabled }} NFS provisioner
 ```
 
-關鍵 `values.yaml` 參數：
+### values.yaml 結構
+
+`pools` 用有序 **list**（而非 map），保證 slurm.conf 的 NodeName 順序與 PartitionName Nodes= 順序一致。
+
 ```yaml
 cluster:
   name: slurm-lab
   namespace: slurm
-  runtime: k3s            # kind | k3s
+  runtime: kind              # kind | k3s（影響 TaskPlugin 與 device file 路徑）
+
+image:
+  controller: slurm-controller:latest
+  worker: slurm-worker:latest
+  operator: slurm-operator:latest
+  pullPolicy: IfNotPresent
 
 pools:
-  cpu:
+  - id: cpu
+    statefulset: slurm-worker-cpu
+    partition: debug
     minReplicas: 1
     maxReplicas: 4
     scaleCooldownSeconds: 60
-  gpu:
-    rtx5070:
-      minReplicas: 0
-      maxReplicas: 1
-      devicePath: /dev/nvidia0
-    rtx4080:
-      minReplicas: 0
-      maxReplicas: 1
-      devicePath: /dev/nvidia1
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 4
+    features: [cpu]
+    gres: []
+    fallback: true
+
+  - id: gpu-rtx5070
+    statefulset: slurm-worker-gpu-rtx5070
+    partition: debug
+    minReplicas: 0
+    maxReplicas: 2
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 2
+    features: [gpu, gpu-rtx5070]
+    gres:
+      - name: gpu
+        type: rtx5070
+        count: 1
+      - name: mps
+        count: 100
+    devicePath: /dev/nvidia0    # 僅 runtime=k3s 時有效
+    matchGres: [gpu:rtx5070, mps]
+
+  - id: gpu-rtx4080
+    statefulset: slurm-worker-gpu-rtx4080
+    partition: debug
+    minReplicas: 0
+    maxReplicas: 2
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 2
+    features: [gpu, gpu-rtx4080]
+    gres:
+      - name: gpu
+        type: rtx4080
+        count: 1
+    devicePath: /dev/nvidia1
+    matchGres: [gpu:rtx4080]
 
 mps:
-  enabled: false           # true → hostIPC + MPS socket mounts
+  enabled: false             # true → GPU pool pod 加 hostIPC + /tmp/nvidia-mps mount
 
 monitoring:
   enabled: true
@@ -270,13 +335,135 @@ monitoring:
   alertmanager:
     slack:
       webhookUrl: ""
+
+storage:
+  enabled: false             # true → NFS subdir provisioner
+  nfsServer: ""
+  nfsPath: /shared
 ```
 
-### 目前已有什麼可以直接 Helm 化
-- StatefulSet 的 replica 數、image tag、resource request 已全部從 `worker-pools.json` 派生 → 改成 `values.yaml` 即可。
-- `PARTITIONS_JSON` env var 已是 JSON 字串，可用 Helm `toJson` filter 注入。
-- Prometheus alert rules ConfigMap 是純 YAML → 直接進 `templates/`。
-- `render-core.py` 改為 Helm pre-install hook，或以 Helm template function 完全取代。
+### _helpers.tpl：slurm.conf 產生邏輯
+
+取代 `render-core.py` 的核心邏輯，寫成兩個 named template：
+
+```
+{{- define "slurm.slurmConf" -}}
+ClusterName={{ .Values.cluster.name }}
+SlurmctldHost=slurm-controller-0(...)
+...
+{{- if eq .Values.cluster.runtime "k3s" }}
+TaskPlugin=task/cgroup
+CgroupPlugin=cgroup/v2
+{{- else }}
+TaskPlugin=task/none
+{{- end }}
+{{- $gresTypes := list -}}
+{{- range .Values.pools }}
+  {{- range .gres }}
+    {{- $gresTypes = append $gresTypes .name }}
+  {{- end }}
+{{- end }}
+GresTypes={{ $gresTypes | uniq | join "," }}
+
+{{- range .Values.pools }}
+{{- $pool := . }}
+{{- range $i := until (int $pool.maxNodes) }}
+NodeName={{ $pool.statefulset }}-{{ $i }} NodeAddr=... CPUs={{ $pool.cpus }} ...
+  Feature={{ $pool.features | join "," }}
+  {{- if $pool.gres }} Gres={{ range $pool.gres }}{{ .name }}{{- if .type }}:{{ .type }}{{- end }}:{{ .count }},{{ end }}{{ end }}
+{{- end }}
+{{- end }}
+PartitionName=debug Nodes=... Default=YES MaxTime=INFINITE State=UP
+{{- end }}
+
+{{- define "slurm.gresConf" -}}
+{{- range .Values.pools }}
+{{- $pool := . }}
+{{- range $i := until (int $pool.maxNodes) }}
+{{- range $pool.gres }}
+{{- if eq .name "mps" }}
+NodeName={{ $pool.statefulset }}-{{ $i }} Name=mps Count={{ .count }}
+{{- else }}
+NodeName={{ $pool.statefulset }}-{{ $i }} Name={{ .name }} Type={{ .type }} Count={{ .count }} File={{ if eq $.Values.cluster.runtime "k3s" }}{{ $pool.devicePath }}{{ else }}/dev/null{{ end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+```
+
+### workers.yaml：pool StatefulSet 迴圈
+
+```yaml
+{{- range .Values.pools }}
+{{- $pool := . }}
+{{- $hasMps := false }}
+{{- range .gres }}{{- if eq .name "mps" }}{{- $hasMps = true }}{{- end }}{{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $pool.statefulset }}
+spec:
+  replicas: {{ $pool.minReplicas }}
+  ...
+    spec:
+      {{- if and $hasMps $.Values.mps.enabled }}
+      hostIPC: true
+      {{- end }}
+      containers:
+        - name: slurm-worker
+          {{- if and (gt (len $pool.gres) 0) (eq $.Values.cluster.runtime "k3s") }}
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          {{- end }}
+      volumes:
+        {{- if and $hasMps $.Values.mps.enabled }}
+        - name: mps-socket
+          hostPath:
+            path: /tmp/nvidia-mps
+            type: DirectoryOrCreate
+        {{- end }}
+{{- end }}
+```
+
+### operator.yaml：PARTITIONS_JSON 從 values 產生
+
+```yaml
+- name: PARTITIONS_JSON
+  value: |
+    [
+    {{- range $i, $pool := .Values.pools }}
+    {{- if $i }},{{ end }}
+    {"partition":"{{ $pool.partition }}",
+     "worker_statefulset":"{{ $pool.statefulset }}",
+     "min_replicas":{{ $pool.minReplicas }},
+     "max_replicas":{{ $pool.maxReplicas }},
+     "scale_up_step":1,"scale_down_step":1,
+     "scale_down_cooldown":{{ $pool.scaleCooldownSeconds }},
+     "match_features":{{ $pool.features | toJson }},
+     {{- if $pool.matchGres }}"match_gres":{{ $pool.matchGres | toJson }},{{ end }}
+     "fallback":{{ default false $pool.fallback }}}
+    {{- end }}
+    ]
+```
+
+### values overlay 策略
+
+| 檔案 | 用途 | 關鍵差異 |
+|------|------|---------|
+| `values.yaml` | 基準（Kind 開發） | `runtime: kind`、`mps.enabled: false`、`devicePath` 被忽略 |
+| `values-k3s.yaml` | Linux + 真實 GPU | `runtime: k3s`、`mps.enabled: true` |
+| `values-dev.yaml` | CI / 無 GPU 環境 | `monitoring.enabled: false`、`storage.enabled: false` |
+
+### 廢棄的檔案
+
+Chart 完成後可移除：
+- `manifests/core/worker-pools.json`（由 `values.yaml` 取代）
+- `scripts/render-core.py`（由 `_helpers.tpl` 取代）
+- `scripts/bootstrap*.sh`（由 `helm install` 取代）
+- `manifests/core/slurm-static.yaml`（由 `helm template` 動態產生）
 
 ---
 

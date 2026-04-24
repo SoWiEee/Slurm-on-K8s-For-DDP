@@ -430,24 +430,25 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 ## 5-A：Helm Chart 封裝 — 讓部署可重複
 
-**現狀問題：** 多支 bootstrap 腳本需依序執行，各 Phase 的 manifest 散落在不同子目錄，環境差異（k3s vs. Kind）靠環境變數控制，容易出錯。
+**現狀問題：** 多支 bootstrap 腳本需依序執行，manifest 散落在 `manifests/` 各子目錄，`worker-pools.json` 改完還要手動跑 `render-core.py`，雙重維護容易出錯。
 
-**目標：** 整個平台一條指令完成部署，參數集中在 `values.yaml`。
+**目標：** 整個平台一條指令完成部署，所有可調參數集中在 `values.yaml`。
 
 ```bash
-helm install slurm-platform ./chart \
-  --set cluster.name=my-lab \
-  --set pools.cpu.maxReplicas=4 \
-  --set pools.gpu.rtx5070.maxReplicas=1 \
-  --set pools.gpu.rtx4080.maxReplicas=1 \
-  --set mps.enabled=true \
-  --set monitoring.enabled=true
+# k3s + 真實 GPU + MPS
+helm install slurm-platform ./chart -f chart/values-k3s.yaml
+
+# Kind 本機開發（無 GPU）
+helm install slurm-platform ./chart -f chart/values-dev.yaml
 ```
 
-**需要做的事：**
-- 將 `manifests/` 各子目錄轉為 Helm subchart（phase1–4 各為 subchart，可選啟用）
-- `worker-pools.json` 變成 `values.yaml` 的一部分，消除 `render-core.py` 與 manifest 的雙重維護
-- `render-core.py` 改為 Helm pre-install hook 或直接改寫為 Helm template
+**設計方向：Monolithic chart + Helm template 直接生成 slurm.conf**
+
+- 單一 chart 目錄（不拆 subchart），monitoring / storage 用 `enabled` flag 控制
+- `worker-pools.json` 與 `render-core.py` 由 `values.yaml` + Helm Go template 取代：`pools` 定義為有序 list，template 用 `range` 迴圈產生 `NodeName`、`gres.conf`、`PARTITIONS_JSON`
+- 環境差異（k3s vs. Kind、real GPU vs. 模擬）用多個 values overlay 管理，不再靠環境變數
+
+詳細設計見 [`docs/note.md §5-A`](docs/note.md)。
 
 ## 5-B：OpenTelemetry 分散式追蹤 — 讓 job 生命週期可視化
 
