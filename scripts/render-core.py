@@ -54,16 +54,20 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
             partition_nodes.append(node_name)
             for g in gres:
                 parts = g.split(":")
-                if len(parts) >= 2:
-                    # real_gpu: point at the actual device file so Slurm can
-                    # verify the device exists at job launch.  The NVIDIA
-                    # device plugin injects /dev/nvidia0 (CUDA_VISIBLE_DEVICES
-                    # remaps it to index 0 regardless of physical slot).
+                gres_name = parts[0]
+                if gres_name == "mps":
+                    # mps GRES in gres.conf has no Type and no File — only Count.
+                    # The MPS daemon owns the device; Slurm just tracks slices.
+                    count = parts[1] if len(parts) >= 2 else "100"
+                    gres_lines.append(f"NodeName={node_name} Name=mps Count={count}")
+                elif len(parts) >= 2:
+                    # real_gpu: use the per-pool devicePath so each GPU pool
+                    # points at its own device node (/dev/nvidia0, /dev/nvidia1).
                     # Kind/dev: use /dev/null as a placeholder for scheduling.
-                    device_file = "/dev/nvidia0" if real_gpu else "/dev/null"
+                    device_file = pool.get("devicePath", "/dev/nvidia0") if real_gpu else "/dev/null"
                     count = parts[2] if len(parts) >= 3 else "1"
                     gres_lines.append(
-                        f"NodeName={node_name} Name={parts[0]} Type={parts[1]}"
+                        f"NodeName={node_name} Name={gres_name} Type={parts[1]}"
                         f" Count={count} File={device_file}"
                     )
 
@@ -386,6 +390,7 @@ spec:
 ---""")
     for pool in cfg["workerPools"]:
         is_gpu_pool = any(g.startswith("gpu") for g in pool.get("gres", []))
+        has_mps_gres = any(g.startswith("mps") for g in pool.get("gres", []))
         # GPU resource limits: injected when --real-gpu and pool has GPU GRES.
         # The NVIDIA device plugin exposes nvidia.com/gpu; the count comes from
         # the first "gpu:*:N" entry in the pool's gres list.
@@ -401,18 +406,19 @@ spec:
             f"\n            requests:\n              nvidia.com/gpu: \"{gpu_count}\""
             if is_gpu_pool and args.real_gpu else ""
         )
-        # MPS socket mount: shared directory used by the MPS control daemon.
+        # MPS socket mount: only for pools that declare mps GRES — the MPS
+        # daemon socket and hostIPC are not needed on non-MPS GPU pools.
         mps_vm = (
             "\n            - name: mps-socket\n              mountPath: /tmp/nvidia-mps"
-            if is_gpu_pool and args.with_mps else ""
+            if has_mps_gres and args.with_mps else ""
         )
         mps_vol = (
             "\n        - name: mps-socket\n          hostPath:\n            path: /tmp/nvidia-mps\n            type: DirectoryOrCreate"
-            if is_gpu_pool and args.with_mps else ""
+            if has_mps_gres and args.with_mps else ""
         )
         mps_host_ipc = (
             "\n      hostIPC: true"
-            if is_gpu_pool and args.with_mps else ""
+            if has_mps_gres and args.with_mps else ""
         )
         docs.append(f"""apiVersion: apps/v1
 kind: StatefulSet

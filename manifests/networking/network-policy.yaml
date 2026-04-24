@@ -92,8 +92,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
                   - slurm-login
                   - slurm-elastic-operator
                   - slurm-exporter
@@ -121,8 +121,8 @@ spec:
         operator: In
         values:
           - slurm-worker-cpu
-          - slurm-worker-gpu-a10
-          - slurm-worker-gpu-h100
+          - slurm-worker-gpu-rtx5070
+          - slurm-worker-gpu-rtx4080
   policyTypes:
     - Ingress
   ingress:
@@ -136,8 +136,8 @@ spec:
                   - slurm-login
                   # Allow inter-worker MPI/DDP collective traffic
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
           port: 6818   # slurmd
@@ -151,8 +151,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
 ---
 # ============================================================
 # INGRESS — login
@@ -181,8 +181,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
     # SSH from controller
     - from:
         - podSelector:
@@ -246,8 +246,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
           port: 6818
@@ -315,8 +315,8 @@ spec:
         operator: In
         values:
           - slurm-worker-cpu
-          - slurm-worker-gpu-a10
-          - slurm-worker-gpu-h100
+          - slurm-worker-gpu-rtx5070
+          - slurm-worker-gpu-rtx4080
   policyTypes:
     - Egress
   egress:
@@ -338,8 +338,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
     # ALL ports to login — srun step I/O callback on ephemeral ports.
     # srun step I/O requires slurmd to connect back to the srun listener on an
     # ephemeral OS-assigned port; restricting to port 22 blocks step output.
@@ -384,8 +384,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
           port: 6818

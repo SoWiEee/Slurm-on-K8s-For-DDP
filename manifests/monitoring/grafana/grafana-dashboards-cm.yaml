@@ -244,9 +244,14 @@ data:
               "refId": "C"
             },
             {
-              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-gpu-a10\"}",
-              "legendFormat": "GPU A10 Workers",
+              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-gpu-rtx5070\"}",
+              "legendFormat": "GPU RTX5070 Workers",
               "refId": "D"
+            },
+            {
+              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-gpu-rtx4080\"}",
+              "legendFormat": "GPU RTX4080 Workers",
+              "refId": "E"
             }
           ]
         },

@@ -64,8 +64,8 @@ spec:
               value: >-
                 [
                   {"partition":"debug","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
-                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-a10","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-a10"],"match_gres":["gpu:a10"]},
-                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-h100","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-h100"],"match_gres":["gpu:h100"]}
+                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-rtx5070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx5070"],"match_gres":["gpu:rtx5070","mps"]},
+                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-rtx4080","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4080"],"match_gres":["gpu:rtx4080"]}
                 ]
             - name: MIN_REPLICAS
               value: "1"

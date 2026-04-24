@@ -17,9 +17,9 @@ NAMESPACE=${NAMESPACE:-slurm}
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 K8S_RUNTIME=${K8S_RUNTIME:-kind}
 KUBE_CONTEXT=${KUBE_CONTEXT:-$([[ "$K8S_RUNTIME" == "k3s" ]] && echo "default" || echo "kind-${CLUSTER_NAME}")}
-GPU_POOL_STS=${GPU_POOL_STS:-slurm-worker-gpu-a10}
-GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-a10}
-GPU_GRES=${GPU_GRES:-gpu:a10:1}
+GPU_POOL_STS=${GPU_POOL_STS:-slurm-worker-gpu-rtx5070}
+GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-rtx5070}
+GPU_GRES=${GPU_GRES:-gpu:rtx5070:1}
 JOB_TIMEOUT=${JOB_TIMEOUT:-120}
 PARTITION=${PARTITION:-debug}
 
@@ -163,7 +163,7 @@ if [[ -n "$err" ]]; then
   echo "$err" | sed 's/^/    /' >&2
 fi
 
-if echo "$out" | grep -qi "nvidia\|tesla\|a10\|h100\|v100"; then
+if echo "$out" | grep -qi "nvidia\|tesla\|rtx\|a10\|h100\|v100"; then
   pass "GPU name visible in Slurm job output"
 elif [[ "$state" == "COMPLETED" ]]; then
   warn "job completed but GPU name not found in output (check GRES binding)"
