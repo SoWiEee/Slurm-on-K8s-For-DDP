@@ -21,7 +21,7 @@ GPU_POOL_STS=${GPU_POOL_STS:-slurm-worker-gpu-rtx5070}
 GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-rtx5070}
 GPU_GRES=${GPU_GRES:-gpu:rtx5070:1}
 JOB_TIMEOUT=${JOB_TIMEOUT:-120}
-PARTITION=${PARTITION:-debug}
+PARTITION=${PARTITION:-gpu-rtx5070}
 
 kubectl config use-context "$KUBE_CONTEXT" >/dev/null
 

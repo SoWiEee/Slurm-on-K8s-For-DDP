@@ -104,15 +104,15 @@ validate_rendered_manifest() {
 
 operator_force_env() {
   local partitions_json='[
-    {"partition":"debug","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
-    {"partition":"debug","worker_statefulset":"slurm-worker-gpu-rtx5070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx5070"],"match_gres":["gpu:rtx5070","mps"]},
-    {"partition":"debug","worker_statefulset":"slurm-worker-gpu-rtx4080","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4080"],"match_gres":["gpu:rtx4080"]}
+    {"partition":"cpu","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
+    {"partition":"gpu-rtx5070","worker_statefulset":"slurm-worker-gpu-rtx5070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx5070"],"match_gres":["gpu:rtx5070","mps"]},
+    {"partition":"gpu-rtx4080","worker_statefulset":"slurm-worker-gpu-rtx4080","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4080"],"match_gres":["gpu:rtx4080"]}
   ]'
 
   kubectl -n "$NAMESPACE" set env deployment/slurm-elastic-operator \
     NAMESPACE="$NAMESPACE" \
     CONTROLLER_POD="slurm-controller-0" \
-    SLURM_PARTITION="debug" \
+    SLURM_PARTITION="cpu" \
     WORKER_STATEFULSET="slurm-worker-cpu" \
     PARTITIONS_JSON="$partitions_json" \
     MIN_REPLICAS="1" \

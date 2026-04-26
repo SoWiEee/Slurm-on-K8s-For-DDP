@@ -4,7 +4,7 @@
 #   Ingress — default-deny all, then whitelist documented communication paths.
 #   Egress  — default-deny all, then whitelist only what each pod type needs:
 #               • DNS (kube-dns UDP/TCP 53) — all pods
-#               • operator  → K8s API (TCP 443) + controller slurmrestd (TCP 6820)
+#               • operator  → K8s API (TCP 443 Kind/hosted, TCP 6443 k3s) + controller slurmrestd (TCP 6820)
 #               • controller→ workers (TCP 6818/22) + login (TCP 22) + NFS (TCP 2049)
 #               • workers   → controller (any port) + inter-worker MPI (any port)
 #                             + login (any port, srun step I/O callback) + NFS (TCP 2049)
@@ -209,10 +209,13 @@ spec:
     - Egress
   egress:
     # K8s API server — ClusterIP in the default namespace resolves to the
-    # control-plane host; allow HTTPS to any destination (port 443).
+    # control-plane host; allow HTTPS to any destination.
+    # 443 covers Kind / hosted K8s; 6443 covers k3s default (--https-listen-port).
     - ports:
         - protocol: TCP
           port: 443
+        - protocol: TCP
+          port: 6443
     # slurmrestd on the controller pod (HTTP, via slurm-restapi ClusterIP)
     - to:
         - podSelector:

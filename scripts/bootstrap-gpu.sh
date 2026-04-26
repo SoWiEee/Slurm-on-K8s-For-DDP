@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# bootstrap-gpu.sh — Deploy NVIDIA device plugin and optionally MPS DaemonSet
+# bootstrap-gpu.sh — Deploy NVIDIA device plugin (with built-in MPS sharing)
 #
 # Run AFTER bootstrap.sh on a Linux host with real GPUs.
 #
 # Usage:
-#   bash scripts/bootstrap-gpu.sh             # device plugin only
-#   bash scripts/bootstrap-gpu.sh --with-mps  # device plugin + MPS daemon
+#   bash scripts/bootstrap-gpu.sh             # device plugin + MPS sharing config
+#   bash scripts/bootstrap-gpu.sh --with-mps  # alias of the above (kept for
+#                                             # back-compat with older docs)
+#
+# Note: --with-mps is now a no-op flag. MPS is always provided by the
+# device-plugin's `sharing.mps` config in manifests/gpu/nvidia-device-plugin.yaml.
+# The previous self-hosted MPS DaemonSet has been deprecated (see
+# manifests/gpu/mps-daemonset.yaml for context).
 
 set -euo pipefail
 
@@ -30,9 +36,9 @@ die() { echo "[bootstrap-gpu][ERROR] $*" >&2; exit 1; }
   die "manifests/gpu/nvidia-device-plugin.yaml not found"
 
 # ---------------------------------------------------------------------------
-# Step 1: Deploy NVIDIA device plugin
+# Step 1: Deploy NVIDIA device plugin (with built-in MPS sharing)
 # ---------------------------------------------------------------------------
-log "deploying NVIDIA device plugin..."
+log "deploying NVIDIA device plugin (sharing.mps enabled)..."
 kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
 
 log "waiting for device plugin DaemonSet to be ready..."
@@ -50,6 +56,9 @@ gpu_nodes=$(kubectl get nodes \
 if [[ -z "$gpu_nodes" ]]; then
   echo "[bootstrap-gpu] WARNING: no nodes advertising nvidia.com/gpu yet" >&2
   echo "  This may take a moment. Check: kubectl describe nodes | grep -A5 Capacity" >&2
+  echo "  Also confirm the node carries the label" >&2
+  echo "    nvidia.com/device-plugin.config=rtx5070-mps  (for RTX 5070 hosts)" >&2
+  echo "    nvidia.com/device-plugin.config=rtx4080-exclusive  (for RTX 4080 hosts)" >&2
 else
   echo "$gpu_nodes" | while IFS=$'\t' read -r node gpu_count; do
     if [[ -n "$gpu_count" && "$gpu_count" != "0" ]]; then
@@ -59,32 +68,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 (optional): Deploy MPS DaemonSet
+# Step 3: --with-mps flag (back-compat no-op)
 # ---------------------------------------------------------------------------
 if [[ "$WITH_MPS" == "true" ]]; then
-  log "deploying MPS control daemon..."
-  [[ -f manifests/gpu/mps-daemonset.yaml ]] || \
-    die "manifests/gpu/mps-daemonset.yaml not found"
-
-  kubectl apply -f manifests/gpu/mps-daemonset.yaml
-  log "waiting for MPS DaemonSet..."
-  kubectl -n "$NAMESPACE" rollout status daemonset/nvidia-mps-daemon --timeout=120s
-
-  log "verifying MPS socket is available..."
-  mps_pod=$(kubectl -n "$NAMESPACE" get pod -l app=nvidia-mps-daemon \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  if [[ -n "$mps_pod" ]]; then
-    if kubectl -n "$NAMESPACE" exec "pod/${mps_pod}" -- \
-        bash -c 'echo get_server_list | nvidia-cuda-mps-control' 2>/dev/null; then
-      log "MPS control daemon responding OK"
-    else
-      echo "[bootstrap-gpu] WARNING: MPS control daemon not yet responding; check pod logs" >&2
-    fi
-  fi
-
-  echo ""
-  echo "[bootstrap-gpu] MPS deployed. Re-render manifests with MPS mounts:"
-  echo "  REAL_GPU=true WITH_MPS=true K8S_RUNTIME=$K8S_RUNTIME bash scripts/bootstrap.sh"
+  log "--with-mps is a no-op — MPS is provided by device-plugin sharing.mps"
+  log "(self-hosted MPS DaemonSet was deprecated; see manifests/gpu/mps-daemonset.yaml)"
 fi
 
 echo ""

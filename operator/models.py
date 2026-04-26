@@ -30,7 +30,7 @@ class Config:
     poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
     policy_name: str = os.getenv("SCALING_POLICY", "checkpoint_aware_queue")
     checkpoint_guard_enabled: bool = os.getenv("CHECKPOINT_GUARD_ENABLED", "true").lower() == "true"
-    default_partition: str = os.getenv("SLURM_PARTITION", "debug")
+    default_partition: str = os.getenv("SLURM_PARTITION", "cpu")
     default_worker_statefulset: str = os.getenv("WORKER_STATEFULSET", "slurm-worker-cpu")
     default_min_replicas: int = int(os.getenv("MIN_REPLICAS", "1"))
     default_max_replicas: int = int(os.getenv("MAX_REPLICAS", "4"))

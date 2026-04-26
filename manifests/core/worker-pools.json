@@ -12,6 +12,7 @@
       "appLabel": "slurm-worker-cpu",
       "workerClass": "cpu-standard",
       "image": "slurm-worker:latest",
+      "partition": "cpu",
       "maxNodes": 4,
       "replicas": 1,
       "cpus": 4,
@@ -30,6 +31,7 @@
       "appLabel": "slurm-worker-gpu-rtx5070",
       "workerClass": "gpu-rtx5070",
       "image": "slurm-worker:latest",
+      "partition": "gpu-rtx5070",
       "maxNodes": 2,
       "replicas": 0,
       "cpus": 4,
@@ -44,8 +46,7 @@
       "gres": [
         "gpu:rtx5070:1",
         "mps:100"
-      ],
-      "devicePath": "/dev/nvidia0"
+      ]
     },
     {
       "name": "slurm-worker-gpu-rtx4080",
@@ -53,6 +54,7 @@
       "appLabel": "slurm-worker-gpu-rtx4080",
       "workerClass": "gpu-rtx4080",
       "image": "slurm-worker:latest",
+      "partition": "gpu-rtx4080",
       "maxNodes": 2,
       "replicas": 0,
       "cpus": 4,
@@ -66,14 +68,27 @@
       ],
       "gres": [
         "gpu:rtx4080:1"
-      ],
-      "devicePath": "/dev/nvidia1"
+      ]
     }
   ],
-  "partition": {
-    "name": "debug",
-    "default": true,
-    "maxTime": "INFINITE",
-    "state": "UP"
-  }
+  "partitions": [
+    {
+      "name": "cpu",
+      "default": true,
+      "maxTime": "INFINITE",
+      "state": "UP"
+    },
+    {
+      "name": "gpu-rtx5070",
+      "default": false,
+      "maxTime": "INFINITE",
+      "state": "UP"
+    },
+    {
+      "name": "gpu-rtx4080",
+      "default": false,
+      "maxTime": "INFINITE",
+      "state": "UP"
+    }
+  ]
 }

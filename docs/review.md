@@ -25,21 +25,23 @@ v3 新增的關鍵風險集中在 **MPS migration 的 K8s 整合層**（§五、
 
 **本輪新發現（migration 相關，按嚴重度排序）：**
 
-| # | 議題 | 類別 | 嚴重度 |
-|---|------|-----|:----:|
-| N1 | MPS DaemonSet 與 worker pod 同時 request `nvidia.com/gpu:1`，互搶設備 | GPU/K8s | 🔴 P0 |
-| N2 | rtx4080 `devicePath=/dev/nvidia1` 在 device-plugin 模式下錯誤 | GPU | 🔴 P0 |
-| N3 | `maxNodes=2` × 單張實體 GPU → 第二個 pod 永遠 Pending | GPU/K8s | 🟠 P1 |
-| N4 | `bootstrap.sh` 對 k3s runtime 仍呼叫 `kind load docker-image`（line 285）| k3s migration | 🔴 P0 |
-| N5 | NetworkPolicy `allow-operator-egress` 只開 TCP/443，k3s API server 預設 6443 | k3s migration | 🔴 P0 |
-| N6 | `AccountingStorageTRES` 未設，sacct 不會記 GPU/MPS 用量 → fairshare 失效 | 排程 | 🟠 P1 |
-| N7 | `partition=debug` 涵蓋所有 CPU/GPU node，無 constraint 的 CPU job 可落到 GPU node | 排程 | 🟠 P1 |
-| N8 | Operator scale-down 無 drain timeout，hang job 永久阻擋縮回 0 | 彈性 | 🟠 P1 |
-| N9 | `hostIPC: true` 在 k3s PSS=baseline 預設下會被 admission 擋下 | k3s migration | 🟠 P1 |
-| N10 | `nvidia-device-plugin.yaml` 未啟用 sharing/replicas，與 MPS 設計矛盾 | GPU | 🟠 P1 |
-| N11 | `ProctrackType=proctrack/linuxproc` 與 `TaskPlugin=task/cgroup` 不一致 | Slurm 設定 | 🟡 P2 |
-| N12 | `verify-gpu.sh` 預設只跑 `--gres=gpu:rtx5070:1`，不驗證 MPS 路徑 | 驗證 | 🟡 P2 |
-| N13 | k3s feature gates `GangScheduling,GenericWorkload` 名稱未對 1.35 GA/Alpha 文件覆核 | 排程 | 🟡 P2 |
+| # | 議題 | 類別 | 嚴重度 | 狀態 |
+|---|------|-----|:----:|:----:|
+| N1 | MPS DaemonSet 與 worker pod 同時 request `nvidia.com/gpu:1`，互搶設備 | GPU/K8s | 🔴 P0 | ✅ |
+| N2 | rtx4080 `devicePath=/dev/nvidia1` 在 device-plugin 模式下錯誤 | GPU | 🔴 P0 | ✅ |
+| N3 | `maxNodes=2` × 單張實體 GPU → 第二個 pod 永遠 Pending | GPU/K8s | 🟠 P1 | ⬜ |
+| N4 | `bootstrap.sh` 對 k3s runtime 仍呼叫 `kind load docker-image`（line 285）| k3s migration | 🔴 P0 | ⬜ |
+| N5 | NetworkPolicy `allow-operator-egress` 只開 TCP/443，k3s API server 預設 6443 | k3s migration | 🔴 P0 | ✅ |
+| N6 | `AccountingStorageTRES` 未設，sacct 不會記 GPU/MPS 用量 → fairshare 失效 | 排程 | 🟠 P1 | ✅ |
+| N7 | `partition=debug` 涵蓋所有 CPU/GPU node，無 constraint 的 CPU job 可落到 GPU node | 排程 | 🟠 P1 | ✅ |
+| N8 | Operator scale-down 無 drain timeout，hang job 永久阻擋縮回 0 | 彈性 | 🟠 P1 | ⬜ |
+| N9 | `hostIPC: true` 在 k3s PSS=baseline 預設下會被 admission 擋下 | k3s migration | 🟠 P1 | ⬜（N1 修法移除 hostIPC，已連帶解除）|
+| N10 | `nvidia-device-plugin.yaml` 未啟用 sharing/replicas，與 MPS 設計矛盾 | GPU | 🟠 P1 | ✅ |
+| N11 | `ProctrackType=proctrack/linuxproc` 與 `TaskPlugin=task/cgroup` 不一致 | Slurm 設定 | 🟡 P2 | ⬜ |
+| N12 | `verify-gpu.sh` 預設只跑 `--gres=gpu:rtx5070:1`，不驗證 MPS 路徑 | 驗證 | 🟡 P2 | ⬜ |
+| N13 | k3s feature gates `GangScheduling,GenericWorkload` 名稱未對 1.35 GA/Alpha 文件覆核 | 排程 | 🟡 P2 | ⬜ |
+
+> **2026-04-27 修復批次：** N1 / N2 / N5 / N7 已 commit；N6（`AccountingStorageTRES`）與 N10（device-plugin sharing.mps）為 N1/N7 的連帶修正，一併標 ✅。詳細修法見各章節下方的「✅ 已修」段落與 [§九 Checklist](#九k3s-第一次部署-checklistv3-新增) 表格更新。
 
 **沿用前兩輪審核已解決項目（保留摘要）：**
 StateSaveLocation PVC 持久化、縮容 drain、slurmdbd + MySQL accounting、kubectl→Python SDK、PDB、`MpiDefault=pmi2`、Lmod、`CHECKPOINT_PATH=""` 不再靜默失效、Checkpoint Grace Period、Worker preStop Hook、job output → `/shared/jobs/`、NetworkPolicy Ingress+Egress + 扇出 RPC 處理、Operator 熔斷器 / readinessProbe、Cooldown 持久化（StatefulSet annotation）、slurmctld IP cache 修正（`fix_node_addr()`）。
@@ -397,19 +399,19 @@ fi
 
 | # | 項目 | 來源 | 狀態 |
 |---|------|------|:----:|
-| 1 | 把 `slurm` namespace 標為 `pod-security.kubernetes.io/enforce=privileged` | N9 | ❌ |
-| 2 | NetworkPolicy operator egress 加 6443 | N5 | ❌ |
-| 3 | bootstrap.sh operator/exporter image 對 k3s 走 `k3s ctr images import` | N4 | ❌ |
-| 4 | 改用 `nvidia-device-plugin` `sharing.mps` 模式，移除自建 MPS DaemonSet | N1 | ❌ |
-| 5 | `worker-pools.json` 移除 `devicePath` 欄位（或全改 `/dev/nvidia0`）| N2 | ❌ |
-| 6 | `maxNodes` 對齊 device-plugin 的 sharing replicas | N3 | ❌ |
-| 7 | slurm.conf 加 `AccountingStorageTRES=gres/gpu,gres/mps` | N6 | ❌ |
-| 8 | `--real-gpu` 同時切 `ProctrackType=proctrack/cgroup` | N11 | ❌ |
-| 9 | `partition` 從單一 `debug` 拆成 `cpu` / `gpu-rtx5070` / `gpu-rtx4080` | N7 | ❌ |
-| 10 | Operator scale-down 加 drain timeout | N8 | ❌ |
-| 11 | verify-gpu.sh 補 MPS 驗證 step | N12 | ❌ |
-| 12 | 確認 K8s 1.35 Workload API feature gate 名稱 | N13 | ❌ |
-| 13 | `fix_node_addr()` 整合到 operator scale-up 路徑 | 3-E v3 強化 | ❌ |
+| 1 | 把 `slurm` namespace 標為 `pod-security.kubernetes.io/enforce=privileged` | N9 | ⬜（N1 修法移除 hostIPC 後可改回 baseline，此項待確認）|
+| 2 | NetworkPolicy operator egress 加 6443 | N5 | ✅ |
+| 3 | bootstrap.sh operator/exporter image 對 k3s 走 `k3s ctr images import` | N4 | ⬜ |
+| 4 | 改用 `nvidia-device-plugin` `sharing.mps` 模式，移除自建 MPS DaemonSet | N1 | ✅ |
+| 5 | `worker-pools.json` 移除 `devicePath` 欄位（或全改 `/dev/nvidia0`）| N2 | ✅ |
+| 6 | `maxNodes` 對齊 device-plugin 的 sharing replicas | N3 | ⬜ |
+| 7 | slurm.conf 加 `AccountingStorageTRES=gres/gpu,gres/mps` | N6 | ✅ |
+| 8 | `--real-gpu` 同時切 `ProctrackType=proctrack/cgroup` | N11 | ⬜ |
+| 9 | `partition` 從單一 `debug` 拆成 `cpu` / `gpu-rtx5070` / `gpu-rtx4080` | N7 | ✅ |
+| 10 | Operator scale-down 加 drain timeout | N8 | ⬜ |
+| 11 | verify-gpu.sh 補 MPS 驗證 step | N12 | ⬜ |
+| 12 | 確認 K8s 1.35 Workload API feature gate 名稱 | N13 | ⬜ |
+| 13 | `fix_node_addr()` 整合到 operator scale-up 路徑 | 3-E v3 強化 | ⬜ |
 
 建議在 Linux 機器跑 `bash scripts/bootstrap.sh` 之前，**先把 1 / 2 / 3 / 9 改完**（這四項直接影響第一次部署能不能成功）；4 / 5 / 6 / 10 在 GPU 工作真正運行前必須改完；其餘項目可在後續驗證階段補。
 
@@ -432,19 +434,19 @@ fi
 
 ## 改進優先順序總表（v3）
 
-| 優先 | 項目 | 類別 | 難度 | 對應 README 動機 |
-|:---:|------|-----|:---:|:---:|
-| **P0** | N1：device-plugin `sharing.mps` 取代自建 MPS DaemonSet | GPU | 中 | 利用率 |
-| **P0** | N2：移除 / 統一 `devicePath=/dev/nvidia0` | GPU | 低 | 利用率 |
-| **P0** | N4：bootstrap.sh operator image 走 k3s 路徑 | k3s migration | 低 | — |
-| **P0** | N5：NetworkPolicy operator egress 加 6443 | k3s migration | 低 | — |
-| **P0** | N9：namespace label privileged | k3s migration | 低 | — |
-| **P0** | 1-A：`SlurmUser=root` | 安全 | 低 | — |
-| **P1** | N3：maxNodes 對齊 sharing replicas | GPU | 低 | 利用率 |
-| **P1** | N6：`AccountingStorageTRES` | 排程 | 低 | Fair-Share |
-| **P1** | N7：partition 拆 cpu/gpu-rtx5070/gpu-rtx4080 | 排程 | 低 | 隔離性 |
-| **P1** | N8：drain timeout | 彈性 | 中 | 彈性 |
-| **P1** | N10：device-plugin sharing config | GPU | 中 | 利用率 |
+| 優先 | 項目 | 類別 | 難度 | 對應 README 動機 | 狀態 |
+|:---:|------|-----|:---:|:---:|:---:|
+| **P0** | N1：device-plugin `sharing.mps` 取代自建 MPS DaemonSet | GPU | 中 | 利用率 | ✅ |
+| **P0** | N2：移除 / 統一 `devicePath=/dev/nvidia0` | GPU | 低 | 利用率 | ✅ |
+| **P0** | N4：bootstrap.sh operator image 走 k3s 路徑 | k3s migration | 低 | — | ⬜ |
+| **P0** | N5：NetworkPolicy operator egress 加 6443 | k3s migration | 低 | — | ✅ |
+| **P0** | N9：namespace label privileged | k3s migration | 低 | — | ⬜（N1 後可選）|
+| **P0** | 1-A：`SlurmUser=root` | 安全 | 低 | — | ⬜ |
+| **P1** | N3：maxNodes 對齊 sharing replicas | GPU | 低 | 利用率 | ⬜ |
+| **P1** | N6：`AccountingStorageTRES` | 排程 | 低 | Fair-Share | ✅ |
+| **P1** | N7：partition 拆 cpu/gpu-rtx5070/gpu-rtx4080 | 排程 | 低 | 隔離性 | ✅ |
+| **P1** | N8：drain timeout | 彈性 | 中 | 彈性 | ⬜ |
+| **P1** | N10：device-plugin sharing config | GPU | 中 | 利用率 | ✅ |
 | **P1** | 1-B：JWT lifespan 1 天 + 輪換 | 安全 | 中 | — |
 | **P1** | 6-A：所有 Pod 加 resources.requests/limits | K8s 整合 | 低 | 容錯 |
 | **P2** | N11：ProctrackType=proctrack/cgroup | Slurm 設定 | 低 | — |

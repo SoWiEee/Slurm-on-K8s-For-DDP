@@ -18,7 +18,8 @@ def indent(text: str, n: int) -> str:
 def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
     node_lines: list[str] = []
     gres_lines: list[str] = []
-    partition_nodes: list[str] = []
+    # partition_name → list of NodeName entries assigned to it
+    partition_nodes: dict[str, list[str]] = {}
     gres_types: set[str] = set()
 
     for pool in cfg["workerPools"]:
@@ -26,6 +27,10 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
         svc = pool["service"]
         features = pool.get("features", [])
         gres = pool.get("gres", [])
+        # Each pool maps to exactly one partition. Pools without an explicit
+        # `partition` field fall back to the first defined partition for
+        # backwards compatibility, but worker-pools.json should always set it.
+        pool_partition = pool.get("partition") or cfg.get("partitions", [{"name": "debug"}])[0]["name"]
         extra: list[str] = []
         if features:
             extra.append(f"Feature={','.join(features)}")
@@ -51,20 +56,23 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
             if extra:
                 line += " " + " ".join(extra)
             node_lines.append(line)
-            partition_nodes.append(node_name)
+            partition_nodes.setdefault(pool_partition, []).append(node_name)
             for g in gres:
                 parts = g.split(":")
                 gres_name = parts[0]
                 if gres_name == "mps":
                     # mps GRES in gres.conf has no Type and no File — only Count.
-                    # The MPS daemon owns the device; Slurm just tracks slices.
+                    # With device-plugin sharing.mps, the plugin owns the daemon
+                    # and exposes pre-sliced nvidia.com/gpu replicas; Slurm just
+                    # tracks the SM% allocation.
                     count = parts[1] if len(parts) >= 2 else "100"
                     gres_lines.append(f"NodeName={node_name} Name=mps Count={count}")
                 elif len(parts) >= 2:
-                    # real_gpu: use the per-pool devicePath so each GPU pool
-                    # points at its own device node (/dev/nvidia0, /dev/nvidia1).
+                    # NVIDIA k8s device-plugin always exposes the allocated GPU
+                    # at /dev/nvidia0 inside the container (regardless of host
+                    # PCI index), so all real_gpu pools share the same File.
                     # Kind/dev: use /dev/null as a placeholder for scheduling.
-                    device_file = pool.get("devicePath", "/dev/nvidia0") if real_gpu else "/dev/null"
+                    device_file = "/dev/nvidia0" if real_gpu else "/dev/null"
                     count = parts[2] if len(parts) >= 3 else "1"
                     gres_lines.append(
                         f"NodeName={node_name} Name={gres_name} Type={parts[1]}"
@@ -108,14 +116,30 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
     ]
     if gres_types:
         header.append(f"GresTypes={','.join(sorted(gres_types))}")
+        # Track GPU/MPS usage in slurmdbd so sacct/fairshare can see GRES alloc.
+        header.append("AccountingStorageTRES=gres/gpu,gres/mps")
     header.append("")
-    part = cfg["partition"]
-    part_line = (
-        f"PartitionName={part['name']} Nodes={','.join(partition_nodes)} "
-        f"Default={'YES' if part.get('default', True) else 'NO'} "
-        f"MaxTime={part.get('maxTime', 'INFINITE')} State={part.get('state', 'UP')}"
-    )
-    slurm_conf = "\n".join(header + node_lines + [part_line]) + "\n"
+
+    # Backwards compat: accept either `partitions` (list, multi-partition) or
+    # the older single-partition `partition` block.
+    partitions_cfg = cfg.get("partitions")
+    if not partitions_cfg:
+        single = cfg.get("partition", {"name": "debug", "default": True})
+        partitions_cfg = [single]
+
+    part_lines: list[str] = []
+    for part in partitions_cfg:
+        pname = part["name"]
+        nodes = partition_nodes.get(pname, [])
+        if not nodes:
+            # Skip partitions with no nodes — slurmctld would fail to parse them.
+            continue
+        part_lines.append(
+            f"PartitionName={pname} Nodes={','.join(nodes)} "
+            f"Default={'YES' if part.get('default', False) else 'NO'} "
+            f"MaxTime={part.get('maxTime', 'INFINITE')} State={part.get('state', 'UP')}"
+        )
+    slurm_conf = "\n".join(header + node_lines + part_lines) + "\n"
     gres_conf = "\n".join(gres_lines) + ("\n" if gres_lines else "")
     return slurm_conf, gres_conf
 
@@ -145,15 +169,23 @@ def main() -> int:
         "--with-mps",
         action="store_true",
         help=(
-            "Add MPS socket mount (/tmp/nvidia-mps) and hostIPC:true to GPU worker pods. "
-            "Requires --real-gpu and the MPS DaemonSet to be deployed separately. "
-            "See manifests/gpu/mps-daemonset.yaml."
+            "Deprecated/no-op: MPS is now provided by the NVIDIA k8s device-plugin "
+            "(`sharing.mps`). Worker pods no longer need hostIPC or a /tmp/nvidia-mps "
+            "hostPath mount — the device-plugin owns the MPS daemon and exposes "
+            "pre-sliced nvidia.com/gpu replicas. The flag is accepted for backwards "
+            "compatibility with older bootstrap.sh invocations."
         ),
     )
     args = parser.parse_args()
     if args.with_mps and not args.real_gpu:
         print("--with-mps requires --real-gpu", file=sys.stderr)
         return 1
+    if args.with_mps:
+        print(
+            "[render-core] note: --with-mps is a no-op; MPS is handled by the "
+            "device-plugin sharing.mps config (manifests/gpu/nvidia-device-plugin.yaml).",
+            file=sys.stderr,
+        )
 
     # Snippets injected into every StatefulSet when --with-shared-storage is set.
     # The PVC claimName must match what phase3/manifests/shared-storage.yaml creates.
@@ -406,20 +438,16 @@ spec:
             f"\n            requests:\n              nvidia.com/gpu: \"{gpu_count}\""
             if is_gpu_pool and args.real_gpu else ""
         )
-        # MPS socket mount: only for pools that declare mps GRES — the MPS
-        # daemon socket and hostIPC are not needed on non-MPS GPU pools.
-        mps_vm = (
-            "\n            - name: mps-socket\n              mountPath: /tmp/nvidia-mps"
-            if has_mps_gres and args.with_mps else ""
-        )
-        mps_vol = (
-            "\n        - name: mps-socket\n          hostPath:\n            path: /tmp/nvidia-mps\n            type: DirectoryOrCreate"
-            if has_mps_gres and args.with_mps else ""
-        )
-        mps_host_ipc = (
-            "\n      hostIPC: true"
-            if has_mps_gres and args.with_mps else ""
-        )
+        # MPS via device-plugin sharing.mps: no hostIPC, no /tmp/nvidia-mps
+        # hostPath mount needed on the worker pod. The device-plugin runs the
+        # MPS daemon itself and injects CUDA_MPS_* env vars + NVIDIA_VISIBLE_*
+        # into pods that request `nvidia.com/gpu`. We keep these placeholders
+        # empty for now; if a future deployment wants to revert to a self-hosted
+        # MPS DaemonSet, this is the splice point.
+        _ = has_mps_gres
+        mps_vm = ""
+        mps_vol = ""
+        mps_host_ipc = ""
         docs.append(f"""apiVersion: apps/v1
 kind: StatefulSet
 metadata:

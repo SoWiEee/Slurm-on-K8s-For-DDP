@@ -5,7 +5,7 @@
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
 
-> 目前正在遷移階段，到 Linux 後記得跑一次 `python scripts/render-core.py --real-gpu --with-mps` 重新生成 `slurm-static.yaml`。
+> 目前正在遷移階段，到 Linux 後第一次部署前，記得用 python scripts/render-core.py --real-gpu --with-lmod 重新生成 manifests/core/slurm-static.yaml，並在 GPU node 上 `kubectl label node <NODE> nvidia.com/device-plugin.config=rtx5070-mps`（或 rtx4080-exclusive）。
 
 ---
 
@@ -304,7 +304,7 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 cat > /shared/my-job.sbatch << 'EOF'
 #!/bin/bash
 #SBATCH -J my-first-job
-#SBATCH -p debug
+#SBATCH -p cpu
 #SBATCH -N 1
 #SBATCH --cpus-per-task=2
 #SBATCH -o /shared/out-%j.txt
