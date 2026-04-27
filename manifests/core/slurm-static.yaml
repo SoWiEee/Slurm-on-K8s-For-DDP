@@ -99,6 +99,7 @@ data:
     SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)
     MpiDefault=pmi2
     ReturnToService=2
+    CompleteWait=0
     SlurmctldPidFile=/var/run/slurmctld.pid
     SlurmdPidFile=/var/run/slurmd.pid
     SlurmdSpoolDir=/var/spool/slurmd
@@ -224,6 +225,8 @@ spec:
               readOnly: true
             - name: ctld-state
               mountPath: /var/spool/slurmctld
+            - name: shared-storage
+              mountPath: /shared
       volumes:
         - name: slurm-config
           configMap:
@@ -251,6 +254,9 @@ spec:
         - name: ctld-state
           persistentVolumeClaim:
             claimName: slurm-ctld-state
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -301,6 +307,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
@@ -330,6 +342,8 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -355,6 +369,9 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi
@@ -423,6 +440,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
@@ -452,6 +475,8 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -477,6 +502,9 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi
@@ -545,6 +573,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
@@ -574,6 +608,8 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -599,6 +635,9 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi
@@ -701,6 +740,8 @@ spec:
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
               readOnly: true
+            - name: shared-storage
+              mountPath: /shared
             - name: modulefile-openmpi
               mountPath: /opt/modulefiles/openmpi
             - name: modulefile-python3
@@ -730,6 +771,9 @@ spec:
           configMap:
             name: slurm-ddp-runtime
             defaultMode: 0755
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: slurm-shared-rwx
         - name: modulefile-openmpi
           configMap:
             name: slurm-modulefile-openmpi

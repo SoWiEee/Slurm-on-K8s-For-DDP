@@ -193,7 +193,7 @@ if [[ -f scripts/render-core.py ]]; then
   fi
   if [[ "$WITH_MPS" == "true" ]]; then
     render_flags+=(--with-mps)
-    log "WITH_MPS=true — enabling hostIPC and MPS socket mounts on GPU workers"
+    log "WITH_MPS=true — flag accepted but is a no-op (MPS handled by device-plugin sharing.mps)"
   fi
   render_rc=0
   "$PYTHON" scripts/render-core.py "${render_flags[@]}" || render_rc=$?

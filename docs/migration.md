@@ -21,7 +21,7 @@
 | k3s | v1.34.6+k3s1（內嵌 containerd 2.2.2-bd1.34）|
 | nvidia-container-toolkit | 1.19.0 |
 | Slurm | slurm-wlm 21.08.5（Ubuntu 22.04 base image apt 包） |
-| device-plugin | `nvcr.io/nvidia/k8s-device-plugin:v0.17.4` |
+| device-plugin | `nvcr.io/nvidia/k8s-device-plugin:v0.15.0`（測試中；v0.17.4 MPS spawn 失敗） |
 
 > ⚠️ 原 doc 假設 GPU pool 名是 `rtx5070` / `rtx4080`。實機只有一張 RTX 4070，已將分支內所有 `rtx5070` → `rtx4070` 全面改名（16 個檔案：`worker-pools.json`、`nvidia-device-plugin.yaml`、`bootstrap.sh`、`verify-gpu.sh`、`verify.sh`、`operator/collector.py`、`network-policy.yaml`、`slurm-elastic-operator.yaml`、`grafana-dashboards-cm.yaml`、`README.md`、`docs/*.md` 等）。
 
@@ -91,7 +91,7 @@ sudo chown $(id -u):$(id -g) ~/.kube/config && chmod 600 ~/.kube/config
 
 #### 症狀
 
-device-plugin v0.17.0 與 v0.17.4 都重複吐：
+device-plugin v0.17.0 與 v0.17.4 都重複吐（v0.15.0 測試中）：
 
 ```
 Failed to start plugin: error waiting for MPS daemon:
@@ -165,7 +165,7 @@ rtx4070-timeslicing: |-
 | docker（Ubuntu apt `docker.io` 29.1.3，build 用） | ✅ |
 | Slurm controller / slurmdbd / slurm-worker-cpu / slurm-login | ✅ Running |
 | Slurm partitions `cpu` / `gpu-rtx4070` / `gpu-rtx4080` | ✅ |
-| nvidia-device-plugin DaemonSet（time-slicing） | ✅ Running，allocatable `nvidia.com/gpu=4` |
+| nvidia-device-plugin DaemonSet（v0.15.0 MPS，測試中） | 待驗證 |
 | `--gres=gpu:rtx4070:1` 路徑 | 待 verify-gpu.sh 跑 |
 | `--gres=mps:N` 路徑（MPS daemon） | ❌ 未解 |
 
@@ -173,11 +173,11 @@ rtx4070-timeslicing: |-
 
 依優先順序：
 
-1. **跑 verify-gpu.sh** 看 step 1–5 是否全綠（time-slicing 模式下的 GPU job 端到端）。
-2. **strace MPS spawn 找根因** — 在 device-plugin pod 內 `apk add strace`（或先 docker build 一個帶 strace 的 sidecar），attach 到 `nvidia-device-plugin` 主程序，看它 spawn `nvidia-cuda-mps-control -d` 時的完整 syscall 序列；對照手動成功的版本找出環境變數或 fd 差異。
-3. **試降版 device-plugin（v0.16.x、v0.15.x）** — 看 v0.17 是否引入 regression。
-4. **試 mainline 預設 kernel 6.8** — `apt install linux-image-generic-hwe-24.04` 切回 6.8，重啟驗證 driver 535 是否能正確 spawn MPS daemon。
-5. **MPS 解掉後** — 把 `nvidia-device-plugin.yaml` 的 mount items 從 `rtx4070-timeslicing` 切回 `rtx4070-mps`；`verify-gpu.sh` 全綠。
+1. **跑 `bash scripts/bootstrap-gpu.sh` 讓 v0.15.0 生效** — apply 更新後的 yaml，等 DaemonSet rollout；觀察 pod log 看 MPS daemon 是否成功啟動（不再出現 `Failed to start plugin: error waiting for MPS daemon`）。
+2. **跑 verify-gpu.sh** 看 step 1–6 是否全綠（v0.15.0 MPS 模式下的 GPU job 端到端；step 6 驗 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）。
+3. **若 v0.15.0 仍失敗** — 用 strace 找根因（`apk add strace` 在 pod 內 attach 到主程序，看 spawn `nvidia-cuda-mps-control -d` 的 syscall 序列）。
+4. **若 v0.15.0 仍失敗** — 試切回 kernel 6.8：`apt install linux-image-generic-hwe-24.04`，重啟驗證 driver 535 + MPS。
+5. **若 v0.15.0 成功** — 更新 migration.md 表格狀態、移除 `rtx4070-timeslicing` ConfigMap key（已無用）。
 
 ### 別忘了清掉
 
@@ -251,6 +251,13 @@ sudo bash scripts/setup-linux-gpu.sh --k3s
 5. 複製 kubeconfig 到 `~/.kube/config`
 6. 等待 k3s node 進入 Ready 狀態
 
+> ⚠️ **sudo kubeconfig 問題（N5）**：腳本以 root 執行，kubeconfig 會被複製到 `/root/.kube/config`，不是你的個人帳號。k3s 安裝完後需手動修正：
+> ```bash
+> sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+> mkdir -p ~/.kube && cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+> chmod 600 ~/.kube/config
+> ```
+
 ### 2. 部署核心 Slurm 叢集
 
 ```bash
@@ -275,30 +282,35 @@ K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh
 bash scripts/bootstrap-gpu.sh
 ```
 
-部署 `manifests/gpu/nvidia-device-plugin.yaml`，內含三個 ConfigMap key：
-- `default`：無 sharing（保險用，未 label 的 GPU 節點走這個）
-- `rtx4070-mps`：`sharing.mps replicas: 4` → 一張 RTX 4070 暴露成 4 個 `nvidia.com/gpu` 切片，內建 MPS daemon 啟動於 `/run/nvidia/mps`
+部署 `manifests/gpu/nvidia-device-plugin.yaml`，內含四個 ConfigMap key：
+- `default`：無 sharing（placeholde；目前未被使用）
+- `rtx4070-mps`：`sharing.mps.resources[].replicas: 4` → 一張 RTX 4070 暴露成 4 個 `nvidia.com/gpu` 切片，由 device-plugin 自行啟動 MPS daemon 於 `/run/nvidia/mps`
+- `rtx4070-timeslicing`：同樣 4 切片，但用 CUDA context-switch（無 MPS daemon，MPS 失敗時的 fallback）
 - `rtx4080-exclusive`：獨佔模式（高顯存／長時訓練用）
 
-### 4. 對 GPU 節點打 label，告訴 device-plugin 用哪個 config
+**DaemonSet 使用哪個 config** 由 `manifests/gpu/nvidia-device-plugin.yaml` 底部的 volume mount 決定（靜態選擇，不依賴 node label）：
 
-**這一步不可省略。** 沒打 label，device-plugin 會走 `default` config，`nvidia.com/gpu` 仍是獨佔 1 張，MPS 不會啟動。
-
-```bash
-# 假設你只有一台 Linux 機器，hostname 也就是節點名：
-NODE=$(kubectl get node -o jsonpath='{.items[0].metadata.name}')
-
-# RTX 4070 host：啟用 MPS sharing（4 切片）
-kubectl label node "$NODE" nvidia.com/device-plugin.config=rtx4070-mps --overwrite
-
-# RTX 4080 host（如果有的話）：獨佔模式
-# kubectl label node <RTX4080-NODE> nvidia.com/device-plugin.config=rtx4080-exclusive --overwrite
+```yaml
+items:
+  - key: rtx4070-mps   # ← 改這裡即可切換 config
+    path: config.yaml
 ```
 
-label 後 device-plugin DaemonSet 會自動 reload，等 30 秒後可驗證：
+要切換 config（例如切回 time-slicing）：
 
 ```bash
-kubectl get node "$NODE" -o jsonpath='{.status.allocatable.nvidia\.com/gpu}'
+# 編輯 manifests/gpu/nvidia-device-plugin.yaml，把 key 改為 rtx4070-timeslicing
+# 再 re-apply：
+kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
+kubectl -n kube-system rollout restart daemonset/nvidia-device-plugin-daemonset
+```
+
+> **注意**：`nvidia.com/device-plugin.config` node label 需要額外的 config-manager sidecar 才能動態切換，目前 DaemonSet 沒有部署這個 sidecar，打 label **不會有任何效果**。
+
+等 DaemonSet rollout 完成後驗證 GPU 切片數：
+
+```bash
+kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
 # RTX 4070 + sharing.mps replicas: 4 → 應該回傳 "4"
 ```
 
@@ -312,7 +324,23 @@ bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s bash scripts/verify.sh
 ```
 
-`verify-gpu.sh` 涵蓋 6 個 step，最後一步 (step 6) 提交 `--gres=mps:25` 的 sbatch 並檢查 job 環境裡 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 與 `CUDA_MPS_PIPE_DIRECTORY` 是否被 Slurm prolog 注入。
+`verify-gpu.sh` 涵蓋 6 個 step：
+
+| Step | 驗證項目 | 失敗時 |
+|------|---------|--------|
+| 1 | device plugin DaemonSet ready | 先跑 `bootstrap-gpu.sh` |
+| 2 | 節點 `nvidia.com/gpu` allocatable > 0 | 確認 DaemonSet 正常 |
+| 3 | GPU worker pod 內 `nvidia-smi` 成功 | 確認 `runtimeClassName: nvidia` |
+| 4 | `sinfo` 顯示 GPU GRES | 確認 `gres.conf` / `slurm.conf GresTypes` |
+| 5 | `sbatch --gres=gpu:rtx4070:1` 完成並看到 GPU name | GPU job 端到端 |
+| 6 | `sbatch --gres=mps:25` 注入 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` | MPS daemon 端到端 |
+
+> **Step 5 注意**：GPU worker StatefulSet 預設 replicas=0，operator 在看到 pending GPU job 後才 scale up（最多 15s polling + pod 啟動時間）。若 job 在 120s 內未完成，會顯示 WARN 而非 FAIL；可用 `JOB_TIMEOUT=300 bash scripts/verify-gpu.sh` 延長等待時間。
+
+> **Step 6（MPS）**：目前正在測試 device-plugin v0.15.0；若 MPS daemon 仍失敗，可先跳過 step 6：
+> ```bash
+> SKIP_MPS=true bash scripts/verify-gpu.sh
+> ```
 
 ---
 
@@ -362,12 +390,14 @@ NodeName=slurm-worker-gpu-rtx4080-0 Name=gpu  Type=rtx4080 Count=1   File=/dev/n
 ## MPS 工作流程（device-plugin sharing.mps 模式）
 
 ```
-[一次性] kubectl label node <rtx4070> nvidia.com/device-plugin.config=rtx4070-mps
+[一次性] manifests/gpu/nvidia-device-plugin.yaml 中設定：
+  volumes.nvidia-config.configMap.items[0].key = rtx4070-mps
+  kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
               │
               ▼
 nvidia-device-plugin DaemonSet (kube-system)
-  reload 後讀取 ConfigMap key "rtx4070-mps"：
-    sharing.mps.replicas: 4
+  讀取掛載的 ConfigMap key "rtx4070-mps"：
+    sharing.mps.resources[].replicas: 4
               │
               ▼
 device-plugin 自己 fork:

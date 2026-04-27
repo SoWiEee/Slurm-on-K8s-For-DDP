@@ -84,6 +84,11 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
         "SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)",
         "MpiDefault=pmi2",
         "ReturnToService=2",
+        # Worker pods have no epilog scripts; setting CompleteWait=0 lets
+        # slurmctld immediately finalize COMPLETING jobs without waiting for
+        # an epilog-done signal. This prevents jobs from sticking in COMPLETING
+        # when the pod is evicted during the (very short) epilog window.
+        "CompleteWait=0",
         "SlurmctldPidFile=/var/run/slurmctld.pid",
         "SlurmdPidFile=/var/run/slurmd.pid",
         "SlurmdSpoolDir=/var/spool/slurmd",
@@ -499,6 +504,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22

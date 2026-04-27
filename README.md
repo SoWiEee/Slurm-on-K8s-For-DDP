@@ -5,8 +5,6 @@
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
 
-> 目前正在遷移階段，到 Linux 後第一次部署前，記得用 python scripts/render-core.py --real-gpu --with-lmod 重新生成 manifests/core/slurm-static.yaml，並在 GPU node 上 `kubectl label node <NODE> nvidia.com/device-plugin.config=rtx4070-mps`（或 rtx4080-exclusive）。
-
 ---
 
 # 🌱 Motivation
@@ -39,87 +37,195 @@
 
 # 🚀 Getting Started
 
-> 環境需求：Linux + K3s
+兩種部署路徑：
 
-## 1. 確認工具已安裝
+| 路徑 | 環境 | GPU | 適用場景 |
+|------|------|-----|----------|
+| **[A] Linux + k3s](#a-linux--k3s--real-gpu-已驗證)** | Ubuntu 24.04 + k3s | 真實 NVIDIA GPU | 生產/驗證 |
+| **[B] Kind（本機模擬）](#b-kind-本機開發模擬)** | Windows/Mac + Docker Desktop | 無（排程邏輯驗證） | 本機開發 |
+
+---
+
+## A. Linux + k3s + Real GPU（已驗證）
+
+> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 535
+
+### 步驟 1：主機準備
+
+安裝 NVIDIA Container Toolkit、k3s，並複製 kubeconfig：
 
 ```bash
-docker version
-kind version
-kubectl version --client
+sudo bash scripts/setup-linux-gpu.sh
+export KUBECONFIG=~/.kube/config
 ```
 
-## 2. 一鍵部署（核心叢集）
+確認 GPU 可見：
 
 ```bash
+nvidia-smi
+kubectl get nodes
+```
+
+### 步驟 2：部署 NVIDIA device plugin
+
+```bash
+kubectl apply -f manifests/gpu/runtime-class.yaml
+kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
+
+# 確認 GPU 資源出現（RTX 4070 time-slicing 4x → 顯示 4）
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+```
+
+> **GPU sharing 策略**：目前 `nvidia-device-plugin.yaml` 使用 `rtx4070-timeslicing`（4 replica）。  
+> MPS config（`rtx4070-mps`）在 driver 535 + k3s 1.34 + Ubuntu 24.04 上 MPS daemon 無法啟動，  
+> 改用 `items[0].key: rtx4070-mps` 可切換（重 apply 即生效）。  
+> Time-slicing 下 `--gres=mps:25` 仍可投遞，`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 由 Slurm prolog 注入。
+
+### 步驟 3：部署核心 Slurm 叢集
+
+```bash
+K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh
+```
+
+`bootstrap.sh` 自動完成：建置 controller/worker/operator image → 建立 Munge/SSH/JWT secret → 生成並套用 `slurm-static.yaml`（含 `gres.conf`、`slurm.conf`）→ 等待 rollout → 確認 slurmctld 可 ping。
+
+### 步驟 4：部署共享儲存（NFS）
+
+**4-A：主機 NFS Server（只需執行一次）**
+
+```bash
+sudo bash scripts/setup-nfs-server.sh
+```
+
+執行完後，確認 `/etc/exports` 涵蓋節點的 **LAN IP 段**（k3s 節點用主機物理 IP 掛載，不是 pod CIDR）：
+
+```bash
+cat /etc/exports
+# 正確範例（同時含 pod CIDR 和 LAN subnet）：
+# /srv/nfs/k8s 10.0.0.0/8(rw,...) 192.168.0.0/25(rw,sync,no_subtree_check,no_root_squash,insecure)
+```
+
+若只有 `10.0.0.0/8`，手動加上 LAN 段後重載：
+
+```bash
+# 查主機 LAN IP 段
+ip addr show | grep 'inet ' | grep -v 127
+# 補進 /etc/exports 後：
+sudo exportfs -ra
+showmount -e localhost   # 確認兩個 rule 都出現
+```
+
+**4-B：部署 NFS provisioner**
+
+```bash
+# 查主機 LAN IP（k3s pod 可達的介面，通常是 enp5s0 / eth0）
+NODE_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet )\S+' | head -1 | cut -d/ -f1)
+echo "NFS_SERVER=$NODE_IP"
+
+KUBECONFIG=~/.kube/config \
+KUBE_CONTEXT=default \
+NFS_SERVER=$NODE_IP \
+NFS_PATH=/srv/nfs/k8s \
+  bash scripts/bootstrap-storage.sh
+```
+
+### 步驟 5：驗證
+
+```bash
+# 儲存（PVC Bound + 跨 pod 讀寫 + 多節點 sbatch）
+KUBE_CONTEXT=default bash scripts/verify-storage.sh
+KUBE_CONTEXT=default bash scripts/verify-storage-e2e.sh
+
+# GPU（device plugin、nvidia-smi in job、MPS GRES）
+K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
+
+# 全叢集（CPU 彈性擴縮、MPI PMI2、GPU pool 彈性擴縮）
+K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
+```
+
+**預期結果（全通過）：**
+
+```
+verify-gpu.sh:
+  PASS: device plugin DaemonSet has ready pods
+  PASS: cluster has 4 allocatable GPU(s)
+  PASS: Slurm nodes have GPU GRES configured
+  PASS: GPU name visible in Slurm job output        ← nvidia-smi 輸出真實 GPU 型號
+  PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
+
+verify.sh:
+  [dev verify] done. all checks passed.
+```
+
+### 清理環境
+
+```bash
+# 移除 k3s（保留 kubeconfig 備份）
+/usr/local/bin/k3s-uninstall.sh
+# 停止 NFS
+sudo systemctl stop nfs-kernel-server
+```
+
+---
+
+## B. Kind（本機開發模擬）
+
+> 環境需求：Docker Desktop + kind + kubectl（Windows/Mac/Linux 均可）
+
+### 快速部署
+
+```bash
+# 確認工具已安裝
+docker version && kind version && kubectl version --client
+
+# 一鍵部署核心叢集（無 GPU，純排程邏輯驗證）
 bash scripts/bootstrap.sh
 
-# 啟用 K8s 1.35 Gang Scheduling 基礎設施（Alpha feature gates）
-# 注意：目前只啟用 K8s 層 feature gates；Operator 整合（_ensure_workload）尚未實作
-KIND_CONFIG=kind-config.yaml bash scripts/bootstrap.sh
-```
-
-`scripts/bootstrap.sh` 自動完成以下步驟：
-
-1. 建立 Kind 叢集（若不存在）
-2. 建置 `slurm-controller:latest`、`slurm-worker:latest` Docker image（從 `docker/`），並 load 進 Kind
-3. 執行 `scripts/render-core.py` 生成 `manifests/core/slurm-static.yaml`（自動偵測 NFS PVC）
-4. 建立 Munge/SSH/JWT secrets（`scripts/create-secrets.sh`）
-5. 套用 `manifests/core/` 所有資源（StatefulSet、Service、ConfigMap、DDP runtime、Lmod modulefiles）
-6. 等待 controller rollout 完成，確認 `slurmctld` 可 ping
-7. 建置 `slurm-elastic-operator:latest` image，套用 `manifests/operator/` 與 `manifests/networking/`
-8. 設定三個 worker pool 的 `PARTITIONS_JSON` 環境變數
-9. 縮放 cpu pool → 1 replica，GPU pool → 0 replica（初始狀態）
-
-> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap.sh`  
-> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap.sh`
-
-## 3. 驗證部署
-
-```bash
+# 驗證
 bash scripts/verify.sh
 ```
 
-依序執行：Pod readiness → slurmctld ping → srun 單節點 → sbatch CPU smoke test → operator scale-up/scale-down → GPU pool 路由驗證。
+`scripts/bootstrap.sh` 自動完成：建立 Kind 叢集 → 建置並 load image → 生成 `slurm-static.yaml` → 套用所有資源 → 等待 rollout → 確認 slurmctld ping。
 
-## 4. 部署共享儲存
+> 慢速機器：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap.sh`  
+> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap.sh`
+
+### 部署共享儲存（可選）
 
 ```bash
-# 主機端 NFS server（只需執行一次，在 WSL2 跑）
+# WSL2 主機端 NFS Server
 sudo bash scripts/setup-nfs-server.sh
 
-# 在 K8s 叢集部署 NFS provisioner + 掛載到所有 pod
-NFS_SERVER=<nfs-server-ip> NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
+# 部署 provisioner（NFS_SERVER 為 WSL2 IP，hostname -I 取得，每次開機會變）
+NFS_SERVER=<wsl2-ip> NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
 
-# 驗證
 bash scripts/verify-storage.sh
 bash scripts/verify-storage-e2e.sh
 ```
 
-> 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
+### 清理環境
 
-> WSL2 的 IP 可以用 `hostname -I` 得知，Windows 每次開機都會變。
+```bash
+kind delete cluster --name slurm-lab
+```
 
-## 5. 部署監控
+---
+
+## 通用步驟（兩種路徑都適用）
+
+## 部署監控
 
 ```bash
 bash scripts/bootstrap-monitoring.sh
-```
 
-自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana + Alertmanager → 套用跨 namespace NetworkPolicy → 等待所有 Pod ready。
-
-```bash
 # 存取 Grafana（admin / admin）
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 # 驗證所有元件正常、metrics 可抓
 bash scripts/verify-monitoring.sh
-
-# 存取 Prometheus（debug）
-kubectl -n monitoring port-forward svc/prometheus 9090:9090
 ```
 
-## 6. Lmod 模組系統（已整合至核心）
+## Lmod 模組系統（已整合至核心）
 
 Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`bootstrap.sh` 執行完畢後即可使用 `module load`。Modulefile 定義在 `manifests/core/lmod-modulefiles.yaml`，以 ConfigMap 管理。
 
@@ -189,12 +295,6 @@ bash scripts/verify-lmod.sh
 > 自訂模組只需編輯 `manifests/core/lmod-modulefiles.yaml` 並 `kubectl apply`，**不需要重建 image**，數秒內生效。
 
 ---
-
-## 清理環境
-
-```bash
-kind delete cluster --name slurm-lab
-```
 
 ---
 
@@ -407,7 +507,7 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 | 類別 | 工具 |
 |------|------|
-| 環境 | Windows 11 + Docker Desktop + Kind |
+| 環境 | Ubuntu 24.04 + k3s（生產）／Windows 11 + Docker Desktop + Kind（本機開發） |
 | 容器編排 | Kubernetes |
 | HPC 排程器 | Slurm (slurmctld + slurmd)，MpiDefault=pmi2 |
 | 節點認證 | Munge |

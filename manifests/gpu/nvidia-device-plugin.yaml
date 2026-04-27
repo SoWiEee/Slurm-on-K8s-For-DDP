@@ -1,4 +1,4 @@
-# NVIDIA Kubernetes Device Plugin (v0.17.x) — with MPS sharing
+# NVIDIA Kubernetes Device Plugin (v0.15.0) — with MPS sharing
 #
 # Exposes real GPUs as nvidia.com/gpu resources to the K8s scheduler, AND
 # enables MPS-based sharing so that one physical GPU can be advertised as
@@ -99,17 +99,13 @@ spec:
       hostPID: true
       containers:
         - name: nvidia-device-plugin-ctr
-          image: nvcr.io/nvidia/k8s-device-plugin:v0.17.4
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.15.0
           env:
             - name: FAIL_ON_INIT_ERROR
               value: "false"
             # NVIDIA_DRIVER_CAPABILITIES must include "compute,utility" for MPS.
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: "compute,utility"
-            # Per-node config selector. Pin a node to a config by labelling it:
-            #   kubectl label node <NODE> nvidia.com/device-plugin.config=rtx4070-mps
-            #   kubectl label node <NODE> nvidia.com/device-plugin.config=rtx4080-exclusive
-            # Falls back to "default" (no sharing) if the label is missing.
             - name: CONFIG_FILE
               value: /etc/nvidia-device-plugin/config.yaml
           args:
@@ -138,13 +134,11 @@ spec:
             # Pick the data key matching the node's
             # nvidia.com/device-plugin.config label. If using a single GPU
             # type host, set the items[].path to the chosen key directly.
-            # Switched from rtx4070-mps to rtx4070-timeslicing: device-plugin
-            # v0.17.x fails to spawn its MPS control daemon on this host
-            # (NVIDIA driver 535.288.01 + k3s 1.34 + Ubuntu 24.04). MPS daemon
-            # works when invoked manually inside the pod, so the issue is in
-            # the device-plugin's auto-spawn flow. Time-slicing achieves the
-            # same 4-replica multiplexing without an MPS daemon. Switch back
-            # to rtx4070-mps once the upstream device-plugin issue is resolved.
+            # Config is statically selected here — all nodes running this DaemonSet
+            # use the same key. To switch configs (e.g. rtx4070-timeslicing),
+            # change items[0].key and re-apply this manifest. The
+            # nvidia.com/device-plugin.config node label is only effective when
+            # a config-manager sidecar is deployed (not present here).
             items:
               - key: rtx4070-timeslicing
                 path: config.yaml

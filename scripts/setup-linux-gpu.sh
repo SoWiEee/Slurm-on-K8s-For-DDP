@@ -85,14 +85,20 @@ if [[ "$INSTALL_K3S" == "true" ]]; then
   if command -v k3s >/dev/null 2>&1; then
     echo "k3s already installed: $(k3s --version | head -1)"
   else
-    # Install k3s with nvidia runtime and disable default traefik.
+    # Install k3s pointing at containerd and disable default traefik.
     # INSTALL_K3S_EXEC passes flags to k3s server.
+    # Note: do NOT pass --kube-apiserver-arg feature-gates=... here;
+    # kube-apiserver 1.28+ fatals on unknown gate names.
     INSTALL_K3S_EXEC="--container-runtime-endpoint unix:///run/containerd/containerd.sock \
-      --disable traefik \
-      --kube-apiserver-arg feature-gates=GangScheduling=true,GenericWorkload=true" \
+      --disable traefik" \
       curl -sfL https://get.k3s.io | sh -
 
-    # Allow non-root kubectl (copy kubeconfig to ~/.kube/config).
+    # Allow non-root kubectl.
+    # WARNING: running as root (sudo), so HOME=/root. The kubeconfig lands at
+    # /root/.kube/config, not the invoking user's home. Copy it manually:
+    #   sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+    #   mkdir -p ~/.kube && cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+    #   chmod 600 ~/.kube/config
     mkdir -p "${HOME}/.kube"
     cp /etc/rancher/k3s/k3s.yaml "${HOME}/.kube/config"
     chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
@@ -100,6 +106,9 @@ if [[ "$INSTALL_K3S" == "true" ]]; then
 
     echo "k3s installed. Kubeconfig: ${HOME}/.kube/config"
     echo "Context: default (use KUBE_CONTEXT=default with bootstrap.sh)"
+    echo "NOTE: if you ran this with sudo, copy kubeconfig to your user home:"
+    echo "  mkdir -p ~/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config"
+    echo "  sudo chown \$(id -u):\$(id -g) ~/.kube/config && chmod 600 ~/.kube/config"
   fi
 
   # Wait for k3s to be ready.

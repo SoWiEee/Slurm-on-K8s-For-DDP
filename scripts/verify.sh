@@ -10,6 +10,7 @@ BASELINE_WORKER_POD=${BASELINE_WORKER_POD:-slurm-worker-cpu-0}
 LOGIN_SELECTOR=${LOGIN_SELECTOR:-app=slurm-login}
 PARTITION=${PARTITION:-cpu}
 GPU_POOL_STS=${GPU_POOL_STS:-slurm-worker-gpu-rtx4070}
+GPU_PARTITION=${GPU_PARTITION:-gpu-rtx4070}
 GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-rtx4070}
 GPU_GRES=${GPU_GRES:-gpu:rtx4070:1}
 GPU_POOL_APP_LABEL=${GPU_POOL_APP_LABEL:-app=${GPU_POOL_STS}}
@@ -225,6 +226,23 @@ wait_replicas_at_most() {
   done
 }
 
+# Read a job output file, trying login pod first then falling back to the pod
+# that ran the job (by Slurm NodeList). Without shared NFS the file lives only
+# on the compute node; the login pod sees nothing.
+read_output_from_job() {
+  local job_id="$1" remote_path="$2"
+  local out node pod
+  out=$(login_exec "cat '${remote_path}' 2>/dev/null || echo ''" 2>/dev/null | tr -d '\r' || true)
+  if [[ -z "$out" ]]; then
+    node=$(safe_login_exec "scontrol show job ${job_id} 2>/dev/null | grep -oP 'BatchHost=\K\S+' | head -1 || true" 2>/dev/null | tr -d '\r' | tail -n1 | xargs || true)
+    if [[ -n "$node" ]]; then
+      out=$(kubectl -n "$NAMESPACE" exec "pod/${node}" -- \
+        bash -c "cat '${remote_path}' 2>/dev/null || echo ''" 2>/dev/null | tr -d '\r' || true)
+    fi
+  fi
+  printf '%s\n' "$out"
+}
+
 assert_job_runs_on_prefix() {
   local job_id="$1" prefix="$2" label="$3"
   local nodelist
@@ -345,7 +363,7 @@ if ! wait_job_finished "$pmi2_job" 120 >/tmp/devverify_pmi2_state.txt; then
   state=$(cat /tmp/devverify_pmi2_state.txt)
   die "pmi2 smoke job ${pmi2_job} did not finish in time (${state})"
 fi
-pmi2_out=$(login_exec "cat /tmp/dev-pmi2-${pmi2_job}.out 2>/dev/null || echo ''" | tr -d '\r')
+pmi2_out=$(read_output_from_job "$pmi2_job" "/tmp/dev-pmi2-${pmi2_job}.out")
 if echo "$pmi2_out" | grep -q "rank:0" && echo "$pmi2_out" | grep -q "rank:1"; then
   echo "pmi2: both ranks completed"
 else
@@ -368,7 +386,7 @@ if [[ -n "$mpirun_path" ]]; then
 mpirun --oversubscribe -np 2 --mca btl_base_warn_component_unused 0 /bin/sh -c 'echo ompi-rank:\${OMPI_COMM_WORLD_RANK} host:\$(hostname)'" "/tmp/dev-ompi-smoke.sbatch")
   echo "submitted ompi job: ${ompi_job}"
   if wait_job_finished "$ompi_job" 120 >/tmp/devverify_ompi_state.txt; then
-    ompi_out=$(login_exec "cat /tmp/dev-ompi-${ompi_job}.out 2>/dev/null || echo ''" | tr -d '\r')
+    ompi_out=$(read_output_from_job "$ompi_job" "/tmp/dev-ompi-${ompi_job}.out")
     if echo "$ompi_out" | grep -q "ompi-rank:0" && echo "$ompi_out" | grep -q "ompi-rank:1"; then
       echo "openmpi: both ranks completed"
     else
@@ -395,8 +413,14 @@ if kubectl -n "$NAMESPACE" get statefulset/${GPU_POOL_STS} >/dev/null 2>&1; then
   wait_no_dev_pending 30 || die "stale dev jobs are still pending before GPU verification"
   log "gpu pool verification (${GPU_POOL_STS}, constraint=${GPU_CONSTRAINT}, gres=${GPU_GRES})"
   kubectl -n "$NAMESPACE" scale statefulset/${GPU_POOL_STS} --replicas=0 >/dev/null || true
+  # GPU worker nodes may be DRAINED from the preStop hook run by the previous pod.
+  # Slurm rejects sbatch immediately when all eligible nodes are DRAINED (rather
+  # than queuing the job as PENDING). Resume them here so the submit succeeds and
+  # the operator can scale up on seeing the pending job.
+  login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null \
+    | xargs -r -I{} scontrol update nodename={} state=resume 2>/dev/null" || true
   gpu_job=$(submit_job "#!/bin/bash
-#SBATCH -p ${PARTITION}
+#SBATCH -p ${GPU_PARTITION}
 #SBATCH -N 1
 #SBATCH -J dev-gpu-smoke
 #SBATCH --constraint=${GPU_CONSTRAINT}

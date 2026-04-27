@@ -1885,3 +1885,367 @@ dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
 | 同一張 GPU 能讓多個 job 共用？ | ✅ 可透過 time-slicing 或 MIG（需真實 GPU + 額外設定） |
 | GPU core 能跨多張 GPU 分割給同一 job？ | ❌ CUDA 硬體架構根本限制 |
 | Kind 環境的 GPU GRES 是真實硬體？ | ❌ `File=/dev/null`，純排程模擬 |
+
+---
+
+# Phase 5-B：Linux + k3s 真實 GPU 驗證 Debug 紀錄（2026-04-27）
+
+這一輪的目標是把整個 migration.md 的 Linux+k3s 路徑實際跑起來，並驗證 GPU、MPS、NFS 共享儲存都能正常運作。以下是踩到的每個坑與修法。
+
+---
+
+## 坑 1：NFS Server 的 export 沒涵蓋 LAN 介面 IP
+
+**現象**
+
+```
+Warning  FailedMount  ...  MountVolume.SetUp failed for volume "nfs-client-root":
+  mount failed: exit status 32
+  mount.nfs: access denied by server while mounting 192.168.0.111:/srv/nfs/k8s
+```
+
+`nfs-subdir-external-provisioner` Pod 卡在 `ContainerCreating` 永遠無法啟動。
+
+**根本原因**
+
+`setup-nfs-server.sh` 只設定了：
+
+```
+/srv/nfs/k8s 10.0.0.0/8(rw,sync,no_subtree_check,no_root_squash,insecure)
+```
+
+k3s 以 native（非 VM）方式跑在主機上，Pod volume 的 NFS mount 是由 **kubelet（節點）** 執行，不是由 Pod 內部發起。節點的 LAN IP 是 `192.168.0.111`（`enp5s0`，在 `192.168.0.0/25`），不在 `10.0.0.0/8` 內。
+
+**修法**
+
+```bash
+# /etc/exports 加上 LAN subnet：
+/srv/nfs/k8s 10.0.0.0/8(rw,sync,...) 192.168.0.0/25(rw,sync,no_subtree_check,no_root_squash,insecure)
+sudo exportfs -ra
+```
+
+**教訓**
+
+Docker/Kind 環境的容器網段通常是 `172.x` 或 `10.x`，所以舊的 export 規則剛好夠用。k3s native 部署時節點 IP 就是主機的物理 IP，必須額外加入。
+
+---
+
+## 坑 2：GPU job 卡在 COMPLETING 永不結束
+
+**現象**
+
+```
+[21:34:15] job 16 state=COMPLETING
+[21:35:33] job 16 state=COMPLETING
+WARN: timed out waiting for GPU job 16
+FAIL: GPU job did not complete (state=COMPLETING)
+```
+
+job 的 ExitCode 已經是 `0:0`（batch script 確實跑完），但 slurmctld 一直等 epilog-done 訊號。
+
+**根本原因**
+
+COMPLETING 在 Slurm 裡代表「batch script 結束，等 slurmstepd 回報 epilog 完成」。GPU worker 是 elastic pool（用完就縮容），operator 把 Pod evict 掉後，preStop hook 設了 `state=drain`，接著 kubelet 殺掉 Pod。slurmstepd 跟著消失，slurmctld 收不到 epilog-done，job 就永遠卡在 COMPLETING。
+
+**修法**
+
+在 `scripts/render-core.py` 的 `slurm.conf` 加一行：
+
+```python
+"CompleteWait=0",
+```
+
+`CompleteWait=0` 讓 slurmctld 在 batch script 結束後不等 epilog-done，直接把 job 轉到 COMPLETED。Worker Pod 沒有任何 epilog script，這個設定完全安全。
+
+**復現方式驗證**
+
+加入後，job 在 RUNNING → COMPLETED 只需幾秒，不再卡住。
+
+---
+
+## 坑 3：verify-gpu.sh 的 job output 讀不到
+
+**現象**
+
+```
+(no output file on submit pod — no shared storage)
+ExitCode=0:0  TresPerNode=gres:gpu:rtx4070:1
+PASS: GPU job ExitCode=0:0 and GPU GRES allocated ...
+```
+
+job 有跑完，但看不到 `nvidia-smi` 的實際輸出。
+
+**根本原因**
+
+原本的 sbatch script 是：
+
+```bash
+#SBATCH --output=/tmp/gpu-verify-%j.out
+```
+
+output 寫在 GPU worker Pod 的 `/tmp`。GPU worker Pod 跑完 job 後被 operator 縮容，Pod 消失，login pod 去讀這個 `/tmp` 路徑當然讀不到。
+
+**修法**
+
+改把 output 寫到 NFS 共享的 `/shared`：
+
+```bash
+JOB_OUT_DIR="${SHARED_DIR}/gpu-verify-$$"   # $$=verify腳本的PID，唯一目錄
+# 在 sbatch submission 前先在 login pod 建立該目錄
+mkdir -p '${JOB_OUT_DIR}'
+# sbatch 腳本內：
+#SBATCH --output=${JOB_OUT_DIR}/%j.out
+```
+
+所有 Pod（controller、worker、login）都 mount 同一個 `slurm-shared-rwx` PVC，job output 寫進去後 login pod 一定讀得到。
+
+---
+
+## 坑 4：verify.sh GPU job 丟到 cpu partition 導致立刻 fail
+
+**現象**
+
+```
+sbatch: error: Batch job submission failed: Requested node configuration is not available
+```
+
+**根本原因**
+
+`verify.sh` 有：
+
+```bash
+PARTITION=${PARTITION:-cpu}
+```
+
+GPU job 的 sbatch script 用了 `#SBATCH -p ${PARTITION}`，結果是 `-p cpu`，cpu partition 根本沒有 `--gres=gpu:rtx4070:1` 的節點，Slurm 立刻拒絕。
+
+**修法**
+
+加一個獨立的 `GPU_PARTITION` 變數，GPU job 改用它：
+
+```bash
+GPU_PARTITION=${GPU_PARTITION:-gpu-rtx4070}
+# sbatch 腳本改為：
+#SBATCH -p ${GPU_PARTITION}
+```
+
+---
+
+## 坑 5：DRAIN 狀態導致 sbatch 立刻被拒
+
+**現象**
+
+```
+sbatch: error: Batch job submission failed: Requested node configuration is not available
+```
+
+（跟坑 4 的錯誤訊息一模一樣，但原因不同。）
+
+**根本原因**
+
+preStop hook（`scontrol update nodename=$(hostname) state=drain reason=k8s-eviction`）在每次 Pod 縮容時都會被觸發，DRAIN 狀態會在 slurmctld 的 StateSaveLocation 裡持久化。
+
+下一次 sbatch 提交時：
+- GPU worker Pod 已縮容，replicas=0
+- slurmctld 裡所有 GPU node 都是 `drained*`
+- Slurm 直接拒絕投遞（DRAINED ≠ DOWN，不會排到 queue 等節點恢復）
+
+Worker Pod 啟動時雖然有 `scontrol update nodename=$(hostname) state=resume`（坑 6 的修法），但 Pod 還沒啟動就已經 sbatch 失敗了。
+
+**修法**
+
+在 verify.sh GPU job 提交前，先 resume 所有 drained 的節點：
+
+```bash
+login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null \
+  | xargs -r -I{} scontrol update nodename={} state=resume 2>/dev/null" || true
+```
+
+這樣 GPU 節點變成 `idle*`（slurmd 未連線但不是 DRAIN），sbatch 成功送出 PENDING，operator 看到 PENDING job 後 scale up，Pod 啟動後 slurmd 重新 register，job 才能 dispatch。
+
+**為何不用 `awk` 解析 `sinfo --Format=NodeList,StateLong`？**
+
+`sinfo --Format` 的欄位是固定寬度，節點名稱過長時會截斷，截斷後與 state 欄位黏在一起，awk `$2` 抓不到正確 state。改用 `-o '%N'` 配合 `-t drain,drained` 過濾才能拿到完整節點名稱。
+
+---
+
+## 坑 6（舊）：DRAIN 在 Pod 重啟後持久化導致 job PENDING
+
+這是上一輪已修的坑，這裡補充說明驗證結果。
+
+**修法**（在 `scripts/render-core.py` worker 啟動 script 裡）：
+
+```bash
+su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+sleep 1
+pgrep -x munged >/dev/null
+# Clear stale DRAIN from preStop hook of previous pod.
+scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
+exec slurmd -Dvvv -N "$(hostname)"
+```
+
+`state=resume` 在 munge 起來後、slurmd 啟動前執行，可以把 slurmctld 裡殘留的 DRAIN/DOWN 清掉。`ReturnToService=2` 只清 DOWN，不清 DRAIN，所以這行 `state=resume` 是必要的。
+
+---
+
+## 最終驗證結果
+
+### verify-gpu.sh
+
+```
+=== [1] NVIDIA device plugin DaemonSet ===
+  PASS: device plugin DaemonSet has ready pods
+
+=== [2] GPU node capacity ===
+  PASS: cluster has 4 allocatable GPU(s)     ← 1 張 RTX 4070 time-slicing 成 4 個 replica
+
+=== [4] Slurm GPU GRES (sinfo) ===
+  PASS: Slurm nodes have GPU GRES configured
+
+=== [5] sbatch GPU job (nvidia-smi) ===
+  Job stdout:
+    NVIDIA GeForce RTX 4070, 535.288.01, 0 %
+    CUDA_VISIBLE_DEVICES=0
+    SLURM_JOB_GPUS=0
+  PASS: GPU name visible in Slurm job output
+
+=== [6] sbatch MPS job (--gres=mps:25) ===
+  MPS job stdout:
+    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25
+    CUDA_VISIBLE_DEVICES=0
+    NVIDIA GeForce RTX 4070
+  PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
+  WARN: CUDA_MPS_PIPE_DIRECTORY missing — time-slicing 模式，MPS daemon 不啟動（預期行為）
+```
+
+### verify.sh
+
+```
+[dev verify] done. all checks passed.
+```
+
+所有測試通過，包含 CPU pool 彈性擴縮、MPI PMI2 多節點、GPU pool 彈性擴縮。
+
+---
+
+## Linux + k3s 完整復現步驟
+
+> 適用環境：Ubuntu 24.04 x86\_64，RTX 4070，NVIDIA driver 535+，k3s v1.34+
+
+### 步驟 0：主機準備
+
+```bash
+# 安裝 NVIDIA Container Toolkit（先裝好 driver）
+sudo bash scripts/setup-linux-gpu.sh
+# 確認 driver
+nvidia-smi
+```
+
+### 步驟 1：k3s 安裝
+
+`setup-linux-gpu.sh` 內部已處理，或手動：
+
+```bash
+INSTALL_K3S_EXEC="--container-runtime-endpoint unix:///run/containerd/containerd.sock --disable traefik" \
+  curl -sfL https://get.k3s.io | sh -
+# 複製 kubeconfig（setup-linux-gpu.sh 已做）
+mkdir -p ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $USER ~/.kube/config
+export KUBECONFIG=~/.kube/config
+```
+
+### 步驟 2：部署 NVIDIA device plugin + RuntimeClass
+
+```bash
+KUBECONFIG=~/.kube/config kubectl apply -f manifests/gpu/runtime-class.yaml
+KUBECONFIG=~/.kube/config kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
+# 驗證（RTX 4070 + time-slicing → 4 GPU）
+KUBECONFIG=~/.kube/config kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+```
+
+> **注意**：`nvidia-device-plugin.yaml` 目前以 `rtx4070-timeslicing` config key 掛載。  
+> MPS config (`rtx4070-mps`) 在 driver 535.288.01 + k3s 1.34 + Ubuntu 24.04 上無法啟動 MPS daemon（device-plugin subprocess spawn 問題，v0.15.0 與 v0.17.4 皆失敗）。  
+> Time-slicing 模式下 `--gres=mps:25` 仍可正常投遞，`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 由 Slurm prolog 注入，但 `CUDA_MPS_PIPE_DIRECTORY` 不會設定。
+
+### 步驟 3：部署核心 Slurm 叢集
+
+```bash
+KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh
+```
+
+### 步驟 4：部署 NFS 共享儲存
+
+**4-A：主機 NFS Server（只需執行一次）**
+
+```bash
+sudo bash scripts/setup-nfs-server.sh
+```
+
+⚠️ 執行完後，確認 `/etc/exports` 涵蓋了節點的 LAN IP（不只 pod CIDR）：
+
+```bash
+cat /etc/exports
+# 應包含類似：
+# /srv/nfs/k8s 10.0.0.0/8(...) 192.168.0.0/25(...)
+#                                ^^^^^^^^^^^^^^^^^^^^^^
+#                                加上主機 LAN subnet
+```
+
+若 `setup-nfs-server.sh` 沒加 LAN subnet，手動補上後 `sudo exportfs -ra`。
+
+**4-B：部署 NFS subdir provisioner**
+
+先確認主機 IP（從 Pod 可達的 IP，通常是 LAN 介面）：
+
+```bash
+ip addr show enp5s0 | grep 'inet '   # e.g., 192.168.0.111
+```
+
+```bash
+NFS_SERVER=192.168.0.111 \
+NFS_PATH=/srv/nfs/k8s \
+KUBECONFIG=~/.kube/config \
+KUBE_CONTEXT=default \
+  bash scripts/bootstrap-storage.sh
+```
+
+### 步驟 5：驗證
+
+```bash
+# 儲存驗證
+KUBECONFIG=~/.kube/config KUBE_CONTEXT=default bash scripts/verify-storage.sh
+KUBECONFIG=~/.kube/config KUBE_CONTEXT=default bash scripts/verify-storage-e2e.sh
+
+# GPU 驗證（含 MPS prolog 測試）
+KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
+
+# 全叢集驗證（CPU 彈性擴縮、MPI、GPU pool）
+KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
+```
+
+### 預期輸出（摘要）
+
+| 驗證項目 | 預期結果 |
+|----------|----------|
+| device plugin DaemonSet | PASS |
+| GPU node capacity | PASS（RTX4070 × 4 replicas） |
+| GPU GRES in sinfo | PASS |
+| sbatch GPU job (`nvidia-smi`) | PASS（輸出 GPU 型號與驅動版本） |
+| sbatch MPS job (`--gres=mps:25`) | PASS（`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25`） |
+| `CUDA_MPS_PIPE_DIRECTORY` | WARN（time-slicing 模式，MPS daemon 不存在，預期） |
+| verify.sh all checks | PASS |
+
+---
+
+## 已修改的檔案清單
+
+| 檔案 | 變更 |
+|------|------|
+| `scripts/render-core.py` | 加 `CompleteWait=0`；worker 啟動時加 `scontrol update state=resume` |
+| `scripts/verify.sh` | 加 `GPU_PARTITION` 變數；GPU sbatch 改用 `GPU_PARTITION`；GPU 提交前 resume drained 節點 |
+| `scripts/verify-gpu.sh` | job output 改寫到 `/shared/gpu-verify-<pid>/<jid>.out` |
+| `scripts/setup-linux-gpu.sh` | 移除無效的 `--kube-apiserver-arg feature-gates=GangScheduling=true,GenericWorkload=true` |
+| `scripts/bootstrap.sh` | 修正 `WITH_MPS=true` 的 log 訊息（MPS 由 device-plugin 負責） |
+| `manifests/gpu/nvidia-device-plugin.yaml` | ConfigMap key 改為 `rtx4070-timeslicing`（MPS daemon spawn 失敗） |
+| `/etc/exports`（主機） | 加入 `192.168.0.0/25` export rule |
