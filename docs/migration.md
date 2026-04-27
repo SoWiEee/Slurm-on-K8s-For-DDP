@@ -18,20 +18,7 @@ MPS 需要 `hostIPC: true` 與 POSIX shared memory，在 Windows WSL2 kernel 上
 
 ---
 
-## 遷移路徑選擇
-
-### Path A — Linux 上繼續用 Kind（最小改動）
-
-適合只需要驗證 GPU 裝置存取，不需要 MPS 的情境。
-
-```
-Linux host → Docker + NVIDIA runtime → Kind cluster → device plugin → GPU pod
-```
-
-優點：幾乎不需修改現有腳本。  
-缺點：`hostIPC` 在 container-in-container 架構下仍有限制，MPS socket 需要額外 `Bidirectional` propagation 設定。
-
-### Path B — Linux + k3s（推薦，完整 GPU/MPS 支援）
+## Linux + k3s（完整 GPU/MPS 支援）
 
 ```
 Linux host → containerd + NVIDIA runtime → k3s → device plugin + MPS daemon → GPU pod
@@ -117,31 +104,6 @@ bash scripts/verify-gpu.sh
 # 驗證核心 Slurm（含 CPU jobs）
 K8S_RUNTIME=k3s bash scripts/verify.sh
 ```
-
----
-
-## Path A：Kind-on-Linux 步驟
-
-如果不想安裝 k3s，可用 Kind + GPU config：
-
-```bash
-# 安裝 NVIDIA CT，設定 Docker runtime（不安裝 k3s）
-sudo bash scripts/setup-linux-gpu.sh
-
-# 建立 Kind cluster 並掛入 GPU 裝置
-KIND_CONFIG=kind-config-gpu.yaml bash scripts/bootstrap.sh
-
-# 部署 device plugin
-bash scripts/bootstrap-gpu.sh
-
-# 驗證
-bash scripts/verify-gpu.sh
-```
-
-`kind-config-gpu.yaml` 的關鍵設定：
-- `extraMounts`：將 `/dev/nvidia*` 掛入 Kind worker 節點
-- `/tmp/nvidia-mps` mount 設定為 `Bidirectional` propagation
-
 ---
 
 ## 環境變數對照表
