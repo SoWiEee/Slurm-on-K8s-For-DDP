@@ -217,59 +217,103 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 
 ## 5-A：Helm Chart 封裝
 
+> **修訂版（2026-04-27）：** 本節原稿寫於 N1 / N7 修復前，`mps.enabled` flag、`partition: debug`、rtx4080 `devicePath: /dev/nvidia1` 已隨 `mps-migration` 分支上線而過時。本版改為對齊：device-plugin `sharing.mps`（N1 / N10）、三 partition 拆分（N7）、`/dev/nvidia0` 一律（N2）、`AccountingStorageTRES`（N6）、namespace PSS=baseline（N9）、k3s `ctr images import`（N4）、NetworkPolicy 6443（N5）。
+
 ### 問題
 目前部署流程是「依序執行多支 bootstrap 腳本，每支腳本依賴前一支的副作用」：
-- 環境差異（k3s vs. Kind、REAL_GPU=true/false）靠環境變數控制，容易漏設。
-- `worker-pools.json` 改完還需要手動跑 `render-core.py`，manifest 和設定雙重維護。
-- 無法用 ArgoCD / Flux 做 GitOps，無版本 rollback 機制。
+- 環境差異（k3s vs. Kind、`REAL_GPU=true/false`）靠環境變數控制，容易漏設。
+- `worker-pools.json` 改完還需要手動跑 `render-core.py`，manifest 與設定雙重維護。
+- 無法用 ArgoCD / Flux 做 GitOps、無版本 rollback、無 dry-run diff。
+- N1 之後還多了「需要記得對 GPU 節點打 `nvidia.com/device-plugin.config` label」這一步驟，若忘記則 MPS 默默失效。
 
 ### 設計方向
 
-**Monolithic chart + Helm template 直接生成 slurm.conf**
+**Monolithic chart + 官方 NVIDIA device-plugin 為 dependency + slurm.conf 拆兩個 ConfigMap。**
 
-不拆 subchart。monitoring / storage 用 `enabled` flag 控制是否渲染。`render-core.py` 完全廢棄，slurm.conf 和 gres.conf 由 `_helpers.tpl` 中的 Go template function 從 `values.yaml` 的 `pools` 列表產生。
+- 主體不拆 subchart；monitoring / storage / gpu 用 `enabled` flag 控制。
+- `render-core.py` 廢棄，`slurm.conf` / `gres.conf` 改由 `_helpers.tpl` 從 `values.yaml` 的 `pools` 列表產生。
+- `nvidia-device-plugin` **不要自己寫 templates**，加成 chart dependency（`condition: gpu.enabled`），sharing 設定透過 values 注入；自寫的 `manifests/gpu/nvidia-device-plugin.yaml` 廢棄。
+- `slurm.conf` ConfigMap 拆成 **`slurm-config-static`**（ClusterName / Auth / Plugin / AccountingStorageTRES，幾乎不變）+ **`slurm-config-nodes`**（NodeName / PartitionName，每次 pool 變動都重產）。worker 只 mount 後者 → 改一個 pool 的 `maxReplicas` 不會 rolling restart 全部 worker。
+- secret（munge.key / slurm-jwt-key）**不由 chart 產生**，install 前要先跑 `scripts/create-secrets.sh`（chart 用 `helm.sh/hook-pre-install` 檢查存在性即可）。
 
 ### Chart 目錄結構
 
 ```
 chart/
-  Chart.yaml
-  values.yaml              ← 預設值（Kind 開發環境基準）
-  values-dev.yaml          ← Kind override（無 GPU，placeholder device）
-  values-k3s.yaml          ← k3s override（real GPU、MPS enabled）
+  Chart.yaml                ← appVersion = Slurm 版本（如 23.11.7）；dependencies: nvidia-device-plugin
+  Chart.lock
+  values.yaml               ← 預設值（Kind 開發環境基準）
+  values-dev.yaml           ← Kind override（無 GPU，File=/dev/null）
+  values-k3s.yaml           ← k3s override（real GPU、sharing.mps、namespace baseline label）
+  charts/                   ← helm dependency update 後的 nvidia-device-plugin tarball
   templates/
-    _helpers.tpl            ← label 函數 + slurm.conf/gres.conf 產生函數
-    namespace.yaml
-    configmap.yaml          ← slurm-config（slurm.conf + gres.conf）
+    _helpers.tpl            ← label 函數 + slurmConf / gresConf / partitionsJson 產生函數
+    namespace.yaml          ← Namespace 物件，含 pod-security.kubernetes.io/enforce=baseline label
+    configmap-static.yaml   ← slurm-config-static（ClusterName / Auth / Plugin / AccountingStorageTRES）
+    configmap-nodes.yaml    ← slurm-config-nodes（NodeName / PartitionName / gres.conf）
     controller.yaml         ← controller StatefulSet + Service + PDB
-    workers.yaml            ← range pools → 每個 pool 的 StatefulSet + Service + PDB
+    workers.yaml            ← range pools → 每 pool 的 StatefulSet + Service + PDB
     operator.yaml           ← operator Deployment + RBAC + PARTITIONS_JSON
     pvc.yaml                ← ctld-state PVC
     login.yaml              ← login Deployment + Service + PDB
-    monitoring.yaml         ← {{- if .Values.monitoring.enabled }} Prometheus + Grafana
-    storage.yaml            ← {{- if .Values.storage.enabled }} NFS provisioner
+    network-policy.yaml     ← 含 operator → K8s API egress（443 + 6443）
+    gpu/
+      device-plugin-config.yaml  ← ConfigMap default / rtx5070-mps / rtx4080-exclusive
+      node-labeler-job.yaml      ← {{- if .Values.gpu.autoLabel }} Job 自動對符合條件的節點打 label
+    monitoring/             ← {{- if .Values.monitoring.enabled }} Prometheus + Grafana + slurm-exporter
+    storage.yaml            ← {{- if .Values.storage.enabled }} NFS subdir provisioner
+    tests/
+      test-scontrol-ping.yaml    ← helm test 用，跑 scontrol ping + sinfo
+      test-mps-job.yaml          ← gpu.enabled=true 時跑 --gres=mps:25 sbatch
 ```
 
-### values.yaml 結構
+### Chart.yaml dependency
 
-`pools` 用有序 **list**（而非 map），保證 slurm.conf 的 NodeName 順序與 PartitionName Nodes= 順序一致。
+```yaml
+apiVersion: v2
+name: slurm-on-k8s
+appVersion: "23.11.7"        # Slurm 版本，升 Slurm 透過 helm upgrade 觸發 rolling restart
+version: 0.1.0
+dependencies:
+  - name: nvidia-device-plugin
+    version: 0.17.0
+    repository: https://nvidia.github.io/k8s-device-plugin
+    condition: gpu.enabled
+```
+
+### values.yaml 結構（對齊 mps-migration）
+
+`pools` 用有序 **list**（而非 map），保證 `slurm.conf` 的 `NodeName` 順序與 `PartitionName Nodes=` 順序一致。
 
 ```yaml
 cluster:
   name: slurm-lab
   namespace: slurm
-  runtime: kind              # kind | k3s（影響 TaskPlugin 與 device file 路徑）
+  runtime: kind              # kind | k3s（影響 TaskPlugin、ProctrackType、device file 路徑）
+  podSecurity: baseline      # baseline | restricted | privileged（labels namespace）
 
 image:
   controller: slurm-controller:latest
   worker: slurm-worker:latest
-  operator: slurm-operator:latest
+  operator: slurm-elastic-operator:latest
   pullPolicy: IfNotPresent
+
+# 每個 pool 同時帶自己的 partition 名稱（N7：partition split）
+partitions:
+  - name: cpu
+    default: true
+    maxTime: INFINITE
+  - name: gpu-rtx5070
+    default: false
+    maxTime: 24:00:00
+  - name: gpu-rtx4080
+    default: false
+    maxTime: 24:00:00
 
 pools:
   - id: cpu
     statefulset: slurm-worker-cpu
-    partition: debug
+    partition: cpu                       # ← 對應 partitions[].name（N7）
     minReplicas: 1
     maxReplicas: 4
     scaleCooldownSeconds: 60
@@ -285,7 +329,7 @@ pools:
 
   - id: gpu-rtx5070
     statefulset: slurm-worker-gpu-rtx5070
-    partition: debug
+    partition: gpu-rtx5070               # ← N7
     minReplicas: 0
     maxReplicas: 2
     scaleCooldownSeconds: 60
@@ -294,7 +338,7 @@ pools:
     sockets: 1
     coresPerSocket: 2
     threadsPerCore: 2
-    maxNodes: 2
+    maxNodes: 4                          # = sharing.mps replicas，避免 Pending（N3）
     features: [gpu, gpu-rtx5070]
     gres:
       - name: gpu
@@ -302,12 +346,12 @@ pools:
         count: 1
       - name: mps
         count: 100
-    devicePath: /dev/nvidia0    # 僅 runtime=k3s 時有效
     matchGres: [gpu:rtx5070, mps]
+    devicePluginConfig: rtx5070-mps      # ← 對應 gpu.deviceConfigs.* key（chart 自動打 node label）
 
   - id: gpu-rtx4080
     statefulset: slurm-worker-gpu-rtx4080
-    partition: debug
+    partition: gpu-rtx4080               # ← N7
     minReplicas: 0
     maxReplicas: 2
     scaleCooldownSeconds: 60
@@ -316,17 +360,73 @@ pools:
     sockets: 1
     coresPerSocket: 2
     threadsPerCore: 2
-    maxNodes: 2
+    maxNodes: 1
     features: [gpu, gpu-rtx4080]
     gres:
       - name: gpu
         type: rtx4080
         count: 1
-    devicePath: /dev/nvidia1
     matchGres: [gpu:rtx4080]
+    devicePluginConfig: rtx4080-exclusive
 
-mps:
-  enabled: false             # true → GPU pool pod 加 hostIPC + /tmp/nvidia-mps mount
+# 注意：不再有頂層 mps.enabled 旗標。MPS 由 device-plugin sharing.mps 提供（N1）；
+# 是否啟用對某個 pool 而言，僅由它的 gres 是否含 mps + devicePluginConfig 是否
+# 指到 *-mps 決定。worker pod 不需要 hostIPC 或 /tmp/nvidia-mps mount。
+
+gpu:
+  enabled: false                         # true 時 nvidia-device-plugin dependency 啟用
+  autoLabel: true                        # true 時 chart post-install Job 自動對節點打 device-plugin.config label
+  # 把 ConfigMap key 完整聲明在 values，讓使用者 override 不需要 fork chart：
+  deviceConfigs:
+    default:
+      version: v1
+    rtx5070-mps:
+      version: v1
+      sharing:
+        mps:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 4
+    rtx4080-exclusive:
+      version: v1                        # 獨佔，無 sharing
+  # 對映「節點 selector → 要套哪個 config key」。autoLabel Job 用這個。
+  nodeAssignments:
+    - selector:
+        # gpu-host-class 是使用者自己事先打的 label，例如 'rtx5070'
+        gpu-host-class: rtx5070
+      config: rtx5070-mps
+    - selector:
+        gpu-host-class: rtx4080
+      config: rtx4080-exclusive
+
+slurm:
+  # 這些以前散在 render-core.py header 裡，現在抽出來給 values override：
+  authType: auth/munge
+  credType: cred/munge
+  selectType: select/cons_tres
+  taskPlugin:
+    kind: task/cgroup                    # k3s 預設；values-dev.yaml 覆寫成 task/none
+  proctrack: proctrack/cgroup            # N11：與 task/cgroup 一致
+  accounting:
+    enabled: true                        # 開 slurmdbd
+    storageTres: [gres/gpu, gres/mps]    # N6
+  jwt:
+    lifespanSeconds: 86400               # 1 day（v3 1-B 建議；舊值 10 年）
+  fairshare:
+    enabled: false                       # P1 之後再啟用
+
+operator:
+  pollIntervalSeconds: 15
+  scaleDownCooldownSeconds: 60
+  drainTimeoutSeconds: 1800              # N8
+  checkpointGuard:
+    enabled: true
+    maxAgeSeconds: 600
+    graceSeconds: 300
+
+networkPolicy:
+  enabled: true
+  apiServerPorts: [443, 6443]            # N5：同時允許兩個 port
 
 monitoring:
   enabled: true
@@ -337,43 +437,60 @@ monitoring:
       webhookUrl: ""
 
 storage:
-  enabled: false             # true → NFS subdir provisioner
+  enabled: false                         # true → NFS subdir provisioner
   nfsServer: ""
   nfsPath: /shared
+
+# 預先建立的 secret 名稱（chart 不產生，只引用）
+secrets:
+  munge: slurm-munge
+  jwt: slurm-jwt
+  ssh: slurm-ssh
 ```
 
-### _helpers.tpl：slurm.conf 產生邏輯
+### `_helpers.tpl`：slurm.conf / gres.conf 產生邏輯
 
-取代 `render-core.py` 的核心邏輯，寫成兩個 named template：
+取代 `render-core.py` 的核心邏輯，寫成三個 named template。注意 `File=/dev/nvidia0` 對所有 GPU pool 都成立（device-plugin 把分配到的 GPU 一律以 `/dev/nvidia0` 暴露給 pod）。
 
 ```
-{{- define "slurm.slurmConf" -}}
+{{- define "slurm.slurmConfStatic" -}}
 ClusterName={{ .Values.cluster.name }}
-SlurmctldHost=slurm-controller-0(...)
-...
+SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.{{ .Values.cluster.namespace }}.svc.cluster.local)
+AuthType={{ .Values.slurm.authType }}
+CredType={{ .Values.slurm.credType }}
+SelectType={{ .Values.slurm.selectType }}
 {{- if eq .Values.cluster.runtime "k3s" }}
-TaskPlugin=task/cgroup
+TaskPlugin={{ .Values.slurm.taskPlugin.kind }}
+ProctrackType={{ .Values.slurm.proctrack }}
 CgroupPlugin=cgroup/v2
 {{- else }}
 TaskPlugin=task/none
+ProctrackType=proctrack/linuxproc
 {{- end }}
 {{- $gresTypes := list -}}
-{{- range .Values.pools }}
-  {{- range .gres }}
-    {{- $gresTypes = append $gresTypes .name }}
-  {{- end }}
-{{- end }}
+{{- range .Values.pools }}{{- range .gres }}{{- $gresTypes = append $gresTypes .name }}{{- end }}{{- end }}
+{{- if $gresTypes }}
 GresTypes={{ $gresTypes | uniq | join "," }}
+{{- if .Values.slurm.accounting.storageTres }}
+AccountingStorageTRES={{ .Values.slurm.accounting.storageTres | join "," }}
+{{- end }}
+{{- end }}
+Include /etc/slurm/slurm.nodes.conf       # ← configmap-nodes 提供
+{{- end }}
 
+{{- define "slurm.slurmConfNodes" -}}
 {{- range .Values.pools }}
 {{- $pool := . }}
 {{- range $i := until (int $pool.maxNodes) }}
-NodeName={{ $pool.statefulset }}-{{ $i }} NodeAddr=... CPUs={{ $pool.cpus }} ...
-  Feature={{ $pool.features | join "," }}
-  {{- if $pool.gres }} Gres={{ range $pool.gres }}{{ .name }}{{- if .type }}:{{ .type }}{{- end }}:{{ .count }},{{ end }}{{ end }}
+NodeName={{ $pool.statefulset }}-{{ $i }} CPUs={{ $pool.cpus }} RealMemory={{ $pool.realMemory }} Sockets={{ $pool.sockets }} CoresPerSocket={{ $pool.coresPerSocket }} ThreadsPerCore={{ $pool.threadsPerCore }} Feature={{ $pool.features | join "," }}{{- if $pool.gres }} Gres={{- $first := true -}}{{- range $pool.gres -}}{{- if not $first }},{{ end }}{{ .name }}{{- if .type }}:{{ .type }}{{- end }}:{{ .count }}{{- $first = false -}}{{- end }}{{- end }} State=CLOUD
 {{- end }}
 {{- end }}
-PartitionName=debug Nodes=... Default=YES MaxTime=INFINITE State=UP
+{{- range .Values.partitions }}
+{{- $part := . }}
+{{- $nodes := list -}}
+{{- range $.Values.pools -}}{{- if eq .partition $part.name -}}{{- range $i := until (int .maxNodes) -}}{{- $nodes = append $nodes (printf "%s-%d" .statefulset $i) -}}{{- end -}}{{- end -}}{{- end }}
+PartitionName={{ $part.name }} Nodes={{ $nodes | join "," }} Default={{ if $part.default }}YES{{ else }}NO{{ end }} MaxTime={{ $part.maxTime }} State=UP
+{{- end }}
 {{- end }}
 
 {{- define "slurm.gresConf" -}}
@@ -384,7 +501,7 @@ PartitionName=debug Nodes=... Default=YES MaxTime=INFINITE State=UP
 {{- if eq .name "mps" }}
 NodeName={{ $pool.statefulset }}-{{ $i }} Name=mps Count={{ .count }}
 {{- else }}
-NodeName={{ $pool.statefulset }}-{{ $i }} Name={{ .name }} Type={{ .type }} Count={{ .count }} File={{ if eq $.Values.cluster.runtime "k3s" }}{{ $pool.devicePath }}{{ else }}/dev/null{{ end }}
+NodeName={{ $pool.statefulset }}-{{ $i }} Name={{ .name }} Type={{ .type }} Count={{ .count }} File={{ if eq $.Values.cluster.runtime "k3s" }}/dev/nvidia0{{ else }}/dev/null{{ end }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -392,13 +509,12 @@ NodeName={{ $pool.statefulset }}-{{ $i }} Name={{ .name }} Type={{ .type }} Coun
 {{- end }}
 ```
 
-### workers.yaml：pool StatefulSet 迴圈
+### `workers.yaml`：pool StatefulSet 迴圈（無 hostIPC）
 
 ```yaml
 {{- range .Values.pools }}
 {{- $pool := . }}
-{{- $hasMps := false }}
-{{- range .gres }}{{- if eq .name "mps" }}{{- $hasMps = true }}{{- end }}{{- end }}
+{{- $isGpu := gt (len $pool.gres) 0 }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -408,27 +524,29 @@ spec:
   replicas: {{ $pool.minReplicas }}
   ...
     spec:
-      {{- if and $hasMps $.Values.mps.enabled }}
-      hostIPC: true
-      {{- end }}
+      # 注意：不需要 hostIPC，sharing.mps 由 device-plugin DaemonSet 處理
       containers:
         - name: slurm-worker
-          {{- if and (gt (len $pool.gres) 0) (eq $.Values.cluster.runtime "k3s") }}
+          {{- if and $isGpu (eq $.Values.cluster.runtime "k3s") }}
           resources:
             limits:
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "1"           # 拿一個 sharing.mps 切片
           {{- end }}
-      volumes:
-        {{- if and $hasMps $.Values.mps.enabled }}
-        - name: mps-socket
-          hostPath:
-            path: /tmp/nvidia-mps
-            type: DirectoryOrCreate
-        {{- end }}
+          # 兩個 ConfigMap 分別 mount，pool 變動只影響 nodes ConfigMap
+          volumeMounts:
+            - name: slurm-config-static
+              mountPath: /etc/slurm/slurm.conf
+              subPath: slurm.conf
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/slurm.nodes.conf
+              subPath: slurm.nodes.conf
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/gres.conf
+              subPath: gres.conf
 {{- end }}
 ```
 
-### operator.yaml：PARTITIONS_JSON 從 values 產生
+### `operator.yaml`：`PARTITIONS_JSON` 從 values 產生
 
 ```yaml
 - name: PARTITIONS_JSON
@@ -442,6 +560,7 @@ spec:
      "max_replicas":{{ $pool.maxReplicas }},
      "scale_up_step":1,"scale_down_step":1,
      "scale_down_cooldown":{{ $pool.scaleCooldownSeconds }},
+     "drain_timeout_seconds":{{ $.Values.operator.drainTimeoutSeconds }},
      "match_features":{{ $pool.features | toJson }},
      {{- if $pool.matchGres }}"match_gres":{{ $pool.matchGres | toJson }},{{ end }}
      "fallback":{{ default false $pool.fallback }}}
@@ -449,21 +568,102 @@ spec:
     ]
 ```
 
-### values overlay 策略
+### GPU 節點自動 labeling（取代手動 `kubectl label node`）
+
+`templates/gpu/node-labeler-job.yaml` 在 `helm install` / `helm upgrade` 時跑一次性 Job：
+
+```yaml
+{{- if and .Values.gpu.enabled .Values.gpu.autoLabel }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-node-labeler
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  template:
+    spec:
+      serviceAccountName: gpu-node-labeler   # 對應 ClusterRole patch nodes
+      restartPolicy: OnFailure
+      containers:
+        - name: labeler
+          image: bitnami/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              {{- range .Values.gpu.nodeAssignments }}
+              kubectl label nodes -l {{- range $k, $v := .selector }} {{ $k }}={{ $v }}{{- end }} \
+                  nvidia.com/device-plugin.config={{ .config }} --overwrite
+              {{- end }}
+{{- end }}
+```
+
+使用者只需要事先對節點打一個語義化 label（如 `gpu-host-class=rtx5070`），chart 就會自動把對應 device-plugin config 的 label 套上去。
+
+### values overlay 策略（移除 `mps.enabled`）
 
 | 檔案 | 用途 | 關鍵差異 |
 |------|------|---------|
-| `values.yaml` | 基準（Kind 開發） | `runtime: kind`、`mps.enabled: false`、`devicePath` 被忽略 |
-| `values-k3s.yaml` | Linux + 真實 GPU | `runtime: k3s`、`mps.enabled: true` |
-| `values-dev.yaml` | CI / 無 GPU 環境 | `monitoring.enabled: false`、`storage.enabled: false` |
+| `values.yaml` | 基準（Kind 開發） | `runtime: kind`、`gpu.enabled: false`、`slurm.taskPlugin.kind: task/none`、`storage/monitoring: enabled` 看情況 |
+| `values-k3s.yaml` | Linux + 真實 GPU + MPS | `runtime: k3s`、`gpu.enabled: true`、`gpu.autoLabel: true` |
+| `values-dev.yaml` | CI / 無 GPU 環境 | `gpu.enabled: false`、`monitoring.enabled: false`、`storage.enabled: false`、`pools` 只留 cpu |
 
-### 廢棄的檔案
+### Helm test
 
-Chart 完成後可移除：
-- `manifests/core/worker-pools.json`（由 `values.yaml` 取代）
-- `scripts/render-core.py`（由 `_helpers.tpl` 取代）
-- `scripts/bootstrap*.sh`（由 `helm install` 取代）
-- `manifests/core/slurm-static.yaml`（由 `helm template` 動態產生）
+`templates/tests/test-scontrol-ping.yaml`：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ .Release.Name }}-test-scontrol"
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: {{ .Values.image.controller }}
+      command: [sh, -c, "scontrol ping && sinfo -h"]
+```
+
+`gpu.enabled=true` 時加 `test-mps-job.yaml`，跑 `--gres=mps:25` sbatch 並確認 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 出現在 job env（呼應 `verify-gpu.sh` step 6）。
+
+### 漸進實作順序（6 個 PR，避免 big-bang 重寫）
+
+| 階段 | 內容 | 完成標準 | 風險 |
+|:---:|---|---|:---:|
+| **A** | `chart/` scaffold：`Chart.yaml`、`values.yaml`、`_helpers.tpl` 把 `render-core.py::build_slurm_conf` 翻成 Go template；其他 templates 為空 | `helm template chart/ -f values-k3s.yaml \| diff -u manifests/core/slurm-static.yaml`，差異收斂到只剩格式空白 | 中 |
+| **B** | 加 `templates/configmap-static.yaml` + `configmap-nodes.yaml` + `controller.yaml` + `workers.yaml` + `pvc.yaml` + `namespace.yaml`（PSS baseline label） | `helm install` 後 `slurmctld` 起得來、`sinfo` 看到所有 pool 的 node | 低 |
+| **C** | 加 `operator.yaml` + `network-policy.yaml`（443+6443）+ `login.yaml` | operator 擴／縮 worker 正常、`scale_action` metric 有資料、`scontrol ping` from login pod 成功 | 低 |
+| **D** | 加 `gpu/` 子目錄；`Chart.yaml` 加 NVIDIA device-plugin dependency；node-labeler Job | `verify-gpu.sh` 全綠（含 step 6 MPS） | 中 |
+| **E** | 把 monitoring / storage 收進 chart `templates/monitoring/` `storage.yaml`，`enabled` flag 控制 | `helm install --set monitoring.enabled=true` 一次帶起 Prometheus + Grafana + slurm-exporter | 低 |
+| **F** | 砍掉 `render-core.py`、`scripts/bootstrap*.sh` 大部分內容（保留 `setup-linux-gpu.sh` 與 `create-secrets.sh`）、`manifests/core/slurm-static.yaml`、`worker-pools.json`；README / migration.md 改寫為 `helm install` | bootstrap 時間 < 5 分鐘；`docs/migration.md` 從多步腳本改為 4 行 helm 指令 | 高 |
+
+> 階段 A–C 可在 Windows + Kind 上做完並驗證；階段 D 需要 Linux + 真實 GPU 才能整合測試。階段 E 與目前 `bootstrap-monitoring.sh` 行為對齊，最低風險。階段 F 是 cutoff，需要 README、CI、文件大量同步更新。
+
+### 廢棄的檔案（Phase F 後）
+
+| 檔案 | 取代者 |
+|------|--------|
+| `manifests/core/worker-pools.json` | `chart/values.yaml::pools` |
+| `scripts/render-core.py` | `chart/templates/_helpers.tpl` |
+| `scripts/bootstrap.sh` 大部分 | `helm install` |
+| `scripts/bootstrap-gpu.sh` | NVIDIA device-plugin chart dependency + node-labeler Job |
+| `scripts/bootstrap-monitoring.sh` | `helm install --set monitoring.enabled=true` |
+| `manifests/core/slurm-static.yaml` | `helm template chart/` 動態產生 |
+| `manifests/gpu/nvidia-device-plugin.yaml` | NVIDIA 官方 chart + `gpu.deviceConfigs` values |
+| `manifests/gpu/mps-daemonset.yaml`（已是 stub） | 直接刪除 |
+
+保留：`scripts/setup-linux-gpu.sh`（host 層 NVIDIA toolkit + k3s 安裝，本來就不該進 chart）、`scripts/create-secrets.sh`（chart 之外的 prerequisite）、`scripts/verify*.sh`（Helm test 之外的 e2e 驗證）。
+
+### 不在 5-A 範圍但需要決定的事
+
+1. **secret 怎麼生**：起步用 `scripts/create-secrets.sh` 預先建立；長期可改 External Secrets / Sealed Secrets。
+2. **CI 怎麼跑**：`helm lint` + `helm template -f values-dev.yaml \| kubectl apply --dry-run=server -f -` + `helm-unittest` 一支 GitHub Actions workflow。
+3. **GitOps 接入點**：等 chart 進 OCI registry 或 GitHub Pages 後，ArgoCD `Application` 指向那個 repo + values overlay，不需要動 chart 本體。
 
 ---
 
