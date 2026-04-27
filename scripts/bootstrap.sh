@@ -141,13 +141,17 @@ validate_live_operator_config() {
   fi
 }
 
-log "ensuring kind cluster '${CLUSTER_NAME}' exists..."
-if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
-  if [[ -n "$KIND_CONFIG" ]]; then
-    kind create cluster --name "$CLUSTER_NAME" --config "$KIND_CONFIG"
-  else
-    kind create cluster --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "ensuring kind cluster '${CLUSTER_NAME}' exists..."
+  if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
+    if [[ -n "$KIND_CONFIG" ]]; then
+      kind create cluster --name "$CLUSTER_NAME" --config "$KIND_CONFIG"
+    else
+      kind create cluster --name "$CLUSTER_NAME"
+    fi
   fi
+else
+  log "k3s runtime — assuming k3s already running (see scripts/setup-linux-gpu.sh --k3s)"
 fi
 
 if ! kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$"; then
@@ -171,7 +175,9 @@ if [[ "$K8S_RUNTIME" != "k3s" ]]; then
   kind load docker-image slurm-controller:latest --name "$CLUSTER_NAME"
   kind load docker-image slurm-worker:latest --name "$CLUSTER_NAME"
 else
-  log "k3s runtime — skipping kind image load (images pulled directly by containerd)"
+  log "k3s runtime — importing core images into containerd via 'k3s ctr images import'..."
+  docker save slurm-controller:latest | sudo k3s ctr images import -
+  docker save slurm-worker:latest | sudo k3s ctr images import -
 fi
 
 log "rendering core manifests (if generator exists)..."
@@ -206,6 +212,17 @@ if [[ -f scripts/render-core.py ]]; then
 fi
 
 validate_rendered_manifest
+
+log "ensuring namespace '${NAMESPACE}' exists with Pod Security baseline label..."
+# k3s 1.25+ enables Pod Security Admission by default (k3s/EKS/GKE: restricted by
+# default for unlabelled namespaces). N1 (sharing.mps) removed the hostIPC
+# requirement, so 'baseline' is sufficient. Setting it explicitly so future
+# additions of hostIPC/privileged are caught at admission instead of at runtime.
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label --overwrite namespace "$NAMESPACE" \
+    pod-security.kubernetes.io/enforce=baseline \
+    pod-security.kubernetes.io/warn=baseline \
+    pod-security.kubernetes.io/audit=baseline >/dev/null
 
 log "creating/applying secrets..."
 REGENERATE_SECRETS="$REGENERATE_SECRETS" scripts/create-secrets.sh "$NAMESPACE"
@@ -281,8 +298,13 @@ rollout_or_dump "statefulset/${baseline_worker_sts}"
 log "building operator image..."
 docker build "${build_flags[@]}" -t slurm-elastic-operator:latest -f docker/operator/Dockerfile .
 
-log "loading operator image to kind..."
-kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "loading operator image to kind..."
+  kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
+else
+  log "k3s runtime — importing operator image into containerd via 'k3s ctr images import'..."
+  docker save slurm-elastic-operator:latest | sudo k3s ctr images import -
+fi
 
 log "applying operator manifest..."
 kubectl apply -f manifests/operator/slurm-elastic-operator.yaml
