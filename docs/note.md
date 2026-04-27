@@ -258,7 +258,7 @@ chart/
     login.yaml              ← login Deployment + Service + PDB
     network-policy.yaml     ← 含 operator → K8s API egress（443 + 6443）
     gpu/
-      device-plugin-config.yaml  ← ConfigMap default / rtx5070-mps / rtx4080-exclusive
+      device-plugin-config.yaml  ← ConfigMap default / rtx4070-mps / rtx4080-exclusive
       node-labeler-job.yaml      ← {{- if .Values.gpu.autoLabel }} Job 自動對符合條件的節點打 label
     monitoring/             ← {{- if .Values.monitoring.enabled }} Prometheus + Grafana + slurm-exporter
     storage.yaml            ← {{- if .Values.storage.enabled }} NFS subdir provisioner
@@ -303,7 +303,7 @@ partitions:
   - name: cpu
     default: true
     maxTime: INFINITE
-  - name: gpu-rtx5070
+  - name: gpu-rtx4070
     default: false
     maxTime: 24:00:00
   - name: gpu-rtx4080
@@ -327,9 +327,9 @@ pools:
     gres: []
     fallback: true
 
-  - id: gpu-rtx5070
-    statefulset: slurm-worker-gpu-rtx5070
-    partition: gpu-rtx5070               # ← N7
+  - id: gpu-rtx4070
+    statefulset: slurm-worker-gpu-rtx4070
+    partition: gpu-rtx4070               # ← N7
     minReplicas: 0
     maxReplicas: 2
     scaleCooldownSeconds: 60
@@ -339,15 +339,15 @@ pools:
     coresPerSocket: 2
     threadsPerCore: 2
     maxNodes: 4                          # = sharing.mps replicas，避免 Pending（N3）
-    features: [gpu, gpu-rtx5070]
+    features: [gpu, gpu-rtx4070]
     gres:
       - name: gpu
-        type: rtx5070
+        type: rtx4070
         count: 1
       - name: mps
         count: 100
-    matchGres: [gpu:rtx5070, mps]
-    devicePluginConfig: rtx5070-mps      # ← 對應 gpu.deviceConfigs.* key（chart 自動打 node label）
+    matchGres: [gpu:rtx4070, mps]
+    devicePluginConfig: rtx4070-mps      # ← 對應 gpu.deviceConfigs.* key（chart 自動打 node label）
 
   - id: gpu-rtx4080
     statefulset: slurm-worker-gpu-rtx4080
@@ -380,7 +380,7 @@ gpu:
   deviceConfigs:
     default:
       version: v1
-    rtx5070-mps:
+    rtx4070-mps:
       version: v1
       sharing:
         mps:
@@ -392,9 +392,9 @@ gpu:
   # 對映「節點 selector → 要套哪個 config key」。autoLabel Job 用這個。
   nodeAssignments:
     - selector:
-        # gpu-host-class 是使用者自己事先打的 label，例如 'rtx5070'
-        gpu-host-class: rtx5070
-      config: rtx5070-mps
+        # gpu-host-class 是使用者自己事先打的 label，例如 'rtx4070'
+        gpu-host-class: rtx4070
+      config: rtx4070-mps
     - selector:
         gpu-host-class: rtx4080
       config: rtx4080-exclusive
@@ -600,7 +600,7 @@ spec:
 {{- end }}
 ```
 
-使用者只需要事先對節點打一個語義化 label（如 `gpu-host-class=rtx5070`），chart 就會自動把對應 device-plugin config 的 label 套上去。
+使用者只需要事先對節點打一個語義化 label（如 `gpu-host-class=rtx4070`），chart 就會自動把對應 device-plugin config 的 label 套上去。
 
 ### values overlay 策略（移除 `mps.enabled`）
 
@@ -976,7 +976,7 @@ Hardware     ←─ 實體 CPU cores、GPU SM + VRAM
 
 ---
 
-## 📍 部署環境規格：Linux + k3s + RTX 5070 + RTX 4080（雙 GPU）
+## 📍 部署環境規格：Linux + k3s + RTX 4070 + RTX 4080（雙 GPU）
 
 > 本節以實際遷移目標環境為例，說明硬體資源如何對應到各層宣告。
 
@@ -986,7 +986,7 @@ Hardware     ←─ 實體 CPU cores、GPU SM + VRAM
 |------|------|------|
 | CPU | 12 cores（如 Intel i7-12700 / Ryzen 9 5900X） | k3s 單節點，所有 pod 共用 |
 | RAM | 32 GB DDR5 | 各 worker pod 依 `RealMemory` 宣告分配帳本 |
-| GPU 0 | NVIDIA RTX 5070（Blackwell GB203） | `/dev/nvidia0`，主 GPU |
+| GPU 0 | NVIDIA RTX 4070（Blackwell GB203） | `/dev/nvidia0`，主 GPU |
 | GPU 0 VRAM | 12 GB GDDR7 | 單一作業可用全部 12 GB |
 | GPU 0 SM | 48 SM | MPS 下 `mps:25` ≈ 12 SM |
 | GPU 0 CUDA Cores | 6144 | 記憶體頻寬 ~672 GB/s |
@@ -1003,10 +1003,10 @@ Hardware     ←─ 實體 CPU cores、GPU SM + VRAM
 | Worker 類型 | StatefulSet 名稱 | Slurm CPUs | Slurm RealMemory | GRES | K8s resource.limits |
 |------------|----------------|-----------|-----------------|------|---------------------|
 | CPU worker | `slurm-worker-cpu` | 4 cores | 3500 MB (~3.4 GB) | 無 | cpu: 4, memory: 3500Mi |
-| GPU worker (RTX 5070) | `slurm-worker-gpu-rtx5070` | 4 cores | 3500 MB | gpu:rtx5070:1, mps:100 | cpu: 4, memory: 3500Mi, nvidia.com/gpu: 1 |
+| GPU worker (RTX 4070) | `slurm-worker-gpu-rtx4070` | 4 cores | 3500 MB | gpu:rtx4070:1, mps:100 | cpu: 4, memory: 3500Mi, nvidia.com/gpu: 1 |
 | GPU worker (RTX 4080) | `slurm-worker-gpu-rtx4080` | 4 cores | 3500 MB | gpu:rtx4080:1, mps:100 | cpu: 4, memory: 3500Mi, nvidia.com/gpu: 1 |
 
-> 兩張 GPU 各為獨立 StatefulSet，`maxNodes=1`（各只能開 1 個 GPU pod）。K8s device plugin 透過 `CUDA_VISIBLE_DEVICES` 決定 pod 拿到哪張 GPU（`0` = RTX 5070，`1` = RTX 4080）。CPU worker pool 最多可開 4 個 pod。
+> 兩張 GPU 各為獨立 StatefulSet，`maxNodes=1`（各只能開 1 個 GPU pod）。K8s device plugin 透過 `CUDA_VISIBLE_DEVICES` 決定 pod 拿到哪張 GPU（`0` = RTX 4070，`1` = RTX 4080）。CPU worker pool 最多可開 4 個 pod。
 
 ### 工作類型與資源分配
 
@@ -1060,8 +1060,8 @@ python tokenize_dataset.py \
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
-#SBATCH --gres=mps:25              # 請求 25% SM（RTX 5070 上 ≈ 12 SM）
-#SBATCH --constraint=gpu-rtx5070
+#SBATCH --gres=mps:25              # 請求 25% SM（RTX 4070 上 ≈ 12 SM）
+#SBATCH --constraint=gpu-rtx4070
 #SBATCH --output=/shared/jobs/%j-infer.out
 
 python infer_batch.py \
@@ -1074,7 +1074,7 @@ python infer_batch.py \
 ```
 Job 1（mps:25）+ Job 2（mps:25）+ Job 3（mps:25）+ Job 4（mps:25）
      ↓
-RTX 5070 MPS Daemon（/tmp/nvidia-mps-0）
+RTX 4070 MPS Daemon（/tmp/nvidia-mps-0）
      ↓
 48 SM 被 4 個 process 共享，每個各佔 12 SM
 GPU SM utilization：4 × 12 = 48 SM（100% 滿載）
@@ -1103,7 +1103,7 @@ GPU SM utilization：4 × 12 = 48 SM（100% 滿載）
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --gres=mps:25             # 每個實驗佔 25% SM
-#SBATCH --constraint=gpu-rtx5070
+#SBATCH --constraint=gpu-rtx4070
 #SBATCH --output=/shared/jobs/%A-%a-hpo.out
 
 # 從 Task ID 選參數
@@ -1123,7 +1123,7 @@ slurmctld 看到 8 個 pending job，各需要 mps:25
      ↓
 Operator 偵測 pending count > 0 → 開啟 GPU worker pod
      ↓
-RTX 5070 最多同時跑 4 個（4 × mps:25 = 100% SM）
+RTX 4070 最多同時跑 4 個（4 × mps:25 = 100% SM）
      ↓
 4 個跑完釋放 → 另外 4 個接著跑
      ↓
@@ -1211,7 +1211,7 @@ torchrun \
 提交 --nodes=2 --gres=gpu:1
      ↓
 slurmctld 找 2 台空閒 GPU worker
-     → rank 0：slurm-worker-gpu-rtx5070-0（/dev/nvidia0，12 GB VRAM）
+     → rank 0：slurm-worker-gpu-rtx4070-0（/dev/nvidia0，12 GB VRAM）
      → rank 1：slurm-worker-gpu-rtx4080-0（/dev/nvidia1，16 GB VRAM）
      ↓
 torchrun 啟動，NCCL 透過 K8s pod network 建立 rendezvous
@@ -1221,13 +1221,13 @@ AllReduce gradient 在兩個 rank 間同步（TCP backend）
 兩個 worker 同時寫 checkpoint 到 NFS /shared/checkpoints/
 ```
 
-| 資源 | Rank 0（RTX 5070） | Rank 1（RTX 4080） |
+| 資源 | Rank 0（RTX 4070） | Rank 1（RTX 4080） |
 |------|-------------------|-------------------|
 | GPU VRAM | 12 GB | 16 GB |
 | GPU SM | 48 SM | 76 SM |
 | 通訊 | NCCL over TCP（K8s pod network） | 同左 |
 
-> ⚠️ 混合 GPU 型號：batch size 以較小的 RTX 5070（12 GB）為準；RTX 5070 的 SM 數也是速度瓶頸。  
+> ⚠️ 混合 GPU 型號：batch size 以較小的 RTX 4070（12 GB）為準；RTX 4070 的 SM 數也是速度瓶頸。  
 > **展示的系統能力：** 跨 worker pod 的多節點 Slurm 排程；NFS 讓兩個 worker 共讀 dataset；Checkpoint guard 保護長時間訓練不被縮容打斷。
 
 ### 資源帳本總覽（雙 GPU 單節點部署）
@@ -1240,11 +1240,11 @@ AllReduce gradient 在兩個 rank 間同步（TCP backend）
 │   ├── slurm-worker-cpu-1         → 同上（operator 依需求開啟）
 │   ├── slurm-worker-cpu-2         → 同上
 │   ├── slurm-worker-cpu-3         → 同上
-│   ├── slurm-worker-gpu-rtx5070-0 → CPUs=4, Mem=3.4G, gpu:rtx5070:1, mps:100
+│   ├── slurm-worker-gpu-rtx4070-0 → CPUs=4, Mem=3.4G, gpu:rtx4070:1, mps:100
 │   └── slurm-worker-gpu-rtx4080-0 → CPUs=4, Mem=3.4G, gpu:rtx4080:1, mps:100
 │
-├── GPU 0: RTX 5070 /dev/nvidia0  (12 GB VRAM, 48 SM)
-│   ├── 整卡模式：slurm-worker-gpu-rtx5070-0 獨占
+├── GPU 0: RTX 4070 /dev/nvidia0  (12 GB VRAM, 48 SM)
+│   ├── 整卡模式：slurm-worker-gpu-rtx4070-0 獨占
 │   └── MPS 模式：nvidia-mps-daemon-0 管理，socket: /tmp/nvidia-mps-0
 │                 ← worker pod 掛載此 socket，mps:N 分配 N% SM
 │
@@ -1303,40 +1303,40 @@ Job A、B 同時跑在 Worker-0；Job C、D 同時跑在 Worker-1。Slurm 的 ba
 
 ### 預設模型：整卡獨占
 
-每台 GPU worker 宣告 1 個 GRES slot（如 `Gres=gpu:rtx5070:1`）。GRES 是整數消耗，無分數分配：
+每台 GPU worker 宣告 1 個 GRES slot（如 `Gres=gpu:rtx4070:1`）。GRES 是整數消耗，無分數分配：
 
 ```
-# Linux + k3s + RTX 5070 環境（maxNodes=1，只有 1 台 GPU worker）
-Job A: --gres=gpu:rtx5070:1  →  佔用整張 RTX 5070，該 worker GRES=0
-Job B: --gres=gpu:rtx5070:1  →  Pending，等 Job A 釋放（因為只有 1 台 GPU worker）
+# Linux + k3s + RTX 4070 環境（maxNodes=1，只有 1 台 GPU worker）
+Job A: --gres=gpu:rtx4070:1  →  佔用整張 RTX 4070，該 worker GRES=0
+Job B: --gres=gpu:rtx4070:1  →  Pending，等 Job A 釋放（因為只有 1 台 GPU worker）
 ```
 
 ### 分配範例
 
-**場景 A：Linux + k3s + 1 台 RTX 5070 worker（實際部署）**
+**場景 A：Linux + k3s + 1 台 RTX 4070 worker（實際部署）**
 
 | Job | 請求 | 分配結果 |
 |-----|------|---------|
-| A `--gres=gpu:rtx5070:1 -N 1` | 1× RTX 5070 | → worker-gpu-rtx5070-0，整張 12 GB 獨占 |
-| B `--gres=gpu:rtx5070:1 -N 1` | 1× RTX 5070 | → Pending，只有 1 台 GPU worker，等 A 結束 |
+| A `--gres=gpu:rtx4070:1 -N 1` | 1× RTX 4070 | → worker-gpu-rtx4070-0，整張 12 GB 獨占 |
+| B `--gres=gpu:rtx4070:1 -N 1` | 1× RTX 4070 | → Pending，只有 1 台 GPU worker，等 A 結束 |
 
 **場景 B：假設未來多張 GPU 機器（可參考設計）**
 
 | Job | 請求 | 分配結果 |
 |-----|------|---------|
-| A `--gres=gpu:rtx5070:1 -N 1` | 1× GPU | → worker-gpu-rtx5070-0，整張獨占 |
-| B `--gres=gpu:rtx5070:1 -N 1` | 1× GPU | → worker-gpu-rtx5070-1，整張獨占 |
-| C `--gres=gpu:rtx5070:1 -N 1` | 1× GPU | → Pending，等 A 或 B 釋放 |
+| A `--gres=gpu:rtx4070:1 -N 1` | 1× GPU | → worker-gpu-rtx4070-0，整張獨占 |
+| B `--gres=gpu:rtx4070:1 -N 1` | 1× GPU | → worker-gpu-rtx4070-1，整張獨占 |
+| C `--gres=gpu:rtx4070:1 -N 1` | 1× GPU | → Pending，等 A 或 B 釋放 |
 
 多節點 DDP job（多 GPU worker 情境）：
 
 ```bash
-#SBATCH --gres=gpu:rtx5070:1
+#SBATCH --gres=gpu:rtx4070:1
 #SBATCH -N 4          # 需要 4 台 GPU worker 同時空閒
 #SBATCH --ntasks-per-node=1
 ```
 
-Slurm 要求 4 台 `gpu-rtx5070` worker 同時空閒。這正是 Gang Scheduling 解決的問題——若只有 3 台空閒，K8s 1.35 原生 `GangScheduling` 會讓 4 個 worker Pod 要嘛全部調度，要嘛全不調度，避免佔著資源等人。
+Slurm 要求 4 台 `gpu-rtx4070` worker 同時空閒。這正是 Gang Scheduling 解決的問題——若只有 3 台空閒，K8s 1.35 原生 `GangScheduling` 會讓 4 個 worker Pod 要嘛全部調度，要嘛全不調度，避免佔著資源等人。
 
 ### GPU 共用機制（進階）
 
@@ -1351,7 +1351,7 @@ CUDA context 輪流使用 GPU，類似 CPU 分時多工。
 - K8s 設定：GPU Operator ConfigMap 把 1 張 GPU 虛擬成 N 份 `nvidia.com/gpu`
 
 ```yaml
-# ConfigMap：1 張 RTX 5070 虛擬成 4 份（需 GPU Operator，本架構未使用）
+# ConfigMap：1 張 RTX 4070 虛擬成 4 份（需 GPU Operator，本架構未使用）
 sharing:
   timeSlicing:
     resources:
@@ -1361,10 +1361,10 @@ sharing:
 
 ```ini
 # gres.conf（Slurm 端）
-NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 Count=4 File=/dev/nvidia0
+NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvidia0
 ```
 
-4 個 job 可同時各請求 `--gres=gpu:rtx5070:1`，時間輪流使用同一張 GPU。**不適合 DDP 訓練**（延遲不可預測、無記憶體保護）。
+4 個 job 可同時各請求 `--gres=gpu:rtx4070:1`，時間輪流使用同一張 GPU。**不適合 DDP 訓練**（延遲不可預測、無記憶體保護）。
 
 #### MPS（Multi-Process Service）
 
@@ -1374,11 +1374,11 @@ NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 Count=4 File=/dev/nvid
 
 ### GPU MPS 完整實作指南（2026）
 
-#### 本架構環境：Linux + k3s + RTX 5070 + RTX 4080（雙 GPU）
+#### 本架構環境：Linux + k3s + RTX 4070 + RTX 4080（雙 GPU）
 
 > **本架構採用路徑 B（Slurm MPS DaemonSet）**，因為我們使用 k3s + 直接安裝 NVIDIA Container Toolkit，**未部署 NVIDIA GPU Operator**。路徑 A 需要 GPU Operator，在 k3s 上需額外安裝，非必要複雜度。
 
-| 項目 | GPU 0：RTX 5070 | GPU 1：RTX 4080 |
+| 項目 | GPU 0：RTX 4070 | GPU 1：RTX 4080 |
 |------|----------------|----------------|
 | 架構 | Blackwell GB203 | Ada Lovelace AD103 |
 | SM 數量 | 48 SM | 76 SM |
@@ -1400,8 +1400,8 @@ NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 Count=4 File=/dev/nvid
 | 記憶體隔離 | ❌（VRAM 共享） | ❌（一個 OOM 可能拖垮其他 process） | ✅（各 instance VRAM 隔離） |
 | context switch overhead | 高（µs 級別） | **極低**（無 context switch） | 無（instance 獨立） |
 | SM 配額控制 | ❌ | ✅ `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` | ✅（profile 固定） |
-| 支援 GPU | 全部 NVIDIA | **Volta+（含 RTX 5070）** | A100/H100/A30 only |
-| RTX 5070 適用 | ✅ | **✅ 本架構採用** | ❌ 不支援 |
+| 支援 GPU | 全部 NVIDIA | **Volta+（含 RTX 4070）** | A100/H100/A30 only |
+| RTX 4070 適用 | ✅ | **✅ 本架構採用** | ❌ 不支援 |
 | 最佳場景 | 開發/測試 | **推論服務多 replica 共用 GPU** | 多租戶需記憶體隔離 |
 
 **雙 GPU + MPS 適合的場景：**
@@ -1434,13 +1434,13 @@ Linux Host（k3s 單節點）
 │    /tmp/nvidia-mps-0/           /tmp/nvidia-mps-1/               │
 │             │                            │                        │
 │  ┌──────────┴──────────┐    ┌────────────┴────────────┐          │
-│  │ worker-gpu-rtx5070  │    │  worker-gpu-rtx4080     │          │
+│  │ worker-gpu-rtx4070  │    │  worker-gpu-rtx4080     │          │
 │  │ Job A (mps:50=24SM) │    │  Job D (mps:50=38SM)    │          │
 │  │ Job B (mps:25=12SM) │    │  (4080 單獨或共用)       │          │
 │  │ Job C (mps:25=12SM) │    └─────────────────────────┘          │
 │  └─────────────────────┘                                         │
 │                                                                   │
-│  /dev/nvidia0  RTX 5070 (12 GB, 48 SM)                           │
+│  /dev/nvidia0  RTX 4070 (12 GB, 48 SM)                           │
 │  /dev/nvidia1  RTX 4080 (16 GB, 76 SM)                           │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -1449,7 +1449,7 @@ Linux Host（k3s 單節點）
 
 ---
 
-#### 路徑 B 實作步驟（本架構採用，Linux + k3s + RTX 5070）
+#### 路徑 B 實作步驟（本架構採用，Linux + k3s + RTX 4070）
 
 **前提：** 已執行 `K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh` 完成基礎部署。
 
@@ -1461,7 +1461,7 @@ Linux Host（k3s 單節點）
 # 確認 host 看到兩張 GPU
 nvidia-smi --list-gpus
 # 期望輸出：
-#   GPU 0: NVIDIA GeForce RTX 5070  (UUID: ...)
+#   GPU 0: NVIDIA GeForce RTX 4070  (UUID: ...)
 #   GPU 1: NVIDIA GeForce RTX 4080  (UUID: ...)
 
 # 確認 K8s 看到 GPU 資源
@@ -1494,7 +1494,7 @@ containers:
     set -e
     mkdir -p /tmp/nvidia-mps-0 /tmp/nvidia-mps-1 \
              /tmp/nvidia-mps-log-0 /tmp/nvidia-mps-log-1
-    # GPU 0 (RTX 5070)
+    # GPU 0 (RTX 4070)
     CUDA_VISIBLE_DEVICES=0 \
     CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-0 \
     CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log-0 \
@@ -1540,7 +1540,7 @@ kubectl -n slurm rollout status daemonset/nvidia-mps-daemon
 mps_pod=$(kubectl -n slurm get pod -l app=nvidia-mps-daemon -o jsonpath='{.items[0].metadata.name}')
 # 驗證兩個 MPS daemon 都回應
 kubectl -n slurm exec "pod/${mps_pod}" -- bash -c '
-  echo "=== GPU 0 (RTX 5070) ==="
+  echo "=== GPU 0 (RTX 4070) ==="
   CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-0 \
     echo get_server_list | nvidia-cuda-mps-control
   echo "=== GPU 1 (RTX 4080) ==="
@@ -1560,7 +1560,7 @@ K8S_RUNTIME=k3s REAL_GPU=true WITH_MPS=true bash scripts/bootstrap.sh
 `render-core.py --with-mps` 會在 GPU worker StatefulSet 自動加入。**雙 GPU 版本需根據 GPU 型號掛載不同 socket 目錄**：
 
 ```yaml
-# RTX 5070 worker StatefulSet（由 render-core.py 注入）
+# RTX 4070 worker StatefulSet（由 render-core.py 注入）
 spec:
   hostIPC: true
   containers:
@@ -1591,7 +1591,7 @@ volumes:
 
 ---
 
-**步驟四：gres.conf 設定 MPS slot（RTX 5070）**
+**步驟四：gres.conf 設定 MPS slot（RTX 4070）**
 
 在 `slurm.conf`（由 `render-core.py` 生成）加入 MPS GresType：
 
@@ -1604,9 +1604,9 @@ CgroupPlugin=cgroup/v2
 
 ```ini
 # gres.conf — 雙 GPU 宣告，各自有 GPU 和 MPS 兩個 GRES 類型
-# RTX 5070（GPU 0）
-NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 File=/dev/nvidia0 Count=1
-NodeName=slurm-worker-gpu-rtx5070-0 Name=mps Count=100   # 100% = 48 SM
+# RTX 4070（GPU 0）
+NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 File=/dev/nvidia0 Count=1
+NodeName=slurm-worker-gpu-rtx4070-0 Name=mps Count=100   # 100% = 48 SM
 
 # RTX 4080（GPU 1）
 NodeName=slurm-worker-gpu-rtx4080-0 Name=gpu Type=rtx4080 File=/dev/nvidia1 Count=1
@@ -1615,12 +1615,12 @@ NodeName=slurm-worker-gpu-rtx4080-0 Name=mps Count=100   # 100% = 76 SM
 
 `mps:N` 代表 N% 的該卡 SM，兩張卡的 SM 數量不同：
 
-| 請求 + constraint | RTX 5070 分配 SM | RTX 4080 分配 SM | 適合工作 |
+| 請求 + constraint | RTX 4070 分配 SM | RTX 4080 分配 SM | 適合工作 |
 |-----------------|----------------|----------------|---------|
 | `--gres=mps:50` | ~24 SM (50%) | ~38 SM (50%) | 中型推論（7B LLM serving） |
 | `--gres=mps:25` | ~12 SM (25%) | ~19 SM (25%) | 小型推論（image classifier） |
 | `--gres=mps:10` | ~5 SM (10%)  | ~8 SM (10%)  | 極輕量 embedding service |
-| `--gres=gpu:rtx5070:1` | 48 SM（整卡） | — | 訓練（需 ≤12 GB VRAM）|
+| `--gres=gpu:rtx4070:1` | 48 SM（整卡） | — | 訓練（需 ≤12 GB VRAM）|
 | `--gres=gpu:rtx4080:1` | — | 76 SM（整卡） | 訓練（需 ≤16 GB VRAM）|
 | `-N 2 --gres=gpu:1` | 48 SM | 76 SM | **2-GPU DDP**（兩 rank） |
 
@@ -1654,10 +1654,10 @@ echo quit | nvidia-cuda-mps-control 2>/dev/null || true
 
 ```bash
 # MPS 推論 job：明確指定哪張 GPU
-# 在 RTX 5070 上（48 SM，12 GB VRAM）
-#SBATCH --job-name=infer-rtx5070
+# 在 RTX 4070 上（48 SM，12 GB VRAM）
+#SBATCH --job-name=infer-rtx4070
 #SBATCH --gres=mps:25             # 25% = ~12 SM
-#SBATCH --constraint=gpu-rtx5070
+#SBATCH --constraint=gpu-rtx4070
 #SBATCH --mem=1G
 python infer.py --model small_model
 
@@ -1709,7 +1709,7 @@ kubectl -n slurm exec "pod/${mps_pod}" -- nvidia-smi dmon -s u -d 2
 **適用：** 部署了 NVIDIA GPU Operator 的正式叢集（需要 ClusterPolicy CRD）。
 
 ```yaml
-# GPU Operator ConfigMap：1 張 RTX 5070 虛擬成 4 個 MPS slot
+# GPU Operator ConfigMap：1 張 RTX 4070 虛擬成 4 個 MPS slot
 data:
   any: |
     sharing:
@@ -1727,7 +1727,7 @@ kubectl patch clusterpolicies.nvidia.com/cluster-policy \
 
 ```ini
 # gres.conf（對應 replicas: 4）
-NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 Count=4 File=/dev/nvidia0
+NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvidia0
 ```
 
 ---
@@ -1736,11 +1736,11 @@ NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 Count=4 File=/dev/nvid
 
 | 部署環境 | 推薦路徑 | 理由 |
 |---------|---------|------|
-| **Linux + k3s + RTX 5070 + RTX 4080（本架構）** | **路徑 B（雙 MPS DaemonSet）** | 無 GPU Operator；兩張卡各一個 daemon，socket 目錄分開 |
+| **Linux + k3s + RTX 4070 + RTX 4080（本架構）** | **路徑 B（雙 MPS DaemonSet）** | 無 GPU Operator；兩張卡各一個 daemon，socket 目錄分開 |
 | Kind（Windows 開發） | ❌ 不適用 | Kind 無真實 GPU，hostIPC 無效 |
 | 部署了 GPU Operator 的正式叢集 | 路徑 A（GPU Operator MPS） | GPU Operator 處理 daemon 生命週期 |
 | 大型 HPC 叢集（多租戶精細 SM 控制） | 路徑 B + Prolog/Epilog | 可按 job 動態調整 SM 百分比 |
-| 混合推論+訓練叢集（雙卡） | 路徑 B + 分 partition | RTX 4080 作訓練 partition，RTX 5070 作 MPS 推論 partition |
+| 混合推論+訓練叢集（雙卡） | 路徑 B + 分 partition | RTX 4080 作訓練 partition，RTX 4070 作 MPS 推論 partition |
 
 **對 operator/main.py 的影響：**
 
@@ -1749,9 +1749,9 @@ NodeName=slurm-worker-gpu-rtx5070-0 Name=gpu Type=rtx5070 Count=4 File=/dev/nvid
 ```json
 [
   {
-    "name": "slurm-worker-gpu-rtx5070",
-    "match_gres": "gpu:rtx5070",
-    "gres_per_node": "gpu:rtx5070:1,mps:100",
+    "name": "slurm-worker-gpu-rtx4070",
+    "match_gres": "gpu:rtx4070",
+    "gres_per_node": "gpu:rtx4070:1,mps:100",
     "maxNodes": 1
   },
   {

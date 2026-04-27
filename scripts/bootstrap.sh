@@ -105,7 +105,7 @@ validate_rendered_manifest() {
 operator_force_env() {
   local partitions_json='[
     {"partition":"cpu","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
-    {"partition":"gpu-rtx5070","worker_statefulset":"slurm-worker-gpu-rtx5070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx5070"],"match_gres":["gpu:rtx5070","mps"]},
+    {"partition":"gpu-rtx4070","worker_statefulset":"slurm-worker-gpu-rtx4070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4070"],"match_gres":["gpu:rtx4070","mps"]},
     {"partition":"gpu-rtx4080","worker_statefulset":"slurm-worker-gpu-rtx4080","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4080"],"match_gres":["gpu:rtx4080"]}
   ]'
 
@@ -228,6 +228,11 @@ log "creating/applying secrets..."
 REGENERATE_SECRETS="$REGENERATE_SECRETS" scripts/create-secrets.sh "$NAMESPACE"
 log "applying core manifests..."
 kubectl apply -f manifests/core/slurm-ddp-runtime.yaml
+# slurmdbd + mysql. slurm.conf has AccountingStorageType=slurmdbd unconditionally
+# and controller startup waits for slurmdbd:6819 — without this, slurmctld hangs.
+if [[ -f manifests/core/slurm-accounting.yaml ]]; then
+  kubectl apply -f manifests/core/slurm-accounting.yaml
+fi
 # Lmod modulefile ConfigMaps (openmpi, python3, cuda stubs).
 # Declared optional in slurm-static.yaml so pods start even if applied late.
 if [[ -f manifests/core/lmod-modulefiles.yaml ]]; then
@@ -240,12 +245,12 @@ kubectl -n "$NAMESPACE" delete service slurm-worker --ignore-not-found=true >/de
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true >/dev/null 2>&1 || true
 
 if [[ "$FORCE_RECREATE" == "true" ]]; then
-  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-rtx5070 slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
-  kubectl -n "$NAMESPACE" delete service slurm-worker-cpu slurm-worker-gpu-rtx5070 slurm-worker-gpu-rtx4080 slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete service slurm-worker-cpu slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx4080 slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete deployment slurm-login slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true >/dev/null 2>&1 || true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx5070 --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4070 --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
 fi
 
@@ -260,7 +265,7 @@ validate_live_commands statefulset/slurm-worker-cpu /bin/bash
 # Always restart long-lived components so /etc/munge/munge.key is recopied from projected secrets.
 maybe_rollout_restart statefulset/slurm-controller
 maybe_rollout_restart statefulset/slurm-worker-cpu
-maybe_rollout_restart statefulset/slurm-worker-gpu-rtx5070
+maybe_rollout_restart statefulset/slurm-worker-gpu-rtx4070
 maybe_rollout_restart statefulset/slurm-worker-gpu-rtx4080
 maybe_rollout_restart deployment/slurm-login
 maybe_rollout_restart deployment/slurm-elastic-operator
@@ -268,7 +273,7 @@ kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-fo
 # Force fresh pods so /etc/munge/munge.key is recopied from the projected secret at process start.
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true >/dev/null 2>&1 || true
-kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx5070 --ignore-not-found=true >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4070 --ignore-not-found=true >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
 
@@ -315,7 +320,7 @@ kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-fo
 
 # Keep a single baseline worker at start so scale-up paths are observable.
 kubectl -n "$NAMESPACE" scale statefulset/${baseline_worker_sts} --replicas=1 >/dev/null 2>&1 || true
-for extra in slurm-worker-gpu-rtx5070 slurm-worker-gpu-rtx4080; do
+for extra in slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx4080; do
   kubectl -n "$NAMESPACE" get statefulset "$extra" >/dev/null 2>&1 && kubectl -n "$NAMESPACE" scale statefulset/${extra} --replicas=0 >/dev/null 2>&1 || true
 done
 

@@ -83,7 +83,6 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
         "ClusterName=kind-slurm",
         "SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)",
         "MpiDefault=pmi2",
-        "ProctrackType=proctrack/linuxproc",
         "ReturnToService=2",
         "SlurmctldPidFile=/var/run/slurmctld.pid",
         "SlurmdPidFile=/var/run/slurmd.pid",
@@ -91,11 +90,16 @@ def build_slurm_conf(cfg: dict, real_gpu: bool = False) -> tuple[str, str]:
         "SlurmUser=root",
         "StateSaveLocation=/var/spool/slurmctld",
         "SwitchType=switch/none",
-        # real_gpu enables cgroup isolation so Slurm can enforce CPU/GPU limits.
-        # Kind uses task/none because cgroup v2 is not reliably available inside
-        # Docker-in-Docker (Kind node containers are not full VMs).
-        *(["TaskPlugin=task/cgroup", "CgroupPlugin=cgroup/v2"] if real_gpu
-          else ["TaskPlugin=task/none"]),
+        # GPU isolation is handled by the kubelet + libnvidia-container hook
+        # (NVIDIA runtime, see manifests/gpu/runtime-class.yaml), not by Slurm.
+        # Slurm 21.08 (Ubuntu 22.04 image) has incomplete cgroup v2 support
+        # (no IgnoreSystemd, no CgroupAutomount=no), and freezer cgroup is not
+        # mounted on cgroup-v2-only hosts (Ubuntu 24.04 default), so
+        # task/cgroup + proctrack/cgroup fail at slurmd startup. Stay with
+        # linuxproc + task/none even in real_gpu mode — Slurm's job is GRES
+        # accounting and scheduling; resource isolation is layered below.
+        "TaskPlugin=task/none",
+        "ProctrackType=proctrack/linuxproc",
         "MailProg=/usr/bin/true",
         "SelectType=select/cons_tres",
         "SelectTypeParameters=CR_Core",
@@ -448,6 +452,15 @@ spec:
         mps_vm = ""
         mps_vol = ""
         mps_host_ipc = ""
+        # Pods that request nvidia.com/gpu must run under the NVIDIA container
+        # runtime so the libnvidia-container hook injects /dev/nvidia*. k3s
+        # 1.27+ auto-registers the `nvidia` runtime; we apply a RuntimeClass
+        # named `nvidia` (manifests/gpu/runtime-class.yaml) and reference it
+        # here. CPU-only pools and Kind dev mode skip this.
+        runtime_class = (
+            "\n      runtimeClassName: nvidia"
+            if is_gpu_pool and args.real_gpu else ""
+        )
         docs.append(f"""apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -464,7 +477,7 @@ spec:
       labels:
         app: {pool['appLabel']}
         worker-class: {pool['workerClass']}
-    spec:{mps_host_ipc}
+    spec:{runtime_class}{mps_host_ipc}
       containers:
         - name: slurm-worker
           image: {pool['image']}

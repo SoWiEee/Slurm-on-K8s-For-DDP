@@ -17,13 +17,13 @@ NAMESPACE=${NAMESPACE:-slurm}
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 K8S_RUNTIME=${K8S_RUNTIME:-kind}
 KUBE_CONTEXT=${KUBE_CONTEXT:-$([[ "$K8S_RUNTIME" == "k3s" ]] && echo "default" || echo "kind-${CLUSTER_NAME}")}
-GPU_POOL_STS=${GPU_POOL_STS:-slurm-worker-gpu-rtx5070}
-GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-rtx5070}
-GPU_GRES=${GPU_GRES:-gpu:rtx5070:1}
+GPU_POOL_STS=${GPU_POOL_STS:-slurm-worker-gpu-rtx4070}
+GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-rtx4070}
+GPU_GRES=${GPU_GRES:-gpu:rtx4070:1}
 JOB_TIMEOUT=${JOB_TIMEOUT:-120}
-PARTITION=${PARTITION:-gpu-rtx5070}
-# MPS test (only meaningful on the rtx5070 pool, which has sharing.mps enabled).
-MPS_PARTITION=${MPS_PARTITION:-gpu-rtx5070}
+PARTITION=${PARTITION:-gpu-rtx4070}
+# MPS test (only meaningful on the rtx4070 pool, which has sharing.mps enabled).
+MPS_PARTITION=${MPS_PARTITION:-gpu-rtx4070}
 MPS_GRES=${MPS_GRES:-mps:25}
 SKIP_MPS=${SKIP_MPS:-false}
 

@@ -214,7 +214,7 @@ class ClusterStateCollector:
 
         Jobs are fetched once per unique partition name, so pools that share a
         partition only trigger one squeue exec instead of one per pool. With
-        the cpu / gpu-rtx5070 / gpu-rtx4080 partition split, each pool now has
+        the cpu / gpu-rtx4070 / gpu-rtx4080 partition split, each pool now has
         its own partition, so this is effectively one squeue per pool — the
         de-duplication still applies if a future config collapses pools.
         """

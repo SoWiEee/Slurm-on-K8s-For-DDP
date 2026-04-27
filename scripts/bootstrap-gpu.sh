@@ -38,6 +38,10 @@ die() { echo "[bootstrap-gpu][ERROR] $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # Step 1: Deploy NVIDIA device plugin (with built-in MPS sharing)
 # ---------------------------------------------------------------------------
+if [[ -f manifests/gpu/runtime-class.yaml ]]; then
+  log "applying NVIDIA RuntimeClass..."
+  kubectl apply -f manifests/gpu/runtime-class.yaml
+fi
 log "deploying NVIDIA device plugin (sharing.mps enabled)..."
 kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
 
@@ -57,7 +61,7 @@ if [[ -z "$gpu_nodes" ]]; then
   echo "[bootstrap-gpu] WARNING: no nodes advertising nvidia.com/gpu yet" >&2
   echo "  This may take a moment. Check: kubectl describe nodes | grep -A5 Capacity" >&2
   echo "  Also confirm the node carries the label" >&2
-  echo "    nvidia.com/device-plugin.config=rtx5070-mps  (for RTX 5070 hosts)" >&2
+  echo "    nvidia.com/device-plugin.config=rtx4070-mps  (for RTX 4070 hosts)" >&2
   echo "    nvidia.com/device-plugin.config=rtx4080-exclusive  (for RTX 4080 hosts)" >&2
 else
   echo "$gpu_nodes" | while IFS=$'\t' read -r node gpu_count; do

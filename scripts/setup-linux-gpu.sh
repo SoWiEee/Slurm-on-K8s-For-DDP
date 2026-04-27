@@ -129,7 +129,7 @@ if [[ "$INSTALL_K3S" == "true" ]]; then
   echo "  bash scripts/bootstrap-gpu.sh   # device-plugin (sharing.mps built-in)"
   echo ""
   echo "  # Label each GPU node so device-plugin picks the right sharing config:"
-  echo "  kubectl label node <RTX5070-NODE> nvidia.com/device-plugin.config=rtx5070-mps"
+  echo "  kubectl label node <RTX4070-NODE> nvidia.com/device-plugin.config=rtx4070-mps"
   echo "  kubectl label node <RTX4080-NODE> nvidia.com/device-plugin.config=rtx4080-exclusive"
 else
   echo "  KIND_CONFIG=kind-config-gpu.yaml bash scripts/bootstrap.sh"

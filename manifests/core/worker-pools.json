@@ -26,12 +26,12 @@
       "gres": []
     },
     {
-      "name": "slurm-worker-gpu-rtx5070",
-      "service": "slurm-worker-gpu-rtx5070",
-      "appLabel": "slurm-worker-gpu-rtx5070",
-      "workerClass": "gpu-rtx5070",
+      "name": "slurm-worker-gpu-rtx4070",
+      "service": "slurm-worker-gpu-rtx4070",
+      "appLabel": "slurm-worker-gpu-rtx4070",
+      "workerClass": "gpu-rtx4070",
       "image": "slurm-worker:latest",
-      "partition": "gpu-rtx5070",
+      "partition": "gpu-rtx4070",
       "maxNodes": 2,
       "replicas": 0,
       "cpus": 4,
@@ -41,10 +41,10 @@
       "threadsPerCore": 2,
       "features": [
         "gpu",
-        "gpu-rtx5070"
+        "gpu-rtx4070"
       ],
       "gres": [
-        "gpu:rtx5070:1",
+        "gpu:rtx4070:1",
         "mps:100"
       ]
     },
@@ -79,7 +79,7 @@
       "state": "UP"
     },
     {
-      "name": "gpu-rtx5070",
+      "name": "gpu-rtx4070",
       "default": false,
       "maxTime": "INFINITE",
       "state": "UP"

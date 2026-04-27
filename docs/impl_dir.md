@@ -15,7 +15,7 @@ k3s + Slurm 的組合解決了一個實際問題：
 
 ### 問題描述
 
-一台混合硬體主機（RTX 5070 + RTX 4080 + 多核 CPU）上，同時存在多種工作：
+一台混合硬體主機（RTX 4070 + RTX 4080 + 多核 CPU）上，同時存在多種工作：
 
 | 工作類型 | 資源需求 | 特性 |
 |---------|---------|------|
@@ -54,8 +54,8 @@ k3s + Slurm 的組合解決了一個實際問題：
 使用者提交 job
     │
     ├── 文字生成（LLM 7B）     → --gres=gpu:rtx4080:1    獨佔整張 RTX 4080
-    ├── 文字分類（小模型）      → --gres=mps:25           RTX 5070 上 MPS 分享
-    ├── 圖片生成（SD 1.5）      → --gres=gpu:rtx5070:1    獨佔 RTX 5070
+    ├── 文字分類（小模型）      → --gres=mps:25           RTX 4070 上 MPS 分享
+    ├── 圖片生成（SD 1.5）      → --gres=gpu:rtx4070:1    獨佔 RTX 4070
     └── 資料前處理             → --cpus-per-task=4        純 CPU worker
 ```
 
@@ -160,7 +160,7 @@ torchrun --nproc_per_node=1 --nnodes=2 train_ddp.py \
 ### C2：MPS 細粒度 GPU 分配
 
 傳統 K8s GPU 分配是整數（0 或 1 張卡），本系統透過 Slurm GRES `mps:N` 實現百分比分配：
-- 一張 RTX 5070（48 SM）最多可以同時跑 4 個 `mps:25` job（各 12 SM）
+- 一張 RTX 4070（48 SM）最多可以同時跑 4 個 `mps:25` job（各 12 SM）
 - 對比「一 job 一卡」，throughput 提升 3–4×（可量化）
 
 ### C3：CPU + GPU 混合 pool 資源隔離

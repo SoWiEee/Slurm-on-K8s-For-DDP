@@ -244,8 +244,8 @@ data:
               "refId": "C"
             },
             {
-              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-gpu-rtx5070\"}",
-              "legendFormat": "GPU RTX5070 Workers",
+              "expr": "slurm_operator_current_replicas{pool=\"slurm-worker-gpu-rtx4070\"}",
+              "legendFormat": "GPU RTX4070 Workers",
               "refId": "D"
             },
             {

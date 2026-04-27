@@ -92,7 +92,7 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
                   - slurm-login
                   - slurm-elastic-operator
@@ -121,7 +121,7 @@ spec:
         operator: In
         values:
           - slurm-worker-cpu
-          - slurm-worker-gpu-rtx5070
+          - slurm-worker-gpu-rtx4070
           - slurm-worker-gpu-rtx4080
   policyTypes:
     - Ingress
@@ -136,7 +136,7 @@ spec:
                   - slurm-login
                   # Allow inter-worker MPI/DDP collective traffic
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
@@ -151,7 +151,7 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
 ---
 # ============================================================
@@ -181,7 +181,7 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
     # SSH from controller
     - from:
@@ -249,7 +249,7 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
@@ -318,7 +318,7 @@ spec:
         operator: In
         values:
           - slurm-worker-cpu
-          - slurm-worker-gpu-rtx5070
+          - slurm-worker-gpu-rtx4070
           - slurm-worker-gpu-rtx4080
   policyTypes:
     - Egress
@@ -341,7 +341,7 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
     # ALL ports to login — srun step I/O callback on ephemeral ports.
     # srun step I/O requires slurmd to connect back to the srun listener on an
@@ -387,7 +387,7 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-rtx5070
+                  - slurm-worker-gpu-rtx4070
                   - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
