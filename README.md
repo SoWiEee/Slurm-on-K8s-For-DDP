@@ -3,7 +3,11 @@
 把 HPC 排程器搬進 Kubernetes，打造一個可讓多位使用者共用 CPU + GPU 硬體資源的批次 AI 工作平台。
 
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
+- 採坑紀錄和實作筆記：[`docs/note.md`](docs/note.md)
+- Windows+Kind 遷移到 Linux+K3s 的計畫：[`docs/migration.md`](docs/migration.md)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
+- 監控系統實作規格：[`docs/monitoring.md`](docs/monitoring.md)
+- AI Review 紀錄：[`docs/review.md`](docs/review.md)
 
 ---
 
@@ -625,6 +629,3 @@ helm install slurm-platform ./chart -f chart/values-dev.yaml
 - [Spack: A Flexible Package Manager](https://github.com/spack/spack)
 - [Grafana](https://grafana.com/)
 - [Kube State Metrics](https://github.com/kubernetes/kube-state-metrics)
-- 開發筆記（踩坑紀錄、設計決策）：[`docs/note.md`](docs/note.md)
-- Phase 4 監控實作規格：[`docs/monitoring.md`](docs/monitoring.md)
-- K8s 物件說明：[`docs/cluster.md`](docs/cluster.md)
