@@ -44,6 +44,8 @@
 | **[A] Linux + k3s](#a-linux--k3s--real-gpu-已驗證)** | Ubuntu 24.04 + k3s | 真實 NVIDIA GPU | 生產/驗證 |
 | **[B] Kind（本機模擬）](#b-kind-本機開發模擬)** | Windows/Mac + Docker Desktop | 無（排程邏輯驗證） | 本機開發 |
 
+> **📦 Phase 5-A Helm chart 開發中。** `chart/` 目錄下的 `slurm-platform` chart 已涵蓋 namespace / PVC / services / ConfigMap / 控制器 + worker StatefulSets（Stage B）；operator、login、NetworkPolicy（Stage C）、GPU Operator dependency（Stage D）、監控與 NFS（Stage E）尚未完成。**目前完整、已驗證可用的部署方式仍是下方 `bootstrap.sh` 路徑**；待 Stage F 收尾時 `bootstrap.sh` 會被 `helm install` 取代，本節指令屆時整段重寫。要追蹤進度可看 [`docs/note.md §5-A`](docs/note.md) 或執行 `bash scripts/verify-helm.sh` 驗證目前 chart 的渲染輸出。
+
 ---
 
 ## A. Linux + k3s + Real GPU（已驗證）
