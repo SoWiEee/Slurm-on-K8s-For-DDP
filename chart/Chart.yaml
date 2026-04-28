@@ -20,6 +20,15 @@ keywords:
 maintainers:
   - name: SoWiEee
     email: kawiisowieee@gmail.com
-# Stage A: chart scaffold + slurm.conf / gres.conf rendering only.
-# Dependencies (gpu-operator, etc.) are added in later stages.
 # See docs/note.md §5-A for the full implementation roadmap.
+#
+# Note: NVIDIA GPU Operator is intentionally NOT a chart dependency. It
+# hardcodes Release.Namespace for all its DaemonSets and needs that
+# namespace to be PSS=privileged for hostPath access to /dev/nvidia*,
+# /run/nvidia/mps, etc. Our slurm namespace is PSS=baseline so the two
+# cannot cohabit cleanly. GPU Operator is installed separately via
+# `scripts/install-gpu-operator.sh` into its own `gpu-operator` namespace;
+# this chart contributes only the device-plugin-config ConfigMap (lives
+# in the gpu-operator namespace, picked up by NVIDIA's device-plugin
+# DaemonSet) and the node-labeler Job that tags GPU nodes with
+# nvidia.com/device-plugin.config=<key>.

@@ -13,11 +13,11 @@ cluster:
   runtime: k3s
   podSecurity: baseline
 
-# Stage D will switch this to true and pull in the gpu-operator dependency.
-# Stage A leaves it false so values-k3s.yaml does not require helm dep update
-# yet.
+# Stage D enables this; values.yaml::gpu-operator subchart override (driver +
+# toolkit disabled) takes over because the host already has nvidia-driver-535 +
+# nvidia-container-toolkit installed by setup-linux-gpu.sh.
 gpu:
-  enabled: false
+  enabled: true
   autoLabel: true
 
 # Real GPU isolation needs the NVIDIA container runtime; the worker pod

@@ -6,7 +6,6 @@
 *.tmproj
 *.bak
 *.swp
-*.tgz
 .project
 .helmignore
 README.md.bak

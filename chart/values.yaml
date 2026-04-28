@@ -165,11 +165,25 @@ image:
   pullPolicy: IfNotPresent
 
 # -- GPU subsystem (used Stage D onwards) ------------------------------------
+# This chart only renders the device-plugin-config ConfigMap and the
+# post-install Job that labels GPU nodes. NVIDIA GPU Operator itself is
+# installed separately into its own namespace via
+# `scripts/install-gpu-operator.sh`; see Chart.yaml notes.
 gpu:
   enabled: false                                   # Kind dev mode: GPU off
   autoLabel: true                                  # post-install Job to apply
                                                    # nvidia.com/device-plugin.config=<key>
                                                    # to nodes matching `nodeAssignments`
+  # Namespace where NVIDIA GPU Operator's components live. The
+  # device-plugin-config ConfigMap is created here (not in cluster.namespace)
+  # because GPU Operator's device-plugin DaemonSet only reads ConfigMaps
+  # from its own namespace. install-gpu-operator.sh creates this namespace
+  # too, but we also create it from the chart so install order is flexible.
+  targetNamespace: gpu-operator
+  # PodSecurity standard for the gpu-operator namespace. Must be
+  # `privileged` for hostPath access to /dev/nvidia*, /run/nvidia/mps, etc.
+  # Override only if you've patched gpu-operator to drop hostPath mounts.
+  targetNamespacePodSecurity: privileged
   deviceConfigs:
     default:
       version: v1
@@ -189,36 +203,6 @@ gpu:
     - selector:
         gpu-host-class: rtx4080
       config: rtx4080-exclusive
-
-# -- NVIDIA GPU Operator subchart override (Stage D) -------------------------
-# Merged into the gpu-operator subchart at install time. Host already has
-# nvidia-driver-535 + nvidia-container-toolkit installed, so driver/toolkit
-# subcomponents are disabled.
-gpu-operator:
-  driver:
-    enabled: false
-  toolkit:
-    enabled: false
-  devicePlugin:
-    enabled: true
-    config:
-      name: slurm-platform-device-plugin-config
-      default: default
-  mps:
-    root: /run/nvidia/mps
-  dcgmExporter:
-    enabled: false
-  gfd:
-    enabled: true
-  nodeStatusExporter:
-    enabled: false
-  migManager:
-    enabled: false
-  validator:
-    plugin:
-      env:
-        - name: WITH_WORKLOAD
-          value: "true"
 
 # -- Operator (Stage C) ------------------------------------------------------
 operator:

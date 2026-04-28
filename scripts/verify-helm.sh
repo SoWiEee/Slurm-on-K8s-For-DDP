@@ -168,6 +168,35 @@ if [[ -n "${RENDERS[values-k3s.yaml]:-}" ]]; then
     grep -q 'port: 6443' "$WORKDIR/np-operator.yaml" \
       || fail "operator NetworkPolicy missing API server port 6443 (k3s)"
   fi
+
+  # ----- Stage D checks: device-plugin-config + GPU labeler ---------------
+  if grep -q 'name: slurm-platform-device-plugin-config' "$k3s_render"; then
+    log "spot-check: device-plugin-config has rtx4070-mps with sharing.mps replicas=4"
+    extract_resource "$k3s_render" ConfigMap slurm-platform-device-plugin-config \
+      > "$WORKDIR/cm-device-plugin.yaml"
+    grep -q 'rtx4070-mps:' "$WORKDIR/cm-device-plugin.yaml" \
+      || fail "device-plugin-config missing rtx4070-mps key"
+    grep -q 'replicas: 4' "$WORKDIR/cm-device-plugin.yaml" \
+      || fail "device-plugin-config rtx4070-mps missing sharing.mps replicas=4"
+
+    log "spot-check: device-plugin-config lives in gpu-operator namespace"
+    grep -q 'namespace: gpu-operator' "$WORKDIR/cm-device-plugin.yaml" \
+      || fail "device-plugin-config not in gpu-operator namespace"
+
+    log "spot-check: gpu-operator Namespace has PSS=privileged"
+    extract_resource "$k3s_render" Namespace gpu-operator > "$WORKDIR/ns-gpu.yaml"
+    [[ -s "$WORKDIR/ns-gpu.yaml" ]] \
+      || fail "gpu-operator Namespace not rendered (gpu.enabled but namespace missing)"
+    grep -q 'pod-security.kubernetes.io/enforce: privileged' "$WORKDIR/ns-gpu.yaml" \
+      || fail "gpu-operator Namespace not labeled PSS=privileged"
+  fi
+
+  if extract_resource "$k3s_render" Job slurm-platform-gpu-labeler \
+      > "$WORKDIR/job-labeler.yaml" && [[ -s "$WORKDIR/job-labeler.yaml" ]]; then
+    log "spot-check: gpu-labeler Job has post-install hook annotation"
+    grep -q '"helm.sh/hook": post-install' "$WORKDIR/job-labeler.yaml" \
+      || fail "gpu-labeler Job missing helm.sh/hook=post-install"
+  fi
 fi
 
 # Extract the content of a `<key>: |` block from a YAML stream, stripping the
@@ -242,6 +271,18 @@ elif ! command -v kubectl >/dev/null; then
 elif ! kubectl version --request-timeout=3s >/dev/null 2>&1; then
   warn "kubectl cannot reach the API server — skipping server-side dry-run"
 else
+  # Some rendered resources target a namespace other than cluster.namespace
+  # (e.g. gpu-operator's device-plugin-config ConfigMap). At install time
+  # helm pre-install hooks create those namespaces; for dry-run we ensure
+  # they exist (idempotent — re-running this script does not churn state).
+  cross_ns="$(for r in "${RENDERS[@]}"; do grep -E '^  namespace: ' "$r"; done \
+    | awk '{print $2}' | sort -u)"
+  for ns in $cross_ns; do
+    if ! kubectl get ns "$ns" >/dev/null 2>&1; then
+      log "creating namespace $ns (so dry-run can validate references)"
+      kubectl create namespace "$ns" >/dev/null
+    fi
+  done
   for label in "${!RENDERS[@]}"; do
     log "kubectl apply --dry-run=server ($label)"
     if ! kubectl apply --dry-run=server -f "${RENDERS[$label]}" \

@@ -1,0 +1,37 @@
+{{- if .Values.gpu.enabled -}}
+{{/*
+NVIDIA k8s-device-plugin configuration ConfigMap.
+
+The NVIDIA device-plugin daemon (managed by gpu-operator) reads sharing
+strategy from this ConfigMap, picking the key by the node label
+`nvidia.com/device-plugin.config`. Each pool can have a different sharing
+strategy: rtx4070-mps for hardware SM partitioning, rtx4080-exclusive for
+single-tenant access, default as a safe fallback.
+
+Notes:
+  - The ConfigMap name `slurm-platform-device-plugin-config` is referenced
+    in values.yaml::gpu-operator.devicePlugin.config.name; both must match.
+  - rtx4070-mps replicas=4 means the device-plugin advertises 4
+    nvidia.com/gpu slots per physical GPU. Slurm uses --gres=mps:N to
+    pick SM percentages within those slots.
+  - On v26.3.1 of gpu-operator, sharing.mps starts a separate
+    mps-control-daemon DaemonSet (foreground -f mode), which is the whole
+    reason we switched off the bundled `sharing.mps` in
+    nvidia-device-plugin (it had a daemonize spawn race; see migration.md).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-platform-device-plugin-config
+  # Lives in the gpu-operator namespace, not slurm — that's where the
+  # device-plugin DaemonSet reads from. install-gpu-operator.sh references
+  # this ConfigMap by name in its --set devicePlugin.config.name= flag.
+  namespace: {{ .Values.gpu.targetNamespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+{{- range $key, $cfg := .Values.gpu.deviceConfigs }}
+  {{ $key }}: |
+    {{- toYaml $cfg | nindent 4 }}
+{{- end }}
+{{- end }}

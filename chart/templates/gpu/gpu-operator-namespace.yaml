@@ -1,0 +1,33 @@
+{{- if .Values.gpu.enabled -}}
+{{/*
+gpu-operator namespace.
+
+Created by this chart so the device-plugin-config ConfigMap can land in
+it during `helm install slurm-platform`. install-gpu-operator.sh later
+runs `helm install gpu-operator ... --create-namespace -n gpu-operator`,
+which is a no-op if the namespace already exists. Order between the two
+helm installs is flexible.
+
+PSS=privileged is required for gpu-operator's hostPath mounts (driver
+libs, /dev/nvidia*, /run/nvidia/mps). The slurm namespace stays at
+PSS=baseline; only this namespace is loosened.
+
+helm.sh/resource-policy=keep prevents `helm uninstall slurm-platform`
+from deleting the namespace, which would also delete gpu-operator's
+DaemonSets, ConfigMaps, and CRD instances. The two helm releases own
+disjoint resources within this namespace.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.gpu.targetNamespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.gpu.targetNamespacePodSecurity }}
+    pod-security.kubernetes.io/audit: {{ .Values.gpu.targetNamespacePodSecurity }}
+    pod-security.kubernetes.io/warn: {{ .Values.gpu.targetNamespacePodSecurity }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/resource-policy": keep
+{{- end }}
