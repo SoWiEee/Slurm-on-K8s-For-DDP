@@ -131,6 +131,43 @@ if [[ -n "${RENDERS[values-k3s.yaml]:-}" ]]; then
       fail "$sts StatefulSet should not project jwt secret (controller-only)"
     fi
   done
+
+  # ----- Stage C+ checks: operator + login + NetworkPolicy ------------------
+  if extract_resource "$k3s_render" Deployment slurm-elastic-operator \
+      > "$WORKDIR/dep-operator.yaml" && [[ -s "$WORKDIR/dep-operator.yaml" ]]; then
+    log "spot-check: operator has PARTITIONS_JSON env covering all pools"
+    grep -q 'name: PARTITIONS_JSON' "$WORKDIR/dep-operator.yaml" \
+      || fail "operator missing PARTITIONS_JSON env"
+    for pool in cpu gpu-rtx4070 gpu-rtx4080; do
+      grep -q "\"partition\":\"$pool\"" "$WORKDIR/dep-operator.yaml" \
+        || fail "operator PARTITIONS_JSON missing partition '$pool'"
+    done
+    log "spot-check: operator mounts slurm-jwt-secret"
+    grep -q 'secretName: slurm-jwt-secret' "$WORKDIR/dep-operator.yaml" \
+      || fail "operator missing slurm-jwt-secret volume"
+  fi
+
+  if extract_resource "$k3s_render" Deployment slurm-login \
+      > "$WORKDIR/dep-login.yaml" && [[ -s "$WORKDIR/dep-login.yaml" ]]; then
+    log "spot-check: login MUST NOT mount jwt secret"
+    if grep -q 'name: slurm-jwt-secret' "$WORKDIR/dep-login.yaml"; then
+      fail "login Deployment should not project jwt secret (controller+operator only)"
+    fi
+    log "spot-check: login mounts slurm-ddp-runtime ConfigMap"
+    grep -q 'name: slurm-ddp-runtime' "$WORKDIR/dep-login.yaml" \
+      || fail "login missing slurm-ddp-runtime ConfigMap mount"
+  fi
+
+  np_count=$(grep -cE '^kind: NetworkPolicy$' "$k3s_render" || true)
+  if (( np_count > 0 )); then
+    log "spot-check: NetworkPolicy operator egress allows both 443 and 6443"
+    extract_resource "$k3s_render" NetworkPolicy allow-operator-egress \
+      > "$WORKDIR/np-operator.yaml"
+    grep -q 'port: 443' "$WORKDIR/np-operator.yaml" \
+      || fail "operator NetworkPolicy missing API server port 443 (Kind)"
+    grep -q 'port: 6443' "$WORKDIR/np-operator.yaml" \
+      || fail "operator NetworkPolicy missing API server port 6443 (k3s)"
+  fi
 fi
 
 # Extract the content of a `<key>: |` block from a YAML stream, stripping the

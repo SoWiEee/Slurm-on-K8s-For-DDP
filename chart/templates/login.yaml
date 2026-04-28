@@ -1,0 +1,220 @@
+{{/*
+Slurm login pod — entry point for users to submit jobs.
+
+Same image as worker (slurm-worker:latest) since it needs the Slurm client
+binaries (sbatch, srun, squeue, scontrol). Runs sshd + munged but NOT
+slurmd, so it can sit outside the partition graph.
+
+Volumes:
+  - slurm-config-static / slurm-config-nodes : same split as workers, mounted
+    at /etc/slurm/slurm.conf, /etc/slurm/slurm.nodes.conf, /etc/slurm/gres.conf.
+  - slurm-secrets    : projected (munge + ssh, no jwt — login does not call
+    slurmrestd directly).
+  - slurm-ddp-runtime: optional ConfigMap with helper scripts (ddp-env.sh,
+    sample-ddp-job.sh) bind-mounted into /opt/slurm-runtime via the startup
+    init step.
+
+The startup script copies SSH keys to /root/.ssh + authorized_keys so the
+operator and workers can ssh in for srun step launches; this is identical
+to scripts/render-core.py to preserve verified behavior.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-login
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-login
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-login
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: slurm-login
+    spec:
+      containers:
+        - name: slurm-login
+          image: {{ .Values.image.worker }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              SSH_SRC_DIR=/slurm-secrets
+              if [[ ! -f "$MUNGE_SRC" ]]; then
+                echo "[login] missing $MUNGE_SRC" >&2
+                exit 1
+              fi
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              cp "$MUNGE_SRC" "$MUNGE_DST"
+              chown munge:munge "$MUNGE_DST"
+              chmod 0400 "$MUNGE_DST"
+              install -d -m 0700 /root/.ssh
+              if [[ -f "$SSH_SRC_DIR/id_ed25519" ]]; then
+                cp "$SSH_SRC_DIR/id_ed25519" /root/.ssh/id_ed25519
+                chmod 0600 /root/.ssh/id_ed25519
+              fi
+              if [[ -f "$SSH_SRC_DIR/id_ed25519.pub" ]]; then
+                cp "$SSH_SRC_DIR/id_ed25519.pub" /root/.ssh/id_ed25519.pub
+                chmod 0644 /root/.ssh/id_ed25519.pub
+                cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+                chmod 0600 /root/.ssh/authorized_keys
+              fi
+              ssh-keygen -A >/dev/null 2>&1 || true
+              if [[ -d /opt/slurm-runtime-src ]]; then
+                install -d -m 0755 /opt/slurm-runtime
+                cp -f /opt/slurm-runtime-src/* /opt/slurm-runtime/ 2>/dev/null || true
+                chmod +x /opt/slurm-runtime/* 2>/dev/null || true
+              fi
+              if ! su -s /bin/sh -c '/usr/sbin/munged --syslog' munge; then
+                echo "[login] munged failed to start" >&2
+                exit 1
+              fi
+              sleep 1
+              pgrep -x munged >/dev/null
+              /usr/sbin/sshd
+              echo "[login] ready: munged+sshd running"
+              tail -f /dev/null
+          ports:
+            - containerPort: 22
+              name: ssh
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: slurm-config-static
+              mountPath: /etc/slurm/slurm.conf
+              subPath: slurm.conf
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/slurm.nodes.conf
+              subPath: slurm.nodes.conf
+            {{- if include "slurm-platform.gresConf" . }}
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/gres.conf
+              subPath: gres.conf
+            {{- end }}
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+            - name: slurm-ddp-runtime
+              mountPath: /opt/slurm-runtime-src
+              readOnly: true
+      volumes:
+        - name: slurm-config-static
+          configMap:
+            name: slurm-config-static
+        - name: slurm-config-nodes
+          configMap:
+            name: slurm-config-nodes
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.secrets.munge }}
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: {{ .Values.secrets.ssh }}
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
+        - name: slurm-ddp-runtime
+          configMap:
+            name: slurm-ddp-runtime
+            defaultMode: 0755
+            optional: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-login-pdb
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: slurm-login
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-login
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-login
+spec:
+  selector:
+    app: slurm-login
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22
+---
+{{/*
+slurm-ddp-runtime ConfigMap — DDP networking helpers used inside login pod
+sbatch scripts. Ported verbatim from manifests/core/slurm-ddp-runtime.yaml.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-ddp-runtime
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    runtime-role: cross-network-mvp
+data:
+  ddp-env.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    iface="${SLURM_DATA_IFACE:-net2}"
+    port="${MASTER_PORT:-29500}"
+
+    data_ip=""
+    if command -v ip >/dev/null 2>&1 && ip -o -4 addr show dev "$iface" >/dev/null 2>&1; then
+      data_ip=$(ip -o -4 addr show dev "$iface" | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    fi
+
+    export SLURM_DATA_IFACE="$iface"
+    export NCCL_SOCKET_IFNAME="$iface"
+    export GLOO_SOCKET_IFNAME="$iface"
+    export TP_SOCKET_IFNAME="$iface"
+    export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
+    export MASTER_PORT="$port"
+
+    if [[ -n "$data_ip" ]]; then
+      export SLURM_DATA_IP="$data_ip"
+      export DDP_LOCAL_DATA_IP="$data_ip"
+    fi
+
+    echo "[ddp-env] iface=$iface data_ip=${data_ip:-<none>} master=${MASTER_ADDR:-<unset>}:${MASTER_PORT}" >&2
+  sample-ddp-job.sh: |
+    #!/usr/bin/env bash
+    # Example usage inside slurm-login:
+    #   sbatch /opt/slurm-runtime/sample-ddp-job.sh
+    # Replace the final python command with the real training entrypoint.
+    # MASTER_ADDR is intentionally left to the submitter so control-plane DNS can
+    # stay stable while collective traffic is pinned to net2.
+    set -euo pipefail
+    source /opt/slurm-runtime/ddp-env.sh
+    export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)}"
+    srun bash -lc 'source /opt/slurm-runtime/ddp-env.sh && env | grep -E "^(MASTER_ADDR|MASTER_PORT|NCCL_SOCKET_IFNAME|GLOO_SOCKET_IFNAME|SLURM_DATA_IP)=" | sort'

@@ -1,0 +1,179 @@
+{{/*
+Slurm elastic operator — multi-pool autoscaler.
+
+Five resources:
+  - ServiceAccount        slurm-elastic-operator
+  - Role + RoleBinding    namespace-scoped (statefulsets patch + pods/exec)
+  - Deployment            single replica, container image .Values.image.operator
+  - PodDisruptionBudget   minAvailable=1
+  - Service               :8000 metrics endpoint (Prometheus scrape; ingress
+                          is wired in network-policy.yaml when monitoring is on)
+
+The operator's PARTITIONS_JSON is generated from .Values.pools via
+slurm-platform.partitionsJson, so the chart is the single source of truth
+for both slurm.conf NodeName lines AND the operator's pool routing — no
+more drift between worker-pools.json and the operator manifest.
+
+Probes: /tmp/operator-ready (readiness, written on first successful poll),
+/tmp/operator-alive (liveness, refreshed every loop iteration; staleness >
+120s = dead). See operator/main.py for details.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: slurm-elastic-operator
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-elastic-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: slurm-elastic-operator
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+rules:
+  # pods + pods/exec: fallback path when slurmrestd is unavailable, the
+  # operator falls back to `kubectl exec slurm-controller-0 -- scontrol show ...`.
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec"]
+    verbs: ["get", "list", "watch", "create"]
+  # statefulsets: scaling target — patch replica count.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: slurm-elastic-operator
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: slurm-elastic-operator
+    namespace: {{ .Values.cluster.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: slurm-elastic-operator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-elastic-operator
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-elastic-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-elastic-operator
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: slurm-elastic-operator
+    spec:
+      serviceAccountName: slurm-elastic-operator
+      containers:
+        - name: operator
+          image: {{ .Values.image.operator }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: NAMESPACE
+              value: {{ .Values.cluster.namespace | quote }}
+            - name: CONTROLLER_POD
+              value: {{ .Values.slurm.controllerHost | quote }}
+            # PARTITIONS_JSON drives the multi-pool routing in operator/main.py.
+            # Generated from .Values.pools so adding/resizing a pool only requires
+            # editing values.yaml.
+            - name: PARTITIONS_JSON
+              value: |
+                {{ include "slurm-platform.partitionsJson" . | trim }}
+            - name: POLL_INTERVAL_SECONDS
+              value: {{ .Values.operator.pollIntervalSeconds | quote }}
+            - name: SCALE_DOWN_COOLDOWN_SECONDS
+              value: {{ .Values.operator.scaleDownCooldownSeconds | quote }}
+            - name: CHECKPOINT_GUARD_ENABLED
+              value: {{ .Values.operator.checkpointGuard.enabled | quote }}
+            - name: CHECKPOINT_PATH
+              value: ""
+            - name: MAX_CHECKPOINT_AGE_SECONDS
+              value: {{ .Values.operator.checkpointGuard.maxAgeSeconds | quote }}
+            - name: CHECKPOINT_GRACE_SECONDS
+              value: {{ .Values.operator.checkpointGuard.graceSeconds | quote }}
+            - name: SLURM_REST_URL
+              value: "http://slurm-restapi.{{ .Values.cluster.namespace }}.svc.cluster.local:6820"
+            - name: SLURM_REST_API_VERSION
+              value: "v0.0.37"
+            - name: SLURM_JWT_KEY_PATH
+              value: "/slurm-jwt/jwt_hs256.key"
+          ports:
+            - name: metrics
+              containerPort: 8000
+              protocol: TCP
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/operator-ready
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -f /tmp/operator-alive &&
+                  test $(( $(date +%s) - $(stat -c %Y /tmp/operator-alive) )) -lt 120
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: {{ .Values.secrets.jwt }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-elastic-operator-pdb
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurm-elastic-operator
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-elastic-operator
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-elastic-operator
+spec:
+  selector:
+    app: slurm-elastic-operator
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
