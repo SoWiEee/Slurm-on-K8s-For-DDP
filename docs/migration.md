@@ -87,41 +87,22 @@ sudo chown $(id -u):$(id -g) ~/.kube/config && chmod 600 ~/.kube/config
 
 或在 ENV 設 `KUBECONFIG=/etc/rancher/k3s/k3s.yaml`（chmod 644 後）。腳本本身尚未修，只是繞過。
 
-### MPS 啟動失敗（**已知 NVIDIA upstream bug，目前用 time-slicing 暫代**）
+### GPU 共享：MPS（目標）／Time-slicing（目前 fallback）
 
-#### 症狀
+device-plugin 內建 `sharing.mps` 在 v0.15–v0.17.x 全系列都壞掉（NVIDIA upstream bug，下面有 root cause + issue 列表）。本專案決定：
 
-device-plugin v0.15.0 / v0.17.0 / v0.17.4 都重複吐：
+- **目前**：用 `sharing.timeSlicing` 跑通端到端，`--gres=gpu:rtx4070:1` 路徑全綠。
+- **目標**：在 Phase 5-A 把 chart 化推上來時，同步把 device-plugin 換成 **NVIDIA GPU Operator**（它把 MPS daemon 拆成獨立 DaemonSet 用前景模式跑，繞過 spawn race），讓 `--gres=mps:N` SM 配額可用。
 
-```
-Failed to start plugin: error waiting for MPS daemon:
-  error checking MPS daemon health:
-    failed to send command to MPS daemon: exit status 1
-```
+---
 
-每 30 秒重試一次，永遠不變綠。`nvidia.com/gpu` allocatable 維持 `0`。
+#### MPS（目標方案：NVIDIA GPU Operator）
 
-#### 已排除
+##### 為什麼 device-plugin 內建 MPS 在 v0.15–v0.17.x 都失敗
 
-| 排查項 | 實測結果 |
-|------|---------|
-| Image tag 錯（v0.17.0 是否 EOL） | 換 v0.17.4 / v0.15.0 同樣失敗 |
-| `runtimeClassName: nvidia` 缺漏 | 已加，pod 內 nvidia-smi 看得到 RTX 4070 |
-| `hostIPC` / `hostPID` / `privileged` | manifest 都已開 |
-| `/run/nvidia/mps` 權限 | root:root 755，從 pod 內 `ls -la` 沒問題 |
-| MPS binary 版本 mismatch | container 與 host 都是 driver 535.288.01 注入的同一支（54208 bytes，2026-01-15 時間戳）|
-| Stale socket 干擾 | 清乾淨 + 重啟 pod 還是失敗 |
-| `CUDA_VISIBLE_DEVICES=GPU-uuid` 模擬 device-plugin env | 手動仍成功 |
-| 進入**同一 pod** 手動 `nvidia-cuda-mps-control -d` + 健康檢查 | ✅ 完美運作，回傳 `100.0` |
-| 在 host 直接跑 daemon | ✅ 完美運作 |
+device-plugin 內部以 `exec.Command("nvidia-cuda-mps-control", "-d")` daemonize 模式啟動 MPS daemon（見 [`internal/mps/daemon.go`](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.17.4/internal/mps/daemon.go)），接著立刻 `echo get_default_active_thread_percentage` 透過 pipe directory 做 health check。`-d` 模式會 fork 出子 process 並讓父 process 立即退出；在 container 的 PID namespace 下，子 process 的 control pipe 初始化在 plugin probe 時還沒就緒，回 `exit status 1`，plugin 判定啟動失敗，每 30 秒重試一次永遠不會變綠。
 
-→ 只要不是 device-plugin 自己 spawn，全部都成功。
-
-#### 根因（已從 upstream 確認）
-
-device-plugin 內部以 `exec.Command("nvidia-cuda-mps-control", "-d")` daemonize 模式啟動 MPS daemon（見 [`internal/mps/daemon.go`](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.17.4/internal/mps/daemon.go)），接著立刻 `echo get_default_active_thread_percentage` 透過 pipe directory 做 health check。`-d` 模式會 fork 出新 process 並以原 process group leader 退出；在 container 的 PID namespace 下，新 process 的初始化在 plugin probe 時還沒完成，導致 control pipe 還沒就緒就被 query，回 `exit status 1`，plugin 判定啟動失敗。
-
-這個 bug 在 NVIDIA k8s-device-plugin 的 v0.15–v0.17.x 全系列都存在，與 driver / kernel / 機器型號無關。相關 GitHub issue：
+這個 bug 與 driver / kernel / 機器型號無關，本機已實測 v0.15.0 / v0.17.0 / v0.17.4 三個 tag 都同樣失敗。相關 upstream issue：
 
 | Issue | 標題 | 狀態 |
 |-------|------|------|
@@ -130,13 +111,54 @@ device-plugin 內部以 `exec.Command("nvidia-cuda-mps-control", "-d")` daemoniz
 | [#1094](https://github.com/NVIDIA/k8s-device-plugin/issues/1094) | error waiting for MPS daemon across versions | open |
 | [#1614](https://github.com/NVIDIA/k8s-device-plugin/issues/1614) | MPS spawn race in containerized PID namespace | closed (not planned) |
 
-換版本沒用（已實測 v0.15.0、v0.17.0、v0.17.4 三個 tag 都同樣失敗，與 issue #1094 報告一致）。release log 沒有任何一版宣告修了這個 spawn race。
+release log 沒有任何一版宣告修了這個 spawn race，短期內也看不到要修的跡象。
 
-#### 三種繞道方案
+##### GPU Operator 為什麼能繞過
 
-##### 方案 1：繼續用 time-slicing（**目前採用**）
+[NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) 把 MPS daemon 拆成獨立的 `mps-control-daemon` DaemonSet 用前景模式（`nvidia-cuda-mps-control -f`）長駐，device-plugin 只透過共享的 `/run/nvidia/mps` 對既存 daemon 做 probe，不再 spawn，根源就消失了。已知在 RTX 40 系列 + driver 535 + k3s 上能跑通。
 
-`manifests/gpu/nvidia-device-plugin.yaml` 加了 `rtx4070-timeslicing` ConfigMap key：
+##### 落地路徑（搭 5-A Helm 化一起做）
+
+GPU Operator 是 Helm chart，本專案 5-A 也要 Helm 化，兩件事最自然的做法是合併。Phase 5-A 的 dependency 從 `nvidia-device-plugin` 換成 `gpu-operator`，並關掉它內建的 driver / toolkit 安裝（host 已經手裝過 `nvidia-driver-535` + `nvidia-container-toolkit`，重複裝會撞）：
+
+```yaml
+# chart/Chart.yaml
+dependencies:
+  - name: gpu-operator
+    version: 24.x.x        # 待 5-A 實作時鎖版
+    repository: https://helm.ngc.nvidia.com/nvidia
+    condition: gpu.enabled
+```
+
+```yaml
+# chart/values-k3s.yaml
+gpu-operator:
+  driver:
+    enabled: false        # 用 host 已裝的 nvidia-driver-535
+  toolkit:
+    enabled: false        # 用 host 已裝的 nvidia-container-toolkit
+  devicePlugin:
+    config:
+      name: rtx4070-mps   # ConfigMap 由本 chart 產生，含 sharing.mps
+  mps:
+    root: /run/nvidia/mps
+```
+
+對應的 Slurm 端不用動：`gres.conf` `Name=mps Count=100`、prolog 注入 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 都已就位，只要 K8s 端 daemon 能起來，`--gres=mps:25` 路徑就會通。
+
+##### 是不是該現在就 Helm 化？
+
+**是，建議直接把 5-A 提前到下一個 milestone 開做。** 三個理由：
+
+1. **GPU Operator 本來就是 Helm 派發**——獨立 `helm install gpu-operator` 雖然技術上可行，但會跟我們手刻的 `manifests/gpu/nvidia-device-plugin.yaml` 共存兩條路徑，反而比較髒。
+2. **5-A 既有規劃就要把 device-plugin 變 chart dependency**（見 [`docs/note.md §5-A`](note.md#5-aHelm-Chart-封裝)），把 dependency 從 `nvidia-device-plugin` 換成 `gpu-operator` 是 1-line 改動，工程成本沒有暴增。
+3. **時機剛好**——`mps-migration` 分支已把 Linux+k3s 路徑驗證通過，正準備合回 main；下一個分支起頭做 5-A 就能直接拿乾淨的基線往前推。
+
+需要修正一處 5-A 既有設計：原稿 `dependencies` 用 `nvidia-device-plugin`（[`docs/note.md` 行 278-282](note.md)），改採 GPU Operator 後 `templates/gpu/device-plugin-config.yaml` 不再自己裝 daemonset，只剩 ConfigMap；`node-labeler-job.yaml` 仍保留（GPU Operator 也讀 `nvidia.com/device-plugin.config` label）。
+
+#### Time-slicing（目前 fallback）
+
+在 5-A + GPU Operator 上線之前，`manifests/gpu/nvidia-device-plugin.yaml` 用 `rtx4070-timeslicing` ConfigMap key 跑：
 
 ```yaml
 rtx4070-timeslicing: |-
@@ -157,34 +179,25 @@ rtx4070-timeslicing: |-
 - **MPS**：硬體 SM 切割（須 daemon），可用 `--gres=mps:N` 指定 SM%
 - **time-slicing**：CUDA context-switch（無 daemon），只能整片 slice 拿（`--gres=gpu:rtx4070:1`）
 
-對 demo / 開發 / 單機 RTX 4070 多 job 並行，time-slicing 已足夠。`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 由 Slurm prolog 注入（render-core.py 已內建），但因為沒有 daemon，這個環境變數實際不影響 SM 配額——保留是為了未來切回 MPS 時不必改 prolog。
+對 demo / 單機 RTX 4070 多 job 並行，time-slicing 已足夠。`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 由 Slurm prolog 注入（`render-core.py` 已內建），time-slicing 模式下因為沒有 daemon、這個變數實際不影響 SM 配額——保留是為了切到 GPU Operator 之後不必改 prolog。
 
-##### 方案 2：分離 MPS DaemonSet（用 `-f` 前景模式）
+`verify-gpu.sh` step 1–5（device-plugin、GPU 切片、`--gres=gpu:rtx4070:1` 的 Slurm job）會通過；step 6（`--gres=mps:25` 檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）會 fail，這是預期的，等 GPU Operator 上來才會綠。
 
-繞過 device-plugin 自己 spawn 的問題：另起一個 DaemonSet 用 `nvidia-cuda-mps-control -f` 前景模式跑 daemon，device-plugin 改成「**假設 daemon 已存在**」模式。NVIDIA 官方 GPU Operator 採這個架構（見下）。手刻版本要：
+##### 既有的 device-plugin spawn 失敗排查紀錄（保留供日後參考）
 
-1. 寫一個 DaemonSet 跑 `nvidia-cuda-mps-control -f`，掛 `/run/nvidia/mps` hostPath
-2. patch device-plugin source 把 spawn-and-probe 改成只 probe（或 fork 一份不 spawn 的 build）
-3. 處理 daemon 重啟時 plugin 的健康檢查 race
+| 排查項 | 實測結果 |
+|------|---------|
+| Image tag 錯（v0.17.0 是否 EOL） | 換 v0.17.4 / v0.15.0 同樣失敗 |
+| `runtimeClassName: nvidia` 缺漏 | 已加，pod 內 nvidia-smi 看得到 RTX 4070 |
+| `hostIPC` / `hostPID` / `privileged` | manifest 都已開 |
+| `/run/nvidia/mps` 權限 | root:root 755，從 pod 內 `ls -la` 沒問題 |
+| MPS binary 版本 mismatch | container 與 host 都是 driver 535.288.01 注入的同一支（54208 bytes，2026-01-15 時間戳）|
+| Stale socket 干擾 | 清乾淨 + 重啟 pod 還是失敗 |
+| `CUDA_VISIBLE_DEVICES=GPU-uuid` 模擬 device-plugin env | 手動仍成功 |
+| 進入**同一 pod** 手動 `nvidia-cuda-mps-control -d` + 健康檢查 | ✅ 完美運作，回傳 `100.0` |
+| 在 host 直接跑 daemon | ✅ 完美運作 |
 
-工程量中等，需要自編 device-plugin image。短期不值得。
-
-##### 方案 3：改用 NVIDIA GPU Operator（推薦長期方向）
-
-[NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) 把 MPS daemon 拆成獨立 `mps-control-daemon` DaemonSet（用前景模式），device-plugin 只 probe 不 spawn，已知能在 RTX 40 系列 + driver 535 上跑通。代價是：
-
-- Helm chart 把整套 driver / toolkit / device-plugin / DCGM exporter 一起裝，跟我們手動裝 `nvidia-driver-535` + `nvidia-container-toolkit` 的路徑會撞
-- k3s 上有人成功（issue 串裡有報告），但需要關掉 GPU Operator 內建的 driver / toolkit 安裝（`driver.enabled=false`、`toolkit.enabled=false`），讓它只接管 device-plugin + MPS daemon
-
-如果之後要做多機 GPU 或 H100，建議直接切 GPU Operator，比繼續維護手刻 manifest 划算。
-
-#### 對本專案的建議
-
-RTX 4070 + driver 535 + k3s 的 demo 環境**短期維持 time-slicing**：
-- `verify-gpu.sh` step 1–5 全綠（device-plugin、GPU 切片、`--gres=gpu:rtx4070:1` 的 Slurm job）
-- step 6（`--gres=mps:25` 檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）會 fail，這是預期的，腳本已加註解
-
-要正式上 MPS（例如要在 demo 展示 SM 配額）就直接跳到方案 3 換 GPU Operator，不要再花時間 debug device-plugin 內建 MPS spawn。
+→ 只要不是 device-plugin 自己 spawn，全部都成功——印證了 root cause 在 device-plugin 的 `-d` daemonize spawn-and-probe 邏輯，不是環境問題。
 
 ### 跑完現況
 
