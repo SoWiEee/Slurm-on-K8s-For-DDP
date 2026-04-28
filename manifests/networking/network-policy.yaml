@@ -4,7 +4,7 @@
 #   Ingress — default-deny all, then whitelist documented communication paths.
 #   Egress  — default-deny all, then whitelist only what each pod type needs:
 #               • DNS (kube-dns UDP/TCP 53) — all pods
-#               • operator  → K8s API (TCP 443) + controller slurmrestd (TCP 6820)
+#               • operator  → K8s API (TCP 443 Kind/hosted, TCP 6443 k3s) + controller slurmrestd (TCP 6820)
 #               • controller→ workers (TCP 6818/22) + login (TCP 22) + NFS (TCP 2049)
 #               • workers   → controller (any port) + inter-worker MPI (any port)
 #                             + login (any port, srun step I/O callback) + NFS (TCP 2049)
@@ -92,8 +92,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
                   - slurm-login
                   - slurm-elastic-operator
                   - slurm-exporter
@@ -121,8 +121,8 @@ spec:
         operator: In
         values:
           - slurm-worker-cpu
-          - slurm-worker-gpu-a10
-          - slurm-worker-gpu-h100
+          - slurm-worker-gpu-rtx4070
+          - slurm-worker-gpu-rtx4080
   policyTypes:
     - Ingress
   ingress:
@@ -136,8 +136,8 @@ spec:
                   - slurm-login
                   # Allow inter-worker MPI/DDP collective traffic
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
           port: 6818   # slurmd
@@ -151,8 +151,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
 ---
 # ============================================================
 # INGRESS — login
@@ -181,8 +181,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
     # SSH from controller
     - from:
         - podSelector:
@@ -209,10 +209,13 @@ spec:
     - Egress
   egress:
     # K8s API server — ClusterIP in the default namespace resolves to the
-    # control-plane host; allow HTTPS to any destination (port 443).
+    # control-plane host; allow HTTPS to any destination.
+    # 443 covers Kind / hosted K8s; 6443 covers k3s default (--https-listen-port).
     - ports:
         - protocol: TCP
           port: 443
+        - protocol: TCP
+          port: 6443
     # slurmrestd on the controller pod (HTTP, via slurm-restapi ClusterIP)
     - to:
         - podSelector:
@@ -246,8 +249,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
           port: 6818
@@ -315,8 +318,8 @@ spec:
         operator: In
         values:
           - slurm-worker-cpu
-          - slurm-worker-gpu-a10
-          - slurm-worker-gpu-h100
+          - slurm-worker-gpu-rtx4070
+          - slurm-worker-gpu-rtx4080
   policyTypes:
     - Egress
   egress:
@@ -338,8 +341,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
     # ALL ports to login — srun step I/O callback on ephemeral ports.
     # srun step I/O requires slurmd to connect back to the srun listener on an
     # ephemeral OS-assigned port; restricting to port 22 blocks step output.
@@ -384,8 +387,8 @@ spec:
                 operator: In
                 values:
                   - slurm-worker-cpu
-                  - slurm-worker-gpu-a10
-                  - slurm-worker-gpu-h100
+                  - slurm-worker-gpu-rtx4070
+                  - slurm-worker-gpu-rtx4080
       ports:
         - protocol: TCP
           port: 6818

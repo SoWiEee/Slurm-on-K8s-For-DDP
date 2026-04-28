@@ -18,7 +18,8 @@ set -euo pipefail
 CLUSTER_NAME=${CLUSTER_NAME:-slurm-lab}
 NAMESPACE=${NAMESPACE:-slurm}
 MON_NAMESPACE=${MON_NAMESPACE:-monitoring}
-KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
+K8S_RUNTIME=${K8S_RUNTIME:-kind}
+KUBE_CONTEXT=${KUBE_CONTEXT:-$([[ "$K8S_RUNTIME" == "k3s" ]] && echo "default" || echo "kind-${CLUSTER_NAME}")}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
 
@@ -57,16 +58,26 @@ docker build "${build_flags[@]}" \
   -f docker/slurm-exporter/Dockerfile \
   docker/slurm-exporter
 
-log "loading slurm-exporter image to kind..."
-kind load docker-image slurm-exporter:latest --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "loading slurm-exporter image to kind..."
+  kind load docker-image slurm-exporter:latest --name "$CLUSTER_NAME"
+else
+  log "k3s runtime — importing slurm-exporter image into containerd via 'k3s ctr images import'..."
+  docker save slurm-exporter:latest | sudo k3s ctr images import -
+fi
 
 log "rebuilding operator image (adds prometheus-client)..."
 docker build "${build_flags[@]}" \
   -t slurm-elastic-operator:phase2 \
   -f docker/operator/Dockerfile .
 
-log "loading operator image to kind..."
-kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "loading operator image to kind..."
+  kind load docker-image slurm-elastic-operator:phase2 --name "$CLUSTER_NAME"
+else
+  log "k3s runtime — importing operator image into containerd via 'k3s ctr images import'..."
+  docker save slurm-elastic-operator:phase2 | sudo k3s ctr images import -
+fi
 
 # ----- monitoring namespace + kube-state-metrics ----------------------------
 log "applying monitoring namespace..."

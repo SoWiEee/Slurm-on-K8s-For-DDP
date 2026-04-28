@@ -1,0 +1,22 @@
+# DEPRECATED — DO NOT APPLY
+#
+# This self-hosted MPS control DaemonSet has been replaced by the NVIDIA
+# k8s device-plugin's built-in `sharing.mps` feature. See
+# `manifests/gpu/nvidia-device-plugin.yaml`.
+#
+# Why removed:
+#   The previous design ran two consumers (this DaemonSet + GPU worker pods)
+#   that each requested `nvidia.com/gpu: 1`, but the device-plugin's default
+#   exclusive allocation could only satisfy one of them — worker pods stayed
+#   Pending forever.
+#
+#   With device-plugin `sharing.mps`, the plugin itself runs the MPS control
+#   daemon and exposes one physical GPU as N `nvidia.com/gpu` replicas. Worker
+#   pods request a single replica and get a Slurm `--gres=mps:K` slice
+#   transparently — no hostIPC, no /tmp/nvidia-mps hostPath needed.
+#
+# If a future deployment needs a self-hosted MPS daemon (e.g. driver/plugin
+# version that doesn't support sharing.mps), recover this file from git
+# history and re-apply.
+---
+# Empty document — kubectl apply on this file is a no-op.

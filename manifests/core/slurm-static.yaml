@@ -61,13 +61,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: slurm-worker-gpu-a10
+  name: slurm-worker-gpu-rtx4070
   namespace: slurm
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    app: slurm-worker-gpu-a10
+    app: slurm-worker-gpu-rtx4070
   ports:
     - name: slurmd
       port: 6818
@@ -76,13 +76,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: slurm-worker-gpu-h100
+  name: slurm-worker-gpu-rtx4080
   namespace: slurm
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    app: slurm-worker-gpu-h100
+    app: slurm-worker-gpu-rtx4080
   ports:
     - name: slurmd
       port: 6818
@@ -98,8 +98,8 @@ data:
     ClusterName=kind-slurm
     SlurmctldHost=slurm-controller-0(slurm-controller-0.slurm-controller.slurm.svc.cluster.local)
     MpiDefault=pmi2
-    ProctrackType=proctrack/linuxproc
     ReturnToService=2
+    CompleteWait=0
     SlurmctldPidFile=/var/run/slurmctld.pid
     SlurmdPidFile=/var/run/slurmd.pid
     SlurmdSpoolDir=/var/spool/slurmd
@@ -107,7 +107,7 @@ data:
     StateSaveLocation=/var/spool/slurmctld
     SwitchType=switch/none
     TaskPlugin=task/none
-    SchedulerType=sched/backfill
+    ProctrackType=proctrack/linuxproc
     MailProg=/usr/bin/true
     SelectType=select/cons_tres
     SelectTypeParameters=CR_Core
@@ -125,30 +125,27 @@ data:
     AccountingStoragePort=6819
     JobAcctGatherType=jobacct_gather/linux
     JobAcctGatherFrequency=30
-    GresTypes=gpu
+    GresTypes=gpu,mps
+    AccountingStorageTRES=gres/gpu,gres/mps
 
     NodeName=slurm-worker-cpu-0 NodeAddr=slurm-worker-cpu-0.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
     NodeName=slurm-worker-cpu-1 NodeAddr=slurm-worker-cpu-1.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
     NodeName=slurm-worker-cpu-2 NodeAddr=slurm-worker-cpu-2.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
     NodeName=slurm-worker-cpu-3 NodeAddr=slurm-worker-cpu-3.slurm-worker-cpu.slurm.svc.cluster.local NodeHostname=slurm-worker-cpu-3 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=cpu
-    NodeName=slurm-worker-gpu-a10-0 NodeAddr=slurm-worker-gpu-a10-0.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
-    NodeName=slurm-worker-gpu-a10-1 NodeAddr=slurm-worker-gpu-a10-1.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
-    NodeName=slurm-worker-gpu-a10-2 NodeAddr=slurm-worker-gpu-a10-2.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
-    NodeName=slurm-worker-gpu-a10-3 NodeAddr=slurm-worker-gpu-a10-3.slurm-worker-gpu-a10.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-a10-3 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-a10 Gres=gpu:a10:1
-    NodeName=slurm-worker-gpu-h100-0 NodeAddr=slurm-worker-gpu-h100-0.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
-    NodeName=slurm-worker-gpu-h100-1 NodeAddr=slurm-worker-gpu-h100-1.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
-    NodeName=slurm-worker-gpu-h100-2 NodeAddr=slurm-worker-gpu-h100-2.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-2 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
-    NodeName=slurm-worker-gpu-h100-3 NodeAddr=slurm-worker-gpu-h100-3.slurm-worker-gpu-h100.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-h100-3 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-h100 Gres=gpu:h100:1
-    PartitionName=debug Nodes=slurm-worker-cpu-0,slurm-worker-cpu-1,slurm-worker-cpu-2,slurm-worker-cpu-3,slurm-worker-gpu-a10-0,slurm-worker-gpu-a10-1,slurm-worker-gpu-a10-2,slurm-worker-gpu-a10-3,slurm-worker-gpu-h100-0,slurm-worker-gpu-h100-1,slurm-worker-gpu-h100-2,slurm-worker-gpu-h100-3 Default=YES MaxTime=INFINITE State=UP
+    NodeName=slurm-worker-gpu-rtx4070-0 NodeAddr=slurm-worker-gpu-rtx4070-0.slurm-worker-gpu-rtx4070.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-rtx4070-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-rtx4070 Gres=gpu:rtx4070:1,mps:100
+    NodeName=slurm-worker-gpu-rtx4070-1 NodeAddr=slurm-worker-gpu-rtx4070-1.slurm-worker-gpu-rtx4070.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-rtx4070-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-rtx4070 Gres=gpu:rtx4070:1,mps:100
+    NodeName=slurm-worker-gpu-rtx4080-0 NodeAddr=slurm-worker-gpu-rtx4080-0.slurm-worker-gpu-rtx4080.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-rtx4080-0 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-rtx4080 Gres=gpu:rtx4080:1
+    NodeName=slurm-worker-gpu-rtx4080-1 NodeAddr=slurm-worker-gpu-rtx4080-1.slurm-worker-gpu-rtx4080.slurm.svc.cluster.local NodeHostname=slurm-worker-gpu-rtx4080-1 CPUs=4 RealMemory=3500 Sockets=1 CoresPerSocket=2 ThreadsPerCore=2 State=UNKNOWN Feature=gpu,gpu-rtx4080 Gres=gpu:rtx4080:1
+    PartitionName=cpu Nodes=slurm-worker-cpu-0,slurm-worker-cpu-1,slurm-worker-cpu-2,slurm-worker-cpu-3 Default=YES MaxTime=INFINITE State=UP
+    PartitionName=gpu-rtx4070 Nodes=slurm-worker-gpu-rtx4070-0,slurm-worker-gpu-rtx4070-1 Default=NO MaxTime=INFINITE State=UP
+    PartitionName=gpu-rtx4080 Nodes=slurm-worker-gpu-rtx4080-0,slurm-worker-gpu-rtx4080-1 Default=NO MaxTime=INFINITE State=UP
   gres.conf: |
-    NodeName=slurm-worker-gpu-a10-0 Name=gpu Type=a10 File=/dev/null
-    NodeName=slurm-worker-gpu-a10-1 Name=gpu Type=a10 File=/dev/null
-    NodeName=slurm-worker-gpu-a10-2 Name=gpu Type=a10 File=/dev/null
-    NodeName=slurm-worker-gpu-a10-3 Name=gpu Type=a10 File=/dev/null
-    NodeName=slurm-worker-gpu-h100-0 Name=gpu Type=h100 File=/dev/null
-    NodeName=slurm-worker-gpu-h100-1 Name=gpu Type=h100 File=/dev/null
-    NodeName=slurm-worker-gpu-h100-2 Name=gpu Type=h100 File=/dev/null
-    NodeName=slurm-worker-gpu-h100-3 Name=gpu Type=h100 File=/dev/null
+    NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0
+    NodeName=slurm-worker-gpu-rtx4070-0 Name=mps Count=100
+    NodeName=slurm-worker-gpu-rtx4070-1 Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0
+    NodeName=slurm-worker-gpu-rtx4070-1 Name=mps Count=100
+    NodeName=slurm-worker-gpu-rtx4080-0 Name=gpu Type=rtx4080 Count=1 File=/dev/nvidia0
+    NodeName=slurm-worker-gpu-rtx4080-1 Name=gpu Type=rtx4080 Count=1 File=/dev/nvidia0
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -310,6 +307,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
@@ -396,24 +399,30 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: slurm-worker-gpu-a10
+  name: slurm-worker-gpu-rtx4070
   namespace: slurm
 spec:
-  serviceName: slurm-worker-gpu-a10
+  serviceName: slurm-worker-gpu-rtx4070
   replicas: 0
   selector:
     matchLabels:
-      app: slurm-worker-gpu-a10
+      app: slurm-worker-gpu-rtx4070
   template:
     metadata:
       labels:
-        app: slurm-worker-gpu-a10
-        worker-class: gpu-a10
+        app: slurm-worker-gpu-rtx4070
+        worker-class: gpu-rtx4070
     spec:
+      runtimeClassName: nvidia
       containers:
         - name: slurm-worker
           image: slurm-worker:latest
           imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
           command:
             - /bin/bash
             - -lc
@@ -431,6 +440,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
@@ -506,35 +521,41 @@ spec:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: slurm-worker-gpu-a10-pdb
+  name: slurm-worker-gpu-rtx4070-pdb
   namespace: slurm
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
-      app: slurm-worker-gpu-a10
+      app: slurm-worker-gpu-rtx4070
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: slurm-worker-gpu-h100
+  name: slurm-worker-gpu-rtx4080
   namespace: slurm
 spec:
-  serviceName: slurm-worker-gpu-h100
+  serviceName: slurm-worker-gpu-rtx4080
   replicas: 0
   selector:
     matchLabels:
-      app: slurm-worker-gpu-h100
+      app: slurm-worker-gpu-rtx4080
   template:
     metadata:
       labels:
-        app: slurm-worker-gpu-h100
-        worker-class: gpu-h100
+        app: slurm-worker-gpu-rtx4080
+        worker-class: gpu-rtx4080
     spec:
+      runtimeClassName: nvidia
       containers:
         - name: slurm-worker
           image: slurm-worker:latest
           imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
           command:
             - /bin/bash
             - -lc
@@ -552,6 +573,12 @@ spec:
               su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
               sleep 1
               pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
               exec slurmd -Dvvv -N "$(hostname)"
           ports:
             - containerPort: 22
@@ -627,13 +654,13 @@ spec:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: slurm-worker-gpu-h100-pdb
+  name: slurm-worker-gpu-rtx4080-pdb
   namespace: slurm
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
-      app: slurm-worker-gpu-h100
+      app: slurm-worker-gpu-rtx4080
 ---
 apiVersion: apps/v1
 kind: Deployment

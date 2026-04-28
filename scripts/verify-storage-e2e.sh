@@ -10,7 +10,7 @@ WORKER_STS=${WORKER_STS:-slurm-worker-cpu}
 CONTROLLER_POD=${CONTROLLER_POD:-slurm-controller-0}
 LOGIN_LABEL_SELECTOR=${LOGIN_LABEL_SELECTOR:-app=slurm-login}
 
-PARTITION=${PARTITION:-debug}
+PARTITION=${PARTITION:-cpu}
 SMOKE_DIR=${SMOKE_DIR:-/shared/phase3-smoke}
 
 # Scaling knobs

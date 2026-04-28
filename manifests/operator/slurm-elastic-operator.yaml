@@ -57,15 +57,15 @@ spec:
             - name: CONTROLLER_POD
               value: slurm-controller-0
             - name: SLURM_PARTITION
-              value: debug
+              value: cpu
             - name: WORKER_STATEFULSET
               value: slurm-worker-cpu
             - name: PARTITIONS_JSON
               value: >-
                 [
-                  {"partition":"debug","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
-                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-a10","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-a10"],"match_gres":["gpu:a10"]},
-                  {"partition":"debug","worker_statefulset":"slurm-worker-gpu-h100","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-h100"],"match_gres":["gpu:h100"]}
+                  {"partition":"cpu","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
+                  {"partition":"gpu-rtx4070","worker_statefulset":"slurm-worker-gpu-rtx4070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4070"],"match_gres":["gpu:rtx4070","mps"]},
+                  {"partition":"gpu-rtx4080","worker_statefulset":"slurm-worker-gpu-rtx4080","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4080"],"match_gres":["gpu:rtx4080"]}
                 ]
             - name: MIN_REPLICAS
               value: "1"

@@ -1,0 +1,144 @@
+# NVIDIA Kubernetes Device Plugin (v0.15.0) — with MPS sharing
+#
+# Exposes real GPUs as nvidia.com/gpu resources to the K8s scheduler, AND
+# enables MPS-based sharing so that one physical GPU can be advertised as
+# multiple `nvidia.com/gpu` replicas. The device-plugin runs the MPS control
+# daemon itself — there is NO separate MPS DaemonSet; worker pods do NOT need
+# hostIPC or a /tmp/nvidia-mps hostPath mount.
+#
+# Sharing strategy:
+#   - rtx4070 host (label nvidia.com/gpu.product=NVIDIA-GeForce-RTX-4070)
+#       → 4 replicas via MPS (each Slurm `--gres=mps:25` lands on one slice)
+#   - rtx4080 host (label nvidia.com/gpu.product=NVIDIA-GeForce-RTX-4080)
+#       → 1 replica, exclusive (no sharing — used as `--gres=gpu:rtx4080:1`)
+#
+# Prerequisites (on each GPU node):
+#   - NVIDIA driver >= 535 (run: nvidia-smi)
+#   - NVIDIA Container Toolkit (run: scripts/setup-linux-gpu.sh)
+#
+# Apply: kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
+#
+# Verify:
+#   kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+#   # rtx4070 node should show 4; rtx4080 node should show 1.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-device-plugin-config
+  namespace: kube-system
+data:
+  # Default config: no sharing. Used when a node does not match any of the
+  # per-product configs below.
+  default: |-
+    version: v1
+    flags:
+      migStrategy: none
+      failOnInitError: false
+  # MPS sharing for RTX 4070 hosts: one physical GPU → 4 replicas.
+  # Slurm requests `--gres=mps:25` (25% SM); device-plugin grants one replica.
+  rtx4070-mps: |-
+    version: v1
+    flags:
+      migStrategy: none
+      failOnInitError: false
+    sharing:
+      mps:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
+  # Time-slicing fallback: same 4-replica multiplexing without MPS daemon.
+  # Used when device-plugin fails to spawn the MPS control daemon (observed on
+  # NVIDIA driver 535.288.01 + k3s 1.34 + Ubuntu 24.04). With time-slicing the
+  # GPU is shared via CUDA context-switch instead of SM partitioning, so
+  # --gres=mps:N is not meaningful — use --gres=gpu:rtx4070:1 to grab one slice.
+  rtx4070-timeslicing: |-
+    version: v1
+    flags:
+      migStrategy: none
+      failOnInitError: false
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
+  # No sharing for RTX 4080 — exclusive whole-GPU allocation.
+  rtx4080-exclusive: |-
+    version: v1
+    flags:
+      migStrategy: none
+      failOnInitError: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      # Use NVIDIA container runtime so the libnvidia-container hook fires and
+      # /dev/nvidia* is injected when NVIDIA_VISIBLE_DEVICES is set. Requires
+      # the RuntimeClass in manifests/gpu/runtime-class.yaml to be applied.
+      runtimeClassName: nvidia
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      # MPS daemon (managed by device-plugin) needs hostIPC + hostPID.
+      hostIPC: true
+      hostPID: true
+      containers:
+        - name: nvidia-device-plugin-ctr
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.15.0
+          env:
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+            # NVIDIA_DRIVER_CAPABILITIES must include "compute,utility" for MPS.
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            - name: CONFIG_FILE
+              value: /etc/nvidia-device-plugin/config.yaml
+          args:
+            - --config-file=/etc/nvidia-device-plugin/config.yaml
+            - --mps-root=/run/nvidia/mps
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: mps-root
+              mountPath: /run/nvidia/mps
+            - name: nvidia-config
+              mountPath: /etc/nvidia-device-plugin
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: mps-root
+          hostPath:
+            path: /run/nvidia/mps
+            type: DirectoryOrCreate
+        - name: nvidia-config
+          configMap:
+            name: nvidia-device-plugin-config
+            # Pick the data key matching the node's
+            # nvidia.com/device-plugin.config label. If using a single GPU
+            # type host, set the items[].path to the chosen key directly.
+            # Config is statically selected here — all nodes running this DaemonSet
+            # use the same key. To switch configs (e.g. rtx4070-timeslicing),
+            # change items[0].key and re-apply this manifest. The
+            # nvidia.com/device-plugin.config node label is only effective when
+            # a config-manager sidecar is deployed (not present here).
+            items:
+              - key: rtx4070-timeslicing
+                path: config.yaml

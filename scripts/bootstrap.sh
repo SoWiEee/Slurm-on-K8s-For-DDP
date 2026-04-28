@@ -6,9 +6,16 @@ KIND_CONFIG=${KIND_CONFIG:-}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
 DOCKER_BUILD_NO_CACHE=${DOCKER_BUILD_NO_CACHE:-false}
 NAMESPACE=${NAMESPACE:-slurm}
-KUBE_CONTEXT=${KUBE_CONTEXT:-kind-${CLUSTER_NAME}}
+# K8S_RUNTIME: "kind" (default, Windows/Mac dev) or "k3s" (Linux GPU host).
+# k3s skips kind cluster creation and uses containerd import for images.
+K8S_RUNTIME=${K8S_RUNTIME:-kind}
+KUBE_CONTEXT=${KUBE_CONTEXT:-$([[ "$K8S_RUNTIME" == "k3s" ]] && echo "default" || echo "kind-${CLUSTER_NAME}")}
 FORCE_RECREATE=${FORCE_RECREATE:-false}
 REGENERATE_SECRETS=${REGENERATE_SECRETS:-false}
+# Set REAL_GPU=true on Linux hosts with NVIDIA GPU + device plugin.
+REAL_GPU=${REAL_GPU:-false}
+# Set WITH_MPS=true to add MPS socket mounts to GPU worker pods (requires REAL_GPU=true).
+WITH_MPS=${WITH_MPS:-false}
 
 log() {
   echo "[bootstrap] $*"
@@ -57,9 +64,11 @@ wait_slurm_ready() {
 }
 
 log "validating tools..."
-require_tool kind
 require_tool kubectl
 require_tool docker
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  require_tool kind
+fi
 
 # Resolve a working Python 3 interpreter.
 # Override with PYTHON=/path/to/python3 if auto-detection fails.
@@ -95,15 +104,15 @@ validate_rendered_manifest() {
 
 operator_force_env() {
   local partitions_json='[
-    {"partition":"debug","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
-    {"partition":"debug","worker_statefulset":"slurm-worker-gpu-a10","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-a10"],"match_gres":["gpu:a10"]},
-    {"partition":"debug","worker_statefulset":"slurm-worker-gpu-h100","min_replicas":0,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-h100"],"match_gres":["gpu:h100"]}
+    {"partition":"cpu","worker_statefulset":"slurm-worker-cpu","min_replicas":1,"max_replicas":4,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["cpu"],"fallback":true},
+    {"partition":"gpu-rtx4070","worker_statefulset":"slurm-worker-gpu-rtx4070","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4070"],"match_gres":["gpu:rtx4070","mps"]},
+    {"partition":"gpu-rtx4080","worker_statefulset":"slurm-worker-gpu-rtx4080","min_replicas":0,"max_replicas":2,"scale_up_step":1,"scale_down_step":1,"scale_down_cooldown":60,"match_features":["gpu-rtx4080"],"match_gres":["gpu:rtx4080"]}
   ]'
 
   kubectl -n "$NAMESPACE" set env deployment/slurm-elastic-operator \
     NAMESPACE="$NAMESPACE" \
     CONTROLLER_POD="slurm-controller-0" \
-    SLURM_PARTITION="debug" \
+    SLURM_PARTITION="cpu" \
     WORKER_STATEFULSET="slurm-worker-cpu" \
     PARTITIONS_JSON="$partitions_json" \
     MIN_REPLICAS="1" \
@@ -132,13 +141,17 @@ validate_live_operator_config() {
   fi
 }
 
-log "ensuring kind cluster '${CLUSTER_NAME}' exists..."
-if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
-  if [[ -n "$KIND_CONFIG" ]]; then
-    kind create cluster --name "$CLUSTER_NAME" --config "$KIND_CONFIG"
-  else
-    kind create cluster --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "ensuring kind cluster '${CLUSTER_NAME}' exists..."
+  if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
+    if [[ -n "$KIND_CONFIG" ]]; then
+      kind create cluster --name "$CLUSTER_NAME" --config "$KIND_CONFIG"
+    else
+      kind create cluster --name "$CLUSTER_NAME"
+    fi
   fi
+else
+  log "k3s runtime — assuming k3s already running (see scripts/setup-linux-gpu.sh --k3s)"
 fi
 
 if ! kubectl config get-contexts -o name | grep -q "^${KUBE_CONTEXT}$"; then
@@ -157,9 +170,15 @@ log "building core images..."
 docker build "${build_flags[@]}" -t slurm-controller:latest docker/controller
 docker build "${build_flags[@]}" -t slurm-worker:latest docker/worker
 
-log "loading core images to kind..."
-kind load docker-image slurm-controller:latest --name "$CLUSTER_NAME"
-kind load docker-image slurm-worker:latest --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "loading core images to kind..."
+  kind load docker-image slurm-controller:latest --name "$CLUSTER_NAME"
+  kind load docker-image slurm-worker:latest --name "$CLUSTER_NAME"
+else
+  log "k3s runtime — importing core images into containerd via 'k3s ctr images import'..."
+  docker save slurm-controller:latest | sudo k3s ctr images import -
+  docker save slurm-worker:latest | sudo k3s ctr images import -
+fi
 
 log "rendering core manifests (if generator exists)..."
 if [[ -f scripts/render-core.py ]]; then
@@ -167,6 +186,14 @@ if [[ -f scripts/render-core.py ]]; then
   if kubectl -n "$NAMESPACE" get pvc slurm-shared-rwx >/dev/null 2>&1; then
     render_flags+=(--with-shared-storage)
     log "NFS PVC detected — rendering with shared storage"
+  fi
+  if [[ "$REAL_GPU" == "true" ]]; then
+    render_flags+=(--real-gpu)
+    log "REAL_GPU=true — enabling GPU resources and cgroup task plugin"
+  fi
+  if [[ "$WITH_MPS" == "true" ]]; then
+    render_flags+=(--with-mps)
+    log "WITH_MPS=true — flag accepted but is a no-op (MPS handled by device-plugin sharing.mps)"
   fi
   render_rc=0
   "$PYTHON" scripts/render-core.py "${render_flags[@]}" || render_rc=$?
@@ -186,10 +213,26 @@ fi
 
 validate_rendered_manifest
 
+log "ensuring namespace '${NAMESPACE}' exists with Pod Security baseline label..."
+# k3s 1.25+ enables Pod Security Admission by default (k3s/EKS/GKE: restricted by
+# default for unlabelled namespaces). N1 (sharing.mps) removed the hostIPC
+# requirement, so 'baseline' is sufficient. Setting it explicitly so future
+# additions of hostIPC/privileged are caught at admission instead of at runtime.
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label --overwrite namespace "$NAMESPACE" \
+    pod-security.kubernetes.io/enforce=baseline \
+    pod-security.kubernetes.io/warn=baseline \
+    pod-security.kubernetes.io/audit=baseline >/dev/null
+
 log "creating/applying secrets..."
 REGENERATE_SECRETS="$REGENERATE_SECRETS" scripts/create-secrets.sh "$NAMESPACE"
 log "applying core manifests..."
 kubectl apply -f manifests/core/slurm-ddp-runtime.yaml
+# slurmdbd + mysql. slurm.conf has AccountingStorageType=slurmdbd unconditionally
+# and controller startup waits for slurmdbd:6819 — without this, slurmctld hangs.
+if [[ -f manifests/core/slurm-accounting.yaml ]]; then
+  kubectl apply -f manifests/core/slurm-accounting.yaml
+fi
 # Lmod modulefile ConfigMaps (openmpi, python3, cuda stubs).
 # Declared optional in slurm-static.yaml so pods start even if applied late.
 if [[ -f manifests/core/lmod-modulefiles.yaml ]]; then
@@ -202,13 +245,13 @@ kubectl -n "$NAMESPACE" delete service slurm-worker --ignore-not-found=true >/de
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker --ignore-not-found=true >/dev/null 2>&1 || true
 
 if [[ "$FORCE_RECREATE" == "true" ]]; then
-  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 --ignore-not-found=true >/dev/null 2>&1 || true
-  kubectl -n "$NAMESPACE" delete service slurm-worker-cpu slurm-worker-gpu-a10 slurm-worker-gpu-h100 slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete statefulset slurm-controller slurm-worker-cpu slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete service slurm-worker-cpu slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx4080 slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete deployment slurm-login slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true >/dev/null 2>&1 || true
   kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true >/dev/null 2>&1 || true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-a10 --ignore-not-found=true >/dev/null 2>&1 || true
-  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4070 --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
 fi
 
 kubectl apply -f manifests/core/slurm-static.yaml
@@ -222,16 +265,16 @@ validate_live_commands statefulset/slurm-worker-cpu /bin/bash
 # Always restart long-lived components so /etc/munge/munge.key is recopied from projected secrets.
 maybe_rollout_restart statefulset/slurm-controller
 maybe_rollout_restart statefulset/slurm-worker-cpu
-maybe_rollout_restart statefulset/slurm-worker-gpu-a10
-maybe_rollout_restart statefulset/slurm-worker-gpu-h100
+maybe_rollout_restart statefulset/slurm-worker-gpu-rtx4070
+maybe_rollout_restart statefulset/slurm-worker-gpu-rtx4080
 maybe_rollout_restart deployment/slurm-login
 maybe_rollout_restart deployment/slurm-elastic-operator
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-found=true >/dev/null 2>&1 || true
 # Force fresh pods so /etc/munge/munge.key is recopied from the projected secret at process start.
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-controller --ignore-not-found=true >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-cpu --ignore-not-found=true >/dev/null 2>&1 || true
-kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-a10 --ignore-not-found=true >/dev/null 2>&1 || true
-kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-h100 --ignore-not-found=true >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4070 --ignore-not-found=true >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" delete pod -l app=slurm-worker-gpu-rtx4080 --ignore-not-found=true >/dev/null 2>&1 || true
 kubectl -n "$NAMESPACE" delete pod -l app=slurm-login --ignore-not-found=true >/dev/null 2>&1 || true
 
 if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
@@ -260,8 +303,13 @@ rollout_or_dump "statefulset/${baseline_worker_sts}"
 log "building operator image..."
 docker build "${build_flags[@]}" -t slurm-elastic-operator:latest -f docker/operator/Dockerfile .
 
-log "loading operator image to kind..."
-kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
+if [[ "$K8S_RUNTIME" != "k3s" ]]; then
+  log "loading operator image to kind..."
+  kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
+else
+  log "k3s runtime — importing operator image into containerd via 'k3s ctr images import'..."
+  docker save slurm-elastic-operator:latest | sudo k3s ctr images import -
+fi
 
 log "applying operator manifest..."
 kubectl apply -f manifests/operator/slurm-elastic-operator.yaml
@@ -272,7 +320,7 @@ kubectl -n "$NAMESPACE" delete pod -l app=slurm-elastic-operator --ignore-not-fo
 
 # Keep a single baseline worker at start so scale-up paths are observable.
 kubectl -n "$NAMESPACE" scale statefulset/${baseline_worker_sts} --replicas=1 >/dev/null 2>&1 || true
-for extra in slurm-worker-gpu-a10 slurm-worker-gpu-h100; do
+for extra in slurm-worker-gpu-rtx4070 slurm-worker-gpu-rtx4080; do
   kubectl -n "$NAMESPACE" get statefulset "$extra" >/dev/null 2>&1 && kubectl -n "$NAMESPACE" scale statefulset/${extra} --replicas=0 >/dev/null 2>&1 || true
 done
 

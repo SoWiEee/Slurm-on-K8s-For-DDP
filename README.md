@@ -1,6 +1,6 @@
-# Slurm-on-K8s-For-DDP
+# Slurm-on-K8s
 
-把 HPC 排程器搬進 Kubernetes，讓 AI 訓練任務既能用 Slurm 的精準資源管理，又能享受雲端的彈性伸縮。
+把 HPC 排程器搬進 Kubernetes，打造一個可讓多位使用者共用 CPU + GPU 硬體資源的批次 AI 工作平台。
 
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
@@ -9,106 +9,223 @@
 
 # 🌱 Motivation
 
-如果你曾經跑過分散式 AI 訓練，你大概有過這樣的經驗：
+一台有 CPU 和 GPU 的機器，同時有多種 AI 工作要跑——模型推論、超參數搜尋、fine-tuning、資料前處理。  
+沒有好的排程系統時，會發生：
 
-- 租了 8 張 GPU，但模型訓練只用了一半，剩下的資源就這樣閒著。
-- 任務跑到一半節點掛掉，checkpoint 沒存好，重頭來過。
-- 想擴充節點，卻要等管理員手動改設定。
+- GPU 跑推論時大量閒置（utilization < 20%），同一張卡只讓一個 process 用。
+- 多人共用一台主機互相搶資源，沒有隊列、沒有隔離、先到先得。
+- Fine-tuning 跑到一半機器重啟，checkpoint 沒存好，重頭來過。
+- 工作量少的時候，worker 進程還是佔著資源不釋放。
 
 這些問題的根源在於：現有工具在**資源彈性**和**排程精準度**之間做了取捨。
 
 | 工具 | 擅長 | 不擅長 |
 |------|------|--------|
-| Kubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意 |
-| Slurm | 批次排程、CPU/GPU 精準分配、叢集治理 | 動態節點、雲端彈性、容錯恢復 |
+| Kubernetes | 彈性伸縮、容器管理、雲端原生 | HPC workload 的精細資源語意（CPU affinity、GPU GRES、MPS 分配） |
+| Slurm | 批次排程、CPU/GPU 精準分配、叢集治理、多使用者隊列 | 動態節點、雲端彈性、容錯恢復 |
 
-本專案的目標很直接：**讓兩者合作**。把 Slurm 跑在 Kubernetes 上，用 Kubernetes 的彈性支撐 Slurm 的排程能力，並在此基礎上實作 AI 訓練所需的共享儲存與 checkpoint 容錯。
+本專案的目標很直接：**讓兩者合作**。把 Slurm 跑在 Kubernetes 上，用 K8s 的彈性伸縮撐起 Slurm 的排程能力，解決硬體資源分配的核心問題：
+
+- **利用率**：透過 Slurm MPS（`--gres=mps:25`）讓多個 AI job 共用同一張 GPU 的 SM，utilization 從 < 20% 提升至 70%+
+- **隔離性**：CPU pool 和 GPU pool 獨立 autoscale，不同類型的工作互不競爭
+- **彈性**：沒有 job 時 worker pod 自動縮回 0；job 進 queue 時 Operator 自動擴出對應節點
+- **容錯**：Checkpoint-aware 縮容保護，確保 fine-tuning job 不被中途打斷；NFS PVC 讓結果跨節點持久化
+
+使用者只需要 SSH 進 login node，用熟悉的 `sbatch` 提交工作，不需要知道底層 K8s 的存在。
 
 ---
 
 # 🚀 Getting Started
 
-> 環境需求：Windows 11 + Docker Desktop + Kind (v0.31.0 = v1.35.0 K8s) + kubectl
+兩種部署路徑：
 
-## 1. 確認工具已安裝
+| 路徑 | 環境 | GPU | 適用場景 |
+|------|------|-----|----------|
+| **[A] Linux + k3s](#a-linux--k3s--real-gpu-已驗證)** | Ubuntu 24.04 + k3s | 真實 NVIDIA GPU | 生產/驗證 |
+| **[B] Kind（本機模擬）](#b-kind-本機開發模擬)** | Windows/Mac + Docker Desktop | 無（排程邏輯驗證） | 本機開發 |
+
+---
+
+## A. Linux + k3s + Real GPU（已驗證）
+
+> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 535
+
+### 步驟 1：主機準備
+
+安裝 NVIDIA Container Toolkit、k3s，並複製 kubeconfig：
 
 ```bash
-docker version
-kind version
-kubectl version --client
+sudo bash scripts/setup-linux-gpu.sh
+export KUBECONFIG=~/.kube/config
 ```
 
-## 2. 一鍵部署（核心叢集）
+確認 GPU 可見：
 
 ```bash
+nvidia-smi
+kubectl get nodes
+```
+
+### 步驟 2：部署 NVIDIA device plugin
+
+```bash
+kubectl apply -f manifests/gpu/runtime-class.yaml
+kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
+
+# 確認 GPU 資源出現（RTX 4070 time-slicing 4x → 顯示 4）
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+```
+
+> **GPU sharing 策略**：目前 `nvidia-device-plugin.yaml` 使用 `rtx4070-timeslicing`（4 replica）。  
+> MPS config（`rtx4070-mps`）在 driver 535 + k3s 1.34 + Ubuntu 24.04 上 MPS daemon 無法啟動，  
+> 改用 `items[0].key: rtx4070-mps` 可切換（重 apply 即生效）。  
+> Time-slicing 下 `--gres=mps:25` 仍可投遞，`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 由 Slurm prolog 注入。
+
+### 步驟 3：部署核心 Slurm 叢集
+
+```bash
+K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh
+```
+
+`bootstrap.sh` 自動完成：建置 controller/worker/operator image → 建立 Munge/SSH/JWT secret → 生成並套用 `slurm-static.yaml`（含 `gres.conf`、`slurm.conf`）→ 等待 rollout → 確認 slurmctld 可 ping。
+
+### 步驟 4：部署共享儲存（NFS）
+
+**4-A：主機 NFS Server（只需執行一次）**
+
+```bash
+sudo bash scripts/setup-nfs-server.sh
+```
+
+執行完後，確認 `/etc/exports` 涵蓋節點的 **LAN IP 段**（k3s 節點用主機物理 IP 掛載，不是 pod CIDR）：
+
+```bash
+cat /etc/exports
+# 正確範例（同時含 pod CIDR 和 LAN subnet）：
+# /srv/nfs/k8s 10.0.0.0/8(rw,...) 192.168.0.0/25(rw,sync,no_subtree_check,no_root_squash,insecure)
+```
+
+若只有 `10.0.0.0/8`，手動加上 LAN 段後重載：
+
+```bash
+# 查主機 LAN IP 段
+ip addr show | grep 'inet ' | grep -v 127
+# 補進 /etc/exports 後：
+sudo exportfs -ra
+showmount -e localhost   # 確認兩個 rule 都出現
+```
+
+**4-B：部署 NFS provisioner**
+
+```bash
+# 查主機 LAN IP（k3s pod 可達的介面，通常是 enp5s0 / eth0）
+NODE_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet )\S+' | head -1 | cut -d/ -f1)
+echo "NFS_SERVER=$NODE_IP"
+
+KUBECONFIG=~/.kube/config \
+KUBE_CONTEXT=default \
+NFS_SERVER=$NODE_IP \
+NFS_PATH=/srv/nfs/k8s \
+  bash scripts/bootstrap-storage.sh
+```
+
+### 步驟 5：驗證
+
+```bash
+# 儲存（PVC Bound + 跨 pod 讀寫 + 多節點 sbatch）
+KUBE_CONTEXT=default bash scripts/verify-storage.sh
+KUBE_CONTEXT=default bash scripts/verify-storage-e2e.sh
+
+# GPU（device plugin、nvidia-smi in job、MPS GRES）
+K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
+
+# 全叢集（CPU 彈性擴縮、MPI PMI2、GPU pool 彈性擴縮）
+K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
+```
+
+**預期結果（全通過）：**
+
+```
+verify-gpu.sh:
+  PASS: device plugin DaemonSet has ready pods
+  PASS: cluster has 4 allocatable GPU(s)
+  PASS: Slurm nodes have GPU GRES configured
+  PASS: GPU name visible in Slurm job output        ← nvidia-smi 輸出真實 GPU 型號
+  PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
+
+verify.sh:
+  [dev verify] done. all checks passed.
+```
+
+### 清理環境
+
+```bash
+# 移除 k3s（保留 kubeconfig 備份）
+/usr/local/bin/k3s-uninstall.sh
+# 停止 NFS
+sudo systemctl stop nfs-kernel-server
+```
+
+---
+
+## B. Kind（本機開發模擬）
+
+> 環境需求：Docker Desktop + kind + kubectl（Windows/Mac/Linux 均可）
+
+### 快速部署
+
+```bash
+# 確認工具已安裝
+docker version && kind version && kubectl version --client
+
+# 一鍵部署核心叢集（無 GPU，純排程邏輯驗證）
 bash scripts/bootstrap.sh
 
-# 啟用 K8s 1.35 Gang Scheduling 基礎設施（Alpha feature gates）
-# 注意：目前只啟用 K8s 層 feature gates；Operator 整合（_ensure_workload）尚未實作
-KIND_CONFIG=kind-config.yaml bash scripts/bootstrap.sh
-```
-
-`scripts/bootstrap.sh` 自動完成以下步驟：
-
-1. 建立 Kind 叢集（若不存在）
-2. 建置 `slurm-controller:latest`、`slurm-worker:latest` Docker image（從 `docker/`），並 load 進 Kind
-3. 執行 `scripts/render-core.py` 生成 `manifests/core/slurm-static.yaml`（自動偵測 NFS PVC）
-4. 建立 Munge/SSH/JWT secrets（`scripts/create-secrets.sh`）
-5. 套用 `manifests/core/` 所有資源（StatefulSet、Service、ConfigMap、DDP runtime、Lmod modulefiles）
-6. 等待 controller rollout 完成，確認 `slurmctld` 可 ping
-7. 建置 `slurm-elastic-operator:latest` image，套用 `manifests/operator/` 與 `manifests/networking/`
-8. 設定三個 worker pool 的 `PARTITIONS_JSON` 環境變數
-9. 縮放 cpu pool → 1 replica，GPU pool → 0 replica（初始狀態）
-
-> 慢速機器可加參數：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap.sh`  
-> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap.sh`
-
-## 3. 驗證部署
-
-```bash
+# 驗證
 bash scripts/verify.sh
 ```
 
-依序執行：Pod readiness → slurmctld ping → srun 單節點 → sbatch CPU smoke test → operator scale-up/scale-down → GPU pool 路由驗證。
+`scripts/bootstrap.sh` 自動完成：建立 Kind 叢集 → 建置並 load image → 生成 `slurm-static.yaml` → 套用所有資源 → 等待 rollout → 確認 slurmctld ping。
 
-## 4. 部署共享儲存
+> 慢速機器：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap.sh`  
+> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap.sh`
+
+### 部署共享儲存（可選）
 
 ```bash
-# 主機端 NFS server（只需執行一次，在 WSL2 跑）
+# WSL2 主機端 NFS Server
 sudo bash scripts/setup-nfs-server.sh
 
-# 在 K8s 叢集部署 NFS provisioner + 掛載到所有 pod
-NFS_SERVER=<nfs-server-ip> NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
+# 部署 provisioner（NFS_SERVER 為 WSL2 IP，hostname -I 取得，每次開機會變）
+NFS_SERVER=<wsl2-ip> NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
 
-# 驗證
 bash scripts/verify-storage.sh
 bash scripts/verify-storage-e2e.sh
 ```
 
-> 若 NFS 不通，可以看[這個](https://github.com/SoWiEee/Slurm-on-K8s-For-DDP/blob/main/docs/note.md#phase-3-%E5%AF%A6%E9%9A%9B%E9%83%A8%E7%BD%B2%E8%B8%A9%E5%9D%91%E7%B4%80%E9%8C%842026-03-29-on-windows-11--wsl2--kind)進行除錯。
+### 清理環境
 
-> WSL2 的 IP 可以用 `hostname -I` 得知，Windows 每次開機都會變。
+```bash
+kind delete cluster --name slurm-lab
+```
 
-## 5. 部署監控
+---
+
+## 通用步驟（兩種路徑都適用）
+
+## 部署監控
 
 ```bash
 bash scripts/bootstrap-monitoring.sh
-```
 
-自動完成：建置 slurm-exporter 鏡像 → 重建 operator 鏡像（加入 prometheus-client）→ 部署 kube-state-metrics + Prometheus + Grafana + Alertmanager → 套用跨 namespace NetworkPolicy → 等待所有 Pod ready。
-
-```bash
 # 存取 Grafana（admin / admin）
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 # 驗證所有元件正常、metrics 可抓
 bash scripts/verify-monitoring.sh
-
-# 存取 Prometheus（debug）
-kubectl -n monitoring port-forward svc/prometheus 9090:9090
 ```
 
-## 6. Lmod 模組系統（已整合至核心）
+## Lmod 模組系統（已整合至核心）
 
 Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`bootstrap.sh` 執行完畢後即可使用 `module load`。Modulefile 定義在 `manifests/core/lmod-modulefiles.yaml`，以 ConfigMap 管理。
 
@@ -179,12 +296,6 @@ bash scripts/verify-lmod.sh
 
 ---
 
-## 清理環境
-
-```bash
-kind delete cluster --name slurm-lab
-```
-
 ---
 
 # 🏗️ System Architecture
@@ -247,7 +358,8 @@ graph TD
 
 
 ![image](assets/architecture.jpg)
-<img width="2604" height="1484" alt="System Overview" src="https://github.com/user-attachments/assets/79b3b075-5d92-4545-adbf-89bfc14bbb4f" />
+
+> 最新架構圖請看 [`architecture.html`](assets/architecture.html)
 
 ### 主要元件說明
 
@@ -292,7 +404,7 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 cat > /shared/my-job.sbatch << 'EOF'
 #!/bin/bash
 #SBATCH -J my-first-job
-#SBATCH -p debug
+#SBATCH -p cpu
 #SBATCH -N 1
 #SBATCH --cpus-per-task=2
 #SBATCH -o /shared/out-%j.txt
@@ -395,7 +507,7 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 | 類別 | 工具 |
 |------|------|
-| 環境 | Windows 11 + Docker Desktop + Kind |
+| 環境 | Ubuntu 24.04 + k3s（生產）／Windows 11 + Docker Desktop + Kind（本機開發） |
 | 容器編排 | Kubernetes |
 | HPC 排程器 | Slurm (slurmctld + slurmd)，MpiDefault=pmi2 |
 | 節點認證 | Munge |
@@ -410,55 +522,87 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 ---
 
-# 🔭 Phase 5 Roadmap：平台化與高可用
+# 🔭 Phase 5 Roadmap：批次 AI 工作平台
 
-> Phase 5 的目標是讓這個系統從「可運作的研究原型」演進成「可交付的平台產品」。
-> Lmod 模組系統已完成（見 Getting Started §6）；以下為後續規劃，詳細技術設計見 `docs/note.md`。
+> Phase 5 的目標是讓這個系統從「可運作的基礎設施原型」演進成「能讓使用者直接提交各種 AI job 的批次運算平台」。  
+> 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為後續擴充方向。  
+> 開發順序：**易部署 → 可觀測 → 工作負載完整 → 真實登入體驗**
 
-## 5-A：Helm Chart 封裝
+## 5-A：Helm Chart 封裝 — 讓部署可重複
 
-目前每個 Phase 有獨立的 manifest 資料夾，部署需要依序執行多支 bootstrap 腳本。Helm 讓整個系統可以一條指令完成：
+**現狀問題：** 多支 bootstrap 腳本需依序執行，manifest 散落在 `manifests/` 各子目錄，`worker-pools.json` 改完還要手動跑 `render-core.py`，雙重維護容易出錯。
+
+**目標：** 整個平台一條指令完成部署，所有可調參數集中在 `values.yaml`。
 
 ```bash
-helm install slurm-on-k8s ./chart \
-  --set cluster.name=my-lab \
-  --set pools.cpu.maxReplicas=8 \
-  --set pools.gpuA10.maxReplicas=4 \
-  --set monitoring.enabled=true \
-  --set alertmanager.slack.webhookUrl="https://hooks.slack.com/..."
+# k3s + 真實 GPU + MPS
+helm install slurm-platform ./chart -f chart/values-k3s.yaml
+
+# Kind 本機開發（無 GPU）
+helm install slurm-platform ./chart -f chart/values-dev.yaml
 ```
 
-主要收益：環境差異（dev / staging / prod）只需一份 `values.yaml`，消除目前「改完 JSON 還要重新 render manifest」的摩擦。
+**設計方向：Monolithic chart + Helm template 直接生成 slurm.conf**
 
-## 5-B：OpenTelemetry 分散式追蹤
+- 單一 chart 目錄（不拆 subchart），monitoring / storage 用 `enabled` flag 控制
+- `worker-pools.json` 與 `render-core.py` 由 `values.yaml` + Helm Go template 取代：`pools` 定義為有序 list，template 用 `range` 迴圈產生 `NodeName`、`gres.conf`、`PARTITIONS_JSON`
+- 環境差異（k3s vs. Kind、real GPU vs. 模擬）用多個 values overlay 管理，不再靠環境變數
 
-讓一個訓練 job 的完整生命週期變成一條可視化的 Trace：
+詳細設計見 [`docs/note.md §5-A`](docs/note.md)。
+
+## 5-B：OpenTelemetry 分散式追蹤 — 讓 job 生命週期可視化
+
+**目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓使用者清楚看到時間花在哪裡（排隊、K8s 啟動、實際執行）。
 
 ```
-[sbatch submit] → [pending in queue] → [scale-up decision]
-  → [K8s provisioning] → [slurmd registration] → [DDP torchrun]
-    → [checkpoint write] → [scale-down decision] → [job complete]
+[sbatch submit] → [pending in queue] → [Operator scale-up decision]
+  → [K8s pod provisioning] → [slurmd registration] → [job execution]
+    → [checkpoint write] → [Operator scale-down] → [job complete]
 ```
 
-每個 span 攜帶 `job_id`、`pool`、`checkpoint_age`、`ddp_rank` 等 attribute，用 Jaeger 或 Grafana Tempo 可視化整條鏈。這是目前所有 Slurm-on-K8s 方案都沒有做到的端到端觀測視角。
+每個 span 攜帶 `job_id`、`pool`、`gres`、`provisioning_latency` 等 attribute，用 Grafana Tempo 可視化。這是目前所有 Slurm-on-K8s 開源方案都沒有做到的端到端觀測視角。
 
-## 5-C：Fair-Share 多租戶
+**需要做的事：**
+- Operator 加入 `opentelemetry-sdk`，在 `scale_action`、`loop_observation` 事件上建立 span
+- 部署 Grafana Tempo（加入 `manifests/monitoring/`）
+- Prometheus histogram exemplar → Tempo 連結，從 latency spike 直接跳到對應 trace
 
-支援多個 team / project 共用同一個叢集，搭配 Slurm 的 Fair-Share Scheduler：
+## 5-C：工作負載模板 — 讓使用者開箱即用
 
-- 每個 team 有自己的 Slurm account 和 `shares` 配額
-- 新增 Grafana 面板：per-account queue depth、cumulative CPU-hours、FairShare 分數
-- Operator 可依 account priority 調整各 pool 的 scale-up 優先順序
+**目標：** NFS 上預放一組 `/shared/templates/` job 腳本，使用者 cp 過去改參數就能跑，涵蓋平台支援的五種典型 AI 工作。
 
-目標 TA：多個 AI 研究小組共用 GPU 叢集的組織（學術單位、內部平台團隊）。
+| 模板 | GRES 設定 | 展示的系統能力 |
+|------|----------|--------------|
+| `01_preprocess.sh` | `--cpus-per-task=8` | CPU pool 獨立 autoscale，與 GPU job 並行不干擾 |
+| `02_batch_infer.sh` | `--gres=mps:25` | MPS 多工，同一張 GPU 跑 4 個推論 job |
+| `03_hpo_array.sh` | `--array=1-8 --gres=mps:25` | Job array + MPS，8 組超參數實驗並行 |
+| `04_finetune_lora.sh` | `--gres=gpu:rtx4080:1` | 整卡獨佔 + checkpoint guard 縮容保護 |
+| `05_ddp_2gpu.sh` | `--nodes=2 --gres=gpu:1` | 跨 worker pod 的 2-GPU DDP 訓練 |
 
-## 5-D：Operator 高可用（HA）
+**需要做的事：**
+- 新增 `templates/` 目錄，放 5 支含詳細註解的 sbatch 腳本
+- `bootstrap-lmod.sh` 結尾加一步：把 `templates/` cp 到 `/shared/templates/`
+- Login pod 的 `/etc/motd` 顯示平台說明與模板位置
 
-目前 Operator 是 Single Replica，Pod 重啟會有 15–30 秒的決策空窗。Phase 5 計畫：
+## 5-D：SSH Login — 讓使用者直接登入
 
-- Leader Election via K8s Lease（`coordination.k8s.io/v1`）：多個 Operator Pod 同時運行，只有 leader 執行 scaling loop
-- Cooldown 狀態已透過 StatefulSet annotation 持久化（Phase 2 已完成），重新選主不會重置 cooldown
-- 目標：Zero-downtime Operator 滾動升級
+**現狀問題：** 目前登入 login node 需要執行 `kubectl exec`，使用者必須先安裝 kubectl 並取得 kubeconfig。
+
+**目標：** 使用者用標準 SSH 直接進入 login pod，不需要知道 K8s 的存在。
+
+```
+使用者電腦 → ssh -p 2222 user@<k3s-host-ip>
+                  ↓
+           NodePort :2222 → slurm-login pod
+                              ├── sbatch / squeue / sinfo
+                              └── /shared/（NFS 掛載，模型 + 輸出共用）
+```
+
+**需要做的事：**
+- `docker/login/Dockerfile` 加入 `openssh-server`，設定 SSH key 認證（禁用密碼登入）
+- `slurm-login` Service 改為 NodePort，固定 port 2222
+- `scripts/bootstrap.sh` 加入 SSH host key 初始化步驟
+- 後續（多租戶時）：`scripts/add-user.sh` 同時在 Linux 和 Slurm（`sacctmgr`）建帳號
 
 ---
 

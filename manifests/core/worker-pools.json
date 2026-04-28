@@ -12,6 +12,7 @@
       "appLabel": "slurm-worker-cpu",
       "workerClass": "cpu-standard",
       "image": "slurm-worker:latest",
+      "partition": "cpu",
       "maxNodes": 4,
       "replicas": 1,
       "cpus": 4,
@@ -25,12 +26,13 @@
       "gres": []
     },
     {
-      "name": "slurm-worker-gpu-a10",
-      "service": "slurm-worker-gpu-a10",
-      "appLabel": "slurm-worker-gpu-a10",
-      "workerClass": "gpu-a10",
+      "name": "slurm-worker-gpu-rtx4070",
+      "service": "slurm-worker-gpu-rtx4070",
+      "appLabel": "slurm-worker-gpu-rtx4070",
+      "workerClass": "gpu-rtx4070",
       "image": "slurm-worker:latest",
-      "maxNodes": 4,
+      "partition": "gpu-rtx4070",
+      "maxNodes": 2,
       "replicas": 0,
       "cpus": 4,
       "realMemory": 3500,
@@ -39,19 +41,21 @@
       "threadsPerCore": 2,
       "features": [
         "gpu",
-        "gpu-a10"
+        "gpu-rtx4070"
       ],
       "gres": [
-        "gpu:a10:1"
+        "gpu:rtx4070:1",
+        "mps:100"
       ]
     },
     {
-      "name": "slurm-worker-gpu-h100",
-      "service": "slurm-worker-gpu-h100",
-      "appLabel": "slurm-worker-gpu-h100",
-      "workerClass": "gpu-h100",
+      "name": "slurm-worker-gpu-rtx4080",
+      "service": "slurm-worker-gpu-rtx4080",
+      "appLabel": "slurm-worker-gpu-rtx4080",
+      "workerClass": "gpu-rtx4080",
       "image": "slurm-worker:latest",
-      "maxNodes": 4,
+      "partition": "gpu-rtx4080",
+      "maxNodes": 2,
       "replicas": 0,
       "cpus": 4,
       "realMemory": 3500,
@@ -60,17 +64,31 @@
       "threadsPerCore": 2,
       "features": [
         "gpu",
-        "gpu-h100"
+        "gpu-rtx4080"
       ],
       "gres": [
-        "gpu:h100:1"
+        "gpu:rtx4080:1"
       ]
     }
   ],
-  "partition": {
-    "name": "debug",
-    "default": true,
-    "maxTime": "INFINITE",
-    "state": "UP"
-  }
+  "partitions": [
+    {
+      "name": "cpu",
+      "default": true,
+      "maxTime": "INFINITE",
+      "state": "UP"
+    },
+    {
+      "name": "gpu-rtx4070",
+      "default": false,
+      "maxTime": "INFINITE",
+      "state": "UP"
+    },
+    {
+      "name": "gpu-rtx4080",
+      "default": false,
+      "maxTime": "INFINITE",
+      "state": "UP"
+    }
+  ]
 }
