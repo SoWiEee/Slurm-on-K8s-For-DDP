@@ -1,0 +1,25 @@
+apiVersion: v2
+name: slurm-platform
+description: |
+  Elastic Slurm-on-Kubernetes platform for distributed AI training (PyTorch DDP).
+  Multi-pool autoscaling (CPU, GPU-RTX4070, GPU-RTX4080), checkpoint-aware
+  scale-down, dual-subnet DDP networking. Targets Linux + k3s + real GPU
+  (production) and Windows + Kind (local development).
+type: application
+version: 0.1.0
+appVersion: "23.11.7"
+kubeVersion: ">=1.28.0-0"
+home: https://github.com/SoWiEee/Slurm-on-K8s-For-DDP
+keywords:
+  - slurm
+  - hpc
+  - ddp
+  - pytorch
+  - autoscaling
+  - mps
+maintainers:
+  - name: SoWiEee
+    email: kawiisowieee@gmail.com
+# Stage A: chart scaffold + slurm.conf / gres.conf rendering only.
+# Dependencies (gpu-operator, etc.) are added in later stages.
+# See docs/note.md §5-A for the full implementation roadmap.

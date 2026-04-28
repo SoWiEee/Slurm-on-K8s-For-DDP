@@ -217,7 +217,9 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 
 ## 5-A：Helm Chart 封裝
 
-> **修訂版（2026-04-27）：** 本節原稿寫於 N1 / N7 修復前，`mps.enabled` flag、`partition: debug`、rtx4080 `devicePath: /dev/nvidia1` 已隨 `mps-migration` 分支上線而過時。本版改為對齊：device-plugin `sharing.mps`（N1 / N10）、三 partition 拆分（N7）、`/dev/nvidia0` 一律（N2）、`AccountingStorageTRES`（N6）、namespace PSS=baseline（N9）、k3s `ctr images import`（N4）、NetworkPolicy 6443（N5）。
+> **修訂版 2（2026-04-28）：** Linux+k3s+RTX4070 路徑驗證後（commit `3eec54f`），確認 `nvidia-device-plugin` 內建 `sharing.mps` 在 v0.15–v0.17.x 全系列因 upstream `cmd.Exec("nvidia-cuda-mps-control", "-d")` daemonize spawn race 而無法啟動（見 [`docs/migration.md#GPU-共享MPS目標Time-slicing目前-fallback`](migration.md)）。**本版把 chart dependency 從 `nvidia-device-plugin` 改成 `gpu-operator`**，後者把 MPS daemon 拆成獨立 `mps-control-daemon` DaemonSet 用前景模式跑，繞過 spawn race。Phase 5-A 直接以 GPU Operator 為目標，不再經過 device-plugin 直裝這一步。
+>
+> **修訂版 1（2026-04-27）：** 本節原稿寫於 N1 / N7 修復前，`mps.enabled` flag、`partition: debug`、rtx4080 `devicePath: /dev/nvidia1` 已隨 `mps-migration` 分支上線而過時。先對齊：sharing.mps（N1 / N10）、三 partition 拆分（N7）、`/dev/nvidia0` 一律（N2）、`AccountingStorageTRES`（N6）、namespace PSS=baseline（N9）、k3s `ctr images import`（N4）、NetworkPolicy 6443（N5）。
 
 ### 問題
 目前部署流程是「依序執行多支 bootstrap 腳本，每支腳本依賴前一支的副作用」：
@@ -225,14 +227,17 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 - `worker-pools.json` 改完還需要手動跑 `render-core.py`，manifest 與設定雙重維護。
 - 無法用 ArgoCD / Flux 做 GitOps、無版本 rollback、無 dry-run diff。
 - N1 之後還多了「需要記得對 GPU 節點打 `nvidia.com/device-plugin.config` label」這一步驟，若忘記則 MPS 默默失效。
+- 自寫的 `manifests/gpu/nvidia-device-plugin.yaml` 內建 MPS 已知壞掉（migration 階段 fallback 到 time-slicing），長期需要換 GPU Operator 才能拿回 `--gres=mps:N` SM 配額；Phase 5-A 是合併兩件事的最佳時機。
 
 ### 設計方向
 
-**Monolithic chart + 官方 NVIDIA device-plugin 為 dependency + slurm.conf 拆兩個 ConfigMap。**
+**Monolithic chart + NVIDIA GPU Operator 為 dependency + slurm.conf 拆兩個 ConfigMap。**
 
 - 主體不拆 subchart；monitoring / storage / gpu 用 `enabled` flag 控制。
 - `render-core.py` 廢棄，`slurm.conf` / `gres.conf` 改由 `_helpers.tpl` 從 `values.yaml` 的 `pools` 列表產生。
-- `nvidia-device-plugin` **不要自己寫 templates**，加成 chart dependency（`condition: gpu.enabled`），sharing 設定透過 values 注入；自寫的 `manifests/gpu/nvidia-device-plugin.yaml` 廢棄。
+- **GPU 子系統用 NVIDIA GPU Operator 作為 chart dependency**（`condition: gpu.enabled`），不再自寫 device-plugin DaemonSet。sharing 設定透過 ConfigMap + `nvidia.com/device-plugin.config` label 由 GPU Operator 內建的 device-plugin 套用。Operator 內建的 `mps-control-daemon` DaemonSet 解決自寫 device-plugin 內建 MPS 在 v0.15–v0.17.x 都壞掉的 spawn race。
+- **GPU Operator 的 driver / toolkit 子模組關掉**（`driver.enabled=false`、`toolkit.enabled=false`）：host 已用 `apt install nvidia-driver-535` + `nvidia-container-toolkit` 裝好，重複裝會撞。Operator 只負責 device-plugin、MPS daemon、DCGM exporter（可選）。
+- 自寫的 `manifests/gpu/nvidia-device-plugin.yaml` + `manifests/gpu/mps-daemonset.yaml` 廢棄。
 - `slurm.conf` ConfigMap 拆成 **`slurm-config-static`**（ClusterName / Auth / Plugin / AccountingStorageTRES，幾乎不變）+ **`slurm-config-nodes`**（NodeName / PartitionName，每次 pool 變動都重產）。worker 只 mount 後者 → 改一個 pool 的 `maxReplicas` 不會 rolling restart 全部 worker。
 - secret（munge.key / slurm-jwt-key）**不由 chart 產生**，install 前要先跑 `scripts/create-secrets.sh`（chart 用 `helm.sh/hook-pre-install` 檢查存在性即可）。
 
@@ -240,12 +245,12 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 
 ```
 chart/
-  Chart.yaml                ← appVersion = Slurm 版本（如 23.11.7）；dependencies: nvidia-device-plugin
+  Chart.yaml                ← appVersion = Slurm 版本（如 23.11.7）；dependencies: gpu-operator
   Chart.lock
   values.yaml               ← 預設值（Kind 開發環境基準）
   values-dev.yaml           ← Kind override（無 GPU，File=/dev/null）
-  values-k3s.yaml           ← k3s override（real GPU、sharing.mps、namespace baseline label）
-  charts/                   ← helm dependency update 後的 nvidia-device-plugin tarball
+  values-k3s.yaml           ← k3s override（real GPU、GPU Operator MPS、namespace baseline label）
+  charts/                   ← helm dependency update 後的 gpu-operator tarball
   templates/
     _helpers.tpl            ← label 函數 + slurmConf / gresConf / partitionsJson 產生函數
     namespace.yaml          ← Namespace 物件，含 pod-security.kubernetes.io/enforce=baseline label
@@ -259,6 +264,8 @@ chart/
     network-policy.yaml     ← 含 operator → K8s API egress（443 + 6443）
     gpu/
       device-plugin-config.yaml  ← ConfigMap default / rtx4070-mps / rtx4080-exclusive
+                                 ← GPU Operator 的 device-plugin 透過 nvidia.com/device-plugin.config
+                                 ←   label 從這個 ConfigMap 讀取 sharing 設定
       node-labeler-job.yaml      ← {{- if .Values.gpu.autoLabel }} Job 自動對符合條件的節點打 label
     monitoring/             ← {{- if .Values.monitoring.enabled }} Prometheus + Grafana + slurm-exporter
     storage.yaml            ← {{- if .Values.storage.enabled }} NFS subdir provisioner
@@ -266,6 +273,8 @@ chart/
       test-scontrol-ping.yaml    ← helm test 用，跑 scontrol ping + sinfo
       test-mps-job.yaml          ← gpu.enabled=true 時跑 --gres=mps:25 sbatch
 ```
+
+注意：GPU Operator chart 自帶 `mps-control-daemon` / `device-plugin` / `dcgm-exporter` / `gpu-feature-discovery` 等 DaemonSet template，不需要在我們 chart 的 `gpu/` 子目錄寫任何 DaemonSet——只要 ConfigMap（device-plugin config 內容）+ labeler Job（把 ConfigMap key 綁到節點）。
 
 ### Chart.yaml dependency
 
@@ -275,11 +284,13 @@ name: slurm-on-k8s
 appVersion: "23.11.7"        # Slurm 版本，升 Slurm 透過 helm upgrade 觸發 rolling restart
 version: 0.1.0
 dependencies:
-  - name: nvidia-device-plugin
-    version: 0.17.0
-    repository: https://nvidia.github.io/k8s-device-plugin
+  - name: gpu-operator
+    version: "v24.9.x"       # 5-A 落地時鎖具體 patch 版本（NGC helm.ngc.nvidia.com/nvidia/gpu-operator）
+    repository: https://helm.ngc.nvidia.com/nvidia
     condition: gpu.enabled
 ```
+
+GPU Operator 預設會把 driver / toolkit / DCGM exporter 一起裝，跟 host 已裝的 `nvidia-driver-535` + `nvidia-container-toolkit` 衝突——必須在 values 把這兩個子模組關掉（見下面 `gpu-operator:` 段）。
 
 ### values.yaml 結構（對齊 mps-migration）
 
@@ -374,9 +385,11 @@ pools:
 # 指到 *-mps 決定。worker pod 不需要 hostIPC 或 /tmp/nvidia-mps mount。
 
 gpu:
-  enabled: false                         # true 時 nvidia-device-plugin dependency 啟用
+  enabled: false                         # true 時 gpu-operator dependency 啟用
   autoLabel: true                        # true 時 chart post-install Job 自動對節點打 device-plugin.config label
-  # 把 ConfigMap key 完整聲明在 values，讓使用者 override 不需要 fork chart：
+  # 我們自己的 ConfigMap，由 templates/gpu/device-plugin-config.yaml 渲染。
+  # GPU Operator 會掛載這個 ConfigMap 到 device-plugin pod，並依
+  # nvidia.com/device-plugin.config label 選用對應 key。
   deviceConfigs:
     default:
       version: v1
@@ -398,6 +411,36 @@ gpu:
     - selector:
         gpu-host-class: rtx4080
       config: rtx4080-exclusive
+
+# GPU Operator subchart override（key 必須與 Chart.yaml dependency 的 name 一致）。
+# 只在 gpu.enabled=true 時生效。host 已自裝 nvidia-driver-535 + nvidia-container-toolkit，
+# 所以關掉 driver / toolkit；只讓 Operator 接管 device-plugin、MPS daemon、（可選）DCGM。
+gpu-operator:
+  driver:
+    enabled: false                       # 用 host apt 裝的 nvidia-driver-535
+  toolkit:
+    enabled: false                       # 用 host apt 裝的 nvidia-container-toolkit
+  devicePlugin:
+    enabled: true
+    config:
+      # 指向我們自己的 ConfigMap（templates/gpu/device-plugin-config.yaml）
+      name: slurm-on-k8s-device-plugin-config
+      default: default
+  mps:
+    root: /run/nvidia/mps                # 與 host hostPath 對齊
+  dcgmExporter:
+    enabled: false                       # 等 5-B 觀測性再開
+  gfd:                                   # gpu-feature-discovery
+    enabled: true                        # 自動補 nvidia.com/gpu.product 等 label
+  nodeStatusExporter:
+    enabled: false
+  migManager:
+    enabled: false                       # RTX 4070/4080 不支援 MIG
+  validator:
+    plugin:
+      env:
+        - name: WITH_WORKLOAD            # 把 validator 的 cuda-vector-add workload 開起來
+          value: "true"
 
 slurm:
   # 這些以前散在 render-core.py header 裡，現在抽出來給 values override：
@@ -638,7 +681,7 @@ spec:
 | **A** | `chart/` scaffold：`Chart.yaml`、`values.yaml`、`_helpers.tpl` 把 `render-core.py::build_slurm_conf` 翻成 Go template；其他 templates 為空 | `helm template chart/ -f values-k3s.yaml \| diff -u manifests/core/slurm-static.yaml`，差異收斂到只剩格式空白 | 中 |
 | **B** | 加 `templates/configmap-static.yaml` + `configmap-nodes.yaml` + `controller.yaml` + `workers.yaml` + `pvc.yaml` + `namespace.yaml`（PSS baseline label） | `helm install` 後 `slurmctld` 起得來、`sinfo` 看到所有 pool 的 node | 低 |
 | **C** | 加 `operator.yaml` + `network-policy.yaml`（443+6443）+ `login.yaml` | operator 擴／縮 worker 正常、`scale_action` metric 有資料、`scontrol ping` from login pod 成功 | 低 |
-| **D** | 加 `gpu/` 子目錄；`Chart.yaml` 加 NVIDIA device-plugin dependency；node-labeler Job | `verify-gpu.sh` 全綠（含 step 6 MPS） | 中 |
+| **D** | 加 `gpu/` 子目錄（`device-plugin-config.yaml` ConfigMap + `node-labeler-job.yaml`）；`Chart.yaml` 加 **NVIDIA GPU Operator** dependency 並在 `values-k3s.yaml` 設 `gpu-operator.driver.enabled=false` / `gpu-operator.toolkit.enabled=false`；移除自寫 `manifests/gpu/nvidia-device-plugin.yaml` | `verify-gpu.sh` 全綠（**含 step 6 MPS**——這是 Phase 5-A 的核心 milestone，因為 GPU Operator 才能讓 `--gres=mps:N` 成立） | 中-高 |
 | **E** | 把 monitoring / storage 收進 chart `templates/monitoring/` `storage.yaml`，`enabled` flag 控制 | `helm install --set monitoring.enabled=true` 一次帶起 Prometheus + Grafana + slurm-exporter | 低 |
 | **F** | 砍掉 `render-core.py`、`scripts/bootstrap*.sh` 大部分內容（保留 `setup-linux-gpu.sh` 與 `create-secrets.sh`）、`manifests/core/slurm-static.yaml`、`worker-pools.json`；README / migration.md 改寫為 `helm install` | bootstrap 時間 < 5 分鐘；`docs/migration.md` 從多步腳本改為 4 行 helm 指令 | 高 |
 
@@ -651,11 +694,11 @@ spec:
 | `manifests/core/worker-pools.json` | `chart/values.yaml::pools` |
 | `scripts/render-core.py` | `chart/templates/_helpers.tpl` |
 | `scripts/bootstrap.sh` 大部分 | `helm install` |
-| `scripts/bootstrap-gpu.sh` | NVIDIA device-plugin chart dependency + node-labeler Job |
+| `scripts/bootstrap-gpu.sh` | GPU Operator chart dependency + node-labeler Job |
 | `scripts/bootstrap-monitoring.sh` | `helm install --set monitoring.enabled=true` |
 | `manifests/core/slurm-static.yaml` | `helm template chart/` 動態產生 |
-| `manifests/gpu/nvidia-device-plugin.yaml` | NVIDIA 官方 chart + `gpu.deviceConfigs` values |
-| `manifests/gpu/mps-daemonset.yaml`（已是 stub） | 直接刪除 |
+| `manifests/gpu/nvidia-device-plugin.yaml` | GPU Operator subchart + `gpu.deviceConfigs` values（Operator 內建 device-plugin DaemonSet）|
+| `manifests/gpu/mps-daemonset.yaml`（已是 stub） | 直接刪除（Operator 內建 `mps-control-daemon` DaemonSet）|
 
 保留：`scripts/setup-linux-gpu.sh`（host 層 NVIDIA toolkit + k3s 安裝，本來就不該進 chart）、`scripts/create-secrets.sh`（chart 之外的 prerequisite）、`scripts/verify*.sh`（Helm test 之外的 e2e 驗證）。
 
