@@ -1,14 +1,10 @@
 # Development Notes
 
-這份筆記保留原本的階段紀錄，以及這一輪開發實際踩到的坑。
-
----
-
-# Phase 1
-
-- 建立 Slurm Controller / Worker 映像。
-- 在 Kind 部署靜態 Slurm 叢集。
-- 讓 Pod 間具備 SSH 互通與 Munge 認證。
+1. [採坑紀錄](#debug-record)
+2. 開發規劃：[監控系統](#phase-4-plan已完成)、[階段五計畫](#phase-5-plan)
+3. [工作和硬體資源的分配關係](#工作和硬體資源的分配關係)
+4. [GPU MPS 完整實作指南](#gpu-mps-完整實作指南)
+5. [參考資料](#-參考來源)
 
 ## Debug Record
 
@@ -38,24 +34,7 @@ NO NETWORK ADDRESS FOUND
 - 在 `slurm.conf` 明確設定 `NodeAddr` / `NodeHostname`。
 - controller 改用 `slurm-controller-0(slurm-controller-0....svc.cluster.local)`。
 
----
-
-# Phase 2
-
-- 開發 Python Operator，實作 `Pending Job -> Scale Up`。
-- 實作 `Idle Node -> Scale Down`。
-- 讓整個 Phase 1 + Phase 2 能以 `bootstrap.sh` / `verify.sh` 穩定驗證。
-- (2-B) 加入結構化日誌，讓 autoscaling 行為可追蹤、可分析、可做報告。
-- (2-C) 把單一 worker pool 擴展成 multi-pool / partition-aware autoscaling。
-- (2-D) 加入 checkpoint-aware scale-down guard，避免正在跑的工作因過早縮容而丟失恢復點。
-- (2-E) 在單一叢集引入兩個子網路，分成 management subnet 和 data subnet。
-  - Slurm 控制流量維持單純
-  - 之後若要做 PyTorch DDP / MPI / NCCL，能逐步把高流量傳輸導向 `data subnet`
-  - verify 時也能清楚展示哪些元件是 control plane、哪些元件是 dual-homed compute plane
-
-## Debug Record
-
-### 問題 1：`duplicate partition in config: debug`
+### 問題 3：`duplicate partition in config: debug`
 
 觀察到 operator 啟動時直接 `ValueError: duplicate partition in config: debug`
 
@@ -66,87 +45,265 @@ NO NETWORK ADDRESS FOUND
 - validation 不能用 partition name 當唯一鍵。
 - 要接受「同一 partition 對應多個 worker pool」。
 
-# Phase 3
+### 問題 4：slurmdbd 啟動後 hostname 不符
 
-- 在 Kind 單機環境部署 NFS Server 並整合 `nfs-subdir-external-provisioner`。
-- 建立 StorageClass + RWX PVC。
-- 將 Controller / Worker / Login 掛載共享儲存。
-- 將 Phase 2-D 的 checkpoint-aware guard 與真實 workload 串起來。
+**現象：** slurmdbd 啟動後立即 fatal exit：`This host not configured to run SlurmDBD (slurmdbd-xxx != slurmdbd)`。
 
-## Debug Record
+**原因：** `slurmdbd.conf` 的 `DbdHost=slurmdbd`，但 Deployment pod 的 hostname 是 `slurmdbd-{replicaset}-{random}`（Kubernetes 預設行為）。slurmdbd 在啟動時會驗證 `DbdHost` 是否匹配當前 hostname。
 
-確認 Phase 1/2 完成後，使用者是否可以從 Login Pod 提交 `sbatch` 並取回輸出檔案（`*.out`、`*.err`）？
+**修法：** `slurm-accounting.yaml` 的 Deployment pod spec 加入 `hostname: slurmdbd`，讓 pod hostname 固定為 `slurmdbd`。
 
-### Phase 1/2 的限制分析
+### 問題 5：slurmctld 首次啟動 fatal（TRES 缺失）
 
-`slurm-login.yaml`（Phase 1/2 版本）的 volumeMounts 只有：
+**現象：** 新叢集第一次啟動時，slurmctld fatal exit：`You are running with a database but for some reason we have no TRES from it`。
 
-```
-/etc/slurm           ← ConfigMap（唯讀）
-/slurm-secrets       ← Secret（唯讀）
-/opt/slurm-runtime-src ← ConfigMap（唯讀）
-```
+**原因：** `slurm.conf` 設定了 `AccountingStorageType=accounting_storage/slurmdbd`，slurmctld 啟動時需要從 slurmdbd 取得 TRES（Trackable RESources）定義。若 slurmdbd 尚未 ready（容器剛建立），且又沒有本地 state file，slurmctld 就會 fatal exit 而非等待。
 
-Worker pods 同樣**沒有任何共享可寫 Volume**。
-
-Slurm 預設將 `slurm-<JOBID>.out` 寫到 `$SLURM_SUBMIT_DIR`，但 job 是在 worker pod 上執行的，worker 的本機 ephemeral 檔案系統與 login pod 完全隔離。因此：
-
-- `srun`（互動式）：stdout 透過 Slurm I/O forwarding 回傳，**可用**。
-- `sbatch`：job 成功提交與執行，但輸出檔案寫在 worker 的本機磁碟，login pod **看不到**。
-
-verify.sh 的 smoke test 刻意使用 `sleep N` job，迴避了這個問題。
-
-### Phase 3 實作現況
-
-Phase 3 **已完成實作**，並非只有設計：
-
-| 檔案 | 內容 |
-|------|------|
-| `scripts/setup-nfs-server.sh` | 在 Windows 11 主機上建立 NFS Server（`/srv/nfs/k8s`） |
-| `manifests/storage/nfs-subdir-provisioner.tmpl.yaml` | NFS subdir external provisioner Deployment（需替換 `__NFS_SERVER__` / `__NFS_PATH__`） |
-| `manifests/storage/shared-storage.yaml` | StorageClass `slurm-shared-nfs` + PVC `slurm-shared-rwx`（20Gi RWX） |
-| `scripts/bootstrap-storage.sh` | 部署 provisioner → 建立 PVC → patch controller/worker/login 加入 `/shared` mount |
-| `scripts/verify-storage.sh` | 驗證 PVC Bound + `/shared` 掛載在所有 pod 上 |
-| `scripts/verify-storage-e2e.sh` | **完整 e2e 測試**：operator scale-up → login 提交多節點 `sbatch` → 等待 job COMPLETING → 從 login 讀回 `/shared/` 輸出驗證 |
-
-Phase 3 部署後，`/shared` 以 ReadWriteMany 方式同時掛載到：
-- `slurm-controller-0`
-- `slurm-worker-cpu-*`（以及所有副本）
-- `slurm-login`
-
-使用者只需在 job script 加入：
+**修法：** `scripts/render-core.py` 的 controller 啟動腳本加入 wait loop：偵測到 `AccountingStorageType=slurmdbd` 時，先用 bash TCP 連線確認 `slurmdbd.slurm.svc.cluster.local:6819` 可達，再 exec slurmctld。
 
 ```bash
-#SBATCH --output=/shared/out-%j.txt
-#SBATCH --error=/shared/err-%j.txt
+if grep -q 'AccountingStorageType=accounting_storage/slurmdbd' /etc/slurm/slurm.conf; then
+  until (echo >/dev/tcp/slurmdbd.slurm.svc.cluster.local/6819) 2>/dev/null; do sleep 3; done
+fi
+exec slurmctld -Dvvv
 ```
 
-job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出（因共享 NFS，任何 pod 均可讀）。
+### 問題 6：PDB 與 StatefulSet 縮容的關係
 
-**E2E 測試說明：** `verify-storage-e2e.sh` 驗證的是多節點場景下的完整生命週期：
-1. 暫停 operator → 提交帶 `--hold` 的觸發 job（確保 cpu-1 不立即被搶）
-2. 恢復 operator → scale-up 到 2 台 worker
-3. 等待 cpu-1 變 `idle`（含 fix_node_addr 修正 IP cache + SIGHUP fallback）
-4. 取消 trigger job → 提交真實 2 節點 smoke job（operator 繼續暫停，避免縮容干擾）
-5. 等待 job 完成，從 login pod 讀取 `/shared/` 輸出驗證每台 worker 的 hostname
+常見誤解：*認為 PDB 的 `maxUnavailable: 1` 會阻止 operator 把 replicas 從 4 降到 0。
 
-### 部署順序建議
+實際行為：
+- StatefulSet `replicas` 調整是 **Desired State**，K8s controller 會逐步刪除 Pod（最高優先）
+- PDB 保護的是 **Voluntary Disruption**（如 `kubectl drain node`、節點升級）
+- operator 調整 replicas = K8s 內部操作，**不受 PDB 約束**
+- 結論：PDB 與 drain-then-scale 並不衝突；PDB 保護的是基礎設施層面，drain 保護的是 job 層面
 
-在 Phase 2 + Phase 3 同時啟用時，建議部署順序為：
+
+### 問題 7：`MpiDefault=pmi2` 與 `mpi_pmi2.so` plugin 位置
+
+現象：改為 `MpiDefault=pmi2` 後，`srun --mpi=pmi2` job 可能出現 `srun: error: PMI2 not found`。
+
+原因：Ubuntu 22.04 的 `slurmd` 套件把 MPI plugin 放在 `/usr/lib/x86_64-linux-gnu/slurm-wlm/`，路徑需在 `PluginDir` 中。
+
+排查步驟：
+```bash
+# 在 worker pod 確認 pmi2 plugin 存在
+kubectl -n slurm exec pod/slurm-worker-cpu-0 -- \
+  find /usr/lib -name 'mpi_pmi2.so' 2>/dev/null
+
+# 確認 PluginDir 設定（通常不用手動設）
+kubectl -n slurm exec pod/slurm-controller-0 -- \
+  scontrol show config | grep PluginDir
+```
+
+實際發現：Ubuntu 22.04 `slurmd`（Slurm 21.08）內建 PMI2，不需要額外安裝；plugin 會自動在 PluginDir 找到。
+
+### 問題 8：`srun --mpi=pmi2` 在單節點多 task 的行為
+
+確認：`--ntasks=2 --nodes=1` 加上 `srun --mpi=pmi2` 可以在同一個 worker pod 啟動兩個 MPI rank，`$SLURM_PROCID` 分別為 0 和 1。這對容器化 HPC 測試是最低門檻的 MPI 驗證方式，不需要 pod 間網路或 InfiniBand。
+
+
+### 問題 9：`/etc/profile.d/slurm-modulepath.sh` 在 sbatch 裡不生效
+
+現象：login pod 互動式 shell `module avail` 正常，但 sbatch job 內 `module load` 後 `MPI_HOME` 仍是 NOT_SET。
+
+原因：
+- `/etc/profile.d/*.sh` 只在 **login shell** 啟動時自動 source（`bash -l`）
+- Slurm 以非互動、非 login 的 `/bin/bash` 執行 sbatch 腳本
+- 因此 `/etc/profile.d/slurm-modulepath.sh` 完全沒被讀到，`MODULEPATH` 未設定
+- Lmod 找不到 `/opt/modulefiles`，`module load openmpi/4.1` 靜默失敗
+
+修法：改用 Lmod 官方機制，在 Dockerfile 寫入 `/etc/lmod/modulespath`：
+```dockerfile
+RUN mkdir -p /etc/lmod && echo '/opt/modulefiles' > /etc/lmod/modulespath
+```
+Lmod 在每次 `source /etc/profile.d/lmod.sh` 時都會讀這個檔案，不論 shell 類型。
+
+### 問題 10：job output 在 worker pod，不在 login pod
+
+現象：`cat /tmp/phase5-verify-$jid.out` 在 login pod 找不到檔案。
+
+原因：Slurm 的 `--output` 路徑是在**執行 job 的 worker node** 上建立的。
+沒有共享 filesystem（NFS/Lustre），output 不會自動傳回 login node。
+
+在真實 HPC：所有節點共享 NFS，`/home/user/` 或 `/scratch/` 上的 output 到處都能讀。
+
+最終解法（Lmod + NFS 整合）：`bootstrap-lmod.sh` 掛載 NFS 到所有 Pod，並確保 `/shared/jobs/` 目錄存在。job script 輸出路徑改為：
+```bash
+#SBATCH --output=/shared/jobs/phase5-verify-%j.out
+#SBATCH --error=/shared/jobs/phase5-verify-%j.err
+```
+所有節點共享同一 NFS，login pod 可直接 `cat /shared/jobs/<outfile>` 取得輸出。
+
+
+## 問題 11：NFS Server 的 export 沒涵蓋 LAN 介面 IP
+
+**現象**
 
 ```
-1. bash scripts/bootstrap.sh              # Phase 1 + Phase 2
-2. sudo bash scripts/setup-nfs-server.sh  # 主機端 NFS（一次性，在 WSL2 執行）
-3. NFS_SERVER=<wsl2-ip> bash scripts/bootstrap-storage.sh
-4. bash scripts/verify-storage.sh
-5. bash scripts/verify-storage-e2e.sh    # WORKER_STS 預設 slurm-worker-cpu
+Warning  FailedMount  ...  MountVolume.SetUp failed for volume "nfs-client-root":
+  mount failed: exit status 32
+  mount.nfs: access denied by server while mounting 192.168.0.111:/srv/nfs/k8s
 ```
+
+`nfs-subdir-external-provisioner` Pod 卡在 `ContainerCreating` 永遠無法啟動。
+
+**根本原因**
+
+`setup-nfs-server.sh` 只設定了：
+
+```
+/srv/nfs/k8s 10.0.0.0/8(rw,sync,no_subtree_check,no_root_squash,insecure)
+```
+
+k3s 以 native（非 VM）方式跑在主機上，Pod volume 的 NFS mount 是由 **kubelet（節點）** 執行，不是由 Pod 內部發起。節點的 LAN IP 是 `192.168.0.111`（`enp5s0`，在 `192.168.0.0/25`），不在 `10.0.0.0/8` 內。
+
+**修法**
+
+```bash
+# /etc/exports 加上 LAN subnet：
+/srv/nfs/k8s 10.0.0.0/8(rw,sync,...) 192.168.0.0/25(rw,sync,no_subtree_check,no_root_squash,insecure)
+sudo exportfs -ra
+```
+
+## 問題 12：GPU job 卡在 COMPLETING 永不結束
+
+**現象**
+
+```
+[21:34:15] job 16 state=COMPLETING
+[21:35:33] job 16 state=COMPLETING
+WARN: timed out waiting for GPU job 16
+FAIL: GPU job did not complete (state=COMPLETING)
+```
+
+job 的 ExitCode 已經是 `0:0`（batch script 確實跑完），但 slurmctld 一直等 epilog-done 訊號。
+
+**根本原因**
+
+COMPLETING 在 Slurm 裡代表「batch script 結束，等 slurmstepd 回報 epilog 完成」。GPU worker 是 elastic pool（用完就縮容），operator 把 Pod evict 掉後，preStop hook 設了 `state=drain`，接著 kubelet 殺掉 Pod。slurmstepd 跟著消失，slurmctld 收不到 epilog-done，job 就永遠卡在 COMPLETING。
+
+**修法**
+
+在 `scripts/render-core.py` 的 `slurm.conf` 加一行：
+
+```python
+"CompleteWait=0",
+```
+
+`CompleteWait=0` 讓 slurmctld 在 batch script 結束後不等 epilog-done，直接把 job 轉到 COMPLETED。Worker Pod 沒有任何 epilog script，這個設定完全安全。
+
+**復現方式驗證**
+
+加入後，job 在 RUNNING → COMPLETED 只需幾秒，不再卡住。
 
 ---
 
-# Phase 4 (可觀測性)
+## 問題 12：verify-gpu.sh 的 job output 讀不到
 
-## Prometheus + Grafana 監控（已完成）
+**現象**
+
+```
+(no output file on submit pod — no shared storage)
+ExitCode=0:0  TresPerNode=gres:gpu:rtx4070:1
+PASS: GPU job ExitCode=0:0 and GPU GRES allocated ...
+```
+
+job 有跑完，但看不到 `nvidia-smi` 的實際輸出。
+
+**根本原因**
+
+原本的 sbatch script 是：
+
+```bash
+#SBATCH --output=/tmp/gpu-verify-%j.out
+```
+
+output 寫在 GPU worker Pod 的 `/tmp`。GPU worker Pod 跑完 job 後被 operator 縮容，Pod 消失，login pod 去讀這個 `/tmp` 路徑當然讀不到。
+
+**修法**
+
+改把 output 寫到 NFS 共享的 `/shared`：
+
+```bash
+JOB_OUT_DIR="${SHARED_DIR}/gpu-verify-$$"   # $$=verify腳本的PID，唯一目錄
+# 在 sbatch submission 前先在 login pod 建立該目錄
+mkdir -p '${JOB_OUT_DIR}'
+# sbatch 腳本內：
+#SBATCH --output=${JOB_OUT_DIR}/%j.out
+```
+
+所有 Pod（controller、worker、login）都 mount 同一個 `slurm-shared-rwx` PVC，job output 寫進去後 login pod 一定讀得到。
+
+---
+
+## 問題 13：verify.sh GPU job 丟到 cpu partition 導致立刻 fail
+
+觀察到：
+
+```
+sbatch: error: Batch job submission failed: Requested node configuration is not available
+```
+
+**根本原因**
+
+`verify.sh` 有：
+
+```bash
+PARTITION=${PARTITION:-cpu}
+```
+
+GPU job 的 sbatch script 用了 `#SBATCH -p ${PARTITION}`，結果是 `-p cpu`，cpu partition 根本沒有 `--gres=gpu:rtx4070:1` 的節點，Slurm 立刻拒絕。
+
+**修法**
+
+加一個獨立的 `GPU_PARTITION` 變數，GPU job 改用它：
+
+```bash
+GPU_PARTITION=${GPU_PARTITION:-gpu-rtx4070}
+# sbatch 腳本改為：
+#SBATCH -p ${GPU_PARTITION}
+```
+
+## 問題 14：DRAIN 狀態導致 sbatch 立刻被拒
+
+觀察到：
+
+```
+sbatch: error: Batch job submission failed: Requested node configuration is not available
+```
+
+**根本原因**
+
+preStop hook（`scontrol update nodename=$(hostname) state=drain reason=k8s-eviction`）在每次 Pod 縮容時都會被觸發，DRAIN 狀態會在 slurmctld 的 StateSaveLocation 裡持久化。
+
+下一次 sbatch 提交時：
+- GPU worker Pod 已縮容，replicas=0
+- slurmctld 裡所有 GPU node 都是 `drained*`
+- Slurm 直接拒絕投遞（DRAINED ≠ DOWN，不會排到 queue 等節點恢復）
+
+Worker Pod 啟動時雖然有 `scontrol update nodename=$(hostname) state=resume`（坑 6 的修法），但 Pod 還沒啟動就已經 sbatch 失敗了。
+
+**修法**
+
+在 verify.sh GPU job 提交前，先 resume 所有 drained 的節點：
+
+```bash
+login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null \
+  | xargs -r -I{} scontrol update nodename={} state=resume 2>/dev/null" || true
+```
+
+這樣 GPU 節點變成 `idle*`（slurmd 未連線但不是 DRAIN），sbatch 成功送出 PENDING，operator 看到 PENDING job 後 scale up，Pod 啟動後 slurmd 重新 register，job 才能 dispatch。
+
+**為何不用 `awk` 解析 `sinfo --Format=NodeList,StateLong`？**
+
+`sinfo --Format` 的欄位是固定寬度，節點名稱過長時會截斷，截斷後與 state 欄位黏在一起，awk `$2` 抓不到正確 state。改用 `-o '%N'` 配合 `-t drain,drained` 過濾才能拿到完整節點名稱。
+
+---
+
+# Phase 4 Plan（已完成）
+
+## Prometheus + Grafana 監控
 
 詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
 
@@ -156,56 +313,17 @@ job 完成後即可在 login pod 的 `/shared/` 直接讀取輸出（因共享 N
 | kube-state-metrics | K8s 原生 | StatefulSet replicas, Pod ready |
 | operator 自定義 | prometheus_client HTTP server（port 8000） | scale_up/down_total, guard_blocks, poll_duration |
 
-Phase 4 已部署 Prometheus + Grafana + slurm-exporter + kube-state-metrics。Grafana 提供三個看板：
+已經部署 Prometheus + Grafana + slurm-exporter + kube-state-metrics。Grafana 提供三個看板：
 - **Bridge Overview**：視覺化 Slurm queue depth 與 K8s StatefulSet replicas 的聯動關係
 - **Slurm Cluster State**：node states 圓餅圖、各 partition queue depth 時序
 - **K8s Operator**：scale event timeline、poll duration histogram、guard block 計數
 
-**部署：** `bash scripts/bootstrap-monitoring.sh`  
-**驗證：** `bash scripts/verify-monitoring.sh`
-
-**參考來源：** `github.com/SlinkyProject/slurm-exporter`（REST API 驅動）、`github.com/vpenso/prometheus-slurm-exporter`（exec 驅動，較易入門）
+部署指令：`bash scripts/bootstrap-monitoring.sh`  
+驗證指令：`bash scripts/verify-monitoring.sh`
 
 ---
 
-## 相關開源專案對照
-
-| 改進項目 | 主要參考來源 | 備註 |
-|---------|------------|------|
-| REST API | SlinkyProject/slurm-exporter | SchedMD 官方，生產驗證 |
-| SIGTERM handler | pytorch/elastic | torchelastic 官方模式 |
-| Pre-check | Character.ai Slonk | blog.character.ai/slonk |
-| Scale-down 安全性 | nebius/soperator | Go+Kubebuilder，架構參考 |
-| sbatch + torchrun 整合 | aws/aws-parallelcluster | 業界驗證的環境變數設定 |
-| Prometheus monitoring | vpenso/prometheus-slurm-exporter | exec 版本，入門用 |
-| Prometheus monitoring | SlinkyProject/slurm-exporter | REST API 版本，演進目標 |
-
-## Debug Record
-
-### A. verify-monitoring.sh 在無 wget/curl 的 image 裡 exec 失敗
-
-**症狀：**
-
-verify script 對 kube-state-metrics 和 slurm-exporter 的 metrics 檢查全部 FAIL，但 Prometheus 上這兩個 target 都是 UP。
-
-**根因（三個獨立問題）：**
-
-1. **distroless image 無 shell/wget/curl**：`check_metrics_endpoint` 用 `kubectl exec pod -- wget ...` 的方式，但 kube-state-metrics 使用的 image 沒有這些工具，exec 直接失敗。
-
-2. **python:3.11-slim 無 wget/curl**：slurm-exporter image 同樣無 curl/wget。
-
-3. **Windows 環境無 `python3` 指令**：Prometheus target 解析原本用 `python3 -c "..."` 做 JSON 解析，Windows 下指令應為 `py`，導致腳本報錯誤而非解析失敗，造成誤判。
-
-**修正：**
-
-改用 **port-forward + host-side curl** 的方式取代 exec：
-- 每個 metrics 檢查改為：啟動 `kubectl port-forward`，等待 3 秒，用 host 上的 `curl` 抓 `/metrics`，直接 pipe 給 `grep`，完成後 kill port-forward。
-- Prometheus targets 解析從 `python3` JSON 解析改為 `grep -A5 ... | grep '"health":"up"'`，無需任何 Python。
-- 同時修正 kube-state-metrics 的 metric 名稱：實際名稱為 `kube_statefulset_status_replicas`（非 `kube_statefulset_replicas`）。
-
----
-
-# Phase 5 技術規劃
+# Phase 5 Plan
 
 Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進成「使用者能直接提交各種 AI 批次工作的運算平台」。
 
@@ -801,160 +919,6 @@ NodePort :2222 → slurm-login pod
 
 ---
 
-## Debug Record
-
-### 問題 1：slurmdbd 啟動後 hostname 不符
-
-**現象：** slurmdbd 啟動後立即 fatal exit：`This host not configured to run SlurmDBD (slurmdbd-xxx != slurmdbd)`。
-
-**原因：** `slurmdbd.conf` 的 `DbdHost=slurmdbd`，但 Deployment pod 的 hostname 是 `slurmdbd-{replicaset}-{random}`（Kubernetes 預設行為）。slurmdbd 在啟動時會驗證 `DbdHost` 是否匹配當前 hostname。
-
-**修法：** `slurm-accounting.yaml` 的 Deployment pod spec 加入 `hostname: slurmdbd`，讓 pod hostname 固定為 `slurmdbd`。
-
----
-
-### 問題 2：slurmctld 首次啟動 fatal（TRES 缺失）
-
-**現象：** 新叢集第一次啟動時，slurmctld fatal exit：`You are running with a database but for some reason we have no TRES from it`。
-
-**原因：** `slurm.conf` 設定了 `AccountingStorageType=accounting_storage/slurmdbd`，slurmctld 啟動時需要從 slurmdbd 取得 TRES（Trackable RESources）定義。若 slurmdbd 尚未 ready（容器剛建立），且又沒有本地 state file，slurmctld 就會 fatal exit 而非等待。
-
-**修法：** `scripts/render-core.py` 的 controller 啟動腳本加入 wait loop：偵測到 `AccountingStorageType=slurmdbd` 時，先用 bash TCP 連線確認 `slurmdbd.slurm.svc.cluster.local:6819` 可達，再 exec slurmctld。
-
-```bash
-if grep -q 'AccountingStorageType=accounting_storage/slurmdbd' /etc/slurm/slurm.conf; then
-  until (echo >/dev/tcp/slurmdbd.slurm.svc.cluster.local/6819) 2>/dev/null; do sleep 3; done
-fi
-exec slurmctld -Dvvv
-```
-
-### 問題 3：PDB 與 StatefulSet 縮容的關係
-
-**常見誤解：** 認為 PDB 的 `maxUnavailable: 1` 會阻止 operator 把 replicas 從 4 降到 0。
-
-**實際行為：**
-- StatefulSet `replicas` 調整是 **Desired State**，K8s controller 會逐步刪除 Pod（最高優先）
-- PDB 保護的是 **Voluntary Disruption**（如 `kubectl drain node`、節點升級）
-- operator 調整 replicas = K8s 內部操作，**不受 PDB 約束**
-- 結論：PDB 與 drain-then-scale 並不衝突；PDB 保護的是基礎設施層面，drain 保護的是 job 層面
-
----
-
-### 問題 4：`MpiDefault=pmi2` 與 `mpi_pmi2.so` plugin 位置
-
-**現象：** 改為 `MpiDefault=pmi2` 後，`srun --mpi=pmi2` job 可能出現 `srun: error: PMI2 not found`。
-
-**原因：** Ubuntu 22.04 的 `slurmd` 套件把 MPI plugin 放在 `/usr/lib/x86_64-linux-gnu/slurm-wlm/`，路徑需在 `PluginDir` 中。
-
-**排查步驟：**
-```bash
-# 在 worker pod 確認 pmi2 plugin 存在
-kubectl -n slurm exec pod/slurm-worker-cpu-0 -- \
-  find /usr/lib -name 'mpi_pmi2.so' 2>/dev/null
-
-# 確認 PluginDir 設定（通常不用手動設）
-kubectl -n slurm exec pod/slurm-controller-0 -- \
-  scontrol show config | grep PluginDir
-```
-
-**實際發現：** Ubuntu 22.04 `slurmd`（Slurm 21.08）內建 PMI2，不需要額外安裝；plugin 會自動在 PluginDir 找到。
-
----
-
-### 問題 5：`srun --mpi=pmi2` 在單節點多 task 的行為
-
-**確認：** `--ntasks=2 --nodes=1` 加上 `srun --mpi=pmi2` 可以在同一個 worker pod 啟動兩個 MPI rank，`$SLURM_PROCID` 分別為 0 和 1。這對容器化 HPC 測試是最低門檻的 MPI 驗證方式，不需要 pod 間網路或 InfiniBand。
-
----
-
-### 問題 6：`/etc/profile.d/slurm-modulepath.sh` 在 sbatch 裡不生效
-
-**現象：** login pod 互動式 shell `module avail` 正常，但 sbatch job 內 `module load` 後 `MPI_HOME` 仍是 NOT_SET。
-
-**原因：**
-- `/etc/profile.d/*.sh` 只在 **login shell** 啟動時自動 source（`bash -l`）
-- Slurm 以非互動、非 login 的 `/bin/bash` 執行 sbatch 腳本
-- 因此 `/etc/profile.d/slurm-modulepath.sh` 完全沒被讀到，`MODULEPATH` 未設定
-- Lmod 找不到 `/opt/modulefiles`，`module load openmpi/4.1` 靜默失敗
-
-**修法：** 改用 Lmod 官方機制，在 Dockerfile 寫入 `/etc/lmod/modulespath`：
-```dockerfile
-RUN mkdir -p /etc/lmod && echo '/opt/modulefiles' > /etc/lmod/modulespath
-```
-Lmod 在每次 `source /etc/profile.d/lmod.sh` 時都會讀這個檔案，不論 shell 類型。
-
----
-
-### 問題 7：job output 在 worker pod，不在 login pod
-
-**現象：** `cat /tmp/phase5-verify-$jid.out` 在 login pod 找不到檔案。
-
-**原因：** Slurm 的 `--output` 路徑是在**執行 job 的 worker node** 上建立的。
-沒有共享 filesystem（NFS/Lustre），output 不會自動傳回 login node。
-
-**在真實 HPC：** 所有節點共享 NFS，`/home/user/` 或 `/scratch/` 上的 output 到處都能讀。
-
-**最終解法（Lmod + NFS 整合）：** `bootstrap-lmod.sh` 掛載 NFS 到所有 Pod，並確保 `/shared/jobs/` 目錄存在。job script 輸出路徑改為：
-```bash
-#SBATCH --output=/shared/jobs/phase5-verify-%j.out
-#SBATCH --error=/shared/jobs/phase5-verify-%j.err
-```
-所有節點共享同一 NFS，login pod 可直接 `cat /shared/jobs/<outfile>` 取得輸出。
-
----
-
-### 問題 8：Phase 3 E2E — slurmd 在新 pod 啟動後持續 NOT_RESPONDING
-
-**影響範圍：** `verify-storage-e2e.sh` 的多節點 sbatch 驗證流程。
-
-**現象：** operator 把 worker 從 1 台 scale-up 到 2 台後，`slurm-worker-cpu-1` pod 已 Running，但 `sinfo` 一直顯示 `idle*`（IDLE+NOT_RESPONDING）。SIGHUP 讓它短暫變成 `idle`，但 sbatch job 跑完卻卡在 COMPLETING 數分鐘不離開 queue。
-
-**根因（三層疊加）：**
-
-| 層次 | 現象 | 原因 |
-|------|------|------|
-| 1. NP race | pod 起來後 ~30s 內 `idle*` | CNI NetworkPolicy 比 slurmd 第一次 registration RPC 晚幾秒套用；slurmctld 的 back-ping（registration agent）此時失敗 → NOT_RESPONDING |
-| 2. Slurm 扇出 RPC 使用 ephemeral port | RESPONSE_FORWARD_FAILED，心跳持續失敗 | slurmctld 的 fan-out tree RPC 要求 worker 連回 controller 的**臨時 port**（OS 隨機分配，非 6817）回傳聚合結果。NetworkPolicy `allow-worker-egress` 只開放 6817，其餘封包被 drop |
-| 3. slurmctld IP cache 過期 | TERMINATE_JOB Connection timed out，COMPLETING 永遠不解 | pod 每次重啟取得新 IP（e.g. .44 → .84 → .91），但 slurmctld 把 NodeAddr 解析結果快取在記憶體，不重查 DNS；所有後續 PING/TERMINATE_JOB/KILL_JOB 打到舊 IP |
-
-**診斷方式：**
-```bash
-# 看 slurmctld 在用哪個 IP 連 cpu-1
-kubectl -n slurm logs pod/slurm-controller-0 | grep "connect to.*6818"
-# 對比 pod 實際 IP
-kubectl -n slurm get pod slurm-worker-cpu-1 -o jsonpath='{.status.podIP}'
-
-# 看 slurmd 收到 zero-bytes 與 RESPONSE_FORWARD_FAILED
-kubectl -n slurm logs pod/slurm-worker-cpu-1 | grep -E "Zero Bytes|FORWARD_FAILED|slurm_msg_sendto"
-```
-
-**修法（三步對應三層）：**
-
-1. **NetworkPolicy 放開 worker → controller 所有 port**（解決 ephemeral port 被 block）
-
-   `manifests/networking/network-policy.yaml` 的 `allow-worker-egress` 和 `allow-login-egress` 中，原本 `ports: [6817, 22]` 改為**不限制 port**（移除 ports 欄位），允許 worker/login 往 controller 送任何 TCP。
-
-2. **SIGHUP 補充 registration**（解決 NP race）
-
-   `verify-storage-e2e.sh` 的 `wait_slurm_node_responding()` 在 `idle*` 持續 30 秒後，對 worker pod 發 `kill -HUP $(pgrep slurmd)`，觸發 slurmd 重新送 registration RPC；此時 NP 已套用完成，back-ping 成功。
-
-3. **更新 slurmctld 的 NodeAddr**（解決 IP cache 過期）
-
-   在 `wait_slurm_node_responding()` 開始前（以及 SIGHUP 後）執行：
-   ```bash
-   pod_ip=$(kubectl -n slurm get pod slurm-worker-cpu-1 -o jsonpath='{.status.podIP}')
-   kubectl -n slurm exec pod/slurm-controller-0 -- bash -lc \
-     "scontrol update NodeName=slurm-worker-cpu-1 NodeAddr=${pod_ip}"
-   ```
-   強制 slurmctld 更新快取 IP，之後的 PING/TERMINATE_JOB 才能到達新 pod。
-
-**附帶發現：**
-- `sbatch --hold` 讓 trigger job 保持 PENDING 不執行；`scancel` 已 hold 的 job 瞬間消失（無 COMPLETING 殘留），比取消 RUNNING job 乾淨很多。
-- 多節點 job 的 COMPLETING 卡住，主因是 `REQUEST_TERMINATE_JOB`（slurmctld→slurmd:6818）或 `EPILOG_COMPLETE`（slurmd→slurmctld:6817）任一方向失敗，不是 NFS 問題。
-- `scontrol reconfigure` **不應**在 verify 流程呼叫：它會讓 slurmctld 嘗試 DNS resolve 所有靜態節點（包含未部署的 gpu 節點），Block 30–60 秒，導致 operator REST API 回傳空結果，誤觸 scale-down。
-
----
-
 ## Phase 5 建議優先順序
 
 | 項目 | 難度 | 價值 | 建議順序 | 依賴 |
@@ -964,7 +928,6 @@ kubectl -n slurm logs pod/slurm-worker-cpu-1 | grep -E "Zero Bytes|FORWARD_FAILE
 | 工作負載模板（5-C） | 低 | 使用者開箱即用，展示平台能力 | **第三** | NFS（Phase 3 已完成） |
 | SSH Login（5-D） | 中 | 真實使用體驗，不需要 kubectl | **第四** | Helm（Login Service 進 chart） |
 | Fair-Share 多租戶 | 中 | 多人共用不互搶（後期） | 第五 | SSH Login（需要使用者帳號） |
-| Operator HA | 中 | Zero-downtime 升級（生產需求） | 第六 | Helm（replicas 從 values 控制） |
 
 5-C（模板）技術依賴最少，可以在 5-A 進行中同步完成。5-D 放第四是因為單一使用者情境下 `kubectl exec` 仍可接受，SSH 優先級低於讓平台本身功能完整。
 
@@ -993,11 +956,15 @@ kubectl -n slurm logs pod/slurm-worker-cpu-1 | grep -E "Zero Bytes|FORWARD_FAILE
 **slurmdbd 提供什麼？**
 slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是 Phase 5 Fair-Share 多租戶排程的前置條件。
 
-# Job-Hardware Mapping
+# 工作和硬體資源的分配關係
+
+1. [資源模型概覽](#-資源模型概覽)
+2. [CPU Job 分配](#cpu-job-分配)
+3. [GPU Job 分配](#gpu-job-分配)
 
 ## 📦 資源模型概覽
 
-本 repo 採用 **Slurm-on-K8s 雙層架構**，每個 worker node 是一個 K8s Pod，Slurm 把整個 Pod 視為一台 node：
+本專案採用 **Slurm-on-K8s 雙層架構**，每個 worker node 是一個 K8s Pod，Slurm 把整個 Pod 視為一台 node：
 
 ```
 Slurm Layer  ←─ 排程、配置記帳（CR_Core、GRES）
@@ -1058,7 +1025,7 @@ Hardware     ←─ 實體 CPU cores、GPU SM + VRAM
 
 #### Type 1：資料前處理（Preprocessing）
 
-**使用情境：** 在跑推論或訓練之前，先把原始文本 tokenize、格式轉換、資料清洗。
+使用情境：在跑推論或訓練之前，先把原始文本 tokenize、格式轉換、資料清洗。
 
 ```bash
 #!/bin/bash
@@ -1090,13 +1057,13 @@ python tokenize_dataset.py \
 | RAM | 8 GB | cgroup memory |
 | GPU | 無 | — |
 
-> **展示的系統能力：** CPU pool 獨立 autoscale；CPU job 與 GPU job 不競爭資源；NFS 讓輸出跨節點共享。
+> 展示的系統能力：CPU pool 獨立 autoscale；CPU job 與 GPU job 不競爭資源；NFS 讓輸出跨節點共享。
 
 ---
 
 #### Type 2：批次文字推論（Batch Inference with MPS）
 
-**使用情境：** 對一批文件（1000 筆）跑模型推論，取得分類結果、摘要、或向量表示。多個推論 job 透過 MPS 共用同一張 GPU 的 SM。
+使用情境：對一批文件（1000 筆）跑模型推論，取得分類結果、摘要、或向量表示。多個推論 job 透過 MPS 共用同一張 GPU 的 SM。
 
 ```bash
 #!/bin/bash
@@ -1131,13 +1098,13 @@ GPU SM utilization：4 × 12 = 48 SM（100% 滿載）
 | GPU VRAM | 共享 12 GB（無隔離） | — |
 | CPU | 2 cores | 8 cores |
 
-> **展示的系統能力：** MPS 細粒度 GPU 分配；GPU utilization 從 ~20%（串行）提升到 ~80–100%（並行）；Operator 偵測 queue 後自動開啟 GPU worker。
+> 展示的系統能力：MPS 細粒度 GPU 分配；GPU utilization 從 ~20%（串行）提升到 ~80–100%（並行）；Operator 偵測 queue 後自動開啟 GPU worker。
 
 ---
 
 #### Type 3：超參數搜尋（HPO with Job Array）
 
-**使用情境：** 對同一個模型嘗試 8 組不同的 learning rate / batch size 組合，找出最佳設定。每組實驗是獨立的 sbatch job，透過 `--array` 並行提交。
+使用情境：對同一個模型嘗試 8 組不同的 learning rate / batch size 組合，找出最佳設定。每組實驗是獨立的 sbatch job，透過 `--array` 並行提交。
 
 ```bash
 #!/bin/bash
@@ -1175,13 +1142,13 @@ RTX 4070 最多同時跑 4 個（4 × mps:25 = 100% SM）
 對比串行：8 × 20 分鐘 = 160 分鐘（縮短 4×）
 ```
 
-> **展示的系統能力：** Job array 批次提交；MPS 讓多組實驗並行；Operator autoscale 依 queue 深度動態開 worker。
+> 展示的系統能力：Job array 批次提交；MPS 讓多組實驗並行；Operator autoscale 依 queue 深度動態開 worker。
 
 ---
 
 #### Type 4：LoRA Fine-tuning（GPU 獨佔 + Checkpoint 保護）
 
-**使用情境：** 對預訓練模型做領域適應（fine-tuning），需要整張 GPU VRAM 和長時間運算，途中定期寫 checkpoint，確保意外中斷可以續跑。
+使用情境：對預訓練模型做領域適應（fine-tuning），需要整張 GPU VRAM 和長時間運算，途中定期寫 checkpoint，確保意外中斷可以續跑。
 
 ```bash
 #!/bin/bash
@@ -1221,13 +1188,13 @@ Checkpoint Guard：檢查 /shared/checkpoints/run-$JID/latest.ckpt
 | GPU SM | 76 SM（100%） | 不與其他 job 共用 |
 | CPU / RAM | 4 cores / 14 GB | 資料 loading / preprocessing |
 
-> **展示的系統能力：** 整卡獨佔 GRES 分配；Checkpoint-aware 縮容保護；NFS PVC 讓 checkpoint 跨 pod 持久化。
+> 展示的系統能力：整卡獨佔 GRES 分配；Checkpoint-aware 縮容保護；NFS PVC 讓 checkpoint 跨 pod 持久化。
 
 ---
 
-#### Type 5：雙 GPU DDP 訓練
+#### Type 5：雙 GPU DDP 訓練（Optional）
 
-**使用情境：** 模型或 batch size 太大，單卡放不下，需要跨兩個 GPU worker 做梯度同步。每個 worker pod 各持一張 GPU，NCCL AllReduce 走 K8s pod 網路。
+使用情境：模型或 batch size 太大，單卡放不下，需要跨兩個 GPU worker 做梯度同步。每個 worker pod 各持一張 GPU，NCCL AllReduce 走 K8s pod 網路。
 
 ```bash
 #!/bin/bash
@@ -1272,7 +1239,7 @@ AllReduce gradient 在兩個 rank 間同步（TCP backend）
 | 通訊 | NCCL over TCP（K8s pod network） | 同左 |
 
 > ⚠️ 混合 GPU 型號：batch size 以較小的 RTX 4070（12 GB）為準；RTX 4070 的 SM 數也是速度瓶頸。  
-> **展示的系統能力：** 跨 worker pod 的多節點 Slurm 排程；NFS 讓兩個 worker 共讀 dataset；Checkpoint guard 保護長時間訓練不被縮容打斷。
+> 展示的系統能力：跨 worker pod 的多節點 Slurm 排程；NFS 讓兩個 worker 共讀 dataset；Checkpoint guard 保護長時間訓練不被縮容打斷。
 
 ### 資源帳本總覽（雙 GPU 單節點部署）
 
@@ -1297,8 +1264,6 @@ AllReduce gradient 在兩個 rank 間同步（TCP backend）
     └── MPS 模式：nvidia-mps-daemon-1 管理，socket: /tmp/nvidia-mps-1
                   ← worker pod 掛載此 socket，mps:N 分配 N% SM
 ```
-
-> **k3s vs Kind 差異：** k3s 直接使用 containerd + NVIDIA runtime，不需要 container-in-container；`/dev/nvidia0` 直接可見，`TaskPlugin=task/cgroup` 有真實 OS 隔離效果。Kind 在 Windows 下無法直通 GPU，所有 GPU 宣告為 `File=/dev/null`（排程帳本有效，實際不存在硬體）。
 
 ---
 
@@ -1390,8 +1355,8 @@ Slurm 要求 4 台 `gpu-rtx4070` worker 同時空閒。這正是 Gang Scheduling
 
 CUDA context 輪流使用 GPU，類似 CPU 分時多工。
 
-- 適用：**所有 NVIDIA GPU**
-- 隔離：**無記憶體隔離**（所有 context 共享 VRAM），context switch 有開銷
+- 適用：所有 NVIDIA GPU
+- 隔離：無記憶體隔離（所有 context 共享 VRAM），context switch 有開銷
 - K8s 設定：GPU Operator ConfigMap 把 1 張 GPU 虛擬成 N 份 `nvidia.com/gpu`
 
 ```yaml
@@ -1416,11 +1381,11 @@ NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvid
 
 ---
 
-### GPU MPS 完整實作指南（2026）
+# GPU MPS 完整實作指南
 
-#### 本架構環境：Linux + k3s + RTX 4070 + RTX 4080（雙 GPU）
+本架構環境預計使用 Linux + k3s + RTX 4070 + RTX 4080（雙 GPU），目前在單一主機 RTX 4070 開發，之後會嘗試用雙顯卡。
 
-> **本架構採用路徑 B（Slurm MPS DaemonSet）**，因為我們使用 k3s + 直接安裝 NVIDIA Container Toolkit，**未部署 NVIDIA GPU Operator**。路徑 A 需要 GPU Operator，在 k3s 上需額外安裝，非必要複雜度。
+> 本架構採用路徑 B（Slurm MPS DaemonSet），因為我們使用 k3s + 直接安裝 NVIDIA Container Toolkit，未部署 NVIDIA GPU Operator。路徑 A 需要 GPU Operator，在 k3s 上需額外安裝，非必要複雜度。
 
 | 項目 | GPU 0：RTX 4070 | GPU 1：RTX 4080 |
 |------|----------------|----------------|
@@ -1433,9 +1398,7 @@ NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvid
 | MIG 支援 | ❌ | ❌ |
 | K8s Runtime | k3s + containerd + NVIDIA Container Toolkit（共用） | ← |
 
----
-
-#### MPS 運作原理 vs Time-Slicing
+## MPS 運作原理 vs Time-Slicing
 
 | 維度 | Time-Slicing | MPS | MIG |
 |------|-------------|-----|-----|
@@ -1448,19 +1411,17 @@ NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvid
 | RTX 4070 適用 | ✅ | **✅ 本架構採用** | ❌ 不支援 |
 | 最佳場景 | 開發/測試 | **推論服務多 replica 共用 GPU** | 多租戶需記憶體隔離 |
 
-**雙 GPU + MPS 適合的場景：**
+✔️ 雙 GPU + MPS 適合的場景：
 - 多個小型推論 server 並排（LLM serving、image classifier），兩張 GPU 分流不同服務
 - 批次推論（offline batch inference），task 間共享 SM bandwidth
 - 教授展示：同一張 GPU 跑多個 AI 服務而不互相等待；兩張 GPU 同時跑不同服務
 
-**不適合的場景：**
+❌ 不適合的場景：
 - PyTorch DDP 訓練（DDP 本身已充分利用整張 GPU，加 MPS 只增加風險；DDP 請用整卡模式）
 - 需要記憶體隔離的多租戶（兩張卡均無 MIG，MPS 沒有 VRAM 隔離）
 - 不同 Linux 用戶共用同一張 GPU（每個 Linux 用戶只能有一個 MPS server）
 
----
-
-#### 實作架構：雙 GPU MPS Control Daemon on k3s
+## 實作架構：雙 GPU MPS Control Daemon on k3s
 
 每張 GPU 需要獨立的 MPS daemon process，使用不同的 socket 目錄。本架構部署**兩個 MPS daemon Pod**（各管一張 GPU）。
 
@@ -1491,9 +1452,8 @@ Linux Host（k3s 單節點）
 
 各 worker pod 掛載對應 GPU 的 MPS socket 目錄，CUDA 呼叫由該 GPU 的 MPS Server 代理。兩張 GPU 的 MPS daemon 完全獨立，互不干擾。
 
----
 
-#### 路徑 B 實作步驟（本架構採用，Linux + k3s + RTX 4070）
+### 路徑 B 實作步驟（本架構採用，Linux + k3s + RTX 4070）
 
 **前提：** 已執行 `K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh` 完成基礎部署。
 
@@ -1748,7 +1708,7 @@ kubectl -n slurm exec "pod/${mps_pod}" -- nvidia-smi dmon -s u -d 2
 
 ---
 
-#### 路徑 A：GPU Operator MPS（參考，本架構未使用）
+### 路徑 A：GPU Operator MPS（參考，本架構未使用）
 
 **適用：** 部署了 NVIDIA GPU Operator 的正式叢集（需要 ClusterPolicy CRD）。
 
@@ -1776,7 +1736,7 @@ NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvid
 
 ---
 
-#### 本架構實作建議
+## ✴️ 本架構實作建議
 
 | 部署環境 | 推薦路徑 | 理由 |
 |---------|---------|------|
@@ -1827,7 +1787,7 @@ if args.with_mps:
 
 ---
 
-#### 監控 MPS 使用狀況
+## 監控 MPS 使用狀況
 
 ```bash
 # 在 MPS Daemon 所在 pod 或 host 執行
@@ -1844,16 +1804,7 @@ dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
 
 ---
 
-#### 參考來源
-
-- [Slurm GRES MPS 官方文件](https://slurm.schedmd.com/gres.html) — `GresTypes=gpu,mps` 設定與 Prolog 行為
-- [GPU Slicing in CycleCloud Slurm with CUDA MPS](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/gpu-slicing-in-cyclecloud-slurm-with-cuda-multi-process-service-mps/4365999) — Microsoft Azure HPC，Slurm Prolog/Epilog 實戰
-- [GKE MPS 實作](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nvidia-mps-gpus) — `hostIPC: true` 要求和 Google 自訂 GPU stack
-- [SURF MPS for Slurm GitHub](https://github.com/basvandervlies/surf_slurm_mps) — 荷蘭國家超算中心的 MPS Prolog/Epilog 完整實作
-- [NVIDIA GPU Operator MPS 文件](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html) — ClusterPolicy ConfigMap `sharing.mps` 設定
-- [MIG vs Time-Slicing vs MPS 比較](https://www.kubenatives.com/p/mig-vs-time-slicing-vs-mps-which) — 三種機制的適用場景分析
-
-### 核心限制：為何不能跨 GPU 分割 SM？
+## ⚠️ 核心限制：為何不能跨 GPU 分割 SM？
 
 用戶場景：GPU0 剩 4 SM 閒置、GPU1 剩 4 SM 閒置，Job C 需要 8 SM，能否合用？
 
@@ -1882,43 +1833,7 @@ dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
 | DDP 大型訓練 | 整張 GPU（1 job per GPU）| 全部 |
 | 跨 GPU SM 碎片整合 | ❌ 硬體不支援 | 無 |
 
----
-
-## AI/HPC Infra Review
-
-### 實作設計是否妥當？
-
-| 面向 | 評估 | 說明 |
-|------|------|------|
-| CPU consumable resource 模型 | ✅ 正確 | `cons_tres` + `CR_Core` 是 HPC 業界標準做法 |
-| GPU 整卡獨占預設 | ✅ 合理 | DDP 訓練場景下整卡獨占是正確的起點 |
-| `TaskPlugin=task/none` | ⚠️ 可接受於模擬 | Kind 環境做驗證可以，**不能用於效能測試或多租戶** |
-| GPU GRES `File=/dev/null` | ✅ Kind 環境唯一可行方案 | 排程邏輯可驗證，硬體部分需真實環境補齊 |
-| 無 GPU sharing 機制 | ✅ DDP 場景下正確 | DDP 不應 time-slice；加 GPU sharing 反而造成干擾 |
-
-**整體評語：** 以驗證排程控制流為目標，目前設計選擇是合理的。主要缺口在隔離層（`task/none`）和 Kind GPU 模擬的不完整性，這兩個缺口在設計文件中已有明確說明，不是未知風險。
-
-### Kind 環境 vs 真實環境差距
-
-| 項目 | Kind 環境 | 真實 GPU 叢集 |
-|------|----------|-------------|
-| GPU 裝置 | `/dev/null`（純排程帳本） | NVIDIA device plugin，實際 GPU 分配 |
-| CPU 隔離 | 無（task/none） | task/cgroup + cpuset 強制 binding |
-| GPU sharing | 不可用 | Time-Slicing / MIG / MPS（按需啟用）|
-| 記憶體限制 | Slurm 記帳但不強制 | cgroup v2 memory.max 強制 OOM |
-| NCCL / collective | CPU 模擬 | NVLink / RDMA InfiniBand |
-
-### 若要部署真實環境，建議的改動順序
-
-1. 換掉 `TaskPlugin=task/none` → `task/cgroup`，配合 `CgroupPlugin=cgroup/v2`
-2. 部署 NVIDIA GPU Operator，device plugin 取代 `/dev/null` 模擬
-3. 視 GPU 型號選 sharing 策略：A100/H100 → MIG；一般推論服務 → time-slicing
-4. Slurm `gres.conf` 對齊實際 MIG partition，`File=` 指向真實 `/dev/nvidia*`
-5. Gang Scheduling → 啟用 K8s 1.35 `GangScheduling` feature gate（已完成）
-
----
-
-## 快速查詢表
+### FAQ
 
 | 問題 | 答案 |
 |------|------|
@@ -1932,251 +1847,11 @@ dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
 
 ---
 
-# Phase 5-B：Linux + k3s 真實 GPU 驗證 Debug 紀錄（2026-04-27）
-
-這一輪的目標是把整個 migration.md 的 Linux+k3s 路徑實際跑起來，並驗證 GPU、MPS、NFS 共享儲存都能正常運作。以下是踩到的每個坑與修法。
-
----
-
-## 坑 1：NFS Server 的 export 沒涵蓋 LAN 介面 IP
-
-**現象**
-
-```
-Warning  FailedMount  ...  MountVolume.SetUp failed for volume "nfs-client-root":
-  mount failed: exit status 32
-  mount.nfs: access denied by server while mounting 192.168.0.111:/srv/nfs/k8s
-```
-
-`nfs-subdir-external-provisioner` Pod 卡在 `ContainerCreating` 永遠無法啟動。
-
-**根本原因**
-
-`setup-nfs-server.sh` 只設定了：
-
-```
-/srv/nfs/k8s 10.0.0.0/8(rw,sync,no_subtree_check,no_root_squash,insecure)
-```
-
-k3s 以 native（非 VM）方式跑在主機上，Pod volume 的 NFS mount 是由 **kubelet（節點）** 執行，不是由 Pod 內部發起。節點的 LAN IP 是 `192.168.0.111`（`enp5s0`，在 `192.168.0.0/25`），不在 `10.0.0.0/8` 內。
-
-**修法**
-
-```bash
-# /etc/exports 加上 LAN subnet：
-/srv/nfs/k8s 10.0.0.0/8(rw,sync,...) 192.168.0.0/25(rw,sync,no_subtree_check,no_root_squash,insecure)
-sudo exportfs -ra
-```
-
-**教訓**
-
-Docker/Kind 環境的容器網段通常是 `172.x` 或 `10.x`，所以舊的 export 規則剛好夠用。k3s native 部署時節點 IP 就是主機的物理 IP，必須額外加入。
-
----
-
-## 坑 2：GPU job 卡在 COMPLETING 永不結束
-
-**現象**
-
-```
-[21:34:15] job 16 state=COMPLETING
-[21:35:33] job 16 state=COMPLETING
-WARN: timed out waiting for GPU job 16
-FAIL: GPU job did not complete (state=COMPLETING)
-```
-
-job 的 ExitCode 已經是 `0:0`（batch script 確實跑完），但 slurmctld 一直等 epilog-done 訊號。
-
-**根本原因**
-
-COMPLETING 在 Slurm 裡代表「batch script 結束，等 slurmstepd 回報 epilog 完成」。GPU worker 是 elastic pool（用完就縮容），operator 把 Pod evict 掉後，preStop hook 設了 `state=drain`，接著 kubelet 殺掉 Pod。slurmstepd 跟著消失，slurmctld 收不到 epilog-done，job 就永遠卡在 COMPLETING。
-
-**修法**
-
-在 `scripts/render-core.py` 的 `slurm.conf` 加一行：
-
-```python
-"CompleteWait=0",
-```
-
-`CompleteWait=0` 讓 slurmctld 在 batch script 結束後不等 epilog-done，直接把 job 轉到 COMPLETED。Worker Pod 沒有任何 epilog script，這個設定完全安全。
-
-**復現方式驗證**
-
-加入後，job 在 RUNNING → COMPLETED 只需幾秒，不再卡住。
-
----
-
-## 坑 3：verify-gpu.sh 的 job output 讀不到
-
-**現象**
-
-```
-(no output file on submit pod — no shared storage)
-ExitCode=0:0  TresPerNode=gres:gpu:rtx4070:1
-PASS: GPU job ExitCode=0:0 and GPU GRES allocated ...
-```
-
-job 有跑完，但看不到 `nvidia-smi` 的實際輸出。
-
-**根本原因**
-
-原本的 sbatch script 是：
-
-```bash
-#SBATCH --output=/tmp/gpu-verify-%j.out
-```
-
-output 寫在 GPU worker Pod 的 `/tmp`。GPU worker Pod 跑完 job 後被 operator 縮容，Pod 消失，login pod 去讀這個 `/tmp` 路徑當然讀不到。
-
-**修法**
-
-改把 output 寫到 NFS 共享的 `/shared`：
-
-```bash
-JOB_OUT_DIR="${SHARED_DIR}/gpu-verify-$$"   # $$=verify腳本的PID，唯一目錄
-# 在 sbatch submission 前先在 login pod 建立該目錄
-mkdir -p '${JOB_OUT_DIR}'
-# sbatch 腳本內：
-#SBATCH --output=${JOB_OUT_DIR}/%j.out
-```
-
-所有 Pod（controller、worker、login）都 mount 同一個 `slurm-shared-rwx` PVC，job output 寫進去後 login pod 一定讀得到。
-
----
-
-## 坑 4：verify.sh GPU job 丟到 cpu partition 導致立刻 fail
-
-**現象**
-
-```
-sbatch: error: Batch job submission failed: Requested node configuration is not available
-```
-
-**根本原因**
-
-`verify.sh` 有：
-
-```bash
-PARTITION=${PARTITION:-cpu}
-```
-
-GPU job 的 sbatch script 用了 `#SBATCH -p ${PARTITION}`，結果是 `-p cpu`，cpu partition 根本沒有 `--gres=gpu:rtx4070:1` 的節點，Slurm 立刻拒絕。
-
-**修法**
-
-加一個獨立的 `GPU_PARTITION` 變數，GPU job 改用它：
-
-```bash
-GPU_PARTITION=${GPU_PARTITION:-gpu-rtx4070}
-# sbatch 腳本改為：
-#SBATCH -p ${GPU_PARTITION}
-```
-
----
-
-## 坑 5：DRAIN 狀態導致 sbatch 立刻被拒
-
-**現象**
-
-```
-sbatch: error: Batch job submission failed: Requested node configuration is not available
-```
-
-（跟坑 4 的錯誤訊息一模一樣，但原因不同。）
-
-**根本原因**
-
-preStop hook（`scontrol update nodename=$(hostname) state=drain reason=k8s-eviction`）在每次 Pod 縮容時都會被觸發，DRAIN 狀態會在 slurmctld 的 StateSaveLocation 裡持久化。
-
-下一次 sbatch 提交時：
-- GPU worker Pod 已縮容，replicas=0
-- slurmctld 裡所有 GPU node 都是 `drained*`
-- Slurm 直接拒絕投遞（DRAINED ≠ DOWN，不會排到 queue 等節點恢復）
-
-Worker Pod 啟動時雖然有 `scontrol update nodename=$(hostname) state=resume`（坑 6 的修法），但 Pod 還沒啟動就已經 sbatch 失敗了。
-
-**修法**
-
-在 verify.sh GPU job 提交前，先 resume 所有 drained 的節點：
-
-```bash
-login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null \
-  | xargs -r -I{} scontrol update nodename={} state=resume 2>/dev/null" || true
-```
-
-這樣 GPU 節點變成 `idle*`（slurmd 未連線但不是 DRAIN），sbatch 成功送出 PENDING，operator 看到 PENDING job 後 scale up，Pod 啟動後 slurmd 重新 register，job 才能 dispatch。
-
-**為何不用 `awk` 解析 `sinfo --Format=NodeList,StateLong`？**
-
-`sinfo --Format` 的欄位是固定寬度，節點名稱過長時會截斷，截斷後與 state 欄位黏在一起，awk `$2` 抓不到正確 state。改用 `-o '%N'` 配合 `-t drain,drained` 過濾才能拿到完整節點名稱。
-
----
-
-## 坑 6（舊）：DRAIN 在 Pod 重啟後持久化導致 job PENDING
-
-這是上一輪已修的坑，這裡補充說明驗證結果。
-
-**修法**（在 `scripts/render-core.py` worker 啟動 script 裡）：
-
-```bash
-su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
-sleep 1
-pgrep -x munged >/dev/null
-# Clear stale DRAIN from preStop hook of previous pod.
-scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
-exec slurmd -Dvvv -N "$(hostname)"
-```
-
-`state=resume` 在 munge 起來後、slurmd 啟動前執行，可以把 slurmctld 裡殘留的 DRAIN/DOWN 清掉。`ReturnToService=2` 只清 DOWN，不清 DRAIN，所以這行 `state=resume` 是必要的。
-
----
-
-## 最終驗證結果
-
-### verify-gpu.sh
-
-```
-=== [1] NVIDIA device plugin DaemonSet ===
-  PASS: device plugin DaemonSet has ready pods
-
-=== [2] GPU node capacity ===
-  PASS: cluster has 4 allocatable GPU(s)     ← 1 張 RTX 4070 time-slicing 成 4 個 replica
-
-=== [4] Slurm GPU GRES (sinfo) ===
-  PASS: Slurm nodes have GPU GRES configured
-
-=== [5] sbatch GPU job (nvidia-smi) ===
-  Job stdout:
-    NVIDIA GeForce RTX 4070, 535.288.01, 0 %
-    CUDA_VISIBLE_DEVICES=0
-    SLURM_JOB_GPUS=0
-  PASS: GPU name visible in Slurm job output
-
-=== [6] sbatch MPS job (--gres=mps:25) ===
-  MPS job stdout:
-    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25
-    CUDA_VISIBLE_DEVICES=0
-    NVIDIA GeForce RTX 4070
-  PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
-  WARN: CUDA_MPS_PIPE_DIRECTORY missing — time-slicing 模式，MPS daemon 不啟動（預期行為）
-```
-
-### verify.sh
-
-```
-[dev verify] done. all checks passed.
-```
-
-所有測試通過，包含 CPU pool 彈性擴縮、MPI PMI2 多節點、GPU pool 彈性擴縮。
-
----
-
 ## Linux + k3s 完整復現步驟
 
 > 適用環境：Ubuntu 24.04 x86\_64，RTX 4070，NVIDIA driver 535+，k3s v1.34+
 
-### 步驟 0：主機準備
+### 1. 主機準備
 
 ```bash
 # 安裝 NVIDIA Container Toolkit（先裝好 driver）
@@ -2185,7 +1860,7 @@ sudo bash scripts/setup-linux-gpu.sh
 nvidia-smi
 ```
 
-### 步驟 1：k3s 安裝
+### 2. k3s 安裝
 
 `setup-linux-gpu.sh` 內部已處理，或手動：
 
@@ -2199,7 +1874,7 @@ sudo chown $USER ~/.kube/config
 export KUBECONFIG=~/.kube/config
 ```
 
-### 步驟 2：部署 NVIDIA device plugin + RuntimeClass
+### 3. 部署 NVIDIA device plugin + RuntimeClass
 
 ```bash
 KUBECONFIG=~/.kube/config kubectl apply -f manifests/gpu/runtime-class.yaml
@@ -2212,13 +1887,13 @@ KUBECONFIG=~/.kube/config kubectl get nodes -o jsonpath='{range .items[*]}{.meta
 > MPS config (`rtx4070-mps`) 在 driver 535.288.01 + k3s 1.34 + Ubuntu 24.04 上無法啟動 MPS daemon（device-plugin subprocess spawn 問題，v0.15.0 與 v0.17.4 皆失敗）。  
 > Time-slicing 模式下 `--gres=mps:25` 仍可正常投遞，`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 由 Slurm prolog 注入，但 `CUDA_MPS_PIPE_DIRECTORY` 不會設定。
 
-### 步驟 3：部署核心 Slurm 叢集
+### 4. 部署核心 Slurm 叢集
 
 ```bash
 KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh
 ```
 
-### 步驟 4：部署 NFS 共享儲存
+### 5. 部署 NFS 共享儲存
 
 **4-A：主機 NFS Server（只需執行一次）**
 
@@ -2254,7 +1929,7 @@ KUBE_CONTEXT=default \
   bash scripts/bootstrap-storage.sh
 ```
 
-### 步驟 5：驗證
+### 6. 驗證
 
 ```bash
 # 儲存驗證
@@ -2268,7 +1943,7 @@ KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bas
 KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
-### 預期輸出（摘要）
+### 7. 預期輸出（摘要）
 
 | 驗證項目 | 預期結果 |
 |----------|----------|
@@ -2282,14 +1957,12 @@ KUBECONFIG=~/.kube/config K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bas
 
 ---
 
-## 已修改的檔案清單
+# 📖 參考來源
 
-| 檔案 | 變更 |
-|------|------|
-| `scripts/render-core.py` | 加 `CompleteWait=0`；worker 啟動時加 `scontrol update state=resume` |
-| `scripts/verify.sh` | 加 `GPU_PARTITION` 變數；GPU sbatch 改用 `GPU_PARTITION`；GPU 提交前 resume drained 節點 |
-| `scripts/verify-gpu.sh` | job output 改寫到 `/shared/gpu-verify-<pid>/<jid>.out` |
-| `scripts/setup-linux-gpu.sh` | 移除無效的 `--kube-apiserver-arg feature-gates=GangScheduling=true,GenericWorkload=true` |
-| `scripts/bootstrap.sh` | 修正 `WITH_MPS=true` 的 log 訊息（MPS 由 device-plugin 負責） |
-| `manifests/gpu/nvidia-device-plugin.yaml` | ConfigMap key 改為 `rtx4070-timeslicing`（MPS daemon spawn 失敗） |
-| `/etc/exports`（主機） | 加入 `192.168.0.0/25` export rule |
+- [Slurm GRES MPS 官方文件](https://slurm.schedmd.com/gres.html) — `GresTypes=gpu,mps` 設定與 Prolog 行為
+- [GPU Slicing in CycleCloud Slurm with CUDA MPS](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/gpu-slicing-in-cyclecloud-slurm-with-cuda-multi-process-service-mps/4365999) — Microsoft Azure HPC，Slurm Prolog/Epilog 實戰
+- [GKE MPS 實作](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nvidia-mps-gpus) — `hostIPC: true` 要求和 Google 自訂 GPU stack
+- [SURF MPS for Slurm GitHub](https://github.com/basvandervlies/surf_slurm_mps) — 荷蘭國家超算中心的 MPS Prolog/Epilog 完整實作
+- [NVIDIA GPU Operator MPS 文件](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html) — ClusterPolicy ConfigMap `sharing.mps` 設定
+- [MIG vs Time-Slicing vs MPS 比較](https://www.kubenatives.com/p/mig-vs-time-slicing-vs-mps-which) — 三種機制的適用場景分析
+
