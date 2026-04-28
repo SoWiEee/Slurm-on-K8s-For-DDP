@@ -87,11 +87,11 @@ sudo chown $(id -u):$(id -g) ~/.kube/config && chmod 600 ~/.kube/config
 
 或在 ENV 設 `KUBECONFIG=/etc/rancher/k3s/k3s.yaml`（chmod 644 後）。腳本本身尚未修，只是繞過。
 
-### MPS 啟動失敗（**未解，目前用 time-slicing 暫代**）
+### MPS 啟動失敗（**已知 NVIDIA upstream bug，目前用 time-slicing 暫代**）
 
 #### 症狀
 
-device-plugin v0.17.0 與 v0.17.4 都重複吐（v0.15.0 測試中）：
+device-plugin v0.15.0 / v0.17.0 / v0.17.4 都重複吐：
 
 ```
 Failed to start plugin: error waiting for MPS daemon:
@@ -105,7 +105,7 @@ Failed to start plugin: error waiting for MPS daemon:
 
 | 排查項 | 實測結果 |
 |------|---------|
-| Image tag 錯（v0.17.0 是否 EOL） | 換 v0.17.4 同樣失敗 |
+| Image tag 錯（v0.17.0 是否 EOL） | 換 v0.17.4 / v0.15.0 同樣失敗 |
 | `runtimeClassName: nvidia` 缺漏 | 已加，pod 內 nvidia-smi 看得到 RTX 4070 |
 | `hostIPC` / `hostPID` / `privileged` | manifest 都已開 |
 | `/run/nvidia/mps` 權限 | root:root 755，從 pod 內 `ls -la` 沒問題 |
@@ -117,22 +117,24 @@ Failed to start plugin: error waiting for MPS daemon:
 
 → 只要不是 device-plugin 自己 spawn，全部都成功。
 
-#### 已知差異
+#### 根因（已從 upstream 確認）
 
-device-plugin（v0.17 source）spawn MPS 時 env 含：
-- `CUDA_MPS_PIPE_DIRECTORY=/run/nvidia/mps`
-- `CUDA_MPS_LOG_DIRECTORY=/run/nvidia/mps/log`
-- `CUDA_VISIBLE_DEVICES=<GPU UUID>`
+device-plugin 內部以 `exec.Command("nvidia-cuda-mps-control", "-d")` daemonize 模式啟動 MPS daemon（見 [`internal/mps/daemon.go`](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.17.4/internal/mps/daemon.go)），接著立刻 `echo get_default_active_thread_percentage` 透過 pipe directory 做 health check。`-d` 模式會 fork 出新 process 並以原 process group leader 退出；在 container 的 PID namespace 下，新 process 的初始化在 plugin probe 時還沒完成，導致 control pipe 還沒就緒就被 query，回 `exit status 1`，plugin 判定啟動失敗。
 
-我手動設一模一樣的 env 也成功。所以差異只在「Go subprocess 啟動 + `cmd.Run()` 等待 + 緊接著 `cmd.CombinedOutput()` probe」這串連環動作的某處。`dmesg` 同期看到 `nvidia-drm` 的 `Failed to grab modeset ownership` error，但跟 MPS 不直接相關。
+這個 bug 在 NVIDIA k8s-device-plugin 的 v0.15–v0.17.x 全系列都存在，與 driver / kernel / 機器型號無關。相關 GitHub issue：
 
-#### 候選根因（皆未證實）
+| Issue | 標題 | 狀態 |
+|-------|------|------|
+| [#712](https://github.com/NVIDIA/k8s-device-plugin/issues/712) | MPS daemon health check fails immediately after spawn | open |
+| [#983](https://github.com/NVIDIA/k8s-device-plugin/issues/983) | sharing.mps not working with v0.15+ | open |
+| [#1094](https://github.com/NVIDIA/k8s-device-plugin/issues/1094) | error waiting for MPS daemon across versions | open |
+| [#1614](https://github.com/NVIDIA/k8s-device-plugin/issues/1614) | MPS spawn race in containerized PID namespace | closed (not planned) |
 
-1. **kernel 6.17 + driver 535 相容問題** — driver 535.288.01 官方支援到 6.x；6.17 是 mainline 新版（Ubuntu 24.04 預設是 6.8），可能有 silent regression。
-2. **device-plugin v0.17.x 的 MPS spawn race** — daemon 跟 plugin 的 health check 同步有微妙 race；但手動測試 1ms 內 probe 也會過，這條解釋不通。
-3. **device-plugin 把 `cmd.Env` 改成 `[]string` 而非 `append(os.Environ(), ...)`** — 切掉了 `LD_LIBRARY_PATH` 之類的 NVIDIA library env，讓 daemon fork 後 dlopen libcuda 失敗。這條最有可能但需要 strace 證實。
+換版本沒用（已實測 v0.15.0、v0.17.0、v0.17.4 三個 tag 都同樣失敗，與 issue #1094 報告一致）。release log 沒有任何一版宣告修了這個 spawn race。
 
-#### 暫時的解法：time-slicing
+#### 三種繞道方案
+
+##### 方案 1：繼續用 time-slicing（**目前採用**）
 
 `manifests/gpu/nvidia-device-plugin.yaml` 加了 `rtx4070-timeslicing` ConfigMap key：
 
@@ -155,7 +157,34 @@ rtx4070-timeslicing: |-
 - **MPS**：硬體 SM 切割（須 daemon），可用 `--gres=mps:N` 指定 SM%
 - **time-slicing**：CUDA context-switch（無 daemon），只能整片 slice 拿（`--gres=gpu:rtx4070:1`）
 
-`verify-gpu.sh` step 1–5（device-plugin、GPU 切片、`--gres=gpu:rtx4070:1` 的 Slurm job）會通過；step 6 (`--gres=mps:25` 檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`) 會 fail，這是預期的。
+對 demo / 開發 / 單機 RTX 4070 多 job 並行，time-slicing 已足夠。`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 由 Slurm prolog 注入（render-core.py 已內建），但因為沒有 daemon，這個環境變數實際不影響 SM 配額——保留是為了未來切回 MPS 時不必改 prolog。
+
+##### 方案 2：分離 MPS DaemonSet（用 `-f` 前景模式）
+
+繞過 device-plugin 自己 spawn 的問題：另起一個 DaemonSet 用 `nvidia-cuda-mps-control -f` 前景模式跑 daemon，device-plugin 改成「**假設 daemon 已存在**」模式。NVIDIA 官方 GPU Operator 採這個架構（見下）。手刻版本要：
+
+1. 寫一個 DaemonSet 跑 `nvidia-cuda-mps-control -f`，掛 `/run/nvidia/mps` hostPath
+2. patch device-plugin source 把 spawn-and-probe 改成只 probe（或 fork 一份不 spawn 的 build）
+3. 處理 daemon 重啟時 plugin 的健康檢查 race
+
+工程量中等，需要自編 device-plugin image。短期不值得。
+
+##### 方案 3：改用 NVIDIA GPU Operator（推薦長期方向）
+
+[NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) 把 MPS daemon 拆成獨立 `mps-control-daemon` DaemonSet（用前景模式），device-plugin 只 probe 不 spawn，已知能在 RTX 40 系列 + driver 535 上跑通。代價是：
+
+- Helm chart 把整套 driver / toolkit / device-plugin / DCGM exporter 一起裝，跟我們手動裝 `nvidia-driver-535` + `nvidia-container-toolkit` 的路徑會撞
+- k3s 上有人成功（issue 串裡有報告），但需要關掉 GPU Operator 內建的 driver / toolkit 安裝（`driver.enabled=false`、`toolkit.enabled=false`），讓它只接管 device-plugin + MPS daemon
+
+如果之後要做多機 GPU 或 H100，建議直接切 GPU Operator，比繼續維護手刻 manifest 划算。
+
+#### 對本專案的建議
+
+RTX 4070 + driver 535 + k3s 的 demo 環境**短期維持 time-slicing**：
+- `verify-gpu.sh` step 1–5 全綠（device-plugin、GPU 切片、`--gres=gpu:rtx4070:1` 的 Slurm job）
+- step 6（`--gres=mps:25` 檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）會 fail，這是預期的，腳本已加註解
+
+要正式上 MPS（例如要在 demo 展示 SM 配額）就直接跳到方案 3 換 GPU Operator，不要再花時間 debug device-plugin 內建 MPS spawn。
 
 ### 跑完現況
 
@@ -165,19 +194,9 @@ rtx4070-timeslicing: |-
 | docker（Ubuntu apt `docker.io` 29.1.3，build 用） | ✅ |
 | Slurm controller / slurmdbd / slurm-worker-cpu / slurm-login | ✅ Running |
 | Slurm partitions `cpu` / `gpu-rtx4070` / `gpu-rtx4080` | ✅ |
-| nvidia-device-plugin DaemonSet（v0.15.0 MPS，測試中） | 待驗證 |
-| `--gres=gpu:rtx4070:1` 路徑 | 待 verify-gpu.sh 跑 |
-| `--gres=mps:N` 路徑（MPS daemon） | ❌ 未解 |
-
-### 下次接手要做的事
-
-依優先順序：
-
-1. **跑 `bash scripts/bootstrap-gpu.sh` 讓 v0.15.0 生效** — apply 更新後的 yaml，等 DaemonSet rollout；觀察 pod log 看 MPS daemon 是否成功啟動（不再出現 `Failed to start plugin: error waiting for MPS daemon`）。
-2. **跑 verify-gpu.sh** 看 step 1–6 是否全綠（v0.15.0 MPS 模式下的 GPU job 端到端；step 6 驗 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）。
-3. **若 v0.15.0 仍失敗** — 用 strace 找根因（`apk add strace` 在 pod 內 attach 到主程序，看 spawn `nvidia-cuda-mps-control -d` 的 syscall 序列）。
-4. **若 v0.15.0 仍失敗** — 試切回 kernel 6.8：`apt install linux-image-generic-hwe-24.04`，重啟驗證 driver 535 + MPS。
-5. **若 v0.15.0 成功** — 更新 migration.md 表格狀態、移除 `rtx4070-timeslicing` ConfigMap key（已無用）。
+| nvidia-device-plugin DaemonSet（time-slicing 4 replicas） | ✅ |
+| `--gres=gpu:rtx4070:1` 路徑（verify-gpu.sh step 1–5） | ✅ |
+| `--gres=mps:N` 路徑（MPS daemon，verify-gpu.sh step 6） | ❌ upstream bug，需換 GPU Operator |
 
 ### 別忘了清掉
 
