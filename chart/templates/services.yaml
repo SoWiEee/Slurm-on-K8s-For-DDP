@@ -1,0 +1,67 @@
+{{/*
+Services for the Slurm cluster.
+
+  - slurm-controller : headless Service for slurmctld; publishNotReadyAddresses
+                       so DNS resolves before the pod becomes Ready (slurmctld
+                       readiness probe waits for slurmdbd, which can take 30+s
+                       on cold start).
+  - slurm-restapi    : ClusterIP for slurmrestd on :6820, used by the operator
+                       to query job/node state.
+  - per-pool worker  : headless Service per pool, named after the pool's
+                       statefulset so the StatefulSet's pod DNS records resolve
+                       to <pod>.<svc>.<ns>.svc.cluster.local — this is what
+                       slurm.conf's NodeAddr lines reference.
+*/}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-controller
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: slurm-controller
+  ports:
+    - name: slurmctld
+      port: 6817
+      targetPort: 6817
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-restapi
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: slurm-controller
+  ports:
+    - name: rest
+      port: 6820
+      targetPort: 6820
+{{- range .Values.pools }}
+{{- $pool := . }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $pool.statefulset }}
+  namespace: {{ $.Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" $ | nindent 4 }}
+    pool-id: {{ $pool.id }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ $pool.appLabel }}
+  ports:
+    - name: slurmd
+      port: 6818
+      targetPort: 6818
+{{- end }}

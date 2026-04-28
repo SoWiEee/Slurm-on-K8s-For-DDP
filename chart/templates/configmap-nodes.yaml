@@ -1,0 +1,23 @@
+{{/*
+slurm-config-nodes — NodeName / PartitionName lines + gres.conf body.
+
+Mounted at /etc/slurm/slurm.nodes.conf and /etc/slurm/gres.conf via
+subPath. Changes here come from a `helm upgrade` that touches `pools` or
+`partitions`, e.g. resizing maxNodes or adding a new pool. Once Stage B
+completes, this is the only ConfigMap that should change on a pool resize.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-config-nodes
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  slurm.nodes.conf: |
+{{ include "slurm-platform.slurmConfNodes" . | indent 4 }}
+{{- $gres := include "slurm-platform.gresConf" . }}
+{{- if $gres }}
+  gres.conf: |
+{{ $gres | indent 4 }}
+{{- end }}

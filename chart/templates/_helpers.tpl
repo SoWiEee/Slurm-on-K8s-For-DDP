@@ -122,11 +122,15 @@ which matches how scripts/bootstrap.sh decides today.
 
 {{/*
 -----------------------------------------------------------------------------
-slurm-platform.slurmConf — full slurm.conf body.
+slurm-platform.slurmConfStatic — header section of slurm.conf.
 
-Layout (matches render-core.py::build_slurm_conf line-by-line so the produced
-ConfigMap can be diffed against manifests/core/slurm-static.yaml):
+Lives in the slurm-config-static ConfigMap, which is mounted at
+/etc/slurm/slurm.conf on every Slurm pod. Changes here roll all pods.
+Ends with `Include /etc/slurm/slurm.nodes.conf` so Slurm pulls NodeName +
+PartitionName lines from the separately-mounted slurm-config-nodes
+ConfigMap (Slurm 21.08+ supports the Include directive).
 
+Layout (matches render-core.py::build_slurm_conf header line-by-line):
   ClusterName / SlurmctldHost / MpiDefault / ReturnToService / CompleteWait
   PidFile / SpoolDir / SlurmUser / StateSaveLocation / SwitchType
   TaskPlugin / ProctrackType / MailProg / SelectType / SelectTypeParameters
@@ -138,12 +142,10 @@ ConfigMap can be diffed against manifests/core/slurm-static.yaml):
   AccountingStorage* + JobAcctGather*
   GresTypes (if any pool has gres)
   AccountingStorageTRES (if any pool has gres AND slurm.accounting.storageTres set)
-  <blank>
-  NodeName lines (in pool order, ordinal 0..maxNodes-1)
-  PartitionName lines (in partition order, skipping empty partitions)
+  Include /etc/slurm/slurm.nodes.conf
 -----------------------------------------------------------------------------
 */}}
-{{- define "slurm-platform.slurmConf" -}}
+{{- define "slurm-platform.slurmConfStatic" -}}
 {{- $ns := .Values.cluster.namespace -}}
 {{- $s := .Values.slurm -}}
 ClusterName={{ .Values.cluster.name }}
@@ -169,8 +171,8 @@ AuthType={{ $s.authType }}
 CryptoType={{ $s.cryptoType }}
 AuthAltTypes={{ $s.authAltTypes }}
 AuthAltParameters={{ $s.authAltParameters }}
-{{ "" }}
-{{- if $s.accounting.enabled }}
+
+{{ if $s.accounting.enabled -}}
 # Job accounting via slurmdbd (gracefully degrades if slurmdbd is unavailable)
 AccountingStorageType={{ $s.accounting.storageType }}
 AccountingStorageHost={{ $s.accounting.storageHost }}
@@ -185,7 +187,27 @@ GresTypes={{ $gresTypes }}
 AccountingStorageTRES={{ join "," $s.accounting.storageTres }}
 {{- end }}
 {{- end }}
-{{ "" }}
+
+Include /etc/slurm/slurm.nodes.conf
+{{- end -}}
+
+{{/*
+-----------------------------------------------------------------------------
+slurm-platform.slurmConfNodes — body of /etc/slurm/slurm.nodes.conf.
+
+Lives in the slurm-config-nodes ConfigMap. NodeName lines emit in pool
+order, then PartitionName lines emit in partition order (empty partitions
+skipped, matching render-core.py).
+
+Splitting NodeName + PartitionName out of slurm.conf means a pool replica
+or partition change rolls only the workers tied to slurm-config-nodes,
+not those tied to slurm-config-static. For Stage B both ConfigMaps are
+mounted on every pod so this is a forward-compatibility hook; selective
+mounting is wired up later.
+-----------------------------------------------------------------------------
+*/}}
+{{- define "slurm-platform.slurmConfNodes" -}}
+{{- $ns := .Values.cluster.namespace -}}
 {{- range .Values.pools }}
 {{- $pool := . }}
 {{- $gresStr := "" }}
@@ -197,7 +219,7 @@ AccountingStorageTRES={{ join "," $s.accounting.storageTres }}
 {{- if $pool.features }}
 {{- $featureStr = printf " Feature=%s" (join "," $pool.features) }}
 {{- end }}
-{{- range $i, $_ := until (int $pool.maxNodes) -}}
+{{- range $i, $_ := until (int $pool.maxNodes) }}
 {{- $nodeName := printf "%s-%d" $pool.statefulset $i }}
 {{- $nodeAddr := printf "%s.%s.%s.svc.cluster.local" $nodeName $pool.statefulset $ns }}
 NodeName={{ $nodeName }} NodeAddr={{ $nodeAddr }} NodeHostname={{ $nodeName }} CPUs={{ $pool.cpus }} RealMemory={{ $pool.realMemory }} Sockets={{ $pool.sockets }} CoresPerSocket={{ $pool.coresPerSocket }} ThreadsPerCore={{ $pool.threadsPerCore }} State=UNKNOWN{{ $featureStr }}{{ $gresStr }}

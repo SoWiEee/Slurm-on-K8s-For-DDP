@@ -1,0 +1,157 @@
+{{/*
+Slurm controller (slurmctld + slurmrestd + sshd + munged in one pod).
+
+Single-replica StatefulSet with a stable network identity so worker pods
+can resolve `slurm-controller-0.slurm-controller.<ns>.svc.cluster.local`
+(the SlurmctldHost emitted by _helpers.tpl).
+
+Volumes:
+  - slurm-config-static  → /etc/slurm/slurm.conf       (subPath)
+  - slurm-config-nodes   → /etc/slurm/slurm.nodes.conf (subPath)
+  - slurm-config-nodes   → /etc/slurm/gres.conf        (subPath)
+  - slurm-secrets        → /slurm-secrets              (projected: munge + ssh + jwt)
+  - ctld-state           → /var/spool/slurmctld        (PVC, persists job queue)
+
+The startup script is deliberately kept identical to scripts/render-core.py
+output so a Stage B `helm install` produces a controller pod with the same
+behavior verified in the mps-migration commit (3eec54f).
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurm-controller
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-controller
+spec:
+  serviceName: slurm-controller
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-controller
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: slurm-controller
+    spec:
+      containers:
+        - name: slurm-controller
+          image: {{ .Values.image.controller }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              ssh-keygen -A >/dev/null 2>&1 || true
+              /usr/sbin/sshd
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              # Wait for slurmdbd if accounting is configured, so slurmctld
+              # does not fatal-exit on first boot due to missing TRES data.
+              if grep -q 'AccountingStorageType=accounting_storage/slurmdbd' /etc/slurm/slurm.conf 2>/dev/null; then
+                echo "[controller] waiting for slurmdbd port {{ .Values.slurm.accounting.storagePort }}..."
+                until (echo >/dev/tcp/{{ .Values.slurm.accounting.storageHost }}/{{ .Values.slurm.accounting.storagePort }}) 2>/dev/null; do
+                  sleep 3
+                done
+                echo "[controller] slurmdbd is up"
+              fi
+              exec slurmctld -Dvvv &
+              CTLD_PID=$!
+              # Wait for slurmctld to be ready before starting slurmrestd.
+              # slurmrestd needs SLURM_JWT set (from scontrol token) so its
+              # rest_auth/jwt plugin can bootstrap a valid auth context.
+              until scontrol ping >/dev/null 2>&1; do sleep 2; done
+              # lifespan=315360000 (10 years) avoids the daemon losing its auth
+              # context after the default 24-hour token expiry.
+              SLURM_JWT=$(scontrol token username=root lifespan=315360000 | sed 's/SLURM_JWT=//') \
+                SLURMRESTD_SECURITY=disable_user_check \
+                /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
+              wait $CTLD_PID
+          ports:
+            - containerPort: 22
+              name: ssh
+            - containerPort: 6817
+              name: slurmctld
+            - containerPort: 6820
+              name: rest
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmctld >/dev/null && pgrep -x slurmrestd >/dev/null"]
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          volumeMounts:
+            - name: slurm-config-static
+              mountPath: /etc/slurm/slurm.conf
+              subPath: slurm.conf
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/slurm.nodes.conf
+              subPath: slurm.nodes.conf
+            {{- if include "slurm-platform.gresConf" . }}
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/gres.conf
+              subPath: gres.conf
+            {{- end }}
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+            - name: ctld-state
+              mountPath: /var/spool/slurmctld
+      volumes:
+        - name: slurm-config-static
+          configMap:
+            name: slurm-config-static
+        - name: slurm-config-nodes
+          configMap:
+            name: slurm-config-nodes
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.secrets.munge }}
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: {{ .Values.secrets.ssh }}
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
+              - secret:
+                  name: {{ .Values.secrets.jwt }}
+                  items:
+                    - key: jwt_hs256.key
+                      path: jwt_hs256.key
+        - name: ctld-state
+          persistentVolumeClaim:
+            claimName: slurm-ctld-state
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: slurm-controller-pdb
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: slurm-controller

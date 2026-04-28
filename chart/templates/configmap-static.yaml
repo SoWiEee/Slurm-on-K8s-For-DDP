@@ -1,0 +1,20 @@
+{{/*
+slurm-config-static — header section of slurm.conf.
+
+Mounted at /etc/slurm/slurm.conf on every Slurm pod (controller, workers,
+login). Changes here roll all Slurm pods; that is intended, because changing
+e.g. AuthType or AccountingStorage requires a coordinated restart.
+
+The header ends with `Include /etc/slurm/slurm.nodes.conf`, which Slurm
+reads from the slurm-config-nodes ConfigMap mounted at the same directory.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-config-static
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  slurm.conf: |
+{{ include "slurm-platform.slurmConfStatic" . | indent 4 }}

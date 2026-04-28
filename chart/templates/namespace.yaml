@@ -1,0 +1,26 @@
+{{/*
+Namespace with Pod Security Standards label.
+
+Worker pods that need NVIDIA runtime / hostIPC etc. require at least
+`baseline`. `restricted` would block runtimeClassName=nvidia and is too
+strict for HPC workloads; `privileged` is loose. Default `baseline`.
+
+helm.sh/hook=pre-install,pre-upgrade plus hook-weight=-10 ensures the
+namespace exists before any other resource targeted at it. We skip Helm's
+own release tracking on the namespace (helm.sh/resource-policy=keep) so
+`helm uninstall` does not nuke shared NFS provisioner / monitoring add-ons
+that may have been deployed alongside this chart.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.cluster.podSecurity }}
+    pod-security.kubernetes.io/audit: {{ .Values.cluster.podSecurity }}
+    pod-security.kubernetes.io/warn: {{ .Values.cluster.podSecurity }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/resource-policy": keep
