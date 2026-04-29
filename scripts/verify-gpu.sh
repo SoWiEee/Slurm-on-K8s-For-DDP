@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # verify-gpu.sh — Verify real GPU access via Slurm
 #
-# Prerequisites: REAL_GPU=true bootstrap.sh has been run and bootstrap-gpu.sh
-# has deployed the NVIDIA device plugin.
+# Prerequisites:
+#   - scripts/install-gpu-operator.sh has installed NVIDIA GPU Operator
+#     into the gpu-operator namespace
+#   - helm install slurm-platform -f chart/values-k3s.yaml has deployed the
+#     core Slurm cluster (which contributes the device-plugin-config ConfigMap
+#     and post-install node-labeler Job).
 #
 # Tests:
 #   1. NVIDIA device plugin DaemonSet is running
@@ -52,7 +56,7 @@ echo "  Ready: ${ds_ready}/${ds_desired}"
 if [[ "${ds_ready:-0}" -gt 0 ]]; then
   pass "device plugin DaemonSet has ready pods"
 else
-  fail "no ready device plugin pods (run bootstrap-gpu.sh first)"
+  fail "no ready device plugin pods (run scripts/install-gpu-operator.sh first)"
 fi
 
 # ---------------------------------------------------------------------------

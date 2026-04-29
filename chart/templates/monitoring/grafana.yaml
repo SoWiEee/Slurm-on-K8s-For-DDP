@@ -1,0 +1,152 @@
+{{- if .Values.monitoring.enabled -}}
+{{/*
+Grafana — admin/admin by default. Two ConfigMaps:
+
+  grafana-provisioning   — datasource (Prometheus) + dashboards provider
+                           manifest. Mounted as a directory each (one
+                           subPath per file) so Grafana sees a directory
+                           at /etc/grafana/provisioning/{datasources,dashboards}.
+  grafana-dashboards     — JSON dashboards loaded from chart/dashboards/.
+                           AsConfig auto-renders all *.json under that path
+                           into ConfigMap data: keys with their filenames.
+
+Why two volume entries point at the same provisioning ConfigMap: the
+container expects `provisioning/datasources/` and `provisioning/dashboards/`
+to be directories. Mounting one ConfigMap with both keys at the parent
+path would project them as files, not directories — Grafana then ignores
+them.
+*/}}
+{{- $mNs := .Values.monitoring.namespace -}}
+{{- $g := .Values.monitoring.grafana -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        url: http://prometheus.{{ $mNs }}.svc.cluster.local:9090
+        access: proxy
+        isDefault: true
+        editable: false
+        jsonData:
+          httpMethod: POST
+          timeInterval: {{ .Values.monitoring.prometheus.scrapeIntervalSeconds }}s
+
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: Slurm
+        orgId: 1
+        folder: Slurm
+        folderUid: slurm
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+{{ (.Files.Glob "dashboards/*.json").AsConfig | indent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: {{ $g.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: {{ $g.adminPassword | quote }}
+            - name: GF_PATHS_PROVISIONING
+              value: /etc/grafana/provisioning
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: grafana-provisioning-datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: grafana-provisioning-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: grafana-dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: grafana-provisioning-datasources
+          configMap:
+            name: grafana-provisioning
+            items:
+              - key: datasources.yaml
+                path: datasources.yaml
+        - name: grafana-provisioning-dashboards
+          configMap:
+            name: grafana-provisioning
+            items:
+              - key: dashboards.yaml
+                path: dashboards.yaml
+        - name: grafana-dashboards
+          configMap:
+            name: grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: grafana
+spec:
+  type: ClusterIP
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+{{- end }}

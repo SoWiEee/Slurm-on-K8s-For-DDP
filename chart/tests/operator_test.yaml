@@ -1,0 +1,45 @@
+suite: elastic operator
+templates:
+  - operator.yaml
+tests:
+  - it: PARTITIONS_JSON contains all configured pools
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"partition":"cpu"'
+        documentSelector:
+          path: kind
+          value: Deployment
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"partition":"gpu-rtx4070"'
+        documentSelector:
+          path: kind
+          value: Deployment
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"partition":"gpu-rtx4080"'
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: operator mounts the JWT secret for slurmrestd auth
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: slurm-jwt-secret
+            secret:
+              secretName: slurm-jwt-secret
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: operator Service exposes port 8000 for Prometheus scraping
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 8000
+        documentSelector:
+          path: kind
+          value: Service

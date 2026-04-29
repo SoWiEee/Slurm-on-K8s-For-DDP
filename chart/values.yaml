@@ -1,0 +1,291 @@
+# =============================================================================
+# slurm-platform — default values (Kind / Windows + Docker Desktop baseline)
+# =============================================================================
+# This file is the development baseline. For production k3s + real GPU, layer
+# `values-k3s.yaml` on top via `helm install ... -f values-k3s.yaml`.
+#
+# Stage A scope: only `cluster`, `partitions`, `pools`, and `slurm` are wired
+# into templates. Other top-level keys (image, gpu, operator, monitoring,
+# storage, secrets, networkPolicy) are pre-declared per docs/note.md §5-A so
+# values overlays can be authored once and stay valid through Stages B–F.
+
+cluster:
+  name: kind-slurm           # Slurm ClusterName; kept as kind-slurm to match
+                             # current manifests/core/slurm-static.yaml byte-equivalent.
+  namespace: slurm
+  runtime: kind              # kind | k3s — affects taskPlugin defaults and
+                             # gres.conf File path (k3s → /dev/nvidia0).
+  podSecurity: baseline      # baseline | restricted | privileged.
+
+# Partition definitions in slurm.conf order. Each pool below references one
+# of these by name via `pool.partition`.
+partitions:
+  - name: cpu
+    default: true
+    maxTime: INFINITE
+    state: UP
+  - name: gpu-rtx4070
+    default: false
+    maxTime: INFINITE
+    state: UP
+  - name: gpu-rtx4080
+    default: false
+    maxTime: INFINITE
+    state: UP
+
+# Worker pools — ordered list (NOT a map). The order here determines the
+# emission order of NodeName lines in slurm.conf and gres.conf, which affects
+# Slurm's node ordinal assignment. Do not reorder unless you know what you're
+# doing.
+#
+# `gres` accepts both inline strings ("gpu:rtx4070:1", "mps:100") and the
+# structured form ({name, type, count}); _helpers.tpl normalizes both. The
+# structured form is preferred for new configs.
+pools:
+  - id: cpu
+    statefulset: slurm-worker-cpu
+    appLabel: slurm-worker-cpu
+    workerClass: cpu-standard
+    partition: cpu
+    minReplicas: 1
+    maxReplicas: 4
+    replicas: 1                # initial replicas; operator scales between min/max
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 4
+    features: [cpu]
+    gres: []
+    matchGres: []
+    fallback: true
+
+  - id: gpu-rtx4070
+    statefulset: slurm-worker-gpu-rtx4070
+    appLabel: slurm-worker-gpu-rtx4070
+    workerClass: gpu-rtx4070
+    partition: gpu-rtx4070
+    minReplicas: 0
+    maxReplicas: 2
+    replicas: 0
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 2
+    features: [gpu, gpu-rtx4070]
+    gres:
+      - name: gpu
+        type: rtx4070
+        count: 1
+      - name: mps
+        count: 100
+    matchGres: ["gpu:rtx4070", "mps"]
+    devicePluginConfig: rtx4070-mps
+
+  - id: gpu-rtx4080
+    statefulset: slurm-worker-gpu-rtx4080
+    appLabel: slurm-worker-gpu-rtx4080
+    workerClass: gpu-rtx4080
+    partition: gpu-rtx4080
+    minReplicas: 0
+    maxReplicas: 2
+    replicas: 0
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 2
+    features: [gpu, gpu-rtx4080]
+    gres:
+      - name: gpu
+        type: rtx4080
+        count: 1
+    matchGres: ["gpu:rtx4080"]
+    devicePluginConfig: rtx4080-exclusive
+
+slurm:
+  # Header values for slurm.conf. Defaults match the current
+  # render-core.py output verbatim, so Stage A produces a byte-equivalent
+  # ConfigMap. Override per-environment in values-k3s.yaml / values-dev.yaml.
+  controllerHost: slurm-controller-0
+  controllerService: slurm-controller
+  authType: auth/munge
+  credType: cred/munge
+  cryptoType: crypto/munge
+  authAltTypes: auth/jwt
+  authAltParameters: jwt_key=/slurm-secrets/jwt_hs256.key
+  selectType: select/cons_tres
+  selectTypeParameters: CR_Core
+  switchType: switch/none
+  mpiDefault: pmi2
+  returnToService: 2
+  # CompleteWait=0 prevents COMPLETING-stuck jobs when a worker pod is evicted
+  # mid-epilog (see docs/note.md mps-migration debug record).
+  completeWait: 0
+  # Slurm 21.08 (Ubuntu 22.04 image) has incomplete cgroup v2 support, so
+  # we stay with task/none + proctrack/linuxproc even on k3s + real GPU.
+  # GPU isolation comes from the kubelet + libnvidia-container hook, not
+  # Slurm. Override only when running newer Slurm.
+  taskPlugin: task/none
+  proctrackType: proctrack/linuxproc
+  mailProg: /usr/bin/true
+  slurmctldPidFile: /var/run/slurmctld.pid
+  slurmdPidFile: /var/run/slurmd.pid
+  slurmdSpoolDir: /var/spool/slurmd
+  slurmUser: root
+  stateSaveLocation: /var/spool/slurmctld
+  slurmctldPort: 6817
+  slurmdPort: 6818
+  accounting:
+    enabled: true                                  # adds AccountingStorage* lines
+    storageType: accounting_storage/slurmdbd
+    storageHost: slurmdbd.slurm.svc.cluster.local
+    storagePort: 6819
+    jobAcctGatherType: jobacct_gather/linux
+    jobAcctGatherFrequency: 30
+    storageTres: ["gres/gpu", "gres/mps"]          # AccountingStorageTRES
+  jwt:
+    keyPath: /slurm-secrets/jwt_hs256.key
+    lifespanSeconds: 86400                         # used by Stage B+ controller scripts
+  fairshare:
+    enabled: false                                 # P1+ feature
+
+# -- Image references (used Stage B onwards) ---------------------------------
+image:
+  controller: slurm-controller:latest
+  worker: slurm-worker:latest
+  operator: slurm-elastic-operator:latest
+  pullPolicy: IfNotPresent
+
+# -- GPU subsystem (used Stage D onwards) ------------------------------------
+# This chart only renders the device-plugin-config ConfigMap and the
+# post-install Job that labels GPU nodes. NVIDIA GPU Operator itself is
+# installed separately into its own namespace via
+# `scripts/install-gpu-operator.sh`; see Chart.yaml notes.
+gpu:
+  enabled: false                                   # Kind dev mode: GPU off
+  autoLabel: true                                  # post-install Job to apply
+                                                   # nvidia.com/device-plugin.config=<key>
+                                                   # to nodes matching `nodeAssignments`
+  # Namespace where NVIDIA GPU Operator's components live. The
+  # device-plugin-config ConfigMap is created here (not in cluster.namespace)
+  # because GPU Operator's device-plugin DaemonSet only reads ConfigMaps
+  # from its own namespace. install-gpu-operator.sh creates this namespace
+  # too, but we also create it from the chart so install order is flexible.
+  targetNamespace: gpu-operator
+  # PodSecurity standard for the gpu-operator namespace. Must be
+  # `privileged` for hostPath access to /dev/nvidia*, /run/nvidia/mps, etc.
+  # Override only if you've patched gpu-operator to drop hostPath mounts.
+  targetNamespacePodSecurity: privileged
+  deviceConfigs:
+    default:
+      version: v1
+    rtx4070-mps:
+      version: v1
+      sharing:
+        mps:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 4
+    rtx4080-exclusive:
+      version: v1
+  nodeAssignments:
+    - selector:
+        gpu-host-class: rtx4070
+      config: rtx4070-mps
+    - selector:
+        gpu-host-class: rtx4080
+      config: rtx4080-exclusive
+
+# -- Operator (Stage C) ------------------------------------------------------
+operator:
+  pollIntervalSeconds: 15
+  scaleDownCooldownSeconds: 60
+  drainTimeoutSeconds: 1800
+  checkpointGuard:
+    enabled: true
+    maxAgeSeconds: 600
+    graceSeconds: 300
+
+# -- NetworkPolicy (Stage C) -------------------------------------------------
+networkPolicy:
+  enabled: true
+  apiServerPorts: [443, 6443]                      # both Kind (443) and k3s (6443)
+
+# -- Monitoring add-on (Stage E) ---------------------------------------------
+# Enabled in values-k3s.yaml. The monitoring stack (Prometheus / Alertmanager /
+# Grafana / kube-state-metrics) lives in its own namespace; slurm-exporter
+# lives in cluster.namespace (it talks to slurmrestd over JWT).
+#
+# Cross-namespace scrape paths are opened automatically by network-policy.yaml
+# when both monitoring.enabled and networkPolicy.enabled are true.
+monitoring:
+  enabled: false
+  namespace: monitoring
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    scrapeIntervalSeconds: 15
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    # When `slack.webhookUrl` is set, the Alertmanager template wires a
+    # slack receiver in place of the default `dev-null`. Leave empty to
+    # match the legacy manifest's silent routing.
+    slack:
+      webhookUrl: ""
+      channel: "#slurm-alerts"
+  grafana:
+    image: grafana/grafana:10.4.2
+    adminPassword: admin
+  kubeStateMetrics:
+    image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.12.0
+  slurmExporter:
+    image: slurm-exporter:latest
+    pullPolicy: IfNotPresent
+    restUrl: ""                                    # defaults to slurm-restapi.<ns>.svc:6820
+    restApiVersion: v0.0.37
+    scrapeIntervalSeconds: 15
+
+# -- Shared storage add-on (Stage E) -----------------------------------------
+# Deploys the NFS subdir external provisioner (in its own namespace) and a
+# StorageClass + RWX PVC named `slurm-shared-rwx` in cluster.namespace. The
+# core Slurm controller/worker StatefulSets do NOT mount this PVC by default
+# in the chart yet (parity with manifests/core/slurm-static.yaml requires
+# explicit opt-in via a future `slurm.sharedStorage.mount: true` flag — left
+# for Stage F so /shared mount stays consistent across both Helm and legacy
+# bootstrap paths).
+storage:
+  enabled: false
+  # When true, controller / workers / login mount the shared PVC at /shared.
+  # Off by default in `values.yaml` so storage.enabled=true is composable
+  # without forcing every Slurm pod to depend on NFS reachability.
+  # Override per environment (k3s overlay sets this to true).
+  mountInPods: false
+  nfsServer: ""                                    # required when enabled=true
+  nfsPath: /srv/nfs/k8s
+  provisionerNamespace: nfs-provisioner
+  storageClassName: slurm-shared-nfs
+  # Provisioner identifier baked into the StorageClass + Deployment env. Must
+  # match an EXISTING cluster's value when re-installing on top of a legacy
+  # bootstrap-storage.sh deploy — provisioner names are immutable on
+  # StorageClass, so changing this would force a teardown of all PVs/PVCs.
+  provisionerName: k8s-sigs.io/slurm-nfs-subdir-external-provisioner
+  sharedPvc:
+    name: slurm-shared-rwx
+    size: 20Gi
+    accessMode: ReadWriteMany
+  provisioner:
+    image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+    pullPolicy: IfNotPresent
+
+# -- Pre-existing secrets (created by scripts/create-secrets.sh, not by chart)
+secrets:
+  munge: slurm-munge-key
+  jwt: slurm-jwt-secret
+  ssh: slurm-ssh-key

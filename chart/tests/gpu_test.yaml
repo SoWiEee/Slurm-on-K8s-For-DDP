@@ -1,0 +1,51 @@
+suite: GPU subsystem
+templates:
+  - gpu/gpu-operator-namespace.yaml
+  - gpu/device-plugin-config.yaml
+  - gpu/node-labeler-job.yaml
+tests:
+  - it: nothing renders when gpu.enabled is false
+    set:
+      gpu.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: gpu-operator namespace has PSS=privileged + resource-policy keep
+    template: gpu/gpu-operator-namespace.yaml
+    set:
+      gpu.enabled: true
+    asserts:
+      - equal:
+          path: metadata.labels["pod-security.kubernetes.io/enforce"]
+          value: privileged
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+      # NOT a hook (would cascade-delete on upgrade); see namespace.yaml comment.
+      - notExists:
+          path: metadata.annotations["helm.sh/hook"]
+
+  - it: device-plugin-config lives in gpu-operator namespace, has rtx4070-mps replicas=4
+    template: gpu/device-plugin-config.yaml
+    set:
+      gpu.enabled: true
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: gpu-operator
+      - matchRegex:
+          path: data["rtx4070-mps"]
+          pattern: "replicas: 4"
+
+  - it: node-labeler Job is a post-install hook
+    template: gpu/node-labeler-job.yaml
+    set:
+      gpu.enabled: true
+    documentSelector:
+      path: kind
+      value: Job
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: "post-install,post-upgrade"

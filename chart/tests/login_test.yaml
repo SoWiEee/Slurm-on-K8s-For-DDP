@@ -1,0 +1,100 @@
+suite: login deployment
+templates:
+  - login.yaml
+tests:
+  # Regression for the strict-decode bug found in CI: when storage.enabled +
+  # mountInPods=true, the trailing `defaultMode: 0755 / optional: true` lines
+  # used to dangle after the `{{- end }}` of the shared-PVC volume block, so
+  # they ended up inside `persistentVolumeClaim:` (which has no such fields).
+  # Server-side dry-run rejected the Deployment with `unknown field
+  # "spec.template.spec.volumes[*].persistentVolumeClaim.defaultMode"`.
+  - it: shared PVC volume must not carry configMap-only fields
+    set:
+      storage.enabled: true
+      storage.mountInPods: true
+      storage.nfsServer: "192.168.0.111"
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: shared
+            persistentVolumeClaim:
+              claimName: slurm-shared-rwx
+      - notContains:
+          path: spec.template.spec.volumes
+          any: true
+          content:
+            persistentVolumeClaim:
+              defaultMode: 0755
+      - notContains:
+          path: spec.template.spec.volumes
+          any: true
+          content:
+            persistentVolumeClaim:
+              optional: true
+
+  - it: slurm-ddp-runtime ConfigMap volume keeps defaultMode 0755 + optional
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: slurm-ddp-runtime
+            configMap:
+              name: slurm-ddp-runtime
+              defaultMode: 0755
+              optional: true
+
+  - it: login does NOT mount the JWT secret
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          any: true
+          content:
+            name: slurm-jwt-secret
+
+  - it: /shared mount only renders when storage.enabled AND mountInPods
+    set:
+      storage.enabled: true
+      storage.mountInPods: false
+      storage.nfsServer: "192.168.0.111"
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: shared
+            mountPath: /shared
+      - notContains:
+          path: spec.template.spec.volumes
+          any: true
+          content:
+            name: shared
+
+  - it: PDB allows at most one login pod down
+    documentSelector:
+      path: kind
+      value: PodDisruptionBudget
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+
+  - it: Service exposes SSH on :22
+    documentSelector:
+      path: kind
+      value: Service
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 22

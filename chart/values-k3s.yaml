@@ -1,0 +1,37 @@
+# =============================================================================
+# slurm-platform — k3s + RTX 4070 production override (mps-migration verified)
+# =============================================================================
+# Layer over values.yaml:
+#   helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm
+#
+# Reflects the configuration verified end-to-end on 2026-04-27 in commit
+# 3eec54f (Ubuntu 24.04 + k3s v1.34 + RTX 4070 + driver 535.288.01). Stage A
+# only renders slurm.conf / gres.conf — the other overrides here are inert
+# until later stages wire them up.
+
+cluster:
+  runtime: k3s
+  podSecurity: baseline
+
+# Stage D enables this; values.yaml::gpu-operator subchart override (driver +
+# toolkit disabled) takes over because the host already has nvidia-driver-535 +
+# nvidia-container-toolkit installed by setup-linux-gpu.sh.
+gpu:
+  enabled: true
+  autoLabel: true
+
+# Real GPU isolation needs the NVIDIA container runtime; the worker pod
+# templates (Stage B) already gate `runtimeClassName: nvidia` on
+# `cluster.runtime == "k3s"` AND `pool` having GPU gres.
+
+# Storage on k3s defaults to the NFS subdir provisioner (LAN-mounted to host
+# 192.168.0.111). Stage E wires this in; setting it now keeps the override
+# stable.
+storage:
+  enabled: true
+  mountInPods: true                  # /shared on controller/workers/login
+  nfsServer: 192.168.0.111
+  nfsPath: /srv/nfs/k8s
+
+monitoring:
+  enabled: true

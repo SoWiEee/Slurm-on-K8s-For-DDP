@@ -1,0 +1,11 @@
+.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.tmproj
+*.bak
+*.swp
+.project
+.helmignore
+README.md.bak

@@ -1,0 +1,190 @@
+{{/*
+Worker StatefulSets and PDBs, one per pool.
+
+Per-pool gating:
+  - GPU pools (any non-mps gres entry) get nvidia.com/gpu resource limits and
+    runtimeClassName=nvidia, but only when cluster.runtime=k3s. On Kind there
+    is no NVIDIA runtime; gres.conf File=/dev/null and the pod runs without
+    requesting nvidia.com/gpu so the scheduler does not block on missing
+    device-plugin capacity.
+  - The preStop hook drains the Slurm node before pod termination so any
+    in-flight job has 10s to finish (sleep 10 covers the SIGTERM grace).
+    A subsequent pod for the same StatefulSet ordinal clears DRAIN at startup
+    via `scontrol update nodename=$(hostname) state=resume`, since
+    ReturnToService=2 only clears DOWN, not DRAIN.
+
+The startup script is preserved verbatim from scripts/render-core.py.
+*/}}
+{{- range .Values.pools }}
+{{- $pool := . }}
+{{- $isGpuPool := false }}
+{{- range $pool.gres -}}
+  {{- if kindIs "string" . -}}
+    {{- $name := index (splitList ":" .) 0 -}}
+    {{- if and (ne $name "mps") -}}{{- $isGpuPool = true -}}{{- end -}}
+  {{- else if kindIs "map" . -}}
+    {{- if ne .name "mps" -}}{{- $isGpuPool = true -}}{{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $useNvidiaRuntime := and $isGpuPool (eq $.Values.cluster.runtime "k3s") }}
+{{- $gpuCount := "1" }}
+{{- if $useNvidiaRuntime -}}
+  {{- range $pool.gres -}}
+    {{- if kindIs "string" . -}}
+      {{- $parts := splitList ":" . -}}
+      {{- if and (ne (index $parts 0) "mps") (eq (len $parts) 3) -}}
+        {{- $gpuCount = index $parts 2 -}}
+      {{- end -}}
+    {{- else if kindIs "map" . -}}
+      {{- if ne .name "mps" -}}{{- $gpuCount = printf "%v" (default 1 .count) -}}{{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $pool.statefulset }}
+  namespace: {{ $.Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" $ | nindent 4 }}
+    app: {{ $pool.appLabel }}
+    pool-id: {{ $pool.id }}
+    worker-class: {{ $pool.workerClass }}
+spec:
+  serviceName: {{ $pool.statefulset }}
+  replicas: {{ $pool.replicas }}
+  selector:
+    matchLabels:
+      app: {{ $pool.appLabel }}
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" $ | nindent 8 }}
+        app: {{ $pool.appLabel }}
+        pool-id: {{ $pool.id }}
+        worker-class: {{ $pool.workerClass }}
+    spec:
+      {{- if $useNvidiaRuntime }}
+      runtimeClassName: nvidia
+      {{- end }}
+      containers:
+        - name: slurm-worker
+          image: {{ $.Values.image.worker }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- if $useNvidiaRuntime }}
+          resources:
+            limits:
+              nvidia.com/gpu: {{ $gpuCount | quote }}
+            requests:
+              nvidia.com/gpu: {{ $gpuCount | quote }}
+          {{- end }}
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              MUNGE_SRC=/slurm-secrets/munge.key
+              MUNGE_DST=/etc/munge/munge.key
+              mkdir -p /etc/munge /run/munge /var/lib/munge /var/log/munge /run/sshd
+              chown -R munge:munge /etc/munge /run/munge /var/lib/munge /var/log/munge
+              chmod 0700 /etc/munge /var/lib/munge /var/log/munge
+              chmod 0711 /run/munge
+              install -o munge -g munge -m 0400 "$MUNGE_SRC" "$MUNGE_DST"
+              ssh-keygen -A >/dev/null 2>&1 || true
+              /usr/sbin/sshd
+              su -s /bin/sh -c '/usr/sbin/munged --syslog' munge
+              sleep 1
+              pgrep -x munged >/dev/null
+              # Clear any stale DRAIN set by the previous pod's preStop hook.
+              # The hook drains the node before termination; when a new pod starts
+              # for the same StatefulSet ordinal, the DRAIN persists in slurmctld
+              # state and blocks new jobs. ReturnToService=2 clears DOWN but not
+              # DRAIN, so we clear it explicitly here while munge is already up.
+              scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
+              exec slurmd -Dvvv -N "$(hostname)"
+          ports:
+            - containerPort: 22
+              name: ssh
+            - containerPort: 6818
+              name: slurmd
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null && pgrep -x munged >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -x slurmd >/dev/null"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    scontrol update nodename=$(hostname) state=drain reason=k8s-eviction
+                    2>/dev/null || true; sleep 10
+          volumeMounts:
+            - name: slurm-config-static
+              mountPath: /etc/slurm/slurm.conf
+              subPath: slurm.conf
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/slurm.nodes.conf
+              subPath: slurm.nodes.conf
+            {{- if include "slurm-platform.gresConf" $ }}
+            - name: slurm-config-nodes
+              mountPath: /etc/slurm/gres.conf
+              subPath: gres.conf
+            {{- end }}
+            - name: slurm-secrets
+              mountPath: /slurm-secrets
+              readOnly: true
+            {{- if and $.Values.storage.enabled $.Values.storage.mountInPods }}
+            - name: shared
+              mountPath: /shared
+            {{- end }}
+      volumes:
+        - name: slurm-config-static
+          configMap:
+            name: slurm-config-static
+        - name: slurm-config-nodes
+          configMap:
+            name: slurm-config-nodes
+        - name: slurm-secrets
+          projected:
+            sources:
+              - secret:
+                  name: {{ $.Values.secrets.munge }}
+                  items:
+                    - key: munge.key
+                      path: munge.key
+              - secret:
+                  name: {{ $.Values.secrets.ssh }}
+                  items:
+                    - key: id_ed25519
+                      path: id_ed25519
+                    - key: id_ed25519.pub
+                      path: id_ed25519.pub
+        {{- if and $.Values.storage.enabled $.Values.storage.mountInPods }}
+        - name: shared
+          persistentVolumeClaim:
+            claimName: {{ $.Values.storage.sharedPvc.name }}
+        {{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $pool.statefulset }}-pdb
+  namespace: {{ $.Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" $ | nindent 4 }}
+    pool-id: {{ $pool.id }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: {{ $pool.appLabel }}
+{{- end }}

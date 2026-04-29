@@ -1,0 +1,90 @@
+{{- if .Values.monitoring.enabled -}}
+{{/*
+slurm-exporter — converts slurmrestd into Prometheus metrics. Lives in the
+slurm namespace (not monitoring) because it needs to mount the JWT secret
+and reach slurmrestd over a ClusterIP that isn't exposed beyond the slurm
+namespace's NetworkPolicy.
+
+restUrl defaults to slurm-restapi.<cluster.namespace>.svc:6820 so the
+default values work on any namespace; override only for cross-cluster
+scrape setups.
+*/}}
+{{- $sNs := .Values.cluster.namespace -}}
+{{- $se := .Values.monitoring.slurmExporter -}}
+{{- $restUrl := default (printf "http://slurm-restapi.%s.svc.cluster.local:6820" $sNs) $se.restUrl -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-exporter
+  namespace: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-exporter
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: slurm-exporter
+    spec:
+      containers:
+        - name: slurm-exporter
+          image: {{ $se.image }}
+          imagePullPolicy: {{ $se.pullPolicy }}
+          env:
+            - name: SLURM_REST_URL
+              value: {{ $restUrl | quote }}
+            - name: SLURM_REST_API_VERSION
+              value: {{ $se.restApiVersion | quote }}
+            - name: SLURM_JWT_KEY_PATH
+              value: "/slurm-jwt/jwt_hs256.key"
+            - name: SCRAPE_INTERVAL_SECONDS
+              value: {{ $se.scrapeIntervalSeconds | quote }}
+          ports:
+            - name: http-metrics
+              containerPort: 9341
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9341
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9341
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: slurm-jwt-secret
+              mountPath: /slurm-jwt/jwt_hs256.key
+              subPath: jwt_hs256.key
+              readOnly: true
+      volumes:
+        - name: slurm-jwt-secret
+          secret:
+            secretName: {{ .Values.secrets.jwt }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-exporter
+  namespace: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-exporter
+spec:
+  type: ClusterIP
+  selector:
+    app: slurm-exporter
+  ports:
+    - name: http-metrics
+      port: 9341
+      targetPort: 9341
+      protocol: TCP
+{{- end }}

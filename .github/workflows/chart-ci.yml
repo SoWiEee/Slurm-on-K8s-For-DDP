@@ -1,0 +1,102 @@
+name: chart-ci
+
+# Static Helm chart verification:
+#   - helm lint (default values + every values-*.yaml overlay)
+#   - helm template renders cleanly
+#   - 28 helm-unittest cases under chart/tests/
+#   - Server-side dry-run against an ephemeral Kind cluster (k8s 1.31)
+#
+# Skipped: real cluster install + verify-*.sh (those need image builds + secrets
+# + NFS, which run on the maintainer's k3s host, not in CI).
+
+on:
+  push:
+    branches: [main, helm]
+    paths:
+      - 'chart/**'
+      - 'scripts/verify-helm.sh'
+      - '.github/workflows/chart-ci.yml'
+  pull_request:
+    paths:
+      - 'chart/**'
+      - 'scripts/verify-helm.sh'
+      - '.github/workflows/chart-ci.yml'
+
+jobs:
+  lint-and-template:
+    name: lint + template + unittest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install helm v3.18
+        uses: azure/setup-helm@v4
+        with:
+          # Pinned to v3.18.x: helm-unittest plugin.yaml uses the `platformHooks`
+          # field (introduced upstream around plugin v0.7), which only loads on
+          # helm >= 3.17. Older helm errors with `unknown field "platformHooks"`.
+          version: v3.18.4
+
+      - name: Install helm-unittest plugin
+        # Pin plugin version too — keeps CI deterministic across runs and decouples
+        # us from upstream releasing a plugin that requires an even newer helm.
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version 1.0.3
+
+      - name: helm lint (default + overlays)
+        run: |
+          helm lint chart/
+          for ov in chart/values-*.yaml; do
+            [[ -f "$ov" ]] && helm lint chart/ -f "$ov"
+          done
+
+      - name: helm template (default + overlays)
+        run: |
+          helm template slurm-platform chart/ -n slurm > /tmp/render-default.yaml
+          [[ -s /tmp/render-default.yaml ]] || { echo "default render empty"; exit 1; }
+          for ov in chart/values-*.yaml; do
+            [[ -f "$ov" ]] || continue
+            name=$(basename "$ov" .yaml)
+            helm template slurm-platform chart/ -f "$ov" -n slurm \
+              > "/tmp/render-${name}.yaml"
+            [[ -s "/tmp/render-${name}.yaml" ]] || { echo "$name render empty"; exit 1; }
+          done
+
+      - name: helm-unittest (chart/tests/*_test.yaml)
+        run: helm unittest chart/
+
+      - name: storage.enabled=true without nfsServer must fail
+        run: |
+          if helm template slurm-platform chart/ --set storage.enabled=true -n slurm \
+              > /tmp/render-bad.yaml 2> /tmp/render-bad.err; then
+            echo "FAIL: expected helm template to fail when storage.enabled=true without nfsServer"
+            exit 1
+          fi
+          grep -q 'requires storage.nfsServer to be set' /tmp/render-bad.err
+
+  server-dry-run:
+    name: kubectl apply --dry-run=server (kind 1.31)
+    runs-on: ubuntu-latest
+    needs: lint-and-template
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install helm v3.18
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+
+      - name: Install helm-unittest plugin
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version 1.0.3
+
+      - name: Create ephemeral Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          cluster_name: chart-ci
+
+      - name: Run scripts/verify-helm.sh end-to-end (lint + render + unittest + dry-run)
+        run: |
+          # kind-action exports KUBECONFIG to point at the kind cluster; verify-helm.sh
+          # picks that up automatically via `kubectl version --request-timeout=3s`.
+          bash scripts/verify-helm.sh

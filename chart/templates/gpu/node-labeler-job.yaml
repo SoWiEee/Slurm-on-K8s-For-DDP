@@ -1,0 +1,107 @@
+{{- if and .Values.gpu.enabled .Values.gpu.autoLabel -}}
+{{/*
+Post-install Job that labels GPU nodes with the
+`nvidia.com/device-plugin.config` key matching their hardware class. The
+GPU Operator's device-plugin then reads that label to pick the right
+sharing config from slurm-platform-device-plugin-config.
+
+This replaces the manual `kubectl label nodes ... nvidia.com/device-plugin.config=...`
+step from the pre-helm flow. Users only need to label their nodes once
+with a hardware-class hint (e.g. `gpu-host-class=rtx4070`) and the chart
+takes care of the rest.
+
+Hook order:
+  - hook-weight=10 runs after namespace (-10) and CRDs (default 0). The
+    Job needs the slurm-platform-device-plugin-config ConfigMap to exist
+    by the time GPU Operator's device-plugin reads the labels, but the
+    ConfigMap is in this same release so it deploys before hooks fire.
+  - hook-delete-policy=before-hook-creation,hook-succeeded keeps reruns
+    idempotent (helm upgrade triggers a fresh Job).
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: slurm-platform-gpu-labeler
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: slurm-platform-gpu-labeler
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: slurm-platform-gpu-labeler
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+subjects:
+  - kind: ServiceAccount
+    name: slurm-platform-gpu-labeler
+    namespace: {{ .Values.cluster.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: slurm-platform-gpu-labeler
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: slurm-platform-gpu-labeler
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: slurm-platform-gpu-labeler
+    spec:
+      serviceAccountName: slurm-platform-gpu-labeler
+      restartPolicy: OnFailure
+      containers:
+        - name: labeler
+          image: bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              echo "[gpu-labeler] applying nvidia.com/device-plugin.config labels"
+              {{- range .Values.gpu.nodeAssignments }}
+              {{- $config := .config }}
+              selector="{{- range $k, $v := .selector }}{{ $k }}={{ $v }},{{- end }}"
+              selector="${selector%,}"
+              echo "[gpu-labeler] selector=$selector → config={{ $config }}"
+              kubectl label nodes -l "$selector" \
+                "nvidia.com/device-plugin.config={{ $config }}" --overwrite
+              {{- end }}
+              echo "[gpu-labeler] done"
+{{- end }}

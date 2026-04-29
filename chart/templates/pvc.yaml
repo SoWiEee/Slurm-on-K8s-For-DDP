@@ -1,0 +1,25 @@
+{{/*
+slurm-ctld-state — persists slurmctld job queue + node state across pod
+restarts. Without this PVC, restarting the controller loses the entire
+in-flight job state and active node assignments.
+
+Uses the cluster default StorageClass (local-path on Kind, or whatever
+NFS / EBS provisioner is set as default in the target cluster). 1Gi is
+ample for state — Slurm's StateSaveLocation is small (KB-scale per job).
+
+Stage E may add `storage.enabled` for an additional /shared NFS PVC; that
+lives in templates/storage.yaml, not here.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurm-ctld-state
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

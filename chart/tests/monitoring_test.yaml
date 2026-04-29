@@ -1,0 +1,79 @@
+suite: monitoring stack
+tests:
+  - it: nothing renders when monitoring.enabled is false
+    templates:
+      - monitoring/namespace.yaml
+      - monitoring/prometheus.yaml
+      - monitoring/grafana.yaml
+      - monitoring/alertmanager.yaml
+      - monitoring/kube-state-metrics.yaml
+      - monitoring/slurm-exporter.yaml
+    set:
+      monitoring.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: prometheus scrapes the three expected jobs
+    template: monitoring/prometheus.yaml
+    set:
+      monitoring.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: prometheus-config
+    asserts:
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "job_name: slurm-exporter"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "job_name: slurm-operator"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "job_name: kube-state-metrics"
+
+  - it: alertmanager defaults to dev-null receiver, slack when webhook set
+    template: monitoring/alertmanager.yaml
+    set:
+      monitoring.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: alertmanager-config
+    asserts:
+      - matchRegex:
+          path: data["alertmanager.yml"]
+          pattern: "receiver: dev-null"
+      - notMatchRegex:
+          path: data["alertmanager.yml"]
+          pattern: "slack_configs:"
+
+  - it: alertmanager wires slack receiver when webhookUrl is set
+    template: monitoring/alertmanager.yaml
+    set:
+      monitoring.enabled: true
+      monitoring.alertmanager.slack.webhookUrl: "https://hooks.slack.com/test"
+    documentSelector:
+      path: metadata.name
+      value: alertmanager-config
+    asserts:
+      - matchRegex:
+          path: data["alertmanager.yml"]
+          pattern: "slack_configs:"
+      - matchRegex:
+          path: data["alertmanager.yml"]
+          pattern: 'api_url: "https://hooks.slack.com/test"'
+
+  - it: grafana-dashboards loads all three dashboards from chart/dashboards/
+    template: monitoring/grafana.yaml
+    set:
+      monitoring.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: grafana-dashboards
+    asserts:
+      - exists:
+          path: data["bridge-overview.json"]
+      - exists:
+          path: data["operator.json"]
+      - exists:
+          path: data["sla-efficiency.json"]
