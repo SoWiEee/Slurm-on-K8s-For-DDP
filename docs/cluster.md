@@ -43,63 +43,70 @@
 
 ```mermaid
 graph TD
-    USER[Engineer\nssh / kubectl exec] --> LOGIN
+    USER["Engineer<br/>ssh / kubectl exec"] --> LOGIN
+
     subgraph HOST["Linux Host (acane: Ubuntu 24.04 + k3s)"]
-        NVDR[NVIDIA Driver 595-open\n+ container-toolkit]
-        GPU0[/dev/nvidia0 — RTX 4070]
-        NFSH[NFS export\n/srv/nfs/k8s]
+        NVDR["NVIDIA Driver 595-open<br/>+ container-toolkit"]
+        GPU0["/dev/nvidia0 - RTX 4070"]
+        NFSH["NFS export<br/>/srv/nfs/k8s"]
     end
 
     subgraph K3S["k3s cluster"]
         subgraph SL["slurm namespace"]
-            LOGIN[slurm-login\nDeployment]
-            CTL[slurm-controller-0\nStatefulSet :6817 :6820]
-            OP[slurm-elastic-operator\nDeployment]
-            EXP[slurm-exporter\nDeployment :9341]
-            CPU[slurm-worker-cpu\nStatefulSet]
-            R70[slurm-worker-gpu-rtx4070\nStatefulSet]
-            R80[slurm-worker-gpu-rtx4080\nStatefulSet]
-            DBD[slurmdbd\nDeployment :6819]
-            SQL[mysql\nStatefulSet :3306]
+            LOGIN["slurm-login<br/>Deployment"]
+            CTL["slurm-controller-0<br/>StatefulSet :6817 :6820"]
+            OP["slurm-elastic-operator<br/>Deployment"]
+            EXP["slurm-exporter<br/>Deployment :9341"]
+            CPU["slurm-worker-cpu<br/>StatefulSet"]
+            R70["slurm-worker-gpu-rtx4070<br/>StatefulSet"]
+            R80["slurm-worker-gpu-rtx4080<br/>StatefulSet"]
+            DBD["slurmdbd<br/>Deployment :6819"]
+            SQL["mysql<br/>StatefulSet :3306"]
         end
+
         subgraph GO["gpu-operator namespace"]
-            DP[nvidia-device-plugin\nDaemonSet]
-            MPS[nvidia-device-plugin-\nmps-control-daemon\nDaemonSet]
-            NFD[NFD master/worker\n+ gpu-feature-discovery]
+            DP["nvidia-device-plugin<br/>DaemonSet"]
+            MPS["nvidia-device-plugin-mps-control-daemon<br/>DaemonSet"]
+            NFD["NFD master/worker<br/>+ gpu-feature-discovery"]
         end
+
         subgraph MON["monitoring namespace"]
-            PROM[prometheus :9090]
-            GRAF[grafana :3000]
-            AM[alertmanager :9093]
-            KSM[kube-state-metrics]
+            PROM["prometheus :9090"]
+            GRAF["grafana :3000"]
+            AM["alertmanager :9093"]
+            KSM["kube-state-metrics"]
         end
+
         subgraph NP["nfs-provisioner namespace"]
-            PROV[nfs-subdir-external-\nprovisioner]
+            PROV["nfs-subdir-external-provisioner"]
         end
     end
 
-    LOGIN -- sbatch/srun :6817 --> CTL
-    CTL -- step launch :6818 --> CPU
-    CTL -- step launch :6818 --> R70
-    OP -- HTTP :6820 --> CTL
-    OP -- patch replicas --> CPU
-    OP -- patch replicas --> R70
-    EXP -- HTTP :6820 --> CTL
-    PROM -- scrape --> EXP
-    PROM -- scrape --> OP
-    PROM -- scrape --> KSM
+    LOGIN -- "sbatch/srun :6817" --> CTL
+    CTL -- "step launch :6818" --> CPU
+    CTL -- "step launch :6818" --> R70
+
+    OP -- "HTTP :6820" --> CTL
+    OP -- "patch replicas" --> CPU
+    OP -- "patch replicas" --> R70
+
+    EXP -- "HTTP :6820" --> CTL
+    PROM -- "scrape" --> EXP
+    PROM -- "scrape" --> OP
+    PROM -- "scrape" --> KSM
+
     GRAF --> PROM
     PROM --> AM
 
     CTL -- "AccountingStorage :6819" --> DBD
     DBD -- ":3306" --> SQL
 
-    DP -- "advertise nvidia.com/gpu × 4" --> R70
+    DP -- "advertise nvidia.com/gpu x 4" --> R70
     MPS -- "manage MPS daemon" --> GPU0
     R70 -- "use GPU + MPS" --> GPU0
     NVDR --> GPU0
 
-    PROV -- NFS mount --> NFSH
+    PROV -- "NFS mount" --> NFSH
     PROV -- "dynamic PV (RWX)" --> CTL
     PROV -- "dynamic PV (RWX)" --> CPU
     PROV -- "dynamic PV (RWX)" --> R70
@@ -428,30 +435,33 @@ GPU Operator NFD 自動補：
 
 ```mermaid
 flowchart LR
-    HOST[Linux host\n/srv/nfs/k8s\nNFSv4 export]
+    HOST["Linux host<br/>/srv/nfs/k8s<br/>NFSv4 export"]
 
     subgraph NS_NP["nfs-provisioner ns"]
-        SA[ServiceAccount]
-        CR[ClusterRole + Binding\n(PV lifecycle, cluster-wide)]
-        ROLE[Role + Binding\n(leader lease)]
-        DEPL[Deployment\nnfs-subdir-external-provisioner]
+        SA["ServiceAccount"]
+        CR["ClusterRole + Binding<br/>PV lifecycle, cluster-wide"]
+        ROLE["Role + Binding<br/>leader lease"]
+        DEPL["Deployment<br/>nfs-subdir-external-provisioner"]
     end
 
-    SC[StorageClass\nslurm-shared-nfs\nReclaim=Retain\nBinding=Immediate]
+    SC["StorageClass<br/>slurm-shared-nfs<br/>Reclaim=Retain<br/>Binding=Immediate"]
 
     subgraph NS_S["slurm ns"]
-        PVC[PVC slurm-shared-rwx\n20Gi RWX]
-        CTL[/shared mount]
-        WORK[/shared mount]
-        LOG[/shared mount]
+        PVC["PVC slurm-shared-rwx<br/>20Gi RWX"]
+        CTL["/shared mount"]
+        WORK["/shared mount"]
+        LOG["/shared mount"]
     end
 
-    HOST <-- NFSv4 :2049 --> DEPL
+    HOST <-- "NFSv4 :2049" --> DEPL
+
     SA --> CR
     SA --> ROLE
+
     DEPL -- "watch PVC" --> SC
-    SC -- "dynamic provision" --> PV[(PersistentVolume)]
-    PV -- bound --> PVC
+    SC -- "dynamic provision" --> PV["PersistentVolume"]
+    PV -- "bound" --> PVC
+
     PVC --> CTL
     PVC --> WORK
     PVC --> LOG
@@ -491,25 +501,29 @@ chart `templates/monitoring/`（gated by `monitoring.enabled=true`）。
 ```mermaid
 flowchart LR
     subgraph M["monitoring ns"]
-        PROM[prometheus :9090\n+ alert rules ConfigMap]
-        AM[alertmanager :9093\n+ slack receiver (optional)]
-        GRAF[grafana :3000\n+ datasource + 3 dashboards]
-        KSM[kube-state-metrics :8080]
-    end
-    subgraph S["slurm ns"]
-        EXP[slurm-exporter :9341]
-        OP[slurm-elastic-operator :8000]
-    end
-    subgraph CTL["slurm-controller pod"]
-        REST[slurmrestd :6820]
+        PROM["prometheus :9090<br/>+ alert rules ConfigMap"]
+        AM["alertmanager :9093<br/>+ slack receiver optional"]
+        GRAF["grafana :3000<br/>+ datasource + 3 dashboards"]
+        KSM["kube-state-metrics :8080"]
     end
 
-    EXP -- "JWT-auth GET\n/slurm/v0.0.37/jobs,nodes" --> REST
-    PROM -- scrape :9341 --> EXP
-    PROM -- scrape :8000 --> OP
-    PROM -- scrape :8080 --> KSM
-    PROM -- alerts --> AM
-    GRAF -- query --> PROM
+    subgraph S["slurm ns"]
+        EXP["slurm-exporter :9341"]
+        OP["slurm-elastic-operator :8000"]
+    end
+
+    subgraph CTL["slurm-controller pod"]
+        REST["slurmrestd :6820"]
+    end
+
+    EXP -- "JWT-auth GET<br/>/slurm/v0.0.37/jobs,nodes" --> REST
+
+    PROM -- "scrape :9341" --> EXP
+    PROM -- "scrape :8000" --> OP
+    PROM -- "scrape :8080" --> KSM
+
+    PROM -- "alerts" --> AM
+    GRAF -- "query" --> PROM
 ```
 
 | 物件 | Kind | 說明 |
