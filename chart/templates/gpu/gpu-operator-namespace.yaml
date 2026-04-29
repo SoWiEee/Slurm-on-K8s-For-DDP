@@ -16,6 +16,10 @@ helm.sh/resource-policy=keep prevents `helm uninstall slurm-platform`
 from deleting the namespace, which would also delete gpu-operator's
 DaemonSets, ConfigMaps, and CRD instances. The two helm releases own
 disjoint resources within this namespace.
+
+Rendered as a regular release resource (not a hook) — see namespace.yaml
+comment for why hooks here are dangerous (default `before-hook-creation`
+delete policy cascade-deletes everything in the namespace).
 */}}
 apiVersion: v1
 kind: Namespace
@@ -27,7 +31,5 @@ metadata:
     pod-security.kubernetes.io/audit: {{ .Values.gpu.targetNamespacePodSecurity }}
     pod-security.kubernetes.io/warn: {{ .Values.gpu.targetNamespacePodSecurity }}
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-5"
     "helm.sh/resource-policy": keep
 {{- end }}

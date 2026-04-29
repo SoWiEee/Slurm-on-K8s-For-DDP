@@ -142,6 +142,10 @@ spec:
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
+            {{- if and $.Values.storage.enabled $.Values.storage.mountInPods }}
+            - name: shared
+              mountPath: /shared
+            {{- end }}
       volumes:
         - name: slurm-config-static
           configMap:
@@ -164,6 +168,11 @@ spec:
                       path: id_ed25519
                     - key: id_ed25519.pub
                       path: id_ed25519.pub
+        {{- if and $.Values.storage.enabled $.Values.storage.mountInPods }}
+        - name: shared
+          persistentVolumeClaim:
+            claimName: {{ $.Values.storage.sharedPvc.name }}
+        {{- end }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

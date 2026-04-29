@@ -112,6 +112,10 @@ spec:
               readOnly: true
             - name: ctld-state
               mountPath: /var/spool/slurmctld
+            {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
+            - name: shared
+              mountPath: /shared
+            {{- end }}
       volumes:
         - name: slurm-config-static
           configMap:
@@ -142,6 +146,11 @@ spec:
         - name: ctld-state
           persistentVolumeClaim:
             claimName: slurm-ctld-state
+        {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
+        - name: shared
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.sharedPvc.name }}
+        {{- end }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

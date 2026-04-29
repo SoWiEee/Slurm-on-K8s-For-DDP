@@ -88,8 +88,10 @@ helm_args=(
   --set migManager.enabled=false
   --set nodeStatusExporter.enabled=false
   # Validator's CUDA workload is useful as a smoke test; leave on by default.
-  --set 'validator.plugin.env[0].name=WITH_WORKLOAD'
-  --set 'validator.plugin.env[0].value=true'
+  # ClusterPolicy CRD requires env values to be strings, so use --set-string
+  # (helm parses bare `true` as a YAML boolean otherwise).
+  --set-string 'validator.plugin.env[0].name=WITH_WORKLOAD'
+  --set-string 'validator.plugin.env[0].value=true'
 )
 [[ -n "$DRY_RUN" ]] && helm_args+=(--dry-run)
 

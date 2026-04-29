@@ -11,7 +11,7 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: gpu-operator namespace has PSS=privileged + helm hook annotations
+  - it: gpu-operator namespace has PSS=privileged + resource-policy keep
     template: gpu/gpu-operator-namespace.yaml
     set:
       gpu.enabled: true
@@ -20,11 +20,11 @@ tests:
           path: metadata.labels["pod-security.kubernetes.io/enforce"]
           value: privileged
       - equal:
-          path: metadata.annotations["helm.sh/hook"]
-          value: "pre-install,pre-upgrade"
-      - equal:
           path: metadata.annotations["helm.sh/resource-policy"]
           value: keep
+      # NOT a hook (would cascade-delete on upgrade); see namespace.yaml comment.
+      - notExists:
+          path: metadata.annotations["helm.sh/hook"]
 
   - it: device-plugin-config lives in gpu-operator namespace, has rtx4070-mps replicas=4
     template: gpu/device-plugin-config.yaml

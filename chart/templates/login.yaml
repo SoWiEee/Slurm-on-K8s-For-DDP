@@ -112,6 +112,10 @@ spec:
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
               readOnly: true
+            {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
+            - name: shared
+              mountPath: /shared
+            {{- end }}
       volumes:
         - name: slurm-config-static
           configMap:
@@ -137,6 +141,11 @@ spec:
         - name: slurm-ddp-runtime
           configMap:
             name: slurm-ddp-runtime
+        {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
+        - name: shared
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.sharedPvc.name }}
+        {{- end }}
             defaultMode: 0755
             optional: true
 ---

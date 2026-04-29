@@ -262,6 +262,11 @@ monitoring:
 # bootstrap paths).
 storage:
   enabled: false
+  # When true, controller / workers / login mount the shared PVC at /shared.
+  # Off by default in `values.yaml` so storage.enabled=true is composable
+  # without forcing every Slurm pod to depend on NFS reachability.
+  # Override per environment (k3s overlay sets this to true).
+  mountInPods: false
   nfsServer: ""                                    # required when enabled=true
   nfsPath: /srv/nfs/k8s
   provisionerNamespace: nfs-provisioner

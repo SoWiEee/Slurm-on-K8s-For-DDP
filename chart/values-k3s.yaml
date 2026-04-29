@@ -29,6 +29,7 @@ gpu:
 # stable.
 storage:
   enabled: true
+  mountInPods: true                  # /shared on controller/workers/login
   nfsServer: 192.168.0.111
   nfsPath: /srv/nfs/k8s
 

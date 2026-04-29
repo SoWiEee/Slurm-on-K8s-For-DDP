@@ -5,11 +5,17 @@ Worker pods that need NVIDIA runtime / hostIPC etc. require at least
 `baseline`. `restricted` would block runtimeClassName=nvidia and is too
 strict for HPC workloads; `privileged` is loose. Default `baseline`.
 
-helm.sh/hook=pre-install,pre-upgrade plus hook-weight=-10 ensures the
-namespace exists before any other resource targeted at it. We skip Helm's
-own release tracking on the namespace (helm.sh/resource-policy=keep) so
-`helm uninstall` does not nuke shared NFS provisioner / monitoring add-ons
-that may have been deployed alongside this chart.
+The namespace is rendered as a regular release resource (not a hook).
+We tried `helm.sh/hook=pre-install,pre-upgrade` previously, but the
+default hook delete policy (`before-hook-creation`) caused helm to delete
+the namespace before recreating it on every upgrade — cascade-deleting
+every secret, PVC, and pre-existing add-on inside it. `--create-namespace`
+on `helm install` is enough; a pre-existing namespace is adopted by Helm
+only with `--take-ownership` (Helm 3.16+).
+
+helm.sh/resource-policy=keep prevents `helm uninstall` from nuking the
+namespace and any out-of-release resources (mysql + slurmdbd accounting,
+lmod modulefile ConfigMaps, etc.) that were applied alongside the chart.
 */}}
 apiVersion: v1
 kind: Namespace
@@ -21,6 +27,4 @@ metadata:
     pod-security.kubernetes.io/audit: {{ .Values.cluster.podSecurity }}
     pod-security.kubernetes.io/warn: {{ .Values.cluster.podSecurity }}
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-10"
     "helm.sh/resource-policy": keep
