@@ -197,6 +197,126 @@ if [[ -n "${RENDERS[values-k3s.yaml]:-}" ]]; then
     grep -q '"helm.sh/hook": post-install' "$WORKDIR/job-labeler.yaml" \
       || fail "gpu-labeler Job missing helm.sh/hook=post-install"
   fi
+
+  # ----- Stage E checks: monitoring + storage --------------------------------
+  if extract_resource "$k3s_render" Namespace monitoring \
+      > "$WORKDIR/ns-mon.yaml" && [[ -s "$WORKDIR/ns-mon.yaml" ]]; then
+    log "spot-check: monitoring Namespace has kubernetes.io/metadata.name label"
+    grep -q 'kubernetes.io/metadata.name: monitoring' "$WORKDIR/ns-mon.yaml" \
+      || fail "monitoring Namespace missing kubernetes.io/metadata.name label (cross-ns NetworkPolicy depends on it)"
+
+    log "spot-check: prometheus scrapes operator + slurm-exporter + kube-state-metrics"
+    extract_resource "$k3s_render" ConfigMap prometheus-config \
+      > "$WORKDIR/cm-prom.yaml"
+    grep -q 'job_name: slurm-exporter' "$WORKDIR/cm-prom.yaml" \
+      || fail "prometheus-config missing slurm-exporter scrape job"
+    grep -q 'job_name: slurm-operator' "$WORKDIR/cm-prom.yaml" \
+      || fail "prometheus-config missing slurm-operator scrape job"
+    grep -q 'job_name: kube-state-metrics' "$WORKDIR/cm-prom.yaml" \
+      || fail "prometheus-config missing kube-state-metrics scrape job"
+
+    log "spot-check: prometheus alertmanager target points at monitoring namespace"
+    grep -q "alertmanager.monitoring.svc.cluster.local:9093" "$WORKDIR/cm-prom.yaml" \
+      || fail "prometheus-config alertmanager target not in monitoring namespace"
+
+    log "spot-check: prometheus-alert-rules preserves Prometheus templating syntax"
+    extract_resource "$k3s_render" ConfigMap prometheus-alert-rules \
+      > "$WORKDIR/cm-prom-rules.yaml"
+    # The {{ "{{ $value }}" }} escape must produce literal {{ $value }} in output
+    grep -q '{{ \$value | printf' "$WORKDIR/cm-prom-rules.yaml" \
+      || fail "prometheus-alert-rules lost Go template escape (Prometheus needs literal {{ \$value }})"
+
+    log "spot-check: alertmanager defaults to dev-null receiver"
+    extract_resource "$k3s_render" ConfigMap alertmanager-config \
+      > "$WORKDIR/cm-am.yaml"
+    grep -q 'receiver: dev-null' "$WORKDIR/cm-am.yaml" \
+      || fail "alertmanager-config missing dev-null receiver (default)"
+    if grep -q 'slack_configs:' "$WORKDIR/cm-am.yaml"; then
+      fail "alertmanager-config has slack receiver but webhookUrl is unset (k3s overlay)"
+    fi
+
+    log "spot-check: grafana datasource points at monitoring/prometheus"
+    extract_resource "$k3s_render" ConfigMap grafana-provisioning \
+      > "$WORKDIR/cm-graf-prov.yaml"
+    grep -q "url: http://prometheus.monitoring.svc.cluster.local:9090" "$WORKDIR/cm-graf-prov.yaml" \
+      || fail "grafana-provisioning datasource URL wrong"
+
+    log "spot-check: grafana-dashboards ConfigMap loaded all 3 dashboards"
+    extract_resource "$k3s_render" ConfigMap grafana-dashboards \
+      > "$WORKDIR/cm-graf-dash.yaml"
+    for d in bridge-overview operator sla-efficiency; do
+      grep -qE "^  ${d}\\.json: \\|" "$WORKDIR/cm-graf-dash.yaml" \
+        || fail "grafana-dashboards missing ${d}.json"
+    done
+
+    log "spot-check: slurm-exporter Deployment lives in slurm namespace + mounts JWT"
+    extract_resource "$k3s_render" Deployment slurm-exporter \
+      > "$WORKDIR/dep-exporter.yaml"
+    grep -q 'namespace: slurm' "$WORKDIR/dep-exporter.yaml" \
+      || fail "slurm-exporter Deployment not in slurm namespace"
+    grep -q 'secretName: slurm-jwt-secret' "$WORKDIR/dep-exporter.yaml" \
+      || fail "slurm-exporter missing slurm-jwt-secret volume"
+
+    log "spot-check: kube-state-metrics ClusterRole limited to slurm-relevant resources"
+    extract_resource "$k3s_render" ClusterRole slurm-platform-kube-state-metrics \
+      > "$WORKDIR/cr-ksm.yaml"
+    [[ -s "$WORKDIR/cr-ksm.yaml" ]] \
+      || fail "kube-state-metrics ClusterRole not rendered"
+
+    log "spot-check: NetworkPolicy allow-prometheus-scrape-{operator,exporter} present"
+    for p in allow-prometheus-scrape-operator allow-prometheus-scrape-exporter; do
+      extract_resource "$k3s_render" NetworkPolicy "$p" > "$WORKDIR/np-${p}.yaml"
+      [[ -s "$WORKDIR/np-${p}.yaml" ]] \
+        || fail "NetworkPolicy $p missing (monitoring scrape blocked by default-deny)"
+      grep -q 'kubernetes.io/metadata.name: monitoring' "$WORKDIR/np-${p}.yaml" \
+        || fail "NetworkPolicy $p doesn't allow ingress from monitoring namespace"
+    done
+
+    log "spot-check: NetworkPolicy allow-slurm-exporter-egress reaches controller:6820"
+    extract_resource "$k3s_render" NetworkPolicy allow-slurm-exporter-egress \
+      > "$WORKDIR/np-exporter-egress.yaml"
+    grep -q 'app: slurm-controller' "$WORKDIR/np-exporter-egress.yaml" \
+      || fail "slurm-exporter egress missing slurm-controller target"
+    grep -q 'port: 6820' "$WORKDIR/np-exporter-egress.yaml" \
+      || fail "slurm-exporter egress missing port 6820"
+  fi
+
+  if extract_resource "$k3s_render" StorageClass slurm-shared-nfs \
+      > "$WORKDIR/sc-nfs.yaml" && [[ -s "$WORKDIR/sc-nfs.yaml" ]]; then
+    log "spot-check: slurm-shared-nfs StorageClass uses nfs-subdir provisioner + Retain"
+    grep -q 'reclaimPolicy: Retain' "$WORKDIR/sc-nfs.yaml" \
+      || fail "StorageClass slurm-shared-nfs reclaimPolicy != Retain"
+    grep -q 'provisioner: k8s-sigs.io/slurm-nfs-subdir-external-provisioner' "$WORKDIR/sc-nfs.yaml" \
+      || fail "StorageClass slurm-shared-nfs has wrong provisioner name (must match legacy bootstrap-storage.sh)"
+    grep -q '"helm.sh/resource-policy": keep' "$WORKDIR/sc-nfs.yaml" \
+      || fail "StorageClass slurm-shared-nfs missing helm.sh/resource-policy=keep"
+
+    log "spot-check: slurm-shared-rwx PVC in slurm namespace, RWX, references SC"
+    extract_resource "$k3s_render" PersistentVolumeClaim slurm-shared-rwx \
+      > "$WORKDIR/pvc-shared.yaml"
+    grep -q 'namespace: slurm' "$WORKDIR/pvc-shared.yaml" \
+      || fail "slurm-shared-rwx PVC not in slurm namespace"
+    grep -q 'ReadWriteMany' "$WORKDIR/pvc-shared.yaml" \
+      || fail "slurm-shared-rwx PVC not RWX"
+    grep -q 'storageClassName: slurm-shared-nfs' "$WORKDIR/pvc-shared.yaml" \
+      || fail "slurm-shared-rwx PVC references wrong StorageClass"
+
+    log "spot-check: nfs-provisioner Deployment uses NFS_SERVER + NFS_PATH from values"
+    extract_resource "$k3s_render" Deployment nfs-subdir-external-provisioner \
+      > "$WORKDIR/dep-nfs.yaml"
+    grep -q 'value: "192.168.0.111"' "$WORKDIR/dep-nfs.yaml" \
+      || fail "nfs-provisioner not parameterized with values-k3s.yaml NFS_SERVER"
+    grep -q 'value: "/srv/nfs/k8s"' "$WORKDIR/dep-nfs.yaml" \
+      || fail "nfs-provisioner not parameterized with values-k3s.yaml NFS_PATH"
+
+    log "spot-check: storage.enabled=true without nfsServer must fail fast"
+    if helm template slurm-platform "$CHART_DIR" --set storage.enabled=true -n "$NAMESPACE" \
+        > "$WORKDIR/render-bad-storage.yaml" 2> "$WORKDIR/render-bad-storage.err"; then
+      fail "expected helm template to fail when storage.enabled=true without nfsServer"
+    fi
+    grep -q 'requires storage.nfsServer to be set' "$WORKDIR/render-bad-storage.err" \
+      || fail "storage guard message not raised on missing nfsServer"
+  fi
 fi
 
 # Extract the content of a `<key>: |` block from a YAML stream, stripping the

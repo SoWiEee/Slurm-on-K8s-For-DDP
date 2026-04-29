@@ -220,19 +220,64 @@ networkPolicy:
   apiServerPorts: [443, 6443]                      # both Kind (443) and k3s (6443)
 
 # -- Monitoring add-on (Stage E) ---------------------------------------------
+# Enabled in values-k3s.yaml. The monitoring stack (Prometheus / Alertmanager /
+# Grafana / kube-state-metrics) lives in its own namespace; slurm-exporter
+# lives in cluster.namespace (it talks to slurmrestd over JWT).
+#
+# Cross-namespace scrape paths are opened automatically by network-policy.yaml
+# when both monitoring.enabled and networkPolicy.enabled are true.
 monitoring:
   enabled: false
-  grafana:
-    adminPassword: admin
+  namespace: monitoring
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    scrapeIntervalSeconds: 15
   alertmanager:
+    image: prom/alertmanager:v0.27.0
+    # When `slack.webhookUrl` is set, the Alertmanager template wires a
+    # slack receiver in place of the default `dev-null`. Leave empty to
+    # match the legacy manifest's silent routing.
     slack:
       webhookUrl: ""
+      channel: "#slurm-alerts"
+  grafana:
+    image: grafana/grafana:10.4.2
+    adminPassword: admin
+  kubeStateMetrics:
+    image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.12.0
+  slurmExporter:
+    image: slurm-exporter:latest
+    pullPolicy: IfNotPresent
+    restUrl: ""                                    # defaults to slurm-restapi.<ns>.svc:6820
+    restApiVersion: v0.0.37
+    scrapeIntervalSeconds: 15
 
 # -- Shared storage add-on (Stage E) -----------------------------------------
+# Deploys the NFS subdir external provisioner (in its own namespace) and a
+# StorageClass + RWX PVC named `slurm-shared-rwx` in cluster.namespace. The
+# core Slurm controller/worker StatefulSets do NOT mount this PVC by default
+# in the chart yet (parity with manifests/core/slurm-static.yaml requires
+# explicit opt-in via a future `slurm.sharedStorage.mount: true` flag — left
+# for Stage F so /shared mount stays consistent across both Helm and legacy
+# bootstrap paths).
 storage:
   enabled: false
-  nfsServer: ""
-  nfsPath: /shared
+  nfsServer: ""                                    # required when enabled=true
+  nfsPath: /srv/nfs/k8s
+  provisionerNamespace: nfs-provisioner
+  storageClassName: slurm-shared-nfs
+  # Provisioner identifier baked into the StorageClass + Deployment env. Must
+  # match an EXISTING cluster's value when re-installing on top of a legacy
+  # bootstrap-storage.sh deploy — provisioner names are immutable on
+  # StorageClass, so changing this would force a teardown of all PVs/PVCs.
+  provisionerName: k8s-sigs.io/slurm-nfs-subdir-external-provisioner
+  sharedPvc:
+    name: slurm-shared-rwx
+    size: 20Gi
+    accessMode: ReadWriteMany
+  provisioner:
+    image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+    pullPolicy: IfNotPresent
 
 # -- Pre-existing secrets (created by scripts/create-secrets.sh, not by chart)
 secrets:

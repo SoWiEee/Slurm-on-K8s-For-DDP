@@ -1,0 +1,248 @@
+{{- if .Values.monitoring.enabled -}}
+{{/*
+Prometheus — scrapes slurm-exporter (queue/scheduler metrics), the elastic
+operator (scale events, poll latency), and kube-state-metrics. Alert rules
+live in their own ConfigMap (mounted at /etc/prometheus/rules/) so we can
+roll them without restarting the Prometheus pod (--web.enable-lifecycle
+gives us POST /-/reload, but for now we just rely on the kubelet to remount
+ConfigMap volumes).
+
+Scrape targets reference cluster.namespace by name, so the same alert
+rules port to a non-default namespace by changing values.yaml only.
+*/}}
+{{- $mNs := .Values.monitoring.namespace -}}
+{{- $sNs := .Values.cluster.namespace -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: {{ .Values.monitoring.prometheus.scrapeIntervalSeconds }}s
+      evaluation_interval: {{ .Values.monitoring.prometheus.scrapeIntervalSeconds }}s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager.{{ $mNs }}.svc.cluster.local:9093']
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      - job_name: slurm-exporter
+        static_configs:
+          - targets: ['slurm-exporter.{{ $sNs }}.svc.cluster.local:9341']
+      - job_name: slurm-operator
+        static_configs:
+          - targets: ['slurm-elastic-operator.{{ $sNs }}.svc.cluster.local:8000']
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: ['kube-state-metrics.{{ $mNs }}.svc.cluster.local:8080']
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-alert-rules
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  slurm-slo.yml: |
+    groups:
+      - name: slurm.slo
+        rules:
+          - alert: ProvisioningLatencyHigh
+            expr: >
+              histogram_quantile(0.95,
+                sum(rate(slurm_operator_provisioning_latency_seconds_bucket[10m])) by (le)
+              ) > 180
+            for: 5m
+            labels:
+              severity: warning
+              component: operator
+            annotations:
+              summary: "Scale-up provisioning p95 > 3 minutes"
+              description: >
+                Pods are taking {{ "{{ $value | printf \"%.0f\" }}" }}s (p95) to become Ready after a
+                scale-up. Check for image pull delays or node resource pressure.
+              runbook: "kubectl -n {{ $sNs }} get pods -o wide"
+
+          - alert: QueueWaitTooLong
+            expr: slurm_job_queue_oldest_wait_seconds > 300
+            for: 2m
+            labels:
+              severity: critical
+              component: slurm
+            annotations:
+              summary: "Slurm job has been PENDING for > 5 minutes"
+              description: >
+                The oldest PENDING job has been queued for {{ "{{ $value | printf \"%.0f\" }}" }}s.
+                The autoscaler may have hit maxReplicas or scale-up is silently failing.
+              runbook: "kubectl -n {{ $sNs }} logs deployment/slurm-elastic-operator | grep scale_skipped"
+
+          - alert: ClusterOverProvisioned
+            expr: >
+              slurm_nodes_alloc / clamp_min(slurm_nodes_total, 1) < 0.15
+              and slurm_nodes_total > 1
+            for: 10m
+            labels:
+              severity: info
+              component: slurm
+            annotations:
+              summary: "Cluster utilisation below 15% for 10 minutes"
+              description: >
+                Only {{ "{{ $value | humanizePercentage }}" }} of nodes are running jobs.
+                Consider lowering maxReplicas or the scale-down cooldown period.
+
+          - alert: OperatorPollSlow
+            expr: >
+              histogram_quantile(0.95,
+                rate(slurm_operator_poll_duration_seconds_bucket[5m])
+              ) > 10
+            for: 5m
+            labels:
+              severity: warning
+              component: operator
+            annotations:
+              summary: "Operator poll loop p95 > 10s"
+              description: >
+                The operator loop is taking {{ "{{ $value | printf \"%.1f\" }}" }}s (p95).
+                Scaling reactions will be delayed. Likely cause: slurmctld busy or kubectl exec timeout.
+              runbook: "kubectl -n {{ $sNs }} logs deployment/slurm-elastic-operator | python3 -m json.tool | grep error"
+
+          - alert: SlurmExporterDown
+            expr: slurm_exporter_scrape_success == 0
+            for: 1m
+            labels:
+              severity: critical
+              component: monitoring
+            annotations:
+              summary: "slurm-exporter cannot reach slurmrestd"
+              description: >
+                Slurm metrics have been unavailable for at least 1 minute.
+                All queue/node panels will show stale or zero values.
+              runbook: "kubectl -n {{ $sNs }} logs deployment/slurm-exporter --tail=50"
+
+          - alert: ScalingFlapping
+            expr: >
+              (sum(increase(slurm_operator_scale_up_total[10m]))
+               + sum(increase(slurm_operator_scale_down_total[10m]))) > 8
+            for: 0m
+            labels:
+              severity: warning
+              component: operator
+            annotations:
+              summary: "Autoscaler flapping (> 8 scale events in 10m)"
+              description: >
+                Rapid alternating scale-up/down suggests the cooldown period or step sizes
+                need tuning. Review SCALE_DOWN_COOLDOWN_SECONDS and scale step configuration.
+
+          - alert: WorkerPodsStuck
+            expr: >
+              sum(slurm_operator_pods_ready) / clamp_min(sum(slurm_operator_current_replicas), 1) < 0.5
+              and sum(slurm_operator_current_replicas) > 1
+            for: 5m
+            labels:
+              severity: warning
+              component: k8s
+            annotations:
+              summary: "Less than 50% of worker pods are Ready"
+              description: >
+                Only {{ "{{ $value | humanizePercentage }}" }} of provisioned worker pods are Ready
+                for 5 minutes. Likely a container crash loop or resource exhaustion.
+              runbook: "kubectl -n {{ $sNs }} get pods -o wide"
+
+          - alert: SlurmSchedulerSlow
+            expr: slurm_scheduler_cycle_last_seconds > 5
+            for: 3m
+            labels:
+              severity: warning
+              component: slurm
+            annotations:
+              summary: "Slurm scheduler cycle > 5 seconds"
+              description: >
+                The last Slurm scheduler cycle took {{ "{{ $value | printf \"%.1f\" }}" }}s.
+                This may cause job dispatch delays. Check slurmctld logs for contention.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: {{ .Values.monitoring.prometheus.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --web.console.libraries=/usr/share/prometheus/console_libraries
+            - --web.console.templates=/usr/share/prometheus/consoles
+            - --web.enable-lifecycle
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: prometheus-config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+            - name: alert-rules
+              mountPath: /etc/prometheus/rules/
+      volumes:
+        - name: prometheus-config
+          configMap:
+            name: prometheus-config
+        - name: alert-rules
+          configMap:
+            name: prometheus-alert-rules
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: {{ $mNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+{{- end }}

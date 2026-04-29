@@ -335,6 +335,8 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 
 ## 5-A：Helm Chart 封裝
 
+> **修訂版 4（2026-04-29，Stage E 完成）：** monitoring + storage 進 chart，`enabled` flag 控制。Monitoring stack（Prometheus / Alertmanager / Grafana / kube-state-metrics + slurm-exporter）拆到 `templates/monitoring/`；Grafana dashboards 從 `chart/dashboards/*.json` 用 `Files.Glob.AsConfig` 灌進 ConfigMap。Storage stack（NFS subdir external provisioner + StorageClass + RWX PVC）放在 `templates/storage.yaml`，`storage.enabled=true` 但缺 `nfsServer` 直接 `fail` 終止 render；`storageClassName` 與 `provisionerName` 跟 legacy `manifests/storage/*.yaml` 完全一致（provisioner 名 `k8s-sigs.io/slurm-nfs-subdir-external-provisioner` 是 immutable，必須對齊現有 cluster）。Cross-namespace 流量由 `network-policy.yaml` 在 `monitoring.enabled=true` 時額外加三條：`allow-prometheus-scrape-operator`、`allow-prometheus-scrape-exporter`、`allow-slurm-exporter-egress`。verify-helm.sh 加 14 條 Stage E spot-checks；k3s 1.34 server-side dry-run validate 75 個 resources（default 38 個）全綠。
+>
 > **修訂版 3（2026-04-28，Stage D 中）：** 嘗試把 `gpu-operator` 加成 chart dependency 後發現它把所有 DaemonSet hardcode 在 `Release.Namespace`（沒有 namespaceOverride 機制），且需要該 namespace PSS=`privileged` 才能 mount hostPath（`/dev/nvidia*`、`/run/nvidia/mps`、driver libs）。我們的 slurm namespace 走 PSS=`baseline`（NetworkPolicy + secret projection 都依賴此），兩者放同一個 namespace 不乾淨——dropping 到 privileged 會放鬆 slurm pod 的整體安全姿態。
 >
 > **改採分離安裝**：`gpu-operator` 不再是 subchart，由 `scripts/install-gpu-operator.sh` 獨立 `helm install` 到自己的 `gpu-operator` namespace（PSS=privileged）。本 chart 只負責放 `device-plugin-config` ConfigMap 進該 namespace + cluster-wide 的 node-labeler Job。`Chart.yaml` 移除 dependencies block；`charts/`、`Chart.lock`、`*.tgz` 都不進 git。部署流程從「一條 helm install」變成「一條 setup-linux-gpu.sh + 一條 install-gpu-operator.sh + 一條 helm install slurm-platform」。

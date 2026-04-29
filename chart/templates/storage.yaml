@@ -1,0 +1,189 @@
+{{- if .Values.storage.enabled -}}
+{{- if not .Values.storage.nfsServer -}}
+{{- fail "storage.enabled=true requires storage.nfsServer to be set (e.g. -f values-k3s.yaml)" -}}
+{{- end -}}
+{{/*
+NFS subdir external provisioner + RWX shared PVC.
+
+Direct port of manifests/storage/nfs-subdir-provisioner.tmpl.yaml +
+shared-storage.yaml. The provisioner Deployment is namespaced
+(.Values.storage.provisionerNamespace, default `nfs-provisioner`); the
+StorageClass is cluster-scoped; the PVC lives in cluster.namespace so the
+core Slurm pods can mount it once Stage F wires that up.
+
+Why a separate namespace: the provisioner needs an emptyDir-like host
+mount for the NFS root, but we want PSS=baseline on cluster.namespace —
+matching the legacy bootstrap-storage.sh layout keeps audit posture
+unchanged after the migration.
+
+helm.sh/resource-policy=keep on the StorageClass prevents `helm
+uninstall` from yanking the StorageClass while PVCs still reference it
+(reclaim policy is Retain anyway, but losing the SC blocks new binds
+during a re-install).
+*/}}
+{{- $ns := .Values.cluster.namespace -}}
+{{- $sNs := .Values.storage.provisionerNamespace -}}
+{{- $sc := .Values.storage.storageClassName -}}
+{{- $provisionerName := .Values.storage.provisionerName -}}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-subdir-external-provisioner
+  namespace: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-nfs-subdir-runner
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes", "persistentvolumeclaims", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-nfs-subdir-runner
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: nfs-subdir-external-provisioner
+    namespace: {{ $sNs }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Name }}-nfs-subdir-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leader-locking-nfs-subdir-external-provisioner
+  namespace: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leader-locking-nfs-subdir-external-provisioner
+  namespace: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: nfs-subdir-external-provisioner
+    namespace: {{ $sNs }}
+roleRef:
+  kind: Role
+  name: leader-locking-nfs-subdir-external-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-subdir-external-provisioner
+  namespace: {{ $sNs }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: nfs-subdir-external-provisioner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nfs-subdir-external-provisioner
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: nfs-subdir-external-provisioner
+    spec:
+      serviceAccountName: nfs-subdir-external-provisioner
+      containers:
+        - name: nfs-subdir-external-provisioner
+          image: {{ .Values.storage.provisioner.image }}
+          imagePullPolicy: {{ .Values.storage.provisioner.pullPolicy }}
+          env:
+            - name: PROVISIONER_NAME
+              value: {{ $provisionerName }}
+            - name: NFS_SERVER
+              value: {{ .Values.storage.nfsServer | quote }}
+            - name: NFS_PATH
+              value: {{ .Values.storage.nfsPath | quote }}
+          volumeMounts:
+            - name: nfs-client-root
+              mountPath: /persistentvolumes
+      volumes:
+        - name: nfs-client-root
+          nfs:
+            server: {{ .Values.storage.nfsServer | quote }}
+            path: {{ .Values.storage.nfsPath | quote }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ $sc }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+provisioner: {{ $provisionerName }}
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+parameters:
+  archiveOnDelete: "false"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.storage.sharedPvc.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.storage.sharedPvc.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.sharedPvc.size }}
+  storageClassName: {{ $sc }}
+{{- end }}

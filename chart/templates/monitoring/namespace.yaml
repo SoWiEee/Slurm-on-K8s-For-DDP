@@ -1,0 +1,17 @@
+{{- if .Values.monitoring.enabled -}}
+{{/*
+monitoring namespace.
+
+`kubernetes.io/metadata.name=<ns>` is set automatically by the API server,
+but we set it explicitly so older policies (and the slurm-namespace
+NetworkPolicies in network-policy.yaml that scrape across namespaces) can
+target it without ambiguity.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.monitoring.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+{{- end }}
