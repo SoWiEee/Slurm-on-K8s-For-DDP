@@ -29,13 +29,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install helm v3.16
+      - name: Install helm v3.18
         uses: azure/setup-helm@v4
         with:
-          version: v3.16.4
+          # Pinned to v3.18.x: helm-unittest plugin.yaml uses the `platformHooks`
+          # field (introduced upstream around plugin v0.7), which only loads on
+          # helm >= 3.17. Older helm errors with `unknown field "platformHooks"`.
+          version: v3.18.4
 
       - name: Install helm-unittest plugin
-        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+        # Pin plugin version too — keeps CI deterministic across runs and decouples
+        # us from upstream releasing a plugin that requires an even newer helm.
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version 1.0.3
 
       - name: helm lint (default + overlays)
         run: |
@@ -75,13 +80,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install helm v3.16
+      - name: Install helm v3.18
         uses: azure/setup-helm@v4
         with:
-          version: v3.16.4
+          version: v3.18.4
 
       - name: Install helm-unittest plugin
-        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version 1.0.3
 
       - name: Create ephemeral Kind cluster
         uses: helm/kind-action@v1
