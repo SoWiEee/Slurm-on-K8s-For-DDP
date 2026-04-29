@@ -141,13 +141,13 @@ spec:
         - name: slurm-ddp-runtime
           configMap:
             name: slurm-ddp-runtime
+            defaultMode: 0755
+            optional: true
         {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
         - name: shared
           persistentVolumeClaim:
             claimName: {{ .Values.storage.sharedPvc.name }}
         {{- end }}
-            defaultMode: 0755
-            optional: true
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
