@@ -1,0 +1,62 @@
+suite: worker StatefulSets
+templates:
+  - workers.yaml
+tests:
+  - it: GPU pool gets nvidia runtimeClass + nvidia.com/gpu on k3s
+    set:
+      cluster.runtime: k3s
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.runtimeClassName
+          pattern: "^nvidia$"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+      - matchRegex:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+          pattern: "^1$"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+
+  - it: GPU pool gets NO nvidia runtime on kind (cluster.runtime != k3s)
+    set:
+      cluster.runtime: kind
+    asserts:
+      - isNull:
+          path: spec.template.spec.runtimeClassName
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+
+  - it: CPU pool never has GPU resources regardless of runtime
+    set:
+      cluster.runtime: k3s
+    asserts:
+      - isNull:
+          path: spec.template.spec.runtimeClassName
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - isNull:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+
+  - it: workers do NOT mount the JWT secret (controller+operator only)
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: slurm-jwt-secret
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: slurm-jwt-secret
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070

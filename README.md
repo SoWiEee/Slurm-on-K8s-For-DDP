@@ -1,4 +1,4 @@
-# Slurm-on-K8s
+# Slurm-on-K8s For AI Platform
 
 把 HPC 排程器搬進 Kubernetes，打造一個可讓多位使用者共用 CPU + GPU 硬體資源的批次 AI 工作平台。
 
@@ -41,177 +41,160 @@
 
 # 🚀 Getting Started
 
-兩種部署路徑：
+從 Phase 5-A Stage F 起，部署統一走 Helm。基線在 `chart/values.yaml`（Kind dev / 無 GPU）；
+生產環境用 `chart/values-k3s.yaml` overlay（k3s + RTX4070 + RTX4080，已驗證）。
 
-| 路徑 | 環境 | GPU | 適用場景 |
-|------|------|-----|----------|
-| **[A] Linux + k3s](#a-linux--k3s--real-gpu-已驗證)** | Ubuntu 24.04 + k3s | 真實 NVIDIA GPU | 生產/驗證 |
-| **[B] Kind（本機模擬）](#b-kind-本機開發模擬)** | Windows/Mac + Docker Desktop | 無（排程邏輯驗證） | 本機開發 |
+| 路徑 | 環境 | GPU | 主要 overlay |
+|------|------|-----|--------------|
+| **[A] Linux + k3s](#a-linux--k3s--real-gpu)** | Ubuntu 24.04 + k3s v1.34 | NVIDIA RTX 4070/4080 | `chart/values-k3s.yaml` |
+| **[B] Kind（本機模擬）](#b-kind-本機開發模擬)** | Docker Desktop + kind | 無 | 預設 `values.yaml` |
 
-> **📦 Phase 5-A Helm chart 開發中。** `chart/` 目錄下的 `slurm-platform` chart 已涵蓋 namespace / PVC / services / ConfigMap / 控制器 + worker StatefulSets（Stage B）；operator、login、NetworkPolicy（Stage C）、GPU Operator dependency（Stage D）、監控與 NFS（Stage E）尚未完成。**目前完整、已驗證可用的部署方式仍是下方 `bootstrap.sh` 路徑**；待 Stage F 收尾時 `bootstrap.sh` 會被 `helm install` 取代，本節指令屆時整段重寫。要追蹤進度可看 [`docs/note.md §5-A`](docs/note.md) 或執行 `bash scripts/verify-helm.sh` 驗證目前 chart 的渲染輸出。
+> Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，獨立用 `scripts/install-gpu-operator.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
 
 ---
 
-## A. Linux + k3s + Real GPU（已驗證）
+## A. Linux + k3s + Real GPU
 
-> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 535
+> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 535/595（兩者皆通過）
 
 ### 步驟 1：主機準備
 
-安裝 NVIDIA Container Toolkit、k3s，並複製 kubeconfig：
+安裝 NVIDIA Container Toolkit + k3s + helm，並複製 kubeconfig：
 
 ```bash
 sudo bash scripts/setup-linux-gpu.sh
 export KUBECONFIG=~/.kube/config
-```
 
-確認 GPU 可見：
-
-```bash
 nvidia-smi
 kubectl get nodes
+helm version --short    # 需要 v3.16+
 ```
 
-### 步驟 2：部署 NVIDIA device plugin
+### 步驟 2：建置容器映像並匯入 k3s
 
 ```bash
-kubectl apply -f manifests/gpu/runtime-class.yaml
-kubectl apply -f manifests/gpu/nvidia-device-plugin.yaml
+docker build -t slurm-controller:latest         -f docker/controller/Dockerfile         docker/controller
+docker build -t slurm-worker:latest             -f docker/worker/Dockerfile             docker/worker
+docker build -t slurm-elastic-operator:latest   -f docker/operator/Dockerfile           .
+docker build -t slurm-exporter:latest           -f docker/slurm-exporter/Dockerfile     docker/slurm-exporter
 
-# 確認 GPU 資源出現（RTX 4070 time-slicing 4x → 顯示 4）
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+for img in slurm-controller:latest slurm-worker:latest slurm-elastic-operator:latest slurm-exporter:latest; do
+  docker save "$img" | sudo k3s ctr images import -
+done
 ```
 
-> **GPU sharing 策略**：目前 `nvidia-device-plugin.yaml` 使用 `rtx4070-timeslicing`（4 replica）。  
-> MPS config（`rtx4070-mps`）在 driver 535 + k3s 1.34 + Ubuntu 24.04 上 MPS daemon 無法啟動，  
-> 改用 `items[0].key: rtx4070-mps` 可切換（重 apply 即生效）。  
-> Time-slicing 下 `--gres=mps:25` 仍可投遞，`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25` 由 Slurm prolog 注入。
-
-### 步驟 3：部署核心 Slurm 叢集
+### 步驟 3：建立 secrets（munge / ssh / JWT）
 
 ```bash
-K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh
+bash scripts/create-secrets.sh        # 一次建好 slurm-munge-key / slurm-ssh-key / slurm-jwt-secret
 ```
 
-`bootstrap.sh` 自動完成：建置 controller/worker/operator image → 建立 Munge/SSH/JWT secret → 生成並套用 `slurm-static.yaml`（含 `gres.conf`、`slurm.conf`）→ 等待 rollout → 確認 slurmctld 可 ping。
+### 步驟 4：套用必要的 cluster-scoped 資源 + accounting 後端
 
-### 步驟 4：部署共享儲存（NFS）
+```bash
+kubectl apply -f manifests/gpu/runtime-class.yaml          # NVIDIA RuntimeClass（GPU pool 用）
+kubectl apply -f manifests/core/slurm-accounting.yaml      # mysql + slurmdbd（chart 之外的 prerequisite）
+```
 
-**4-A：主機 NFS Server（只需執行一次）**
+### 步驟 5：（可選）主機 NFS server + LAN exports
 
 ```bash
 sudo bash scripts/setup-nfs-server.sh
-```
-
-執行完後，確認 `/etc/exports` 涵蓋節點的 **LAN IP 段**（k3s 節點用主機物理 IP 掛載，不是 pod CIDR）：
-
-```bash
-cat /etc/exports
-# 正確範例（同時含 pod CIDR 和 LAN subnet）：
-# /srv/nfs/k8s 10.0.0.0/8(rw,...) 192.168.0.0/25(rw,sync,no_subtree_check,no_root_squash,insecure)
-```
-
-若只有 `10.0.0.0/8`，手動加上 LAN 段後重載：
-
-```bash
-# 查主機 LAN IP 段
-ip addr show | grep 'inet ' | grep -v 127
-# 補進 /etc/exports 後：
+cat /etc/exports                       # 必須含 pod CIDR (10.0.0.0/8) AND LAN subnet
 sudo exportfs -ra
-showmount -e localhost   # 確認兩個 rule 都出現
 ```
 
-**4-B：部署 NFS provisioner**
+### 步驟 6：`helm install` 部署整套平台
 
 ```bash
-# 查主機 LAN IP（k3s pod 可達的介面，通常是 enp5s0 / eth0）
-NODE_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet )\S+' | head -1 | cut -d/ -f1)
-echo "NFS_SERVER=$NODE_IP"
-
-KUBECONFIG=~/.kube/config \
-KUBE_CONTEXT=default \
-NFS_SERVER=$NODE_IP \
-NFS_PATH=/srv/nfs/k8s \
-  bash scripts/bootstrap-storage.sh
+helm install slurm-platform ./chart \
+  -f chart/values-k3s.yaml \
+  -n slurm \
+  --create-namespace
 ```
 
-### 步驟 5：驗證
+預設行為（k3s overlay）：
+
+- `gpu.enabled=true`：在 `gpu-operator` namespace 放 device-plugin-config ConfigMap + 跨節點 labeler Job
+- `monitoring.enabled=true`：Prometheus + Alertmanager + Grafana + kube-state-metrics + slurm-exporter（namespace `monitoring`）
+- `storage.enabled=true` + `nfsServer=192.168.0.111`：NFS subdir provisioner + StorageClass `slurm-shared-nfs` + 20Gi RWX PVC
+
+LAN IP 不一樣時用 `--set storage.nfsServer=<your-ip>` 覆寫。
+
+### 步驟 7：安裝 NVIDIA GPU Operator（提供 device-plugin DaemonSet）
 
 ```bash
-# 儲存（PVC Bound + 跨 pod 讀寫 + 多節點 sbatch）
-KUBE_CONTEXT=default bash scripts/verify-storage.sh
-KUBE_CONTEXT=default bash scripts/verify-storage-e2e.sh
+bash scripts/install-gpu-operator.sh    # 進 gpu-operator namespace，PSS=privileged
+```
 
-# GPU（device plugin、nvidia-smi in job、MPS GRES）
+腳本是 idempotent 的，重跑等於 helm upgrade。`--set driver.enabled=false --set toolkit.enabled=false` 因為 host 已經由 setup-linux-gpu.sh 裝好驅動。
+
+### 步驟 8：驗證
+
+```bash
+KUBE_CONTEXT=default bash scripts/verify-helm.sh           # chart 渲染 + dry-run + helm-unittest
+KUBE_CONTEXT=default bash scripts/verify-storage.sh        # PVC Bound、跨 pod 讀寫
+KUBE_CONTEXT=default bash scripts/verify-storage-e2e.sh    # 多節點 sbatch 寫共用儲存
+KUBE_CONTEXT=default bash scripts/verify-monitoring.sh     # Prometheus 抓得到 slurm-exporter / operator
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
-
-# 全叢集（CPU 彈性擴縮、MPI PMI2、GPU pool 彈性擴縮）
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
-```
-
-**預期結果（全通過）：**
-
-```
-verify-gpu.sh:
-  PASS: device plugin DaemonSet has ready pods
-  PASS: cluster has 4 allocatable GPU(s)
-  PASS: Slurm nodes have GPU GRES configured
-  PASS: GPU name visible in Slurm job output        ← nvidia-smi 輸出真實 GPU 型號
-  PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
-
-verify.sh:
-  [dev verify] done. all checks passed.
 ```
 
 ### 清理環境
 
 ```bash
-# 移除 k3s（保留 kubeconfig 備份）
+helm uninstall slurm-platform -n slurm
+helm uninstall gpu-operator   -n gpu-operator     # 保險，install-gpu-operator.sh 也是 helm release
+kubectl delete -f manifests/core/slurm-accounting.yaml
+kubectl delete namespace slurm gpu-operator monitoring nfs-provisioner
+# 主機層
 /usr/local/bin/k3s-uninstall.sh
-# 停止 NFS
 sudo systemctl stop nfs-kernel-server
 ```
+
+> StorageClass 與 gpu-operator namespace 都帶 `helm.sh/resource-policy=keep` 註記，所以 `helm uninstall` 不會自動把它們連同 PV/PVC 拔掉；手動 `kubectl delete namespace` 才會清乾淨。
 
 ---
 
 ## B. Kind（本機開發模擬）
 
-> 環境需求：Docker Desktop + kind + kubectl（Windows/Mac/Linux 均可）
+> 環境需求：Docker Desktop + kind + kubectl + helm v3.16+
 
 ### 快速部署
 
 ```bash
-# 確認工具已安裝
-docker version && kind version && kubectl version --client
+# 1. 建立 Kind 叢集
+kind create cluster --name slurm-lab
 
-# 一鍵部署核心叢集（無 GPU，純排程邏輯驗證）
-bash scripts/bootstrap.sh
+# 2. 建 image 並 load 進 Kind
+docker build -t slurm-controller:latest       -f docker/controller/Dockerfile docker/controller
+docker build -t slurm-worker:latest           -f docker/worker/Dockerfile     docker/worker
+docker build -t slurm-elastic-operator:latest -f docker/operator/Dockerfile   .
+for img in slurm-controller:latest slurm-worker:latest slurm-elastic-operator:latest; do
+  kind load docker-image "$img" --name slurm-lab
+done
 
-# 驗證
+# 3. secrets + accounting prerequisite
+bash scripts/create-secrets.sh
+kubectl apply -f manifests/core/slurm-accounting.yaml
+
+# 4. helm install（預設 values.yaml = Kind baseline，無 GPU、無監控、無 NFS）
+helm install slurm-platform ./chart -n slurm --create-namespace
+
+# 5. verify
+bash scripts/verify-helm.sh
 bash scripts/verify.sh
 ```
 
-`scripts/bootstrap.sh` 自動完成：建立 Kind 叢集 → 建置並 load image → 生成 `slurm-static.yaml` → 套用所有資源 → 等待 rollout → 確認 slurmctld ping。
+預設 values 把 `gpu.enabled` / `monitoring.enabled` / `storage.enabled` 都關掉，純驗證排程邏輯。
 
-> 慢速機器：`ROLLOUT_TIMEOUT=600s bash scripts/bootstrap.sh`  
-> 完整重建：`FORCE_RECREATE=true DOCKER_BUILD_NO_CACHE=true bash scripts/bootstrap.sh`
-
-### 部署共享儲存（可選）
-
-```bash
-# WSL2 主機端 NFS Server
-sudo bash scripts/setup-nfs-server.sh
-
-# 部署 provisioner（NFS_SERVER 為 WSL2 IP，hostname -I 取得，每次開機會變）
-NFS_SERVER=<wsl2-ip> NFS_PATH=/srv/nfs/k8s bash scripts/bootstrap-storage.sh
-
-bash scripts/verify-storage.sh
-bash scripts/verify-storage-e2e.sh
-```
+要在 Kind 上開監控：`helm upgrade slurm-platform ./chart -n slurm --set monitoring.enabled=true`。
 
 ### 清理環境
 
 ```bash
+helm uninstall slurm-platform -n slurm
+kubectl delete -f manifests/core/slurm-accounting.yaml
 kind delete cluster --name slurm-lab
 ```
 
@@ -221,23 +204,27 @@ kind delete cluster --name slurm-lab
 
 ## 部署監控
 
+`monitoring.enabled=true`（k3s overlay 預設打開，Kind baseline 預設關閉）。
+
 ```bash
-bash scripts/bootstrap-monitoring.sh
+# Kind 上事後打開：
+helm upgrade slurm-platform ./chart -n slurm --set monitoring.enabled=true
 
 # 存取 Grafana（admin / admin）
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
-# 驗證所有元件正常、metrics 可抓
+# 驗證 Prometheus 抓得到 slurm-exporter / operator / kube-state-metrics
 bash scripts/verify-monitoring.sh
 ```
 
 ## Lmod 模組系統（已整合至核心）
 
-Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`bootstrap.sh` 執行完畢後即可使用 `module load`。Modulefile 定義在 `manifests/core/lmod-modulefiles.yaml`，以 ConfigMap 管理。
+Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`helm install` 起來後即可使用 `module load`。Modulefile 定義在 `manifests/core/lmod-modulefiles.yaml`，以 ConfigMap 管理（chart 之外，獨立 apply）。
 
 執行一次以確保 NFS job 輸出路徑存在（**需先完成 §4**）：
 
 ```bash
+kubectl apply -f manifests/core/lmod-modulefiles.yaml
 bash scripts/bootstrap-lmod.sh
 ```
 
@@ -282,7 +269,7 @@ sbatch /tmp/my-mpi-job.sh
 > `sbatch` 執行腳本時使用非互動、非 login 的 bash，`/etc/profile.d/` 不會自動載入。  
 > 明確 source 是標準 HPC 做法，與 TACC、NCHC 等真實系統的 job script 寫法一致。
 
-**驗證（12 個 check 全通過）：**
+驗證腳本：
 
 ```bash
 bash scripts/verify-lmod.sh
@@ -290,15 +277,13 @@ bash scripts/verify-lmod.sh
 
 驗證項目包含：Lmod 安裝確認 → `module avail` 顯示三個模組 → `module load` 設定 MPI_HOME → `module purge` 清除環境 → sbatch 提交雙 task MPI job → 確認 rank:0 / rank:1 在 job 內正確執行。
 
-**目前內建模組：**
+目前內建模組如下：
 
 | 模組 | 描述 |
 |------|------|
 | `openmpi/4.1` | OpenMPI 4.1.2（Ubuntu 22.04 套件），設定 MPI_HOME、LD_LIBRARY_PATH、SLURM_MPI_TYPE=pmi2 |
 | `python3/3.10` | 系統 Python 3.10，設定 PYTHON_HOME |
 | `cuda/stub` | CUDA 佔位模組，示範 GPU 叢集的 modulefile 結構 |
-
-> 自訂模組只需編輯 `manifests/core/lmod-modulefiles.yaml` 並 `kubectl apply`，**不需要重建 image**，數秒內生效。
 
 ---
 

@@ -1,0 +1,101 @@
+suite: slurm.conf rendering
+templates:
+  - configmap-static.yaml
+  - configmap-nodes.yaml
+tests:
+  - it: emits ClusterName and SlurmctldHost from values
+    template: configmap-static.yaml
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "ClusterName=kind-slurm"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SlurmctldHost=slurm-controller-0"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "Include /etc/slurm/slurm.nodes.conf"
+
+  - it: emits accounting block when slurm.accounting.enabled
+    template: configmap-static.yaml
+    set:
+      slurm.accounting.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "AccountingStorageType=accounting_storage/slurmdbd"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "AccountingStorageTRES=gres/gpu,gres/mps"
+
+  - it: omits accounting block when disabled
+    template: configmap-static.yaml
+    set:
+      slurm.accounting.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: data["slurm.conf"]
+          pattern: "AccountingStorageType="
+
+  - it: emits NodeName lines for each pool in maxNodes order
+    template: configmap-nodes.yaml
+    asserts:
+      - matchRegex:
+          path: data["slurm.nodes.conf"]
+          pattern: "NodeName=slurm-worker-cpu-0 .*State=UNKNOWN"
+      - matchRegex:
+          path: data["slurm.nodes.conf"]
+          pattern: "NodeName=slurm-worker-gpu-rtx4070-0 .*Gres=gpu:rtx4070:1,mps:100"
+
+  - it: skips PartitionName when no nodes assigned
+    template: configmap-nodes.yaml
+    set:
+      pools:
+        - id: cpu
+          statefulset: slurm-worker-cpu
+          appLabel: slurm-worker-cpu
+          workerClass: cpu-standard
+          partition: cpu
+          minReplicas: 1
+          maxReplicas: 1
+          replicas: 1
+          cpus: 4
+          realMemory: 3500
+          sockets: 1
+          coresPerSocket: 2
+          threadsPerCore: 2
+          maxNodes: 1
+          features: [cpu]
+          gres: []
+          matchGres: []
+    asserts:
+      - matchRegex:
+          path: data["slurm.nodes.conf"]
+          pattern: "PartitionName=cpu Nodes=slurm-worker-cpu-0"
+      - notMatchRegex:
+          path: data["slurm.nodes.conf"]
+          pattern: "PartitionName=gpu-rtx4070 "
+
+  - it: gres.conf uses /dev/null on kind, /dev/nvidia0 on k3s
+    template: configmap-nodes.yaml
+    set:
+      cluster.runtime: kind
+    asserts:
+      - matchRegex:
+          path: data["gres.conf"]
+          pattern: "File=/dev/null"
+      - notMatchRegex:
+          path: data["gres.conf"]
+          pattern: "File=/dev/nvidia0"
+
+  - it: gres.conf emits mps Count without File on any runtime
+    template: configmap-nodes.yaml
+    set:
+      cluster.runtime: k3s
+    asserts:
+      - matchRegex:
+          path: data["gres.conf"]
+          pattern: "Name=mps Count=100"
+      - matchRegex:
+          path: data["gres.conf"]
+          pattern: "Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0"

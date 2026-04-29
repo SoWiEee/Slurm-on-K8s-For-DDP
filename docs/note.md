@@ -335,6 +335,8 @@ Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進
 
 ## 5-A：Helm Chart 封裝
 
+> **修訂版 5（2026-04-29，Stage F 完成 — Phase 5-A 收尾）：** 真實環境驗證通過後，正式 cutover 到 helm。本表「廢棄的檔案」段所列的 12 個檔案全部移除（`scripts/{render-core.py,bootstrap.sh,bootstrap-gpu.sh,bootstrap-monitoring.sh}`、`manifests/core/{slurm-static.yaml,worker-pools.json,slurm-ddp-runtime.yaml}`、`manifests/gpu/{nvidia-device-plugin.yaml,mps-daemonset.yaml}`）；`scripts/{bootstrap-storage.sh,bootstrap-lmod.sh}` 與 `manifests/core/lmod-modulefiles.yaml` 不在原始廢棄表內因此保留。`verify-helm.sh` 移除 legacy parity diff 區段（`manifests/core/slurm-static.yaml` 已不存在）。`chart/tests/` 加入 6 個 `*_test.yaml` 共 28 條 helm-unittest 案例，覆蓋 slurm.conf / workers / operator / gpu / monitoring / storage。README 的「🚀 Getting Started」整段重寫為 helm install 流程；`manifests/core/slurm-accounting.yaml`（mysql + slurmdbd）標註為 chart 之外的 prerequisite。
+>
 > **修訂版 4（2026-04-29，Stage E 完成）：** monitoring + storage 進 chart，`enabled` flag 控制。Monitoring stack（Prometheus / Alertmanager / Grafana / kube-state-metrics + slurm-exporter）拆到 `templates/monitoring/`；Grafana dashboards 從 `chart/dashboards/*.json` 用 `Files.Glob.AsConfig` 灌進 ConfigMap。Storage stack（NFS subdir external provisioner + StorageClass + RWX PVC）放在 `templates/storage.yaml`，`storage.enabled=true` 但缺 `nfsServer` 直接 `fail` 終止 render；`storageClassName` 與 `provisionerName` 跟 legacy `manifests/storage/*.yaml` 完全一致（provisioner 名 `k8s-sigs.io/slurm-nfs-subdir-external-provisioner` 是 immutable，必須對齊現有 cluster）。Cross-namespace 流量由 `network-policy.yaml` 在 `monitoring.enabled=true` 時額外加三條：`allow-prometheus-scrape-operator`、`allow-prometheus-scrape-exporter`、`allow-slurm-exporter-egress`。verify-helm.sh 加 14 條 Stage E spot-checks；k3s 1.34 server-side dry-run validate 75 個 resources（default 38 個）全綠。
 >
 > **修訂版 3（2026-04-28，Stage D 中）：** 嘗試把 `gpu-operator` 加成 chart dependency 後發現它把所有 DaemonSet hardcode 在 `Release.Namespace`（沒有 namespaceOverride 機制），且需要該 namespace PSS=`privileged` 才能 mount hostPath（`/dev/nvidia*`、`/run/nvidia/mps`、driver libs）。我們的 slurm namespace 走 PSS=`baseline`（NetworkPolicy + secret projection 都依賴此），兩者放同一個 namespace 不乾淨——dropping 到 privileged 會放鬆 slurm pod 的整體安全姿態。
@@ -1258,13 +1260,13 @@ AllReduce gradient 在兩個 rank 間同步（TCP backend）
 │
 ├── GPU 0: RTX 4070 /dev/nvidia0  (12 GB VRAM, 48 SM)
 │   ├── 整卡模式：slurm-worker-gpu-rtx4070-0 獨占
-│   └── MPS 模式：nvidia-mps-daemon-0 管理，socket: /tmp/nvidia-mps-0
-│                 ← worker pod 掛載此 socket，mps:N 分配 N% SM
+│   └── MPS 模式：GPU Operator 的 nvidia-mps-control-daemon DS 管理
+│                 device-plugin-config key: rtx4070-mps (replicas=4)
+│                 mps:N 分配 N% SM；socket 由 Operator 自動掛載到 worker pod
 │
-└── GPU 1: RTX 4080 /dev/nvidia1  (16 GB VRAM, 76 SM)
+└── GPU 1: RTX 4080 /dev/nvidia0  (16 GB VRAM, 76 SM；pod 視角永遠是 /dev/nvidia0)
     ├── 整卡模式：slurm-worker-gpu-rtx4080-0 獨占
-    └── MPS 模式：nvidia-mps-daemon-1 管理，socket: /tmp/nvidia-mps-1
-                  ← worker pod 掛載此 socket，mps:N 分配 N% SM
+    └── device-plugin-config key: rtx4080-exclusive（不切，整卡）
 ```
 
 ---
@@ -1423,268 +1425,179 @@ NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvid
 - 需要記憶體隔離的多租戶（兩張卡均無 MIG，MPS 沒有 VRAM 隔離）
 - 不同 Linux 用戶共用同一張 GPU（每個 Linux 用戶只能有一個 MPS server）
 
-## 實作架構：雙 GPU MPS Control Daemon on k3s
+## 實作架構：GPU Operator + MPS on k3s
 
-每張 GPU 需要獨立的 MPS daemon process，使用不同的 socket 目錄。本架構部署**兩個 MPS daemon Pod**（各管一張 GPU）。
+> **2026-04-29 update（Phase 5-A Stage F 收尾）：** 這節原本描述自寫的雙 MPS DaemonSet（每張 GPU 一個 daemon pod，hostPath socket 目錄）。Phase 5-A 已 cutover 到 NVIDIA **GPU Operator**：MPS daemon 由 Operator 內建的 `mps-control-daemon` DaemonSet 管理（前景模式跑，繞過 v0.15–v0.17.x device-plugin 的 spawn race，見 [`docs/migration.md`](migration.md)）；GPU sharing 策略由 device-plugin-config ConfigMap 表達；節點透過 `nvidia.com/device-plugin.config=<key>` label 匹配自己的 sharing 配置。本節描述**目前的實作**。
 
 ```
 Linux Host（k3s 單節點）
-┌──────────────────────────────────────────────────────────────────┐
-│  namespace: slurm                                                 │
-│                                                                   │
-│  ┌───────────────────────┐    ┌───────────────────────┐          │
-│  │ nvidia-mps-daemon-0   │    │ nvidia-mps-daemon-1   │          │
-│  │ CUDA_VISIBLE_DEVICES=0│    │ CUDA_VISIBLE_DEVICES=1│          │
-│  │ nvidia-cuda-mps-ctl -d│    │ nvidia-cuda-mps-ctl -d│          │
-│  └──────────┬────────────┘    └──────────┬────────────┘          │
-│             │ socket                     │ socket                 │
-│    /tmp/nvidia-mps-0/           /tmp/nvidia-mps-1/               │
-│             │                            │                        │
-│  ┌──────────┴──────────┐    ┌────────────┴────────────┐          │
-│  │ worker-gpu-rtx4070  │    │  worker-gpu-rtx4080     │          │
-│  │ Job A (mps:50=24SM) │    │  Job D (mps:50=38SM)    │          │
-│  │ Job B (mps:25=12SM) │    │  (4080 單獨或共用)       │          │
-│  │ Job C (mps:25=12SM) │    └─────────────────────────┘          │
-│  └─────────────────────┘                                         │
-│                                                                   │
-│  /dev/nvidia0  RTX 4070 (12 GB, 48 SM)                           │
-│  /dev/nvidia1  RTX 4080 (16 GB, 76 SM)                           │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  namespace: gpu-operator (PSS=privileged，scripts/install-gpu-operator.sh)  │
+│  ┌─────────────────────────────┐  ┌───────────────────────────────────┐    │
+│  │ nvidia-device-plugin DS     │  │ nvidia-mps-control-daemon DS      │    │
+│  │  讀 ConfigMap:               │  │  per-GPU MPS server（前景模式）   │    │
+│  │  slurm-platform-device-      │  │  socket 目錄由 Operator 管：     │    │
+│  │  plugin-config（rtx4070-mps  │  │  /run/nvidia/mps/{gpu-uuid}/      │    │
+│  │  / rtx4080-exclusive / ...） │  │  以 hostPath mount 進 worker pod  │    │
+│  └─────────────────────────────┘  └───────────────────────────────────┘    │
+│                                                                            │
+│  namespace: slurm (PSS=baseline, helm install slurm-platform)              │
+│  ┌─────────────────────────────┐  ┌───────────────────────────────────┐    │
+│  │ slurm-worker-gpu-rtx4070    │  │ slurm-worker-gpu-rtx4080          │    │
+│  │  node label:                 │  │  node label:                       │    │
+│  │   nvidia.com/device-plugin.  │  │   nvidia.com/device-plugin.        │    │
+│  │   config=rtx4070-mps         │  │   config=rtx4080-exclusive         │    │
+│  │  Job A (mps:50=24SM)         │  │  Job D 整卡訓練                   │    │
+│  │  Job B (mps:25=12SM)         │  │   (76 SM, 16 GB VRAM)              │    │
+│  │  Job C (mps:25=12SM)         │  │                                   │    │
+│  │  --gres=mps:N → SM%          │  │  --gres=gpu:rtx4080:1              │    │
+│  └─────────────────────────────┘  └───────────────────────────────────┘    │
+│                                                                            │
+│  /dev/nvidia0  RTX 4070 (12 GB, 48 SM)   分成 4 個 MPS slot（replicas=4）  │
+│  /dev/nvidia1  RTX 4080 (16 GB, 76 SM)   不分割（exclusive）              │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-各 worker pod 掛載對應 GPU 的 MPS socket 目錄，CUDA 呼叫由該 GPU 的 MPS Server 代理。兩張 GPU 的 MPS daemon 完全獨立，互不干擾。
+關鍵差異 vs 舊架構：
+- **MPS daemon 不再自寫**：GPU Operator 提供 `mps-control-daemon`，pod 不需要 `hostIPC`，socket mount 由 Operator 自動處理
+- **sharing 策略宣告式**：每張卡的 MPS replicas / time-slicing / exclusive 由 ConfigMap 定義，不是腳本邏輯
+- **per-pool 配置**：rtx4070 與 rtx4080 走不同的 ConfigMap key，藉 node label 自動匹配
+- **chart 不擁有 GPU Operator**：`scripts/install-gpu-operator.sh` 把它獨立裝到 PSS=privileged 的 `gpu-operator` namespace；`slurm-platform` chart 只貢獻 device-plugin-config ConfigMap 與 node-labeler Job
 
+### 實作步驟（Linux + k3s + RTX 4070 + RTX 4080）
 
-### 路徑 B 實作步驟（本架構採用，Linux + k3s + RTX 4070）
-
-**前提：** 已執行 `K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh` 完成基礎部署。
+完整流程見 [README.md → Getting Started 路徑 A](../README.md#a-linux--k3s--real-gpu)。本節聚焦 **MPS / GPU sharing 部份**。
 
 ---
 
-**步驟一：確認 NVIDIA 環境（兩張 GPU）**
+**步驟一：確認 NVIDIA 環境**
 
 ```bash
-# 確認 host 看到兩張 GPU
 nvidia-smi --list-gpus
-# 期望輸出：
-#   GPU 0: NVIDIA GeForce RTX 4070  (UUID: ...)
-#   GPU 1: NVIDIA GeForce RTX 4080  (UUID: ...)
-
-# 確認 K8s 看到 GPU 資源
-kubectl get nodes -o custom-columns='NODE:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'
-# 期望輸出：GPU 欄位為 "2"（device plugin 計算所有 GPU）
+# GPU 0: NVIDIA GeForce RTX 4070
+# GPU 1: NVIDIA GeForce RTX 4080
 ```
+
+主機驅動可以是 535 / 595（Phase 5-A 都驗過）。Container Toolkit 由 `scripts/setup-linux-gpu.sh` 裝。
 
 ---
 
-**步驟二：部署雙 GPU MPS DaemonSet**
+**步驟二：device-plugin-config ConfigMap（chart 提供）**
 
-雙 GPU 需要兩個 MPS daemon 分別管理，各自設定 `CUDA_VISIBLE_DEVICES` 和不同的 socket 目錄。`manifests/gpu/mps-daemonset.yaml` 的 DaemonSet pod 請求 `nvidia.com/gpu: 2` 並在同一個 container 啟動兩個 daemon process：
+`chart/values.yaml::gpu.deviceConfigs` 渲染成單一 ConfigMap `slurm-platform-device-plugin-config`（在 `gpu-operator` namespace）：
 
 ```yaml
-# mps-daemonset.yaml（雙 GPU 版本）關鍵部分
-containers:
-- name: mps-control
-  resources:
-    limits:
-      nvidia.com/gpu: "2"   # 佔用兩張 GPU
-  env:
-  - name: CUDA_MPS_PIPE_DIRECTORY_0
-    value: /tmp/nvidia-mps-0
-  - name: CUDA_MPS_PIPE_DIRECTORY_1
-    value: /tmp/nvidia-mps-1
-  command:
-  - /bin/bash
-  - -c
-  - |
-    set -e
-    mkdir -p /tmp/nvidia-mps-0 /tmp/nvidia-mps-1 \
-             /tmp/nvidia-mps-log-0 /tmp/nvidia-mps-log-1
-    # GPU 0 (RTX 4070)
-    CUDA_VISIBLE_DEVICES=0 \
-    CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-0 \
-    CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log-0 \
-    nvidia-cuda-mps-control -d
-    # GPU 1 (RTX 4080)
-    CUDA_VISIBLE_DEVICES=1 \
-    CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-1 \
-    CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log-1 \
-    nvidia-cuda-mps-control -d
-    echo "[mps] both MPS daemons started"
-    # 保活 + 健康檢查
-    while true; do
-      pgrep -x nvidia-cuda-mps- >/dev/null || {
-        echo "[mps] daemon died, restarting..." >&2
-        CUDA_VISIBLE_DEVICES=0 CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-0 \
-          nvidia-cuda-mps-control -d 2>/dev/null || true
-        CUDA_VISIBLE_DEVICES=1 CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-1 \
-          nvidia-cuda-mps-control -d 2>/dev/null || true
-      }
-      sleep 30
-    done
-volumeMounts:
-- name: mps-socket-0
-  mountPath: /tmp/nvidia-mps-0
-- name: mps-socket-1
-  mountPath: /tmp/nvidia-mps-1
-volumes:
-- name: mps-socket-0
-  hostPath:
-    path: /tmp/nvidia-mps-0
-    type: DirectoryOrCreate
-- name: mps-socket-1
-  hostPath:
-    path: /tmp/nvidia-mps-1
-    type: DirectoryOrCreate
+# chart/values.yaml 對應段落（k3s overlay 啟用）
+gpu:
+  enabled: true
+  targetNamespace: gpu-operator
+  deviceConfigs:
+    default:
+      version: v1
+    rtx4070-mps:
+      version: v1
+      sharing:
+        mps:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 4              # 1 張 RTX4070 → 4 個 MPS slot
+    rtx4080-exclusive:
+      version: v1                       # 不切，整卡 exclusive
+  nodeAssignments:
+    - selector: { gpu-host-class: rtx4070 }
+      config: rtx4070-mps
+    - selector: { gpu-host-class: rtx4080 }
+      config: rtx4080-exclusive
 ```
+
+`helm install` 把 ConfigMap 落在 `gpu-operator` namespace（不是 slurm namespace），這是因為 GPU Operator 的 device-plugin DaemonSet 只讀自己 namespace 的 ConfigMap。
+
+---
+
+**步驟三：安裝 GPU Operator（獨立 helm release）**
 
 ```bash
-# 部署並驗證
-kubectl apply -f manifests/gpu/mps-daemonset.yaml
-kubectl -n slurm rollout status daemonset/nvidia-mps-daemon
-
-mps_pod=$(kubectl -n slurm get pod -l app=nvidia-mps-daemon -o jsonpath='{.items[0].metadata.name}')
-# 驗證兩個 MPS daemon 都回應
-kubectl -n slurm exec "pod/${mps_pod}" -- bash -c '
-  echo "=== GPU 0 (RTX 4070) ==="
-  CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-0 \
-    echo get_server_list | nvidia-cuda-mps-control
-  echo "=== GPU 1 (RTX 4080) ==="
-  CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-1 \
-    echo get_server_list | nvidia-cuda-mps-control
-'
+bash scripts/install-gpu-operator.sh
 ```
 
----
-
-**步驟三：重新 render 帶 MPS mount 的 manifests**
+腳本實質是：
 
 ```bash
-K8S_RUNTIME=k3s REAL_GPU=true WITH_MPS=true bash scripts/bootstrap.sh
+helm install gpu-operator nvidia/gpu-operator \
+  -n gpu-operator --create-namespace \
+  --version v26.3.1 \
+  --set driver.enabled=false \              # host 已用 setup-linux-gpu.sh 裝好
+  --set toolkit.enabled=false \
+  --set devicePlugin.config.name=slurm-platform-device-plugin-config \
+  --set devicePlugin.config.default=default \
+  --set mps.root=/run/nvidia/mps
 ```
 
-`render-core.py --with-mps` 會在 GPU worker StatefulSet 自動加入。**雙 GPU 版本需根據 GPU 型號掛載不同 socket 目錄**：
+GPU Operator 起來後，會看到三條主要 DaemonSet：
 
-```yaml
-# RTX 4070 worker StatefulSet（由 render-core.py 注入）
-spec:
-  hostIPC: true
-  containers:
-  - name: worker
-    volumeMounts:
-    - name: mps-socket
-      mountPath: /tmp/nvidia-mps        # 統一掛載點（pod 內看到的路徑）
-    env:
-    - name: CUDA_MPS_PIPE_DIRECTORY
-      value: /tmp/nvidia-mps
-  volumes:
-  - name: mps-socket
-    hostPath:
-      path: /tmp/nvidia-mps-0           # ← GPU 0 的 socket
-      type: DirectoryOrCreate
+```bash
+kubectl -n gpu-operator get ds
+# nvidia-device-plugin-daemonset
+# nvidia-mps-control-daemon-...        ← 只有當有 sharing.mps active 才出現
+# gpu-feature-discovery-...
 ```
-
-```yaml
-# RTX 4080 worker StatefulSet（GPU 1 的 socket）
-volumes:
-- name: mps-socket
-  hostPath:
-    path: /tmp/nvidia-mps-1             # ← GPU 1 的 socket
-    type: DirectoryOrCreate
-```
-
-> ⚠️ `hostIPC: true` 讓 pod 存取 host IPC namespace，已受 NetworkPolicy 限制只有 GPU worker pod 才有此設定。
 
 ---
 
-**步驟四：gres.conf 設定 MPS slot（RTX 4070）**
+**步驟四：node-labeler Job 自動貼 label（chart 提供）**
 
-在 `slurm.conf`（由 `render-core.py` 生成）加入 MPS GresType：
+`chart/templates/gpu/node-labeler-job.yaml` 是個 `helm.sh/hook=post-install,post-upgrade` 的 Job，按 `gpu.nodeAssignments` 把節點貼上 `nvidia.com/device-plugin.config=<key>`，device-plugin DaemonSet 重啟後就會用對應的 sharing 策略。
 
-```ini
-# slurm.conf（render-core.py 生成，REAL_GPU=true）
-GresTypes=gpu,mps
-TaskPlugin=task/cgroup
-CgroupPlugin=cgroup/v2
+如果是單節點，需要手動先標 `gpu-host-class`：
+
+```bash
+kubectl label node <node-name> gpu-host-class=rtx4070 --overwrite
+helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm   # 重跑 labeler Job
 ```
 
-```ini
-# gres.conf — 雙 GPU 宣告，各自有 GPU 和 MPS 兩個 GRES 類型
-# RTX 4070（GPU 0）
-NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 File=/dev/nvidia0 Count=1
-NodeName=slurm-worker-gpu-rtx4070-0 Name=mps Count=100   # 100% = 48 SM
+---
 
-# RTX 4080（GPU 1）
-NodeName=slurm-worker-gpu-rtx4080-0 Name=gpu Type=rtx4080 File=/dev/nvidia1 Count=1
-NodeName=slurm-worker-gpu-rtx4080-0 Name=mps Count=100   # 100% = 76 SM
+**步驟五：gres.conf 由 chart 自動生成**
+
+`chart/templates/_helpers.tpl::gresConf` 根據 `pools[*].gres` 產生：
+
+```ini
+# k3s overlay：RTX 4070 + RTX 4080 各一張
+NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0
+NodeName=slurm-worker-gpu-rtx4070-0 Name=mps Count=100
+NodeName=slurm-worker-gpu-rtx4080-0 Name=gpu Type=rtx4080 Count=1 File=/dev/nvidia0
 ```
 
-`mps:N` 代表 N% 的該卡 SM，兩張卡的 SM 數量不同：
+注意：兩張卡的 `File=` 都是 `/dev/nvidia0`，因為 Slurm 是從 worker pod 的視角看裝置——每個 worker pod 只看到自己被分配的那張 GPU（kubelet + libnvidia-container 注入），所以 pod 內永遠是 `/dev/nvidia0`。
+
+`mps:100` 代表整張卡的 SM 100%。`--gres=mps:25` 拿 25%（RTX4070 ~12 SM、RTX4080 ~19 SM）：
 
 | 請求 + constraint | RTX 4070 分配 SM | RTX 4080 分配 SM | 適合工作 |
 |-----------------|----------------|----------------|---------|
-| `--gres=mps:50` | ~24 SM (50%) | ~38 SM (50%) | 中型推論（7B LLM serving） |
-| `--gres=mps:25` | ~12 SM (25%) | ~19 SM (25%) | 小型推論（image classifier） |
-| `--gres=mps:10` | ~5 SM (10%)  | ~8 SM (10%)  | 極輕量 embedding service |
-| `--gres=gpu:rtx4070:1` | 48 SM（整卡） | — | 訓練（需 ≤12 GB VRAM）|
-| `--gres=gpu:rtx4080:1` | — | 76 SM（整卡） | 訓練（需 ≤16 GB VRAM）|
-| `-N 2 --gres=gpu:1` | 48 SM | 76 SM | **2-GPU DDP**（兩 rank） |
+| `--gres=mps:50 --constraint=gpu-rtx4070` | ~24 SM (50%) | — | 中型推論（7B LLM serving） |
+| `--gres=mps:25 --constraint=gpu-rtx4070` | ~12 SM (25%) | — | 小型推論（image classifier） |
+| `--gres=gpu:rtx4070:1` | 48 SM（整卡） | — | 訓練（≤12 GB VRAM）|
+| `--gres=gpu:rtx4080:1` | — | 76 SM（整卡） | 訓練（≤16 GB VRAM）|
+| `-N 2 --gres=gpu:1` | 48 SM | 76 SM | **2-GPU DDP** |
 
 ---
 
-**步驟五：Prolog/Epilog 腳本（可選，精細 SM 控制）**
-
-若希望每個 job 嚴格限制 SM 百分比（掛入 worker container via ConfigMap）：
+**步驟六：Job 提交語法（不變）**
 
 ```bash
-# /etc/slurm/prolog.d/99-mps.sh
-#!/bin/bash
-[[ "${SLURM_JOB_GRES:-}" != *mps* ]] && exit 0
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
-export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
-mps_count=$(echo "$SLURM_JOB_GRES" | grep -oP 'mps:\K[0-9]+' || echo 100)
-echo "set_active_thread_percentage ${mps_count}" | nvidia-cuda-mps-control
-```
-
-```bash
-# /etc/slurm/epilog.d/99-mps.sh
-#!/bin/bash
-[[ "${SLURM_JOB_GRES:-}" != *mps* ]] && exit 0
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
-echo quit | nvidia-cuda-mps-control 2>/dev/null || true
-```
-
----
-
-**步驟六：Job 提交語法**
-
-```bash
-# MPS 推論 job：明確指定哪張 GPU
-# 在 RTX 4070 上（48 SM，12 GB VRAM）
-#SBATCH --job-name=infer-rtx4070
-#SBATCH --gres=mps:25             # 25% = ~12 SM
+# MPS 推論
+#SBATCH --gres=mps:25
 #SBATCH --constraint=gpu-rtx4070
-#SBATCH --mem=1G
-python infer.py --model small_model
+python infer.py
 
-# 在 RTX 4080 上（76 SM，16 GB VRAM，適合較大模型）
-#SBATCH --job-name=infer-rtx4080
-#SBATCH --gres=mps:25             # 25% = ~19 SM（比 5070 多）
-#SBATCH --constraint=gpu-rtx4080
-#SBATCH --mem=2G
-python infer.py --model large_model
-
-# 整卡訓練（不使用 MPS）
-#SBATCH --job-name=train
-#SBATCH --gres=gpu:rtx4080:1      # 16 GB VRAM，訓練首選
-#SBATCH --mem=3G
+# 整卡訓練
+#SBATCH --gres=gpu:rtx4080:1
 torchrun --nproc_per_node=1 train.py
 
-# 2-GPU DDP（兩 rank，各持 1 張卡）
-#SBATCH --job-name=ddp-2gpu
+# 2-GPU DDP
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1              # 每個 node 1 張，Slurm 自動分配
+#SBATCH --gres=gpu:1
 torchrun --nproc_per_node=1 --nnodes=2 --node_rank=$SLURM_NODEID \
   --master_addr=$(scontrol show hostnames "$SLURM_NODELIST" | head -1) \
   --master_port=29500 train.py
@@ -1695,97 +1608,32 @@ torchrun --nproc_per_node=1 --nnodes=2 --node_rank=$SLURM_NODEID \
 **步驟七：驗證**
 
 ```bash
-# 完整 GPU + MPS 驗證（5 步驟）
-bash scripts/verify-gpu.sh
-
-# 手動確認 MPS 狀態
-mps_pod=$(kubectl -n slurm get pod -l app=nvidia-mps-daemon -o jsonpath='{.items[0].metadata.name}')
-kubectl -n slurm exec "pod/${mps_pod}" -- bash -c '
+bash scripts/verify-helm.sh                         # 渲染 + dry-run + helm-unittest
+bash scripts/verify-gpu.sh                          # device plugin、nvidia-smi、Slurm GRES
+# 手動：直接看 GPU Operator 的 MPS daemon 狀態
+mps_pod=$(kubectl -n gpu-operator get pod -l app=nvidia-mps-control-daemon -o jsonpath='{.items[0].metadata.name}')
+kubectl -n gpu-operator exec "$mps_pod" -- bash -c '
   echo get_server_list | nvidia-cuda-mps-control
   echo get_client_list | nvidia-cuda-mps-control
 '
-# 查看 SM 使用率（MPS 下多 job 應同時可見）
-kubectl -n slurm exec "pod/${mps_pod}" -- nvidia-smi dmon -s u -d 2
-```
-
----
-
-### 路徑 A：GPU Operator MPS（參考，本架構未使用）
-
-**適用：** 部署了 NVIDIA GPU Operator 的正式叢集（需要 ClusterPolicy CRD）。
-
-```yaml
-# GPU Operator ConfigMap：1 張 RTX 4070 虛擬成 4 個 MPS slot
-data:
-  any: |
-    sharing:
-      mps:
-        resources:
-        - name: nvidia.com/gpu
-          replicas: 4
-```
-
-```bash
-kubectl patch clusterpolicies.nvidia.com/cluster-policy \
-  -n gpu-operator --type merge \
-  -p '{"spec": {"devicePlugin": {"config": {"name": "mps-config", "default": "any"}}}}'
-```
-
-```ini
-# gres.conf（對應 replicas: 4）
-NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvidia0
+nvidia-smi dmon -s u -d 2     # 多個 MPS process 應同時佔 SM
 ```
 
 ---
 
 ## ✴️ 本架構實作建議
 
-| 部署環境 | 推薦路徑 | 理由 |
+| 部署環境 | 推薦做法 | 備註 |
 |---------|---------|------|
-| **Linux + k3s + RTX 4070 + RTX 4080（本架構）** | **路徑 B（雙 MPS DaemonSet）** | 無 GPU Operator；兩張卡各一個 daemon，socket 目錄分開 |
-| Kind（Windows 開發） | ❌ 不適用 | Kind 無真實 GPU，hostIPC 無效 |
-| 部署了 GPU Operator 的正式叢集 | 路徑 A（GPU Operator MPS） | GPU Operator 處理 daemon 生命週期 |
-| 大型 HPC 叢集（多租戶精細 SM 控制） | 路徑 B + Prolog/Epilog | 可按 job 動態調整 SM 百分比 |
-| 混合推論+訓練叢集（雙卡） | 路徑 B + 分 partition | RTX 4080 作訓練 partition，RTX 4070 作 MPS 推論 partition |
+| **Linux + k3s + RTX 4070 + RTX 4080（本架構）** | **GPU Operator + chart 的 device-plugin-config** | sharing 由 ConfigMap 表達，per-pool 配置 |
+| Kind（Windows 開發） | `gpu.enabled=false`（預設） | Kind 無真實 GPU，純驗證排程邏輯 |
+| 多節點 GPU 叢集 | 同上 + 每節點貼 `gpu-host-class` label | node-labeler Job 自動把 device-plugin config 對齊到節點 |
+| 大型 HPC 叢集（多租戶精細 SM 控制） | 上述 + Slurm Prolog/Epilog 動態調 SM% | `set_active_thread_percentage` via `nvidia-cuda-mps-control` |
+| 混合推論+訓練叢集（雙卡） | RTX4080 走 `rtx4080-exclusive`，RTX4070 走 `rtx4070-mps` | 已是 chart 預設 nodeAssignments |
 
-**對 operator/main.py 的影響：**
+**對 operator/main.py 的影響：** 完全沒有。`PARTITIONS_JSON` 兩個 GPU pool 由 chart 從 `pools[*]` 自動生成（`chart/templates/_helpers.tpl::partitionsJson`），縮放邏輯不變。
 
-兩個 GPU pool 各自獨立擴縮，`PARTITIONS_JSON` 需包含兩個 pool：
-
-```json
-[
-  {
-    "name": "slurm-worker-gpu-rtx4070",
-    "match_gres": "gpu:rtx4070",
-    "gres_per_node": "gpu:rtx4070:1,mps:100",
-    "maxNodes": 1
-  },
-  {
-    "name": "slurm-worker-gpu-rtx4080",
-    "match_gres": "gpu:rtx4080",
-    "gres_per_node": "gpu:rtx4080:1,mps:100",
-    "maxNodes": 1
-  }
-]
-```
-
-兩張 GPU 各只有 1 張（maxNodes=1），operator 不會 scale-up GPU pool（已有節點），主要幫 CPU pool 做擴縮。縮放邏輯不需修改。
-
-**對 Slurm 設定的影響（render-core.py）：**
-
-```python
-# render-core.py 的 gres.conf 生成邏輯（REAL_GPU=true, WITH_MPS=true）
-# 每個 GPU pool 的 device index 由 worker-pools.json 的 gpuIndex 決定
-device_path = f"/dev/nvidia{pool.get('gpuIndex', 0)}"
-gres_lines.append(
-    f"NodeName={node_name} Name=gpu Type={gpu_type} File={device_path} Count=1"
-)
-if args.with_mps:
-    # socket 目錄根據 GPU index 區分
-    gpu_idx = pool.get('gpuIndex', 0)
-    gres_lines.append(f"NodeName={node_name} Name=mps Count=100")
-    # 同時在 StatefulSet volume 使用 /tmp/nvidia-mps-{gpu_idx}
-```
+**對 Slurm 設定的影響：** `gres.conf` 與 `slurm.conf` 都由 chart helper 渲染，沒有 `render-core.py` 任何痕跡。新增 GPU 型號只要在 `values.yaml::pools` 加一個 entry + 在 `gpu.deviceConfigs` 加對應 sharing 策略 + 在 `gpu.nodeAssignments` 加 selector 即可。
 
 ---
 

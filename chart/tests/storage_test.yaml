@@ -1,0 +1,74 @@
+suite: shared storage
+templates:
+  - storage.yaml
+tests:
+  - it: nothing renders when storage.enabled is false
+    set:
+      storage.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: fails fast when enabled=true but nfsServer is empty
+    set:
+      storage.enabled: true
+      storage.nfsServer: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "requires storage.nfsServer to be set"
+
+  - it: StorageClass uses legacy provisioner name (immutable)
+    set:
+      storage.enabled: true
+      storage.nfsServer: "192.168.0.111"
+    documentSelector:
+      path: kind
+      value: StorageClass
+    asserts:
+      - equal:
+          path: provisioner
+          value: k8s-sigs.io/slurm-nfs-subdir-external-provisioner
+      - equal:
+          path: reclaimPolicy
+          value: Retain
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+
+  - it: PVC slurm-shared-rwx is RWX in slurm namespace
+    set:
+      storage.enabled: true
+      storage.nfsServer: "192.168.0.111"
+    documentSelector:
+      path: kind
+      value: PersistentVolumeClaim
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: slurm
+      - contains:
+          path: spec.accessModes
+          content: ReadWriteMany
+      - equal:
+          path: spec.storageClassName
+          value: slurm-shared-nfs
+
+  - it: provisioner Deployment uses NFS_SERVER + NFS_PATH from values
+    set:
+      storage.enabled: true
+      storage.nfsServer: "192.168.0.111"
+      storage.nfsPath: "/srv/nfs/k8s"
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NFS_SERVER
+            value: "192.168.0.111"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NFS_PATH
+            value: "/srv/nfs/k8s"

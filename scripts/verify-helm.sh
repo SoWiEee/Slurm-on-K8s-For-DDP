@@ -3,12 +3,7 @@
 #
 # Run BEFORE applying the chart to a cluster, and BEFORE verify-gpu.sh /
 # verify.sh / verify-storage.sh against a chart-installed deployment. Catches
-# template errors, missing values, schema regressions, and content drift
-# from manifests/core/slurm-static.yaml without touching the cluster.
-#
-# Stages: as Phase 5-A progresses, the expected resource count grows. The
-# script reads scripts/.verify-helm-expectations to know what to assert; if
-# the file is missing it falls back to "render must succeed" only.
+# template errors, missing values, and schema regressions.
 #
 # Optional cluster check: if kubectl + KUBECONFIG can reach an API server,
 # `kubectl apply --dry-run=server` validates every rendered resource.
@@ -20,7 +15,6 @@ CHART_DIR="${CHART_DIR:-${ROOT}/chart}"
 RELEASE_NAME="${RELEASE_NAME:-slurm-platform}"
 NAMESPACE="${NAMESPACE:-slurm}"
 SKIP_CLUSTER_DRYRUN="${SKIP_CLUSTER_DRYRUN:-}"
-SKIP_LEGACY_DIFF="${SKIP_LEGACY_DIFF:-}"
 
 WORKDIR="$(mktemp -d -t verify-helm.XXXXXX)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -342,48 +336,7 @@ extract_block() {
   ' "$input"
 }
 
-# --- 5. legacy parity: chart vs manifests/core/slurm-static.yaml -----------
-# Until Stage F retires render-core.py, the chart should produce the same
-# slurm.conf + gres.conf content (modulo whitespace and the `Include` directive
-# the chart uses to reference slurm.nodes.conf).
-LEGACY="$ROOT/manifests/core/slurm-static.yaml"
-if [[ -z "$SKIP_LEGACY_DIFF" && -f "$LEGACY" && -n "${RENDERS[values-k3s.yaml]:-}" ]]; then
-  log "legacy parity: chart slurm.conf + gres.conf vs $LEGACY"
-
-  # Chart side: combine static slurm.conf header (sans Include) + nodes body
-  extract_resource "${RENDERS[values-k3s.yaml]}" ConfigMap slurm-config-static \
-    > "$WORKDIR/cm-static.yaml"
-  extract_resource "${RENDERS[values-k3s.yaml]}" ConfigMap slurm-config-nodes \
-    > "$WORKDIR/cm-nodes.yaml"
-  {
-    extract_block "$WORKDIR/cm-static.yaml" "slurm.conf" \
-      | grep -v '^Include /etc/slurm/slurm.nodes.conf$'
-    extract_block "$WORKDIR/cm-nodes.yaml" "slurm.nodes.conf"
-  } | sed 's/[[:space:]]*$//' | grep -v '^$' > "$WORKDIR/chart-slurm-all.txt"
-  extract_block "$WORKDIR/cm-nodes.yaml" "gres.conf" \
-    | sed 's/[[:space:]]*$//' | grep -v '^$' > "$WORKDIR/chart-gres-all.txt"
-
-  # Legacy side: slurm.conf + gres.conf from the single slurm-config ConfigMap
-  extract_resource "$LEGACY" ConfigMap slurm-config > "$WORKDIR/cm-legacy.yaml"
-  extract_block "$WORKDIR/cm-legacy.yaml" "slurm.conf" \
-    | sed 's/[[:space:]]*$//' | grep -v '^$' > "$WORKDIR/legacy-slurm.txt"
-  extract_block "$WORKDIR/cm-legacy.yaml" "gres.conf" \
-    | sed 's/[[:space:]]*$//' | grep -v '^$' > "$WORKDIR/legacy-gres.txt"
-
-  if ! diff -u "$WORKDIR/legacy-slurm.txt" "$WORKDIR/chart-slurm-all.txt" >"$WORKDIR/slurm-diff" 2>&1; then
-    cat "$WORKDIR/slurm-diff" >&2
-    fail "slurm.conf content drifted from $LEGACY"
-  fi
-  if ! diff -u "$WORKDIR/legacy-gres.txt" "$WORKDIR/chart-gres-all.txt" >"$WORKDIR/gres-diff" 2>&1; then
-    cat "$WORKDIR/gres-diff" >&2
-    fail "gres.conf content drifted from $LEGACY"
-  fi
-  log "legacy parity: OK (chart slurm.conf + gres.conf match $LEGACY modulo whitespace)"
-else
-  [[ -n "$SKIP_LEGACY_DIFF" ]] && log "legacy parity: SKIPPED (SKIP_LEGACY_DIFF set)"
-fi
-
-# --- 6. server-side dry-run (optional, requires reachable cluster) --------
+# --- 5. server-side dry-run (optional, requires reachable cluster) --------
 if [[ -n "$SKIP_CLUSTER_DRYRUN" ]]; then
   log "server-side dry-run: SKIPPED (SKIP_CLUSTER_DRYRUN set)"
 elif ! command -v kubectl >/dev/null; then
@@ -415,7 +368,7 @@ else
   done
 fi
 
-# --- 7. helm-unittest (optional, Stage F target) --------------------------
+# --- 6. helm-unittest -----------------------------------------------------
 if helm plugin list 2>/dev/null | grep -q '^unittest'; then
   if compgen -G "$CHART_DIR/tests/*_test.yaml" >/dev/null; then
     log "helm-unittest"
@@ -424,7 +377,7 @@ if helm plugin list 2>/dev/null | grep -q '^unittest'; then
     log "helm-unittest plugin installed but no tests/*_test.yaml — skipping"
   fi
 else
-  log "helm-unittest plugin not installed — skipping (Stage F target)"
+  warn "helm-unittest plugin not installed — install with: helm plugin install https://github.com/helm-unittest/helm-unittest"
 fi
 
 log "ALL CHECKS PASSED"
