@@ -161,6 +161,9 @@ StateSaveLocation={{ $s.stateSaveLocation }}
 SwitchType={{ $s.switchType }}
 TaskPlugin={{ $s.taskPlugin }}
 ProctrackType={{ $s.proctrackType }}
+{{- if $s.taskProlog }}
+TaskProlog={{ $s.taskProlog }}
+{{- end }}
 MailProg={{ $s.mailProg }}
 SelectType={{ $s.selectType }}
 SelectTypeParameters={{ $s.selectTypeParameters }}

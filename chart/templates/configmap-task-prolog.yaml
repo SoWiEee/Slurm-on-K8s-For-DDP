@@ -1,0 +1,46 @@
+{{/*
+TaskProlog ConfigMap — injected env vars for every job step on every worker.
+
+Slurm reads stdout from TaskProlog scripts: lines that start with `export X=Y`
+are added to the job step's environment. We use this to propagate
+CUDA_MPS_PIPE_DIRECTORY (and friends) from the slurmd container's env — set
+by NVIDIA's container-toolkit hook when the GPU Operator's device-plugin
+runs in MPS sharing mode — into the user's job.
+
+Without this, sbatch from the login pod (which has no MPS env) gives the
+job CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=N (set by Slurm itself) but
+CUDA_MPS_PIPE_DIRECTORY=unset, so the CUDA runtime falls back to direct
+GPU access and the MPS daemon is bypassed entirely. See verify-gpu.sh
+step 6 — the WARN line is exactly this gap.
+
+The script is intentionally CPU-pool safe: every `export` is conditional on
+the env var being set in slurmd's environment. On a CPU worker, none of
+these are set, so the prolog prints nothing and behaves like a no-op.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-task-prolog
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  10-mps-env.sh: |
+    #!/bin/sh
+    # Propagate MPS / NVIDIA env vars set by the container-toolkit hook into
+    # the Slurm job step. Slurmstepd sanitizes its child env before exec'ing
+    # TaskProlog (it inherits ONLY the user's sbatch env + a few SLURM_*
+    # variables), so we cannot read $CUDA_MPS_PIPE_DIRECTORY directly here.
+    # Instead, read slurmd's process environ (PID 1 in the worker container)
+    # which carries the env injected by NVIDIA's container-toolkit at pod
+    # start. Each `export` line we print is parsed by slurmd and merged into
+    # the task environment.
+    read_pid1_env() {
+      tr '\0' '\n' < /proc/1/environ 2>/dev/null \
+        | awk -F= -v k="$1" '$1==k {sub("^[^=]+=",""); print; exit}'
+    }
+    for var in CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY NVIDIA_VISIBLE_DEVICES; do
+      val=$(read_pid1_env "$var")
+      [ -n "$val" ] && echo "export ${var}=${val}"
+    done
+    exit 0

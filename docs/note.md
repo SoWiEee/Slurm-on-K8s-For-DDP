@@ -299,6 +299,65 @@ login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null \
 
 `sinfo --Format` 的欄位是固定寬度，節點名稱過長時會截斷，截斷後與 state 欄位黏在一起，awk `$2` 抓不到正確 state。改用 `-o '%N'` 配合 `-t drain,drained` 過濾才能拿到完整節點名稱。
 
+## 問題 15：MPS job 拿不到 `CUDA_MPS_PIPE_DIRECTORY`，CUDA 跳過 MPS 直連 GPU
+
+`scripts/verify-gpu.sh` 的 step 6 過去長期出現：
+
+```
+PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
+WARN: CUDA_MPS_PIPE_DIRECTORY missing or unset — device-plugin sharing.mps may not be active
+```
+
+實機觀察：4 顆 allocatable `nvidia.com/gpu`、`nvidia-cuda-mps-control` daemon 在 `gpu-operator` namespace 跑得好好的、worker pod 容器 env 也有 `CUDA_MPS_PIPE_DIRECTORY=/mps/nvidia.com/gpu/pipe`，但 sbatch 進來的 job 看不到這個變數。代表 MPS 基礎設施 OK，但 Slurm job 沒走過 daemon — CUDA runtime 缺了 socket 路徑就 fallback 直連 GPU，Slurm 宣告的 `mps:25` 只變成排程上的「不超賣」聲明，沒有實際 SM% 限流。
+
+**根本原因（兩層）**
+
+1. **slurmd 的容器 env 不會自動傳給 job step。** 從 login pod 提交的 sbatch，job step 的環境是「使用者 sbatch 當下的 env」+ Slurm 注入的 SLURM_*，**不是** worker 容器的 env。雖然 worker 容器啟動時 NVIDIA container-toolkit hook 已經注入 `CUDA_MPS_PIPE_DIRECTORY`，但只有 slurmd PID 1 看得到，slurmstepd fork 出 user task 前已經把 env 清乾淨。
+2. **`TaskPlugin=task/none` 會讓 `TaskProlog` 完全不執行。** `task/none` 是個 no-op 插件，連 prolog hook 都不掛。我們起初設成 `task/none` 是為了避開 Slurm 21.08 的 cgroup v2 不完整支援，但代價是 TaskProlog 直接被略過。
+
+**修法（chart/templates/configmap-task-prolog.yaml + values.yaml）**
+
+1. `slurm.taskPlugin` 從 `task/none` 改成 `task/affinity`（不需要 cgroup，只用 `sched_setaffinity`，Slurm 21.08 OK）。
+2. 新增 `slurm-task-prolog` ConfigMap，掛到所有 worker pod 的 `/etc/slurm/prolog.d/10-mps-env.sh`。
+3. 在 `slurm.conf` header 加上 `TaskProlog=/etc/slurm/prolog.d/10-mps-env.sh`，由 `slurm.taskProlog` value 控制。
+4. **prolog 必須讀 `/proc/1/environ`**，不能直接 `echo "export X=$X"`。slurmstepd exec TaskProlog 之前會把繼承的 env 砍到只剩 `CUDA_VISIBLE_DEVICES` + `SLURM_*`，所以要從 slurmd（PID 1）的 environ 讀容器層級的 `CUDA_MPS_PIPE_DIRECTORY`：
+
+```sh
+read_pid1_env() {
+  tr '\0' '\n' < /proc/1/environ 2>/dev/null \
+    | awk -F= -v k="$1" '$1==k {sub("^[^=]+=",""); print; exit}'
+}
+for var in CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY NVIDIA_VISIBLE_DEVICES; do
+  val=$(read_pid1_env "$var")
+  [ -n "$val" ] && echo "export ${var}=${val}"
+done
+```
+
+Slurm 會解析 prolog stdout 的 `export X=Y` 行，把這些變數注入 job step env。
+
+**驗證**
+
+修法後 verify-gpu.sh step 6：
+
+```
+MPS job stdout:
+  CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25
+  CUDA_MPS_PIPE_DIRECTORY=/mps/nvidia.com/gpu/pipe
+  CUDA_VISIBLE_DEVICES=0
+  SLURM_JOB_GPUS=0
+  NVIDIA GeForce RTX 4070
+PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
+PASS: CUDA_MPS_PIPE_DIRECTORY set (MPS daemon socket reachable)
+```
+
+batch step 與 srun step 都拿到 socket 路徑，CUDA runtime 真的會走 MPS daemon，多 job 並行才會被 SM% throttle。
+
+**踩坑插曲（驗證階段）**
+
+1. 一開始用 sbatch 直接接 `--gres=gpu:rtx4070:1,mps:25` 會被拒（`Invalid gres specification`）— 拆成兩段、或單獨 `--gres=mps:25` 都會失敗。改成 `--gres=gpu:rtx4070:1` 單獨 sbatch，再讓 verify-gpu.sh 自己組合 GRES 才正常（這是 Slurm 21.08 + cons_tres 對混合 GRES 的解析限制）。
+2. 替換 ConfigMap 後 kubelet 大約要 60 秒才把 symlink 切到新內容，期間 prolog 還是舊版。要 `until grep -q <new-marker> /etc/slurm/prolog.d/10-mps-env.sh; do sleep 5; done` 才能確認生效。
+3. operator 預設 cooldown 60s + preStop 會 DRAIN，導致驗證 job 一直 NODE_FAIL。debug 期間先 `kubectl scale deploy slurm-elastic-operator --replicas=0` 把 operator 停掉，避免它在驗證中途縮容。驗證完記得 scale 回 1。
+
 ---
 
 # Phase 4 Plan（已完成）

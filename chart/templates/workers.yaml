@@ -139,6 +139,11 @@ spec:
               mountPath: /etc/slurm/gres.conf
               subPath: gres.conf
             {{- end }}
+            {{- if $.Values.slurm.taskProlog }}
+            - name: slurm-task-prolog
+              mountPath: /etc/slurm/prolog.d
+              readOnly: true
+            {{- end }}
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
@@ -153,6 +158,12 @@ spec:
         - name: slurm-config-nodes
           configMap:
             name: slurm-config-nodes
+        {{- if $.Values.slurm.taskProlog }}
+        - name: slurm-task-prolog
+          configMap:
+            name: slurm-task-prolog
+            defaultMode: 0755
+        {{- end }}
         - name: slurm-secrets
           projected:
             sources:

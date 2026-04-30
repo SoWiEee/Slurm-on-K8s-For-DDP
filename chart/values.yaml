@@ -129,12 +129,23 @@ slurm:
   # CompleteWait=0 prevents COMPLETING-stuck jobs when a worker pod is evicted
   # mid-epilog (see docs/note.md mps-migration debug record).
   completeWait: 0
-  # Slurm 21.08 (Ubuntu 22.04 image) has incomplete cgroup v2 support, so
-  # we stay with task/none + proctrack/linuxproc even on k3s + real GPU.
-  # GPU isolation comes from the kubelet + libnvidia-container hook, not
-  # Slurm. Override only when running newer Slurm.
-  taskPlugin: task/none
+  # Slurm 21.08 (Ubuntu 22.04 image) has incomplete cgroup v2 support, so we
+  # avoid task/cgroup. We use task/affinity though (NOT task/none) because
+  # task/none disables TaskProlog entirely — it's the task plugin that
+  # invokes the prolog hook, and `none` plugs in a no-op. task/affinity
+  # only needs sched_setaffinity (always available) and is what enables the
+  # MPS env propagation in chart/templates/configmap-task-prolog.yaml.
+  # GPU isolation still comes from the kubelet + libnvidia-container hook,
+  # not Slurm.
+  taskPlugin: task/affinity
   proctrackType: proctrack/linuxproc
+  # TaskProlog runs on the compute node before each task; lines of the form
+  # `export X=Y` printed to stdout are merged into the job environment. We use
+  # this to forward CUDA_MPS_PIPE_DIRECTORY (injected into worker containers
+  # by NVIDIA's container-toolkit hook) into Slurm jobs — without this, CUDA
+  # can't find the MPS server socket and silently bypasses MPS. See
+  # chart/templates/configmap-task-prolog.yaml. Set to "" to disable.
+  taskProlog: /etc/slurm/prolog.d/10-mps-env.sh
   mailProg: /usr/bin/true
   slurmctldPidFile: /var/run/slurmctld.pid
   slurmdPidFile: /var/run/slurmd.pid
