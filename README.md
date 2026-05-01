@@ -348,7 +348,8 @@ graph TD
 ```
 
 
-![image](assets/architecture.jpg)
+<img width="4400" height="2280" alt="圖片" src="https://github.com/user-attachments/assets/5d27ca15-525c-4936-a447-252a8a081934" />
+
 
 > 最新架構圖請看 [`architecture.html`](assets/architecture.html)
 
