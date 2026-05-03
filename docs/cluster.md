@@ -405,8 +405,6 @@ rtx4070-mps:
 device-plugin 會把 1 張實體 RTX 4070 廣告為 4 個 `nvidia.com/gpu` slot。
 Slurm 配合 `Gres=gpu:rtx4070:1,mps:100` + `--gres=mps:N` 旗標切 SM 比例（每 25 對應一個 MPS slot）。
 
-> 為何不再用自己寫的 `mps-daemonset.yaml`？
-> v26.3.x 之後 GPU Operator 內建 `nvidia-device-plugin-mps-control-daemon`，把 MPS daemon 啟動 / 跨 pod 共享 pipe / pinned-mem reservation 全包了。先前自寫的 DaemonSet 在啟動時序上有 race（device-plugin 先讀到舊 `default` config，等 NFD 標籤上來後 config-manager panic）。詳見 `docs/migration.md`。
 
 **節點 label 連動：**
 
@@ -429,9 +427,9 @@ GPU Operator NFD 自動補：
 
 由 chart `templates/storage.yaml` 渲染（gated by `storage.enabled=true`）。
 
-**為何要動態 provisioner 而非 hostPath？**
-單一 host 上 hostPath 無 RWX，跨 pod 無法協同；NFS subdir 動態 provisioner
-為每個 PVC 在 NFS root 下開一個子目錄，所有 pod 透過 NFS RWX 共享同一視圖。
+> [!NOTE]
+> 為何要動態 provisioner 而非 hostPath？
+> 單一 host 上 hostPath 無 RWX，跨 pod 無法協同；NFS subdir 動態 provisioner 為每個 PVC 在 NFS root 下開一個子目錄，所有 pod 透過 NFS RWX 共享同一視圖。
 
 ```mermaid
 flowchart LR
@@ -585,17 +583,6 @@ NetworkPolicy。
 | `allow-login-egress` | login | controller（**所有埠**）；workers 6818/22；NFS 2049 |
 | `allow-slurmdbd-egress` | slurmdbd | mysql 3306 |
 | `allow-slurm-exporter-egress` | exporter | controller 6820 |
-
-> **為何 worker / login → controller 開所有 TCP？**
-> Slurm fan-out tree RPC 會把 `RESPONSE_FORWARD_FAILED` 等回應送回 controller 的**臨時埠**（OS 隨機分配），若只允許 6817 會把 ping 回應 drop，導致 `idle*` (NOT_RESPONDING)。
->
-> **為何 worker→worker 開 any port？**
-> NCCL / Gloo 用 ephemeral port range（1024–65535）做 collective。仍嚴格鎖
-> 在同 namespace、同類別的 worker pod 之間。
->
-> **為何 K8s API egress 用 port 443/6443 而非 podSelector？**
-> kube-apiserver 在 k3s 是 host network 上的 process，不是 namespaced pod，
-> podSelector 無法匹配。
 
 ---
 
