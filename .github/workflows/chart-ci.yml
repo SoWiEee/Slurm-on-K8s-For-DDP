@@ -95,6 +95,15 @@ jobs:
           node_image: kindest/node:v1.31.0
           cluster_name: chart-ci
 
+      - name: Install upstream CRDs the chart depends on (NFD)
+        # The chart emits a `NodeFeatureRule` (kind from nfd.k8s-sigs.io/v1alpha1)
+        # for the R4 fix. In production this CRD is shipped by NVIDIA GPU
+        # Operator's bundled NFD; in CI's bare Kind cluster we install only
+        # the CRD schema upstream so that `kubectl apply --dry-run=server`
+        # can validate the resource. Pinned to a release tag for reproducibility.
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/node-feature-discovery/v0.16.6/deployment/base/nfd-crds/nfd-api-crds.yaml
+
       - name: Run scripts/verify-helm.sh end-to-end (lint + render + unittest + dry-run)
         run: |
           # kind-action exports KUBECONFIG to point at the kind cluster; verify-helm.sh
