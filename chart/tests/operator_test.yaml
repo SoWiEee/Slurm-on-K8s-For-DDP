@@ -23,7 +23,7 @@ tests:
           path: kind
           value: Deployment
 
-  - it: operator mounts the JWT secret for slurmrestd auth
+  - it: operator mounts the JWT secret for slurmrestd auth (mode=0400 for Slurm 23.11)
     asserts:
       - contains:
           path: spec.template.spec.volumes
@@ -31,6 +31,7 @@ tests:
             name: slurm-jwt-secret
             secret:
               secretName: slurm-jwt-secret
+              defaultMode: 0400
         documentSelector:
           path: kind
           value: Deployment

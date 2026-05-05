@@ -1,0 +1,73 @@
+suite: controller StatefulSet
+templates:
+  - controller.yaml
+  - configmap-static.yaml
+  - configmap-nodes.yaml
+tests:
+  - it: controller carries checksum annotations for ConfigMap content (R3)
+    template: controller.yaml
+    asserts:
+      - exists:
+          path: spec.template.metadata.annotations["checksum/config-static"]
+        documentSelector:
+          path: kind
+          value: StatefulSet
+      - exists:
+          path: spec.template.metadata.annotations["checksum/config-nodes"]
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: controller mounts cgroup.conf only when cgroup plugin is enabled (R9)
+    template: controller.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: slurm-config-static
+            mountPath: /etc/slurm/cgroup.conf
+            subPath: cgroup.conf
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: controller mounts cgroup.conf when proctrack/cgroup overlay is set
+    template: controller.yaml
+    set:
+      slurm.proctrackType: proctrack/cgroup
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: slurm-config-static
+            mountPath: /etc/slurm/cgroup.conf
+            subPath: cgroup.conf
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: slurmctld command no longer hardcodes -Dvvv (R12)
+    template: controller.yaml
+    asserts:
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "slurmctld -Dvvv"
+        documentSelector:
+          path: kind
+          value: StatefulSet
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "exec slurmctld -D &"
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: slurmrestd pins openapi version (v0.0.37 for Slurm 21.08; bump on R13)
+    template: controller.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "openapi/v0.0.37"
+        documentSelector:
+          path: kind
+          value: StatefulSet

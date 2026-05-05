@@ -35,6 +35,13 @@ spec:
       labels:
         {{- include "slurm-platform.labels" . | nindent 8 }}
         app: slurm-controller
+      annotations:
+        # R3 fix: roll the controller pod whenever slurm.conf / cgroup.conf /
+        # nodes/gres.conf content changes. helm upgrade picks this up
+        # automatically; manual `kubectl edit configmap` won't (acceptable —
+        # we don't support out-of-band edits).
+        checksum/config-static: {{ include (print $.Template.BasePath "/configmap-static.yaml") . | sha256sum }}
+        checksum/config-nodes: {{ include (print $.Template.BasePath "/configmap-nodes.yaml") . | sha256sum }}
     spec:
       containers:
         - name: slurm-controller
@@ -66,7 +73,10 @@ spec:
                 done
                 echo "[controller] slurmdbd is up"
               fi
-              exec slurmctld -Dvvv &
+              # Daemon log level is driven by SlurmctldDebug in slurm.conf
+              # (R12 fix); the -D flag here only keeps slurmctld in foreground
+              # so the container PID 1 stays attached.
+              exec slurmctld -D &
               CTLD_PID=$!
               # Wait for slurmctld to be ready before starting slurmrestd.
               # slurmrestd needs SLURM_JWT set (from scontrol token) so its
@@ -74,6 +84,8 @@ spec:
               until scontrol ping >/dev/null 2>&1; do sleep 2; done
               # lifespan=315360000 (10 years) avoids the daemon losing its auth
               # context after the default 24-hour token expiry.
+              # openapi/v0.0.37 matches Slurm 21.08 (Ubuntu 22.04 base). When
+              # Slurm is upgraded (see review.md R13) bump this to v0.0.40.
               SLURM_JWT=$(scontrol token username=root lifespan=315360000 | sed 's/SLURM_JWT=//') \
                 SLURMRESTD_SECURITY=disable_user_check \
                 /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
@@ -99,6 +111,11 @@ spec:
             - name: slurm-config-static
               mountPath: /etc/slurm/slurm.conf
               subPath: slurm.conf
+            {{- if or (eq .Values.slurm.proctrackType "proctrack/cgroup") (contains "task/cgroup" .Values.slurm.taskPlugin) }}
+            - name: slurm-config-static
+              mountPath: /etc/slurm/cgroup.conf
+              subPath: cgroup.conf
+            {{- end }}
             - name: slurm-config-nodes
               mountPath: /etc/slurm/slurm.nodes.conf
               subPath: slurm.nodes.conf
@@ -143,6 +160,9 @@ spec:
                   items:
                     - key: jwt_hs256.key
                       path: jwt_hs256.key
+                      # Slurm 23.11 enforces 0400/0600 on JWT key files
+                      # (auth/jwt fatal if mode looser than 0644).
+                      mode: 0400
         - name: ctld-state
           persistentVolumeClaim:
             claimName: slurm-ctld-state

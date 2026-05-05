@@ -99,3 +99,63 @@ tests:
       - matchRegex:
           path: data["gres.conf"]
           pattern: "Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0"
+
+  - it: emits SlurmctldDebug and SlurmdDebug from values (R12)
+    template: configmap-static.yaml
+    set:
+      slurm.slurmctldDebug: debug
+      slurm.slurmdDebug: verbose
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SlurmctldDebug=debug"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SlurmdDebug=verbose"
+
+  - it: defaults SlurmctldDebug / SlurmdDebug to info when unset
+    template: configmap-static.yaml
+    set:
+      slurm.slurmctldDebug: null
+      slurm.slurmdDebug: null
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SlurmctldDebug=info"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SlurmdDebug=info"
+
+  - it: cgroup.conf is suppressed when no cgroup plugin is in use (R9 default)
+    template: configmap-static.yaml
+    asserts:
+      - notExists:
+          path: data["cgroup.conf"]
+
+  - it: cgroup.conf is emitted when proctrack/cgroup is enabled (privileged overlay)
+    template: configmap-static.yaml
+    set:
+      slurm.proctrackType: proctrack/cgroup
+      slurm.taskPlugin: task/cgroup,task/affinity
+    asserts:
+      - matchRegex:
+          path: data["cgroup.conf"]
+          pattern: "CgroupPlugin=autodetect"
+      - matchRegex:
+          path: data["cgroup.conf"]
+          pattern: "ConstrainCores=yes"
+      - matchRegex:
+          path: data["cgroup.conf"]
+          pattern: "ConstrainDevices=yes"
+
+  - it: TaskPlugin / ProctrackType default for PSS=baseline pods (R9 known limit)
+    template: configmap-static.yaml
+    asserts:
+      # cgroup/v2 plugin needs dbus+systemd which our baseline pods don't have.
+      # See values.yaml comment under R9 for the upgrade path.
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "TaskPlugin=task/affinity"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "ProctrackType=proctrack/linuxproc"

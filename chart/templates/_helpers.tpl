@@ -167,6 +167,8 @@ TaskProlog={{ $s.taskProlog }}
 MailProg={{ $s.mailProg }}
 SelectType={{ $s.selectType }}
 SelectTypeParameters={{ $s.selectTypeParameters }}
+SlurmctldDebug={{ default "info" $s.slurmctldDebug }}
+SlurmdDebug={{ default "info" $s.slurmdDebug }}
 
 SlurmctldPort={{ $s.slurmctldPort }}
 SlurmdPort={{ $s.slurmdPort }}
@@ -192,6 +194,25 @@ AccountingStorageTRES={{ join "," $s.accounting.storageTres }}
 {{- end }}
 
 Include /etc/slurm/slurm.nodes.conf
+{{- end -}}
+
+{{/*
+-----------------------------------------------------------------------------
+slurm-platform.cgroupConf — body of /etc/slurm/cgroup.conf.
+
+Required when TaskPlugin=task/cgroup or ProctrackType=proctrack/cgroup.
+CgroupPlugin=autodetect lets Slurm 23.11+ pick cgroup v1/v2 from
+/sys/fs/cgroup at runtime, so the same config works on Ubuntu 22.04
+(systemd cgroup v1 hybrid) and Ubuntu 24.04 (cgroup v2 unified).
+-----------------------------------------------------------------------------
+*/}}
+{{- define "slurm-platform.cgroupConf" -}}
+{{- $c := .Values.slurm.cgroup | default dict -}}
+CgroupPlugin={{ default "autodetect" $c.plugin }}
+ConstrainCores={{ default "yes" $c.constrainCores }}
+ConstrainRAMSpace={{ default "yes" $c.constrainRamSpace }}
+ConstrainDevices={{ default "yes" $c.constrainDevices }}
+ConstrainSwapSpace={{ default "no" $c.constrainSwapSpace }}
 {{- end -}}
 
 {{/*

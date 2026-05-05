@@ -69,6 +69,7 @@ spec:
         - name: slurm-jwt-secret
           secret:
             secretName: {{ .Values.secrets.jwt }}
+            defaultMode: 0400
 ---
 apiVersion: v1
 kind: Service

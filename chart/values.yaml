@@ -129,16 +129,40 @@ slurm:
   # CompleteWait=0 prevents COMPLETING-stuck jobs when a worker pod is evicted
   # mid-epilog (see docs/note.md mps-migration debug record).
   completeWait: 0
-  # Slurm 21.08 (Ubuntu 22.04 image) has incomplete cgroup v2 support, so we
-  # avoid task/cgroup. We use task/affinity though (NOT task/none) because
-  # task/none disables TaskProlog entirely — it's the task plugin that
-  # invokes the prolog hook, and `none` plugs in a no-op. task/affinity
-  # only needs sched_setaffinity (always available) and is what enables the
-  # MPS env propagation in chart/templates/configmap-task-prolog.yaml.
-  # GPU isolation still comes from the kubelet + libnvidia-container hook,
-  # not Slurm.
+  # R9 / R13 status (2026-05-05 — both deferred):
+  # An attempt to upgrade Slurm 21.08 → 23.11 (Ubuntu 22.04 → 24.04 base)
+  # exposed multiple new incompatibilities with PSS=baseline pods:
+  #   1. Slurm 23.11 slurmstepd ALWAYS calls org.freedesktop.systemd1 over
+  #      dbus to create a transient cgroup scope, even when TaskPlugin is
+  #      task/affinity (no opt-out). Without /run/dbus mounted, slurmd
+  #      refuses to start → "cgroup_dbus_attach_to_scope: cannot connect".
+  #   2. JWT key file mode is enforced as 0400/0600 (was 0644 in 21.08).
+  #   3. openapi/v0.0.37 was removed; slurmrestd needs v0.0.40 plugin.
+  #   4. auth_jwt.so was split out to slurm-wlm-jwt-plugin package.
+  #   5. slurmdbd state file format changed (incompatible PVC migration).
+  # The dbus / systemd-scope dependency (#1) is the blocker — it requires
+  # PSS=privileged + hostPath dbus or a systemd init container, which
+  # widens the attack surface beyond what fits the academic demo. We stay
+  # on Slurm 21.08 + task/affinity + proctrack/linuxproc until the chart
+  # gets a privileged overlay. R9 (clean process-tree kill via cgroup) is
+  # therefore deferred until R13 (Slurm version upgrade) lands.
   taskPlugin: task/affinity
   proctrackType: proctrack/linuxproc
+  # cgroup.conf is still emitted (Slurm reads it whenever any cgroup plugin
+  # is referenced, including from accounting/JobAcctGather). Defaults are
+  # safe even when no cgroup task plugin is active.
+  cgroup:
+    plugin: autodetect
+    constrainCores: "yes"
+    constrainRamSpace: "yes"
+    constrainDevices: "yes"
+    constrainSwapSpace: "no"
+  # Daemon log levels (R12 fix). Replaces hardcoded `slurmctld -Dvvv` /
+  # `slurmd -Dvvv` startup args. Values: quiet | fatal | error | info |
+  # verbose | debug | debug2 | debug3 | debug4 | debug5. `info` is plenty
+  # for production; bump to `debug` only when troubleshooting.
+  slurmctldDebug: info
+  slurmdDebug: info
   # TaskProlog runs on the compute node before each task; lines of the form
   # `export X=Y` printed to stdout are merged into the job environment. We use
   # this to forward CUDA_MPS_PIPE_DIRECTORY (injected into worker containers
@@ -260,6 +284,8 @@ monitoring:
     image: slurm-exporter:latest
     pullPolicy: IfNotPresent
     restUrl: ""                                    # defaults to slurm-restapi.<ns>.svc:6820
+    # Pin to v0.0.37 to match Slurm 21.08 (Ubuntu 22.04). When R13 is
+    # finally executed (Slurm 23.11+), bump to v0.0.40.
     restApiVersion: v0.0.37
     scrapeIntervalSeconds: 15
 

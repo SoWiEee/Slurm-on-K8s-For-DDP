@@ -18,3 +18,15 @@ metadata:
 data:
   slurm.conf: |
 {{ include "slurm-platform.slurmConfStatic" . | indent 4 }}
+  {{- /*
+  cgroup.conf is only emitted when a cgroup-based plugin is in use. Slurm
+  23.11's slurmstepd auto-initializes the cgroup plugin if cgroup.conf is
+  present (regardless of TaskPlugin), and cgroup/v2 needs dbus+systemd in
+  the pod which our PSS=baseline environment does not provide. Guarding by
+  proctrackType keeps PSS=baseline pods clean while still letting a
+  privileged overlay opt in.
+  */}}
+  {{- if or (eq .Values.slurm.proctrackType "proctrack/cgroup") (contains "task/cgroup" .Values.slurm.taskPlugin) }}
+  cgroup.conf: |
+{{ include "slurm-platform.cgroupConf" . | indent 4 }}
+  {{- end }}

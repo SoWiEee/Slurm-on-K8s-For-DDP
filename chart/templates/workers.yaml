@@ -64,6 +64,14 @@ spec:
         app: {{ $pool.appLabel }}
         pool-id: {{ $pool.id }}
         worker-class: {{ $pool.workerClass }}
+      annotations:
+        # R3 fix: roll the worker pod whenever slurm.conf / cgroup.conf /
+        # nodes/gres.conf / task-prolog content changes via helm upgrade.
+        checksum/config-static: {{ include (print $.Template.BasePath "/configmap-static.yaml") $ | sha256sum }}
+        checksum/config-nodes: {{ include (print $.Template.BasePath "/configmap-nodes.yaml") $ | sha256sum }}
+        {{- if $.Values.slurm.taskProlog }}
+        checksum/task-prolog: {{ include (print $.Template.BasePath "/configmap-task-prolog.yaml") $ | sha256sum }}
+        {{- end }}
     spec:
       {{- if $useNvidiaRuntime }}
       runtimeClassName: nvidia
@@ -102,7 +110,9 @@ spec:
               # state and blocks new jobs. ReturnToService=2 clears DOWN but not
               # DRAIN, so we clear it explicitly here while munge is already up.
               scontrol update nodename="$(hostname)" state=resume 2>/dev/null || true
-              exec slurmd -Dvvv -N "$(hostname)"
+              # Daemon log level is driven by SlurmdDebug in slurm.conf (R12 fix);
+              # -D keeps slurmd in foreground so PID 1 doesn't exit.
+              exec slurmd -D -N "$(hostname)"
           ports:
             - containerPort: 22
               name: ssh
@@ -131,6 +141,11 @@ spec:
             - name: slurm-config-static
               mountPath: /etc/slurm/slurm.conf
               subPath: slurm.conf
+            {{- if or (eq $.Values.slurm.proctrackType "proctrack/cgroup") (contains "task/cgroup" $.Values.slurm.taskPlugin) }}
+            - name: slurm-config-static
+              mountPath: /etc/slurm/cgroup.conf
+              subPath: cgroup.conf
+            {{- end }}
             - name: slurm-config-nodes
               mountPath: /etc/slurm/slurm.nodes.conf
               subPath: slurm.nodes.conf
