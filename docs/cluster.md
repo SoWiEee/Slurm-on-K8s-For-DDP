@@ -1,6 +1,6 @@
 # Kubernetes Cluster Architecture
 
-> 本文件對齊 Phase 5-A 之後的實作（Helm chart cutover + k3s + RTX 4070 已驗證）。
+> 本文件對齊 Phase 5 完成後的實作（Lmod + Helm chart cutover + k3s + RTX 4070 已驗證）。
 > 部署來源由 `manifests/core/slurm-static.yaml` 改為 `chart/`（Helm chart）；
 > `bootstrap.sh` / `render-core.py` 已退役。
 

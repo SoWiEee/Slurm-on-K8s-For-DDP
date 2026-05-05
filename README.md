@@ -377,8 +377,9 @@ graph TD
 | 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出；多節點 E2E 驗證通過（含 slurmctld IP cache 修正） |
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
-| 5：Lmod 整合完成 | ✅ 完成 | Lmod 整合至 Phase 1（images + modulefile ConfigMap + `--with-lmod` render）；Phase 5 bootstrap 僅負責確保 `/shared/jobs/` 目錄存在；Worker preStop Hook；job 輸出路徑整合 NFS `/shared/jobs/` |
-| 5+：平台化與高可用 | 📋 規劃中 | Helm Chart、OpenTelemetry 分散式追蹤、Fair-Share 多租戶、Operator HA；Gang Scheduling 基礎設施（K8s feature gate）已就緒，Operator 整合待實作 |
+| 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合至 Phase 1（images + modulefile ConfigMap + `--with-lmod` render）、`/shared/jobs/` 路徑、Worker preStop Hook；**Helm chart cutover**（`chart/`，monolithic + values overlay，Stage A–F 全部完成；`render-core.py` / `bootstrap*.sh` / `manifests/core/*.yaml` 廢棄；`chart/tests/` 28 條 helm-unittest 案例覆蓋 slurm.conf / workers / operator / gpu / monitoring / storage / login）|
+| 6：自訂 Slurm 排程 | 🔒 預留 | 計畫加入針對 DDP / MPS / 多 GPU 共用情境的自訂排程策略（細節 TBD） |
+| 7：分散式追蹤 + SSH Login | 📋 規劃中 | OpenTelemetry job lifecycle trace（Tempo + Operator span + Prometheus exemplar）；Login pod 開放 SSH NodePort 取代 `kubectl exec` |
 
 ---
 
@@ -514,17 +515,16 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 ---
 
-# 🔭 Phase 5 Roadmap：批次 AI 工作平台
+# 🔭 Roadmap
 
-> Phase 5 的目標是讓這個系統從「可運作的基礎設施原型」演進成「能讓使用者直接提交各種 AI job 的批次運算平台」。  
-> 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為後續擴充方向。  
-> 開發順序：**易部署 → 可觀測 → 工作負載完整 → 真實登入體驗**
+> Phase 5 已完成（Lmod + Helm chart cutover）；下一步分為兩塊：Phase 6 預留給自訂 Slurm 排程策略，Phase 7 補齊使用者體驗（端到端 trace + SSH Login）。
+> 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為更後期擴充方向。
 
-## 5-A：Helm Chart 封裝 — 讓部署可重複
+## Phase 5：Lmod + Helm 封裝 ✅ 完成
 
-**現狀問題：** 多支 bootstrap 腳本需依序執行，manifest 散落在 `manifests/` 各子目錄，`worker-pools.json` 改完還要手動跑 `render-core.py`，雙重維護容易出錯。
-
-**目標：** 整個平台一條指令完成部署，所有可調參數集中在 `values.yaml`。
+- **Lmod**：modulefile 以 ConfigMap 管理，掛載至 worker `/opt/modulefiles/`，sbatch 內 `module load` 開機即可用。
+- **Helm chart cutover（`chart/`）**：`worker-pools.json` + `render-core.py` 全部由 `values.yaml` + `_helpers.tpl` 取代；slurm.conf 拆 `slurm-config-static` / `slurm-config-nodes` 兩個 ConfigMap，pool 變動只 rolling 受影響的 StatefulSet。Monitoring / storage / GPU 用 `enabled` flag 控制；GPU Operator 仍走獨立安裝（PSS 隔離理由見 `docs/note.md §5-A 修訂版 3`）。
+- **驗證**：`chart/tests/` 28 條 helm-unittest + `verify-helm.sh` k3s server-side dry-run 全綠；廢棄的 12 個 legacy 檔案已移除。
 
 ```bash
 # k3s + 真實 GPU + MPS
@@ -534,15 +534,18 @@ helm install slurm-platform ./chart -f chart/values-k3s.yaml
 helm install slurm-platform ./chart -f chart/values-dev.yaml
 ```
 
-**設計方向：Monolithic chart + Helm template 直接生成 slurm.conf**
-
-- 單一 chart 目錄（不拆 subchart），monitoring / storage 用 `enabled` flag 控制
-- `worker-pools.json` 與 `render-core.py` 由 `values.yaml` + Helm Go template 取代：`pools` 定義為有序 list，template 用 `range` 迴圈產生 `NodeName`、`gres.conf`、`PARTITIONS_JSON`
-- 環境差異（k3s vs. Kind、real GPU vs. 模擬）用多個 values overlay 管理，不再靠環境變數
-
 詳細設計見 [`docs/note.md §5-A`](docs/note.md)。
 
-## 5-B：OpenTelemetry 分散式追蹤 — 讓 job 生命週期可視化
+## Phase 6：自訂 Slurm 排程策略 🔒 預留
+
+> 預留階段，細節待定。目標方向是針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的排程邏輯（例如 MPS slot 與整卡獨佔的協調、DDP gang-aware placement、與 K8s scheduler 的互動）。
+
+- 目前**不開工**：先讓 Phase 7 把可觀測性與登入體驗補齊，等 trace 資料能呈現現行排程瓶頸後，再決定要解決哪些具體案例。
+- 任何排程改動的設計與決策會寫進 `docs/note.md` 的 Phase 6 段落（目前是 placeholder）。
+
+## Phase 7：分散式追蹤 + SSH Login 📋 規劃中
+
+### 7-A：OpenTelemetry 分散式追蹤
 
 **目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓使用者清楚看到時間花在哪裡（排隊、K8s 啟動、實際執行）。
 
@@ -556,27 +559,10 @@ helm install slurm-platform ./chart -f chart/values-dev.yaml
 
 **需要做的事：**
 - Operator 加入 `opentelemetry-sdk`，在 `scale_action`、`loop_observation` 事件上建立 span
-- 部署 Grafana Tempo（加入 `manifests/monitoring/`）
+- 部署 Grafana Tempo（chart `templates/monitoring/` 加 `enabled` flag）
 - Prometheus histogram exemplar → Tempo 連結，從 latency spike 直接跳到對應 trace
 
-## 5-C：工作負載模板 — 讓使用者開箱即用
-
-**目標：** NFS 上預放一組 `/shared/templates/` job 腳本，使用者 cp 過去改參數就能跑，涵蓋平台支援的五種典型 AI 工作。
-
-| 模板 | GRES 設定 | 展示的系統能力 |
-|------|----------|--------------|
-| `01_preprocess.sh` | `--cpus-per-task=8` | CPU pool 獨立 autoscale，與 GPU job 並行不干擾 |
-| `02_batch_infer.sh` | `--gres=mps:25` | MPS 多工，同一張 GPU 跑 4 個推論 job |
-| `03_hpo_array.sh` | `--array=1-8 --gres=mps:25` | Job array + MPS，8 組超參數實驗並行 |
-| `04_finetune_lora.sh` | `--gres=gpu:rtx4080:1` | 整卡獨佔 + checkpoint guard 縮容保護 |
-| `05_ddp_2gpu.sh` | `--nodes=2 --gres=gpu:1` | 跨 worker pod 的 2-GPU DDP 訓練 |
-
-**需要做的事：**
-- 新增 `templates/` 目錄，放 5 支含詳細註解的 sbatch 腳本
-- `bootstrap-lmod.sh` 結尾加一步：把 `templates/` cp 到 `/shared/templates/`
-- Login pod 的 `/etc/motd` 顯示平台說明與模板位置
-
-## 5-D：SSH Login — 讓使用者直接登入
+### 7-B：SSH Login
 
 **現狀問題：** 目前登入 login node 需要執行 `kubectl exec`，使用者必須先安裝 kubectl 並取得 kubeconfig。
 
@@ -592,8 +578,8 @@ helm install slurm-platform ./chart -f chart/values-dev.yaml
 
 **需要做的事：**
 - `docker/login/Dockerfile` 加入 `openssh-server`，設定 SSH key 認證（禁用密碼登入）
-- `slurm-login` Service 改為 NodePort，固定 port 2222
-- `scripts/bootstrap.sh` 加入 SSH host key 初始化步驟
+- `chart/templates/login.yaml` Service 改為 NodePort，固定 port 2222
+- Login 容器啟動腳本加入 SSH host key 初始化（`ssh-keygen -A`）
 - 後續（多租戶時）：`scripts/add-user.sh` 同時在 Linux 和 Slurm（`sacctmgr`）建帳號
 
 ---

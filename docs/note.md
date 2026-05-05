@@ -348,13 +348,11 @@ batch step 與 srun step 都拿到 socket 路徑，CUDA runtime 真的會走 MPS
 
 ---
 
-# Phase 5 Plan
+# Phase 5 Plan ✅ 完成
 
-Phase 5 的目標是讓這套系統從「可運作的基礎設施原型」演進成「使用者能直接提交各種 AI 批次工作的運算平台」。
-
-目前以**單一使用者**情境為主，系統核心優先做到：**部署可重複 → job 生命週期可視化 → 工作負載開箱即用 → 真實 SSH 登入**。多租戶（Fair-Share 帳號配額）留待後期疊加，不影響前四項。
-
-開發順序：**Helm（5-A）→ OpenTelemetry（5-B）→ 工作負載模板（5-C）→ SSH Login（5-D）**
+> **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 **Phase 7**。
+>
+> 本節以下保留 5-A 的設計與決策記錄，作為 chart 結構的歷史脈絡；活躍的下一階段請看 [`# Phase 6 Plan`](#phase-6-plan) 與 [`# Phase 7 Plan`](#phase-7-plan)。
 
 ---
 
@@ -433,7 +431,30 @@ chart/
 
 ---
 
-## 5-B：OpenTelemetry 分散式追蹤
+# Phase 6 Plan
+
+> **狀態：** 🔒 預留階段，目前不開工。
+
+針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的自訂排程策略。可能方向（待 Phase 7 trace 資料佐證後再收斂）：
+
+- MPS slot 與整卡獨佔的協調（避免 mps job 與 gpu:rtx4070:1 互相 head-of-line block）
+- DDP gang-aware placement：`--nodes=N` 的 job 確保所有 worker pod 同時 ready 才開跑，否則 backoff 而非部分啟動
+- 與 K8s scheduler 的互動（Workload-Aware / Gang Scheduling feature gate 已就緒，見 `docs/review.md`）
+- Operator 擴縮策略與排程決策的協同（例如「為了排這個 gang job，主動把 cpu pool 縮一格騰 quota」）
+
+設計與決策會逐項補在本節。
+
+---
+
+# Phase 7 Plan
+
+> **狀態：** 📋 規劃中。Phase 6 預留期間先做這兩塊讓使用者體驗收斂。
+>
+> 開發順序：**OpenTelemetry（7-A）→ SSH Login（7-B）**
+
+---
+
+## 7-A：OpenTelemetry 分散式追蹤
 
 ### 為什麼 metrics 不夠
 Prometheus 告訴你「現在 p95 provisioning latency 是 45 秒」，但不告訴你：
@@ -481,27 +502,7 @@ TraceID: job-{SLURM_JOB_ID}
 
 ---
 
-## 5-C：工作負載模板
-
-### 目標
-NFS `/shared/templates/` 預放 5 支對應平台典型使用情境的 sbatch 模板，使用者登入後 cp 過去修改參數即可提交，不需要自己研究 GRES 語法。
-
-| 模板 | GRES 設定 | 展示的系統能力 |
-|------|----------|--------------|
-| `01_preprocess.sh` | `--cpus-per-task=8` | CPU pool autoscale，與 GPU job 完全並行 |
-| `02_batch_infer.sh` | `--gres=mps:25` | MPS 多工，4 個推論 job 共用同一張 GPU |
-| `03_hpo_array.sh` | `--array=1-8 --gres=mps:25` | Job array + MPS，8 組超參數實驗並行 |
-| `04_finetune_lora.sh` | `--gres=gpu:rtx4080:1` | 整卡獨佔 + checkpoint guard 縮容保護 |
-| `05_ddp_2gpu.sh` | `--nodes=2 --gres=gpu:1` | 跨 worker pod 的 2-GPU DDP 訓練 |
-
-### 實作路徑
-- 新增 `templates/` 目錄，每支腳本含詳細行內註解（GRES 含義、資源選擇理由）。
-- `bootstrap-lmod.sh` 結尾加一步：`cp -r templates/ /shared/templates/`。
-- Login pod `Dockerfile` 加入 `/etc/motd`，顯示平台簡介與模板路徑。
-
----
-
-## 5-D：SSH Login
+## 7-B：SSH Login
 
 ### 問題
 目前進入 login node 需要 `kubectl exec -it deploy/slurm-login -- bash`，使用者必須安裝 kubectl 並持有 kubeconfig，這不是「共用 AI 計算平台」應有的使用體驗。
@@ -512,13 +513,13 @@ ssh -p 2222 user@<k3s-host-ip>
        ↓
 NodePort :2222 → slurm-login pod
                    ├── sbatch / squeue / sinfo（Slurm 指令即開即用）
-                   └── /shared/（NFS 掛載，模型 + 輸出 + 模板共用）
+                   └── /shared/（NFS 掛載，模型 + 輸出共用）
 ```
 
 ### 實作路徑
 - `docker/login/Dockerfile` 加入 `openssh-server`，SSH key 認證（禁用密碼登入）。
-- `slurm-login` Service 改為 `NodePort`，固定 port 2222。
-- `scripts/bootstrap.sh` 加入 SSH host key 初始化（`ssh-keygen -A`）。
+- `chart/templates/login.yaml` 的 Service 改為 `NodePort`，固定 port 2222。
+- Login 容器啟動腳本加入 SSH host key 初始化（`ssh-keygen -A`）。
 - 後續（多租戶時）：`scripts/add-user.sh` 同時呼叫 `useradd` 和 `sacctmgr add user`。
 
 ---
@@ -544,7 +545,7 @@ NodePort :2222 → slurm-login pod
 `StateSaveLocation`（`/var/spool/slurmctld`）掛載了獨立的 PVC（`slurm-ctld-state`）。controller pod 重啟後，job queue、node 狀態、及會計紀錄指標都會從磁碟還原，不需要重新提交任務。
 
 **slurmdbd 提供什麼？**
-slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是 Phase 5 Fair-Share 多租戶排程的前置條件。
+slurmdbd 搭配 MySQL 後端，把每個 job 的 CPU-hours、使用者、帳戶等資訊持久化。`sacct` 可以查詢歷史 job 統計，也是後期 Fair-Share 多租戶排程的前置條件。
 
 # 工作和硬體資源的分配關係
 
