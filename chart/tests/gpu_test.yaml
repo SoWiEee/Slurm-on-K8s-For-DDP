@@ -3,6 +3,7 @@ templates:
   - gpu/gpu-operator-namespace.yaml
   - gpu/device-plugin-config.yaml
   - gpu/node-labeler-job.yaml
+  - gpu/node-feature-rule.yaml
 tests:
   - it: nothing renders when gpu.enabled is false
     set:
@@ -49,3 +50,37 @@ tests:
       - equal:
           path: metadata.annotations["helm.sh/hook"]
           value: "post-install,post-upgrade"
+
+  - it: NFD NodeFeatureRule renders for declared GPU classes (R4)
+    template: gpu/node-feature-rule.yaml
+    set:
+      gpu.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: NodeFeatureRule
+      - equal:
+          path: apiVersion
+          value: nfd.k8s-sigs.io/v1alpha1
+      # rtx4070 default rule should set the device-plugin.config label
+      - equal:
+          path: spec.rules[0].labels["nvidia.com/device-plugin.config"]
+          value: rtx4070-mps
+      # Vendor 10de hardcoded for NVIDIA, device IDs come from values.yaml
+      - contains:
+          path: spec.rules[0].matchFeatures[0].matchExpressions.vendor.value
+          content: "10de"
+      - contains:
+          path: spec.rules[0].matchFeatures[0].matchExpressions.device.value
+          content: "2783"
+
+  - it: NFD rule is suppressed when gpu.nfdRules.enabled is false
+    template: gpu/node-feature-rule.yaml
+    set:
+      gpu.enabled: true
+      gpu.nfdRules.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

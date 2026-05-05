@@ -1,0 +1,44 @@
+suite: image-puller DaemonSet (R2)
+templates:
+  - image-puller.yaml
+tests:
+  - it: emits a DaemonSet by default
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: DaemonSet
+      - equal:
+          path: metadata.name
+          value: slurm-worker-image-puller
+
+  - it: pulls the worker image via initContainer (so kubelet caches it)
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].image
+          pattern: "slurm-worker"
+      - equal:
+          path: spec.template.spec.initContainers[0].command[0]
+          value: /bin/true
+
+  - it: main container runs pause (no real workload)
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].image
+          pattern: "registry.k8s.io/pause"
+
+  - it: tolerates any taint by default to land on every node
+    asserts:
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            operator: Exists
+            effect: NoSchedule
+
+  - it: can be disabled via imagePuller.enabled=false
+    set:
+      imagePuller.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

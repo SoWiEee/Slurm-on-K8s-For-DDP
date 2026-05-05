@@ -1,0 +1,52 @@
+{{- if and .Values.gpu.enabled .Values.gpu.nfdRules.enabled -}}
+{{/*
+NodeFeatureRule for nvidia.com/device-plugin.config (R4 medium-term fix).
+
+Replaces the one-shot post-install Job (node-labeler-job.yaml) with a
+declarative NFD rule that re-applies the device-plugin config label
+whenever NFD detects an NVIDIA PCI device. NFD watches node hardware
+continuously, so the label survives:
+  - Node reboot
+  - k3s reinstall / node rejoin
+  - Cluster autoscaler replacing nodes
+  - Manual `kubectl label nodes ... -` (NFD restores within ~60 s)
+
+GPU Operator ships NFD by default, so the CRD
+`nodefeaturerules.nfd.k8s-sigs.io` is already present after
+`scripts/install-gpu-operator.sh`. The rule here is cluster-scoped (NFD
+master watches all NodeFeatureRule across the cluster regardless of
+namespace), which is why it's NOT wrapped in a Namespace.
+
+Each rule under .Values.gpu.nfdRules.rules emits one NFD rule. NFD
+matches on PCI device ID (vendor 10de = NVIDIA hardcoded). The first
+rule whose `pciDevices` matches a device on the node wins; later rules
+are skipped per node (NFD evaluates rules in list order).
+
+Reference: https://kubernetes-sigs.github.io/node-feature-discovery/master/usage/customization-guide.html
+*/}}
+apiVersion: nfd.k8s-sigs.io/v1alpha1
+kind: NodeFeatureRule
+metadata:
+  name: slurm-platform-gpu-device-plugin-config
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  rules:
+    {{- range .Values.gpu.nfdRules.rules }}
+    - name: {{ printf "slurm-platform: %s → %s" .name .config | quote }}
+      labels:
+        "nvidia.com/device-plugin.config": {{ .config | quote }}
+      matchFeatures:
+        - feature: pci.device
+          matchExpressions:
+            vendor:
+              op: In
+              value: ["10de"]
+            device:
+              op: In
+              value:
+                {{- range .pciDevices }}
+                - {{ . | quote }}
+                {{- end }}
+    {{- end }}
+{{- end }}

@@ -285,6 +285,21 @@ Returns empty string when no pool has gres.
 {{- range .Values.pools -}}
   {{- $pool := . -}}
   {{- $gresEntries := include "slurm-platform.gresList" $pool | fromJsonArray -}}
+  {{/*
+  R8 fix: emit `Cores=0-(cpus-1)` on the GPU entry so cons_tres can do
+  GPU↔CPU NUMA-affinity binding (`--gres-flags=enforce-binding`). Without
+  this, NCCL helper threads / CUDA driver threads end up on arbitrary
+  CPUs and pay ~10–20% NCCL bandwidth penalty on cross-NUMA hops. For
+  single-socket pods cores_max == cpus-1; future multi-GPU multi-NUMA
+  nodes will need per-GPU Cores= ranges (overlay this helper then).
+  */}}
+  {{- $cpusPerNode := int (default 1 $pool.cpus) -}}
+  {{- $coresRange := "" -}}
+  {{- if gt $cpusPerNode 1 -}}
+    {{- $coresRange = printf "0-%d" (sub $cpusPerNode 1) -}}
+  {{- else -}}
+    {{- $coresRange = "0" -}}
+  {{- end -}}
   {{- range $i, $_ := until (int $pool.maxNodes) -}}
     {{- $nodeName := printf "%s-%d" $pool.statefulset $i -}}
     {{- range $gresEntries -}}
@@ -296,7 +311,7 @@ Returns empty string when no pool has gres.
       {{- else -}}
         {{- $type := index $parts 1 -}}
         {{- $count := index $parts 2 -}}
-        {{- $lines = append $lines (printf "NodeName=%s Name=%s Type=%s Count=%s File=%s" $nodeName $name $type $count $devFile) -}}
+        {{- $lines = append $lines (printf "NodeName=%s Name=%s Type=%s Count=%s File=%s Cores=%s" $nodeName $name $type $count $devFile $coresRange) -}}
       {{- end -}}
     {{- end -}}
   {{- end -}}

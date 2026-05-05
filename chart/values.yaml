@@ -238,6 +238,43 @@ gpu:
     - selector:
         gpu-host-class: rtx4080
       config: rtx4080-exclusive
+  # R4 medium-term fix: declarative NFD NodeFeatureRule that re-applies
+  # `nvidia.com/device-plugin.config=<key>` on every node based on hardware
+  # detection. NFD watches PCI devices and existing labels; the rule
+  # converges automatically after node rebuild, k3s reinstall, etc — no
+  # CronJob, no one-shot post-install Job needed. GPU Operator already
+  # ships NFD so the CRDs (nodefeaturerules.nfd.k8s-sigs.io) are present.
+  # The nodeAssignments-based one-shot Job above remains as a fallback for
+  # clusters without NFD; both can run side-by-side (NFD wins on conflicts).
+  nfdRules:
+    enabled: true
+    # Each rule maps a (PCI device IDs, optional gpu.product regex) match
+    # to a device-plugin config key. Vendor is always NVIDIA (10de); list
+    # device IDs under each rule. Ada Lovelace family: RTX 4070=2783,
+    # RTX 4070 Ti=2782, RTX 4070 Ti SUPER=2705, RTX 4080=2704,
+    # RTX 4080 SUPER=2702. Update for your hardware.
+    rules:
+      - name: rtx4070-class
+        pciDevices: ["2783", "2786", "2705"]
+        config: rtx4070-mps
+      - name: rtx4080-class
+        pciDevices: ["2704", "2702", "2782"]
+        config: rtx4080-exclusive
+
+# -- Image-puller DaemonSet (R2 fix) ----------------------------------------
+# Pre-pulls the worker image onto every potential worker node so that the
+# first scale-up does NOT eat 30–60s on `crictl pull`. The DaemonSet runs
+# `pause` (no real workload, cgroup overhead negligible), but kubelet still
+# pulls the image listed in `containers[0].image` on each matching node and
+# keeps it cached. Subsequent operator scale-ups land on workers that find
+# the image already present (`imagePullPolicy: IfNotPresent`).
+imagePuller:
+  enabled: true
+  # Restrict to nodes that can host Slurm workers — by default any node
+  # without a NoSchedule taint. Override `nodeSelector` to scope to
+  # GPU nodes only when worker images differ between pools.
+  nodeSelector: {}
+  tolerations: []
 
 # -- Operator (Stage C) ------------------------------------------------------
 operator:

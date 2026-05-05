@@ -1,0 +1,86 @@
+{{- if .Values.imagePuller.enabled -}}
+{{/*
+Image-puller DaemonSet (R2 fix).
+
+The first time the operator scales up a worker pool, kubelet has to pull
+slurm-worker:latest (CUDA + OpenMPI + Lmod, multi-GB layers) from the
+local containerd. That cold pull adds 30–60 s to the end-to-end scale-up
+latency, which the user perceives as `sbatch` → "node still PROVISIONING"
+even after the operator has already patched StatefulSet replicas.
+
+This DaemonSet runs `pause` on every node that could host a worker. It
+needs ~0 CPU/memory at runtime, but kubelet still pulls the image listed
+under containers[0].image and keeps it in the local store. When the
+real worker pod lands later, `imagePullPolicy: IfNotPresent` finds the
+image already cached → first-pull becomes a hot-pull (~2–3 s).
+
+Why DaemonSet vs other approaches:
+  - `kubectl debug node` / `crictl pull` (manual, doesn't re-pull on
+    image tag updates).
+  - InitContainer on the worker itself (defeats the purpose — the pull
+    only happens after the pod is scheduled).
+  - DaemonSet of `pause` is the standard K8s pattern (KEP-1958, used by
+    GKE / EKS image-streaming, Argo CD, kubernetes-sigs/image-spec).
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: slurm-worker-image-puller
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: slurm-worker-image-puller
+spec:
+  selector:
+    matchLabels:
+      app: slurm-worker-image-puller
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: slurm-worker-image-puller
+    spec:
+      # Tolerate any taint by default — this DS does no real work, so it's
+      # safe to land everywhere. Users can scope down via .Values.imagePuller.
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+        {{- with .Values.imagePuller.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.imagePuller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The pause image (~700 KB) is what actually runs. The pull happens
+      # because the worker image is an `image:` of one of the containers
+      # below — kubelet pulls every image listed in any container,
+      # InitContainer, or ephemeralContainer of every pod scheduled on
+      # the node, even if the container never starts.
+      initContainers:
+        - name: pull-worker
+          image: {{ .Values.image.worker }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/true"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "10m"
+              memory: "16Mi"
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "4Mi"
+            limits:
+              cpu: "10m"
+              memory: "8Mi"
+      terminationGracePeriodSeconds: 5
+{{- end }}

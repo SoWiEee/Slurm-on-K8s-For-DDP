@@ -98,7 +98,26 @@ tests:
           pattern: "Name=mps Count=100"
       - matchRegex:
           path: data["gres.conf"]
-          pattern: "Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0"
+          pattern: "Name=gpu Type=rtx4070 Count=1 File=/dev/nvidia0 Cores=0-3"
+
+  - it: gres.conf includes Cores= range from pool.cpus for cons_tres binding (R8)
+    template: configmap-nodes.yaml
+    set:
+      cluster.runtime: k3s
+    asserts:
+      # rtx4070 pool has cpus=4 → Cores=0-3
+      - matchRegex:
+          path: data["gres.conf"]
+          pattern: "NodeName=slurm-worker-gpu-rtx4070-0 .*Cores=0-3"
+      # rtx4080 pool also cpus=4 → Cores=0-3 (verifies it's not hardcoded
+      # to one pool)
+      - matchRegex:
+          path: data["gres.conf"]
+          pattern: "NodeName=slurm-worker-gpu-rtx4080-0 .*Cores=0-3"
+      # mps lines must NOT have Cores= (Slurm derives mps Cores from gpu)
+      - notMatchRegex:
+          path: data["gres.conf"]
+          pattern: "Name=mps .*Cores="
 
   - it: emits SlurmctldDebug and SlurmdDebug from values (R12)
     template: configmap-static.yaml
