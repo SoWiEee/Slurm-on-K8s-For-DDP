@@ -4,10 +4,10 @@
 
 - 互動式文件：[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
 - 採坑紀錄和實作筆記：[`docs/note.md`](docs/note.md)
-- Windows+Kind 遷移到 Linux+K3s 的計畫：[`docs/migration.md`](docs/migration.md)
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
 - 監控系統實作規格：[`docs/monitoring.md`](docs/monitoring.md)
-- AI Review 紀錄：[`docs/review.md`](docs/review.md)
+- Slurm 優化排程研究：[`docs/scheduler.md`](docs/scheduler.md)
+- AI Review 紀錄：[`docs/review.md`](docs/review.md) (Update after Phase5)
 
 ---
 

@@ -1,467 +1,549 @@
-# HPC / AI Infra 架構審查報告（v3 — MPS migration / k3s 上線前）
+# HPC / AI Infra 架構審查報告（v4 — Phase 5 完成後）
 
-> **評估對象：** Phase 1–5 已完成範圍 + `mps-migration` 分支（rtx4070 / rtx4080 + MPS）
-> **評估時間：** 2026-04-04（v1）、2026-04-10（v2）、2026-04-26（v3：本次）
-> **評估視角：** HPC 叢集工程師 + k3s/K8s SRE
-> **環境前提：** v3 撰寫時程式碼仍在 Windows 主機編輯，**Linux + k3s + 真實 GPU 尚未跑過任何驗證**；本輪審核盡量聚焦於可由閱讀 manifest / 腳本判斷的設計缺陷。
+> **評估對象：** Phase 1–5 全部完成（Lmod + Helm chart cutover + GPU Operator MPS）；Phase 6/7 尚未開工
+> **評估時間：** 2026-05-05（v4 — 本次）
+> **評估視角：** HPC 叢集工程師 + K8s SRE + ML systems
+> **本輪範圍：** 安全議題暫不審（依使用者要求）；v3 已修項目移除，只保留**仍在的議題 + 本輪新發現**
 >
-> 本文件以 README.md 揭示的四大動機（**利用率 / 隔離性 / 彈性 / 容錯**）為審核基準，逐項對照實作是否能兌現該承諾。
-> ✅ 已解決並附簡述、⚠️ 部分達成、❌ 設計上未兌現或反而被新 migration 打破。
+> 本輪審查的兩個重點：
+> 1. **找出阻擋系統真實上線使用的工程缺口**（drain timeout / 監控盲點 / 升級路徑）
+> 2. **找出能讓這套系統「出色」的差異化機會** — 對照 Slinky / SUNK / Slonk / AWS ParallelCluster，這個專案有什麼獨家賣點可以放大
 
 ---
 
 ## 0. 執行摘要
 
-本專案以最小依賴（Kind/k3s + StatefulSet + Python Operator）實作了一套彈性 Slurm 叢集，學習性原型完成度高。但對照 README 的四大動機：
+Phase 5 完成後，**部署可重複性（Helm cutover）和 GPU 共享（GPU Operator MPS）兩件事已經到位**。剩下的差距集中在三層：
 
-| 動機 | 實作狀態 | 主要差距 |
-|-----|---------|---------|
-| 利用率（MPS 70%+） | ⚠️ Migration 完成設定，但 **K8s 與 Slurm 兩層 GPU 排程互相打架**，實機跑不起來 |
-| 隔離性（CPU/GPU 池獨立） | ⚠️ StatefulSet 已分離，但 **partition 仍只有 `debug`**，CPU job 可能落到 GPU node |
-| 彈性（縮回 0 / Operator 擴出） | ⚠️ Drain-then-scale 已實作，但 **無 drain 超時**，遇 hang job 永遠縮不回去 |
-| 容錯（Checkpoint guard / NFS） | ✅ 大致完成，但 SPOF 與 NFS I/O 瓶頸未解決 |
+| 層 | 差距 | 對應章節 |
+|---|---|---|
+| 維運可靠度 | drain timeout、單點 SPOF、image preload、ConfigMap reload、節點 label drift | §2 §3 §5 |
+| 觀測縱深 | 沒有真實 GPU SM%/VRAM/PCIe 指標、沒有 per-job profile、沒有 trace | §6 |
+| 工程體驗 | 沒有 chart artifact 發佈、沒有快照備份、沒有 chaos 測試 | §7 §8 |
 
-v3 新增的關鍵風險集中在 **MPS migration 的 K8s 整合層**（§五、§九）與 **k3s 第一次部署的腳本盲點**（§九），這兩塊是上 Linux 機器後最先會踩的坑。
+對照 README 動機：
 
-**本輪新發現（migration 相關，按嚴重度排序）：**
+| 動機 | 兌現度（v4） | 主要剩餘缺口 |
+|---|:---:|---|
+| 利用率（MPS 70%+） | 🟢 90% | 缺 DCGM exporter，數字驗證不了 |
+| 隔離性（CPU/GPU 池獨立） | 🟢 95% | partition 已拆，QoS / preempt 未啟 |
+| 彈性（縮回 0 / 擴出） | 🟡 70% | drain timeout 未做、image pull 冷啟 30s+ 未優化 |
+| 容錯（Checkpoint guard / NFS） | 🟡 65% | controller SPOF、MySQL 無備份、NFS 無 alt-path |
 
-| # | 議題 | 類別 | 嚴重度 | 狀態 |
-|---|------|-----|:----:|:----:|
-| N1 | MPS DaemonSet 與 worker pod 同時 request `nvidia.com/gpu:1`，互搶設備 | GPU/K8s | 🔴 P0 | ✅ |
-| N2 | rtx4080 `devicePath=/dev/nvidia1` 在 device-plugin 模式下錯誤 | GPU | 🔴 P0 | ✅ |
-| N3 | `maxNodes=2` × 單張實體 GPU → 第二個 pod 永遠 Pending | GPU/K8s | 🟠 P1 | ⬜ |
-| N4 | `bootstrap.sh` 對 k3s runtime 仍呼叫 `kind load docker-image`（line 285）| k3s migration | 🔴 P0 | ✅ |
-| N5 | NetworkPolicy `allow-operator-egress` 只開 TCP/443，k3s API server 預設 6443 | k3s migration | 🔴 P0 | ✅ |
-| N6 | `AccountingStorageTRES` 未設，sacct 不會記 GPU/MPS 用量 → fairshare 失效 | 排程 | 🟠 P1 | ✅ |
-| N7 | `partition=debug` 涵蓋所有 CPU/GPU node，無 constraint 的 CPU job 可落到 GPU node | 排程 | 🟠 P1 | ✅ |
-| N8 | Operator scale-down 無 drain timeout，hang job 永久阻擋縮回 0 | 彈性 | 🟠 P1 | ⬜ |
-| N9 | `hostIPC: true` 在 k3s PSS=baseline 預設下會被 admission 擋下 | k3s migration | 🟠 P1 | ✅（N1 移除 hostIPC + bootstrap.sh 顯式 label baseline）|
-| N10 | `nvidia-device-plugin.yaml` 未啟用 sharing/replicas，與 MPS 設計矛盾 | GPU | 🟠 P1 | ✅ |
-| N11 | `ProctrackType=proctrack/linuxproc` 與 `TaskPlugin=task/cgroup` 不一致 | Slurm 設定 | 🟡 P2 | ⬜ |
-| N12 | `verify-gpu.sh` 預設只跑 `--gres=gpu:rtx4070:1`，不驗證 MPS 路徑 | 驗證 | 🟡 P2 | ✅ |
-| N13 | k3s feature gates `GangScheduling,GenericWorkload` 名稱未對 1.35 GA/Alpha 文件覆核 | 排程 | 🟡 P2 | ⬜ |
+**本輪新發現（按 P0 → P3 排序，標 ★ 是「做了會出色」而非「不做會壞」）：**
 
-> **2026-04-27 修復批次：** N1 / N2 / N5 / N7 已 commit；N6（`AccountingStorageTRES`）與 N10（device-plugin sharing.mps）為 N1/N7 的連帶修正，一併標 ✅。
-> **2026-04-27 第二批：** N4（`bootstrap.sh` / `bootstrap-monitoring.sh` 改以 `k3s ctr images import` 走 containerd 路徑）、N9（`bootstrap.sh` 顯式為 namespace 設 `pod-security.kubernetes.io/enforce=baseline`，N1 已移除 hostIPC）、N12（`verify-gpu.sh` 新增 step 6 驗證 `--gres=mps:25` 與 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 注入）。詳細修法見各章節下方的「✅ 已修」段落與 [§九 Checklist](#九k3s-第一次部署-checklistv3-新增) 表格更新。
+| # | 議題 | 類別 | 嚴重度 | 性質 |
+|---|---|---|:---:|:---:|
+| R1 | Operator scale-down 仍無 drain timeout（v3 N8 沿用） | 彈性 | 🔴 P0 | bug |
+| R2 | scale-up 冷啟 image pull 沒 preload，第一次擴 GPU pod 30–60s | 彈性 | 🟠 P1 | 性能 |
+| R3 | slurm.conf 改變後沒有自動 `scontrol reconfigure`，需手動或 pod 重建 | 維運 | 🟠 P1 | bug |
+| R4 | `nvidia.com/device-plugin.config` node label 由 post-install Job 一次性打，**節點重建即遺失** | GPU | 🟠 P1 | bug |
+| R5 | 沒有 DCGM exporter，「GPU utilization」panel 顯示的是 Slurm allocated GPU 數而非真實 SM% | 觀測 | 🟠 P1 | 觀測盲點 |
+| R6 | Operator 是 single replica + 沒 leader election（v3 3-C 沿用、變嚴重） | 可靠度 | 🟠 P1 | SPOF |
+| R7 | Workers 沒設 `resources.requests/limits`（v3 6-A 沿用），對 cgroup accounting 失效 | K8s | 🟠 P1 | 沿用 |
+| R8 | `gres.conf` 缺 `Cores=` 拓撲宣告，cons_tres 沒法做 GPU↔CPU 親和性 binding | 排程 | 🟡 P2 | 性能 |
+| R9 | `ProctrackType=proctrack/linuxproc` 跟 `task/affinity` 在 GPU job 殺進程不乾淨（v3 N11 沿用） | Slurm 設定 | 🟡 P2 | bug |
+| R10 | StatefulSet `RollingUpdate` 預設策略，chart upgrade 會中斷 running job | 維運 | 🟡 P2 | bug |
+| R11 | Login pod 無 resource limit，使用者可 fork bomb 拖垮整個 node | K8s | 🟡 P2 | 沿用變體 |
+| R12 | `slurmd -Dvvv`（DEBUG3）長期跑會把 log volume 灌爆 | 維運 | 🟡 P2 | 雜訊 |
+| R13 | Slurm 21.08 cgroup v2 支援不完整 — Ubuntu 22.04 image 將是長期技術債 | 升級路徑 | 🟡 P2 | tech debt |
+| R14 | NFS 沒有 `mountOptions: [hard, intr, rsize=1M, wsize=1M]`，DDP I/O 性能堪憂 | 儲存 | 🟡 P2 | 性能 |
+| R15 | Checkpoint guard 只認單一 file path，rotation / 多檔案 ckpt 不認得 | 彈性 | 🟢 P3 | bug |
+| R16 ★ | **缺 OTel job-lifecycle trace** — Phase 7 計畫，但這正是與 Slinky/SUNK 的差異化點 | 差異化 | ★ | feature |
+| R17 ★ | **缺 score-based / ML-aware scheduling** — Phase 6 預留，是論文級貢獻 | 差異化 | ★ | feature |
+| R18 ★ | **缺端到端 chaos / failure injection 測試** — 沒有任何 Slurm-on-K8s 開源方案做這個 | 差異化 | ★ | feature |
+| R19 ★ | **缺 sbatch wrapper 自動填 `--time` / `--mem`**（接 §9 ML 預測） | 差異化 | ★ | feature |
+| R20 ★ | **缺 GPU job profile dashboard**（per-job DCGM panel + 連結到 Grafana Tempo） | 差異化 | ★ | feature |
 
-**沿用前兩輪審核已解決項目（保留摘要）：**
-StateSaveLocation PVC 持久化、縮容 drain、slurmdbd + MySQL accounting、kubectl→Python SDK、PDB、`MpiDefault=pmi2`、Lmod、`CHECKPOINT_PATH=""` 不再靜默失效、Checkpoint Grace Period、Worker preStop Hook、job output → `/shared/jobs/`、NetworkPolicy Ingress+Egress + 扇出 RPC 處理、Operator 熔斷器 / readinessProbe、Cooldown 持久化（StatefulSet annotation）、slurmctld IP cache 修正（`fix_node_addr()`）。
-
----
-
-## 一、安全模型
-
-### 1-A. `SlurmUser=root`（沿用 v2，仍未修）
-
-slurmctld、slurmd、slurmrestd 全部以 `root` 跑。一個 munge / Slurm CVE 即等於完整節點控制。MPS migration 後 worker pod 還額外加上 `hostIPC: true`，scope 只擴大不縮小。
-
-### 1-B. JWT lifespan = 10 年（沿用）
-
-`render-core.py` line 330：`scontrol token username=root lifespan=315360000`。Operator 取得的 JWT 可永久操作 REST API，secret 洩漏即為災難。
-
-### 1-C. `SLURMRESTD_SECURITY=disable_user_check`（沿用）
-
-只靠 NetworkPolicy 把 6820 鎖在 namespace 內，但 NetworkPolicy 是 best-effort（取決於 CNI 是否實作）。k3s 預設 flannel 對 NetworkPolicy 支援是有的，但 IPv6 / hostNetwork 等邊角不一定生效。
-
-### 1-D. munge.key 無輪換（沿用）
-
-### ✅ 1-E. NetworkPolicy Egress（v2 修正）
-
-⚠️ **v3 新增警告（→ N5）：** `allow-operator-egress` 只允許 TCP/443 出站到任意位址，這是給 Kind / hosted K8s API 用的設定。**k3s 預設 API server 在 6443**（除非以 `--https-listen-port=443` 重新設定），上 Linux 後 operator 完全打不到 K8s API，整個 reconcile loop 會持續熔斷 backoff。
-
-修法二選一：
-1. NetworkPolicy egress 加上 `port: 6443`；或
-2. 啟動 k3s 時加 `--https-listen-port=443`（會與其他 443 服務衝突，較不建議）。
-
-建議手段：在 `manifests/networking/network-policy.yaml` 對 operator 的 egress 改為同時允許 443 + 6443，避免 runtime 差異。
+**沿用前輪未修項目（簡要列）：**
+NFS DDP 瓶頸（2-A）、MySQL 無備份（2-C）、Controller SPOF（3-C）、無 Fairshare（4-B）、無 Preempt（4-C）、無 Gang Scheduling 整合（4-D）、Lmod conflict / NCCL 模組（5-C）、k3s + Multus 雙網路未驗證（5-D）、Static pre-declared nodes 代價（6-C）、無 CRD（6-D，刻意設計）、無 per-job tracking（7-B）、N13 feature gate 名稱待覆核。
 
 ---
 
-## 二、儲存與資料持久性
+## 1. 儲存與 I/O
 
-### ✅ 2-0. StateSaveLocation 與 Job Accounting（沿用）
+### 2-A. NFS DDP I/O 瓶頸（沿用，需配套說明）
 
-### 2-A. NFS 是 DDP I/O 瓶頸（沿用）
+問題不變：Phase 3 把 NFS RWX PVC 暴露給所有 pod，DDP checkpoint（13 GB / 次）寫進 NFS 會 stall。**目前沒有任何 templates / 文件警告使用者這件事。**
 
-註：README 動機四宣告「NFS PVC 讓結果跨節點持久化」，但若實際要跑模板 `04_finetune_lora.sh`（13 GB/ckpt）就會立刻撞 NFS 頻寬上限。建議在 `templates/` 文件中明示「checkpoint 寫 NFS 是會 stall 訓練的」，或將 finetune 的 ckpt 寫 hostPath。
+最低限度修法：
+1. `chart/values.yaml` 加 `storage.fastLocalPath`（hostPath 或 emptyDir.medium=Memory）給 ckpt 用
+2. README 在 templates 章節加警告：「checkpoint 寫 NFS 會 stall 訓練」
+3. 提供 `04_finetune_lora.sh` 模板（如果 Phase 7 要重做工作負載模板）示範 hot ckpt 寫 local + 冷封存到 NFS 的兩段策略
 
-### ✅ 2-B. Job 輸出 → `/shared/jobs/`（v2 已修）
+### R14（新）：NFS mountOptions 沒調
+
+`chart/templates/storage.yaml` 的 PVC 沒設 `mountOptions`。NFS subdir provisioner 預設是 `vers=4.1, rsize=8K, wsize=8K`，對 DDP 大 ckpt 寫入是災難（每次 8K 一個 RPC round-trip）。
+
+**修法：** StorageClass 加 `mountOptions: [nfsvers=4.1, rsize=1048576, wsize=1048576, hard, intr, timeo=600, retrans=2]`。光這一行對 ckpt 寫入吞吐有 5–10× 改善（NFS 實測）。
 
 ### 2-C. MySQL 單點 + 無備份（沿用）
 
-⚠️ **v3 強化：** README 動機提到「Fair-Share 排程」，slurmdbd 後端是其前提。MySQL PVC 損毀=> 全部 fairshare 歷史歸零。最低限度應加 `mysqldump` CronJob 到另一個 PVC。
+`slurmdbd` 後端是 fairshare 與長期 accounting 的唯一 source of truth。掛了就全部歷史歸零。最低限度：CronJob 跑 `mysqldump` 到 NFS 或外部 PVC，每天 1 次，保留 7 份。
 
-### N6（新）：`AccountingStorageTRES` 未設，GPU/MPS 用量完全不會記帳
-
-`render-core.py` 的 slurm.conf header 缺以下設定：
-
-```ini
-AccountingStorageTRES=gres/gpu,gres/mps
+```yaml
+# chart/templates/accounting-backup-cronjob.yaml（新）
+apiVersion: batch/v1
+kind: CronJob
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: dump
+              image: mysql:8
+              command: ["sh","-c","mysqldump -h slurmdbd-mysql -u root -p$PW slurm_acct_db | gzip > /backup/$(date +%F).sql.gz"]
 ```
-
-沒有這行，`sacct -X --format=AllocTRES` 不會回傳 GPU 用量；後續若要做 fairshare（`PriorityType=priority/multifactor`），GPU 工作的權重永遠是 0，CPU 與 GPU 工作會被當成等價計費，違背 README「Fair-Share 排程」前置。
-
-**修法：** `build_slurm_conf()` 在偵測到任何 pool 含 gpu / mps GRES 時，自動把 `AccountingStorageTRES` 加進 header。
 
 ---
 
-## 三、故障恢復與可靠性
+## 2. 故障恢復與可靠性
 
-### ✅ 3-0. 縮容 Drain / PDB / Cooldown 持久化 / IP cache（沿用）
+### R1（新 / v3 N8 沿用，升 P0）：Operator scale-down 仍無 drain timeout
 
-### N8（新）：Scale-down 無 drain timeout，hang job 永久阻擋縮回 0
+`operator/app.py` 仍是「等所有 draining node `cpu_alloc=0` 才縮」。一個 hang 的 srun step 會把整個 pool 永遠卡在 max replicas。
 
-`operator/app.py::_do_scale_down`：
+**修法（具體 patch 點）：**
+- `operator/models.py::PoolState` 加 `draining_started: dict[str, float]`（node → epoch ts）
+- `operator/policy.py` 在判斷 scale-down 時，若 `now - draining_started[n] > drain_timeout` 則 emit `force_scale_down` decision
+- `operator/app.py` 收到 `force_scale_down` 時：對每個 stuck node 呼叫 `scancel --nodelist=$n`、`scontrol update state=DOWN reason="drain timeout"`，然後 patch replicas
+- `chart/values.yaml` 加 `operator.drainTimeoutSeconds: 1800`（已存在但未實作）
+- 觸發時 emit metric `slurm_operator_drain_timeout_total{pool, node}` + 結構化 log `drain_timeout_force_kill` → 接 Alertmanager
+
+### R2（新）：scale-up 冷啟 image pull 沒 preload
+
+第一次擴 GPU pod 時，`slurm-worker:latest` 從 local registry pull 約 30–60 秒（image 含 CUDA + OpenMPI + Lmod，輕鬆超過 4GB）。Operator scale-up 完到 slurmd ready 的端到端 latency 主要被 image pull 吃掉。
+
+**修法（兩條路）：**
+1. **DaemonSet image-puller**（推薦）：chart 加一個 `image-puller-daemonset.yaml`，nodeSelector 挑 GPU node，container 是 `pause` 但 image 設成 `slurm-worker:latest`。kubelet 會幫你 pull 一次，之後 `IfNotPresent` 直接用 local cache。
+2. 用 `kubectl debug node` / `crictl pull` 在 cluster bootstrap 時手動 pull 到所有 node。
+
+差異：第一次擴 60s → 第一次擴 5s。對 README 動機三「彈性」是直接的兌現。
+
+### R3（新）：slurm.conf 改變後沒有自動 reconfigure
+
+`chart/templates/configmap-nodes.yaml` 的 ConfigMap 變動會被 kubelet 同步（~60s 延遲），但**slurmctld 不會自動讀新檔**。要嘛重啟 controller pod，要嘛手動 `scontrol reconfigure`。
+
+helm upgrade 改 `pools[].replicas` / `maxNodes` / partition 設定後，行為是「controller 還用舊設定、worker 已經拿新 NodeName」— mismatch，scale 行為錯亂。
+
+**修法選項：**
+- A：controller pod 跑 sidecar，watch ConfigMap mtime，變動時 `scontrol reconfigure`
+- B：chart 用 helm hook `post-upgrade` 跑一個 Job 呼叫 `scontrol reconfigure`
+- C：給 ConfigMap 加 annotation `checksum/config: {{ include "..." . | sha256sum }}`，讓 controller pod 在 ConfigMap 變動時 rolling restart（最簡單）
+
+推薦 C，一行 annotation 解決。
+
+### 3-C. Controller SPOF（沿用，配 R6 升級）
+
+slurmctld single replica + StateSaveLocation 在 PVC。短期（Phase 5 後）可以接受；長期要做 backup controller（Slurm 內建 `BackupController` + `BackupAddr`）。
+
+**最低限度可以先做的：** chart 加 `slurmctld-state-snapshot` CronJob，每小時 `tar` 一份 StateSaveLocation 到 NFS。controller 重建時可以 restore，把 RTO 從「全部 job 重提」降到「< 1 小時」。
+
+### R6（新）：Operator single replica + 無 leader election
+
+`chart/templates/operator.yaml` Deployment replicas=1。Operator 重啟期間（pod restart / image upgrade / node 故障）所有擴縮決策停擺。雖然有 `slurm.k8s/last-scale-up-at` annotation 救 cooldown，但**整個 polling loop 中斷期間 pending job 不會被服務**。
+
+**修法（兩條路，按工程量）：**
+- 短期：保持單副本，但加 `terminationGracePeriodSeconds: 60` + 健康的 readinessProbe，把重啟 RTO 控制在 30s 內
+- 長期：Active-passive — 兩副本 + `coordination.k8s.io/Lease` leader election（Python `kubernetes-client` 有 `leaderelection` module）。Slurm 操作必須 single-writer 所以一定是 active-passive 不是 active-active
+
+對學術 demo 短期那條夠用，但 thesis defense 時被問「operator 掛了會怎樣」要有答案。
+
+### R15（新）：Checkpoint guard 只認單一 file path
+
+`operator/policy.py` 的 checkpoint guard 用 `os.stat(checkpoint_path).st_mtime` 判斷 freshness。問題：
+
+- PyTorch 常見模式是 `ckpt-{step}.pt`（rotation）
+- DeepSpeed 是整個目錄 `global_step{N}/`
+- 多 ckpt 並存（best.pt + latest.pt）
+
+目前實作對這些都不認得。**修法：** 改成 glob pattern 支援 + 取目錄/匹配中最新的 mtime。
 
 ```python
-all_idle = all(self.client.get_node_cpu_alloc(n) == 0 for n in draining)
-if all_idle:
-    self.actuator.patch_replicas(...)   # 真正縮容
-else:
-    # log "waiting_for_drain" 並 return
+# operator/policy.py
+import glob
+def latest_ckpt_age(pattern: str) -> float | None:
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    return time.time() - max(os.path.getmtime(m) for m in matches)
 ```
 
-問題：只要任何一個 draining node 上仍有 alloc 中的 job（包含死 hang 不退出的 srun step、卡在 epilog），replicas 就**永遠不會降下來**。README 動機三宣告「沒有 job 時 worker pod 自動縮回 0」會被一個爛 job 整個破壞。
+`chart/values.yaml` 的 checkpoint pattern 從 string 改 list：
+
+```yaml
+operator:
+  checkpointGuard:
+    patterns:
+      - /shared/jobs/*/checkpoints/*.pt
+      - /shared/jobs/*/global_step*/
+```
+
+---
+
+## 3. 排程策略
+
+### R8（新）：gres.conf 缺 Cores= 拓撲宣告
+
+`chart/templates/_helpers.tpl` 產生的 gres.conf 沒寫 `Cores=`：
+
+```
+NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 File=/dev/nvidia0
+```
+
+**問題：** cons_tres 在分配 GRES 時會嘗試把 GPU 與 CPU 綁同一 NUMA / socket，但**前提是 gres.conf 宣告了 GPU 對應的 CPU core**。沒有 `Cores=` 就退化成隨機綁 CPU。對單 GPU + DDP collective 影響大（NCCL 的 CPU helper thread 跨 NUMA 會掉 ~10–20% 通訊頻寬）。
 
 **修法：**
-1. `PartitionConfig` 新增 `drain_timeout_seconds`（預設 1800s）；
-2. `_draining_nodes` 改存 `dict[node_name, drain_started_at]`；
-3. 超過 timeout 時：發 `scancel` 給節點上的 job、進 `state=DOWN` 後強制 patch replicas，並 emit `drain_timeout_force_kill` 事件供 Prometheus 告警。
 
-### ✅ 3-A. Worker preStop Hook（沿用）
-### ✅ 3-B.  Checkpoint Guard 兩個情境（沿用）
-### 3-C. Controller SPOF（沿用）
-### ✅ 3-D. Cooldown 持久化（沿用）
-### ✅ 3-E. slurmctld IP cache（沿用）
+```
+# gres.conf
+NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 File=/dev/nvidia0 Cores=0-3
+```
 
-⚠️ **v3 警告：** k3s 預設使用 `flannel`，pod IP 仍為 ephemeral，IP cache 問題在 k3s 一樣會發生。`fix_node_addr()` 是 verify 腳本的 workaround，正式 deploy 路徑（bootstrap.sh）並沒有自動執行；上 k3s 後第一次 worker pod 重啟一定會復現 COMPLETING 卡住問題。建議把 `fix_node_addr()` 從 verify-storage-e2e.sh 抽出成 `scripts/lib/fix-node-addr.sh`，由 operator 在 `_do_scale_up` 之後呼叫一次。
+對單 socket 4 core worker，Cores=0-3 等於整 pod。對未來多 GPU node 才是真實效益，但**現在加進 helper 的成本是 0**，未來免遷移。
+
+### 4-A/B/C（沿用）：QoS / Preemption / Fairshare 全未啟
+
+Phase 6 真的開工前，建議先做最小可用 QoS — 至少 `normal` / `high` 兩級，搭配 `PriorityWeightQOS`。這跟 Phase 6 的自訂排程不衝突，是它的前置。
+
+```yaml
+slurm:
+  qos:
+    enabled: true
+    levels:
+      - {name: normal, priority: 100}
+      - {name: high,   priority: 1000, preempt: [normal], preemptMode: REQUEUE}
+```
+
+### R9（新 / v3 N11 沿用）：ProctrackType=linuxproc + TaskPlugin=task/affinity 不一致
+
+values.yaml 註解寫了 Slurm 21.08 cgroup v2 支援不完整所以避開 task/cgroup。**但 proctrack/linuxproc + task/affinity 的組合在 GPU job 殺進程仍然不乾淨**（特別是 NCCL helper thread / CUDA driver thread）。
+
+長期解：升 Slurm 到 23.11+（cgroup v2 完整）+ 切 proctrack/cgroup + task/cgroup。但這要升 base image。短期能做的就是 documentation：在 `note.md` 開個「known limits」段落明示「kill 不乾淨會看到 zombie」是預期行為。
+
+### 4-D. Gang Scheduling 整合（沿用）
+
+K8s 1.35 的 GangScheduling feature gate 從 1.34 開始演進，**至今 OSS scheduler 沒一個正式整合 Slurm**。
+要真的用，還是 Volcano / Kueue + 把 sbatch 包成 K8s Job 那條路（跟原設計衝突）。**建議：Phase 6 直接放棄這條，做 Slurm 原生 gang（同一 partition 下 `--ntasks=N --ntasks-per-node=1`）+ Operator 等 N pods ready 才標 nodes 為 IDLE。**
 
 ---
 
-## 四、排程策略
+## 4. GPU 管理
 
-### ✅ N7（新）：只有一個 `debug` partition，CPU job 可被排到 GPU node
+### R4（新）：node label drift — `nvidia.com/device-plugin.config` 重建即遺失
 
-`render-core.py`：
+`chart/templates/gpu/node-labeler-job.yaml` 是一次性 Job，部署時把 `nvidia.com/device-plugin.config=rtx4070-mps` 打到 node。**Node 重建（k3s 重灌、節點重新加入、雲商重置）後 label 消失**，GPU Operator 退到 default 配置（無 sharing），rtx4070 變成 1 slot。
 
-```python
-part_line = f"PartitionName={part['name']} Nodes={','.join(partition_nodes)} Default=YES ..."
-# partition_nodes 同時包含 cpu / rtx4070 / rtx4080 全部
-```
+**修法（按工程量）：**
+- 短期：把 Job 改成 CronJob（每小時 reconcile 一次）
+- 中期：用 `node-feature-discovery` 的 NodeFeatureRule，根據 hardware feature（PCI VID `0x10de` + Device ID）自動打 label
+- 長期：寫個小 mutating webhook 看到新 node 加入就根據 hostname pattern 打 label
 
-後果：
-- `sbatch hello.sh`（無 constraint）由 Slurm 在所有 5 個節點中挑一個，可能落到剛擴出來的 GPU node。
-- 違反 README 動機二「不同類型的工作互不競爭」。
-- Operator 看不到差別：CPU 池有 pending → 它擴 CPU，但 Slurm 已把 CPU job 派去 GPU；CPU 池一直被視為 idle。
-
-**修法：** `worker-pools.json` 從單一 partition 改為三個：`cpu`、`gpu-rtx4070`、`gpu-rtx4080`，每個 partition 只包含對應 pool 的 NodeName，並設不同 `MaxTime`、`Priority`。`PARTITIONS_JSON` 同步調整 `partition` 欄位。template `01_preprocess.sh` / `02_batch_infer.sh` 的 `-p` 也要改。
-
-### 4-A. 單 partition / 無 QoS / `MaxTime=INFINITE`（沿用）— 與 N7 同一根因，一起改。
-### 4-B. 無 Fairshare（沿用，前置=N6）
-### 4-C. 無 Preemption（沿用）
-### 4-D. Gang Scheduling — 基礎設施就緒、Operator 整合待實作（沿用）
-
-⚠️ **v3 N13：** `setup-linux-gpu.sh` line 92 對 k3s 啟用 `feature-gates=GangScheduling=true,GenericWorkload=true`。K8s 1.35 文件中 Workload API 的 feature gate 名稱仍在演進，Alpha 版本的 gate name 並非 100% 與 Operator 整合計畫對齊；上線前必須以 `kubectl get --raw='/api/v1' | grep scheduling` 與 `kubectl api-resources | grep workload` 真實確認 API 是否暴露。如果 gate 名稱錯，k3s 啟動仍會成功，但 Workload CRD 不會出現，整個 Phase 5+ Gang Scheduling 計畫會默默無效。
-
----
-
-## 五、GPU 管理與 MPS 架構（**v3 重點**）
-
-### ✅ 5-0. MpiDefault=pmi2 / Lmod（沿用）
-
-### ✅ N1：MPS DaemonSet 與 Worker Pod 同時要 `nvidia.com/gpu: 1` — 互搶設備
-
-這是本輪審核**最嚴重**的設計缺陷，在 Linux + 真實 GPU 上一定會直接死掉。
-
-證據：
-
-`manifests/gpu/mps-daemonset.yaml` line 81–85：
-```yaml
-resources:
-  limits:
-    nvidia.com/gpu: "1"
-  requests:
-    nvidia.com/gpu: "1"
-```
-
-`scripts/render-core.py` line 404–408（`--real-gpu` 路徑）：
-```python
-gpu_resources = (
-    f"\n          resources:\n            limits:\n              nvidia.com/gpu: \"{gpu_count}\""
-    f"\n            requests:\n              nvidia.com/gpu: \"{gpu_count}\""
-    if is_gpu_pool and args.real_gpu else ""
-)
-```
-
-`manifests/gpu/nvidia-device-plugin.yaml` 沒有 `sharing`/`timeSlicing`/`mps` 設定，預設行為是 **每張實體 GPU 對應 1 個 `nvidia.com/gpu` resource，且為獨佔**。
-
-於是：
-1. MPS DaemonSet 啟動 → 拿走 GPU node 上的 nvidia.com/gpu=1。
-2. Operator 擴 rtx4070 worker → 申請 `nvidia.com/gpu: 1` → 整個 cluster 沒有可分配 GPU → **Pod 永久 Pending**。
-3. 即使把 DaemonSet 移走，worker pod 內也**沒有 MPS client 連線管道**，因為 `/tmp/nvidia-mps` 是 node-level hostPath，沒有 daemon 寫 socket 進去。
-
-**MPS 在 K8s 上要動起來，正確架構是 MPS-aware sharing：**
-
-選項 A — NVIDIA k8s-device-plugin 0.15+ 內建 MPS sharing：
-
-```yaml
-# 透過 ConfigMap 設定 device-plugin
-config:
-  version: v1
-  sharing:
-    mps:
-      resources:
-      - name: nvidia.com/gpu
-        replicas: 4   # 一張實體 GPU 暴露成 4 份 nvidia.com/gpu
-```
-
-→ 此模式下 device-plugin **自己** 跑 MPS daemon，DaemonSet 不需要、worker pod 也不再需要 hostIPC + /tmp/nvidia-mps 掛載；worker request `nvidia.com/gpu: 1` 拿到的就是「1/4 張 GPU 的 MPS slice」，CUDA_VISIBLE_DEVICES 由 device-plugin 注入。
-
-選項 B — Time-slicing（不需要 MPS daemon、但無 SM% 隔離）：
-
-```yaml
-sharing:
-  timeSlicing:
-    resources:
-    - name: nvidia.com/gpu
-      replicas: 4
-```
-
-→ 適用於沒辦法跑 MPS 的情境（消費級 GPU、driver 版本受限），但無法兌現 README 對 MPS 的承諾。
-
-**建議：放棄目前自架 MPS DaemonSet 的設計**，改用 device-plugin 內建 `sharing.mps`。`manifests/gpu/mps-daemonset.yaml` 和 worker pod 的 `hostIPC: true` + `/tmp/nvidia-mps` 掛載全部移除；`nvidia-device-plugin.yaml` 改為 helm install 並注入 sharing config。Slurm 端 gres.conf 的 `Name=mps Count=100` 仍然保留，作為 Slurm 排程語意；K8s 端的硬切片由 device-plugin 處理。
-
-### ✅ N2：rtx4080 `devicePath=/dev/nvidia1` 是錯的
-
-`worker-pools.json`：
-```json
-"name": "slurm-worker-gpu-rtx4080",
-...
-"devicePath": "/dev/nvidia1"
-```
-
-`render-core.py` line 67：
-```python
-device_file = pool.get("devicePath", "/dev/nvidia0") if real_gpu else "/dev/null"
-```
-
-進到 gres.conf：
-```
-NodeName=slurm-worker-gpu-rtx4080-0 Name=gpu Type=rtx4080 Count=1 File=/dev/nvidia1
-```
-
-**問題：** NVIDIA device-plugin 把分配到的 GPU 一律以 `/dev/nvidia0` 路徑掛進 container（只暴露被 allocate 的那張），**不論該 GPU 在 host 上原始 index 是 0 還是 1**。pod 內 `ls /dev/nvidia*` 永遠只看到 `nvidia0`。
-
-於是 slurmd 啟動時 `gres/gpu` 的 `File=/dev/nvidia1` 找不到設備 → node 進入 `DRAIN reason=gres/gpu count too low` → operator scale 出來的 GPU node 永遠用不了。
-
-**修法：兩種選項：**
-
-1. **保留 devicePath 概念但內容改為 `/dev/nvidia0`**（兩個 pool 都是 0），靠 K8s 把實體 GPU 對應到誰。問題：Slurm 排程器看到兩個 pool 都宣稱同樣的 file，但實際指向不同 GPU；Slurm 並不在意 file path 本身，它只用 file 做存在性檢查 + cgroup device whitelist。所以這樣可行。
-2. **完全移除 `devicePath`，強制 `--real-gpu` 都用 `/dev/nvidia0`**，刪掉 `worker-pools.json` 的 devicePath 欄位。簡單可靠。
-
-推薦修法 2。
-
-### 🟠 N3：`maxNodes=2` × 一張實體 GPU → 第二個 pod 永遠 Pending
-
-`worker-pools.json` rtx4070 與 rtx4080 都 `maxNodes: 2`。但開發者只有 1 張 RTX 4070、1 張 RTX 4080。在沒有 device-plugin sharing 的情況下，每個 pool 可成功 schedule 的 pod 上限就是 1。
-
-實作影響：
-- `slurm.conf` 會宣告 4 個 GPU node（每 pool 兩個），其中 2 個永遠 Pending → sinfo 看到一半 DOWN/UNKNOWN。
-- Operator 嘗試 scale 到 2 時 K8s 吐 `0/N nodes available: 1 Insufficient nvidia.com/gpu`，但 operator 沒有特殊處理 → 進 `_provisioning` 永遠等不到 ready → `_PROVISIONING_LATENCY` 不會記錄。
-
-**修法（與 N1 整合）：** 啟用 device-plugin `sharing.mps replicas: 4` 後，rtx4070 pool maxNodes 可改為 4（一張卡切 4 份）；rtx4080 不啟用 sharing 則維持 1。
-
-### 5-A. gres.conf File 真實 GPU（v2 提及）
-
-`--real-gpu` 已改 `/dev/nvidia0`，本項在 v2 部分修復；但與 N1 / N2 / N3 連動，最終結論仍是要全面以 device-plugin 為準，gres.conf 只負責 Slurm 排程語意。
-
-### 5-B. 缺乏 MIG 支援（沿用）— RTX 系列消費卡無 MIG，學術用途可忽略。
+**對學術專題：** 短期方案夠了，但 thesis 要寫 "production readiness" 要提到。
 
 ### 5-C. Lmod conflict / NCCL 模組（沿用）
 
-### 5-D. DDP 雙網路（沿用）
+modulefiles ConfigMap 沒 `conflict` directive — 同時 `module load cuda/11.8 cuda/12.1` 不會被擋。對單使用者影響小，但 thesis 上 demo 會被問。
 
-⚠️ **v3 警告：** k3s 預設 CNI 是 flannel，不支援 Multus。`manifests/networking/dual-subnet-*.yaml` 在 k3s 上要先 `kubectl apply` Multus DaemonSet 才會有 NAD CRD。`scripts/setup-linux-gpu.sh --k3s` 完全沒提到這件事。如果 v3+ 想驗證雙網路，bootstrap-gpu.sh 要加一個 `--with-multus` 旗標。
+NCCL 也沒有獨立 modulefile：CUDA 包進去算了，但分開更教科書。
 
-### N10（新）：`nvidia-device-plugin.yaml` 沒設 sharing → 與 MPS 設計不相容
+**修法：** 加 `chart/templates/lmod-modulefiles.yaml`（或加 keys 到既有 ConfigMap）：
 
-詳見 N1。manifest 要嘛升級到 helm chart 形式（v0.17+ 支援透過 ConfigMap 注入 sharing config），要嘛在 DaemonSet template 內掛 ConfigMap 並設 `--config-file=/config/config.yaml`。
-
-### N11（新）：`ProctrackType=proctrack/linuxproc` 與 `task/cgroup` 不一致
-
-`render-core.py` header：
-```ini
-ProctrackType=proctrack/linuxproc       # 不論 real_gpu 都這樣
-TaskPlugin=task/cgroup                  # 只有 real_gpu 時
+```lua
+-- /opt/modulefiles/cuda/12.1
+conflict("cuda")
+prepend_path("PATH", "/usr/local/cuda-12.1/bin")
+prepend_path("LD_LIBRARY_PATH", "/usr/local/cuda-12.1/lib64")
+setenv("CUDA_HOME", "/usr/local/cuda-12.1")
 ```
 
-cgroup task plugin 預期搭配 `proctrack/cgroup`。混用 `linuxproc` 會造成 job 結束時 process tree 殺不乾淨（特別是 mpi 子進程），與 `KillOnBadExit` 設定組合下會出現孤兒進程。
+### 5-D. 雙網路（沿用）
 
-**修法：** `--real-gpu` 時 ProctrackType 也切到 `proctrack/cgroup`。
-
-### ✅ N12（新）：`verify-gpu.sh` 沒測 MPS
-
-`scripts/verify-gpu.sh` 預設 `GPU_GRES=gpu:rtx4070:1`。整支腳本沒有 `--gres=mps:25` 的測項。本次 migration 主打 MPS，但 verify 不驗。
-
-**修法：** 新增 step 6 ─ 提交一個 `--gres=mps:25` 的 sbatch，從 job 環境檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25`、`CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps` 是否被 Slurm prolog 正確注入。
+k3s flannel 不支援 Multus。`docs/note.md` 與 chart 都沒提到 Phase 5 之後是否要驗證。**現實：對單機 2 GPU 場景沒意義，DDP collective 走 loopback / 共享記憶體，根本不出 host**。建議：把 5-D 從 roadmap 移除（或標記為「multi-host 才做」），減少視覺雜訊。
 
 ---
 
-## 六、Kubernetes 整合
+## 5. Kubernetes 整合
 
-### 6-A. BestEffort QoS（沿用）
+### R7（新 / v3 6-A 沿用）：Workers 沒設 resources.requests/limits
 
-### ✅ 6-B. 熔斷器 / readinessProbe（沿用）
+`chart/templates/workers.yaml` 對 GPU pool 有設 `nvidia.com/gpu: 1`，但 **CPU / memory 完全沒設 requests 或 limits**。
 
-### 6-C. Static Pre-declared Nodes 代價（沿用）
+後果：
+- Pod QoS 是 `BestEffort`，node memory pressure 時最先被 evict
+- cgroup `memory.max` = node 全量，OOM 殺手鎖定的是整個 node 而非 pod
+- Slurm 視角的 `RealMemory=3500` 跟 K8s cgroup 沒對齊，job memory 超用 K8s 不會擋
+- HPA / VPA 完全失效（不過我們用 Slurm 不用 HPA）
 
-⚠️ **v3 強化：** N3 把這個代價放大了——當 maxNodes 大於實體可調度數時，slurmctld log 會持續刷 `Node X not responding`（每 SlurmdTimeout=300s 一次），對 alertmanager 規則會誤觸 `flapping` 告警。
+**修法：** workers.yaml 從 `pool.cpus` / `pool.realMemory` 自動推導 K8s requests/limits，且要 ≥ Slurm 宣告值（避免 cgroup 比 Slurm 嚴）。
 
-### 6-D. 無 CRD（沿用）
-
-### ✅ N9（新）：k3s 預設 PSS=baseline，`hostIPC: true` 會被 admission 擋下
-
-k3s 1.35 預設啟用 Pod Security Admission（PSS），namespace 沒 label 時是 `restricted` profile，**`restricted` 與 `baseline` 都禁止 `hostIPC`**。要等到把 namespace label 為 `pod-security.kubernetes.io/enforce=privileged` 才能跑 MPS worker / MPS DaemonSet。
-
-`scripts/bootstrap.sh` 完全沒處理這件事。Linux 上第一次跑會看到 admission webhook 拒絕：
-
-```
-Error from server (Forbidden): error when creating ...:
-pods "slurm-worker-gpu-rtx4070-0" is forbidden:
-violates PodSecurity "baseline:latest": host namespaces (hostIPC=true)
+```yaml
+resources:
+  requests:
+    cpu: {{ $pool.cpus }}
+    memory: {{ printf "%dMi" (mul $pool.realMemory 1) }}
+  limits:
+    cpu: {{ $pool.cpus }}
+    memory: {{ printf "%dMi" (mul $pool.realMemory 2) }}  # 2x burst headroom
 ```
 
-**修法：** bootstrap.sh 在 `kubectl apply -f manifests/core/slurm-static.yaml` 前加：
-```bash
-kubectl label --overwrite namespace "$NAMESPACE" \
-    pod-security.kubernetes.io/enforce=privileged \
-    pod-security.kubernetes.io/warn=privileged
+### R10（新）：StatefulSet RollingUpdate 預設策略中斷 running job
+
+```yaml
+# chart/templates/workers.yaml — 沒設 updateStrategy
+spec:
+  serviceName: ...
 ```
 
-長期建議：N1 改成 device-plugin sharing 後就不再需要 hostIPC，namespace 可回到 baseline。
+預設是 `RollingUpdate`，partition=0 — `helm upgrade` 改 worker image / template 會**從最高 ordinal 往下逐個重建 pod**，running job 全部 NODE_FAIL。
 
-### N4（新）：bootstrap.sh 對 k3s runtime 仍呼叫 `kind load docker-image`
+**修法：**
 
-```bash
-# bootstrap.sh line 282–285
-docker build "${build_flags[@]}" -t slurm-elastic-operator:latest -f docker/operator/Dockerfile .
-
-log "loading operator image to kind..."
-kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
+```yaml
+spec:
+  updateStrategy:
+    type: OnDelete   # operator 控制重建時機
 ```
 
-對核心 image（line 169–175）有區分 k3s / kind 路徑，但 **operator image 完全沒區分**。k3s 跑這行會直接 fail（沒有 kind binary、也找不到 cluster name）。
+配套：operator 加新指令 `rolling_upgrade_pool(pool_id)`：drain → scale-down by 1 → wait → delete pod → wait ready → scale-up → drain 下一個。chart upgrade 不做就好（user 自己決定何時 rolling）。
 
-**修法：複製核心 image 的判斷邏輯：**
-```bash
-if [[ "$K8S_RUNTIME" != "k3s" ]]; then
-  kind load docker-image slurm-elastic-operator:latest --name "$CLUSTER_NAME"
-else
-  # k3s containerd: 用 ctr image import 或 k3s ctr
-  docker save slurm-elastic-operator:latest | sudo k3s ctr images import -
-fi
+### R11（新 / 6-A 變體）：Login pod 無 resource limit
+
+login pod 是使用者 shell 的家。沒設 limit 的話 fork bomb / accidentally `python -c 'list(range(10**10))'` 會把整個 node 打死，連帶撞 controller。
+
+**修法：** chart/templates/login.yaml 加 `resources.limits.{cpu, memory}`，至少 4 CPU / 8 GB。
+
+### R12（新）：`slurmd -Dvvv` 太吵
+
+`chart/templates/workers.yaml` 啟動 slurmd 用 `-Dvvv`（DEBUG3）。長期跑會把 kubelet 的 log volume 灌爆（每天每 worker ~500MB）。debug 期 OK，跑久了要關。
+
+**修法：** chart/values.yaml 加 `slurm.daemonLogLevel: info`，預設 info，debug mode 才開 verbose。
+
+### 6-C. Static pre-declared nodes（沿用）
+
+代價在 v3 已寫。Phase 6 真要做動態 partition 就要重新評估這個架構決策；目前決定不動。
+
+---
+
+## 6. 可觀測性
+
+### R5（新 / v3 7-A 升級）：缺真實 GPU 指標 — DCGM exporter
+
+目前 Grafana panel "GPU Utilization" 顯示的是 slurm-exporter 看到的 `allocated_gpu` 數字（Slurm 視角），**不是 NVIDIA SM%、VRAM 使用、PCIe bandwidth**。
+
+對 README 動機一「利用率 70%+」的兌現完全失效 — 你目前無法回答「這張 GPU 真的在算嗎、還是空轉？」
+
+**修法：部署 NVIDIA DCGM exporter**
+
+GPU Operator 內建選項可開 dcgm-exporter（`--set dcgm.enabled=true`），會起一個 DaemonSet 吐：
+- `DCGM_FI_DEV_GPU_UTIL` — SM 使用率（真實）
+- `DCGM_FI_DEV_FB_USED` — VRAM 已用
+- `DCGM_FI_DEV_POWER_USAGE` — 功耗
+- `DCGM_FI_DEV_PCIE_TX/RX_THROUGHPUT` — PCIe 吞吐
+- `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` — Tensor Core 使用率（最接近 ML workload 真實使用率）
+
+**chart 整合：**
+- `scripts/install-gpu-operator.sh` 加 `--set dcgm.enabled=true`
+- `chart/templates/monitoring/prometheus-config.yaml` 加 DCGM scrape job
+- Grafana 加 DCGM dashboard（NVIDIA 官方 ID `12239`）
+
+### 7-B. 無 per-job tracking（沿用，配 R20）
+
+Prometheus 的 GPU 指標是 per-device，沒辦法 join 回 Slurm job_id。要做 per-job：DCGM exporter 支援 `pod` 標籤、再用 slurm-exporter 的 job→pod mapping 串起來。**這是 Phase 7-A trace 的必要前置**（trace span attribute 要能 join metric）。
+
+### R20 ★（新）：GPU job profile dashboard — 差異化機會
+
+對接 R5 + 7-B 之後可以做這個：每個 sbatch job 有自己的 Grafana panel，顯示：
+
+- 該 job 整個 lifetime 的 SM% / VRAM / PCIe / Tensor Core 使用率時序
+- 該 job 的 Slurm 排隊時間 / scale-up latency / 實際執行時間（從 OTel trace pull）
+- 該 job 的 ckpt I/O bandwidth（從 NFS metrics pull）
+
+**為什麼出色：**
+
+| 對比 | 是否有 | 備註 |
+|---|---|---|
+| Slinky | ❌ | 只有 cluster-level dashboard |
+| SUNK | ❌ | 同上 |
+| Slonk | ❌ | 沒釋出 dashboard |
+| AWS ParallelCluster | ⚠️ | 有 CloudWatch per-instance，但沒 join 到 job_id |
+| 本專案（如果做） | ✅ | per-job × per-GPU × full-lifecycle |
+
+對 thesis 是「實作 + 評估章節最強的單一視覺化證據」。
+
+---
+
+## 7. Helm Chart 與部署
+
+### R16 ★（新）：缺 chart artifact 發佈管道
+
+目前 chart 在 git repo 裡，使用者要 `git clone` 才能 helm install。對 thesis demo 沒問題，對 "production readiness" 要提的是：
+
+- **GitHub Pages chart repo**（最簡單）：用 `helm/chart-releaser-action` 把 chart 推到 gh-pages
+- **OCI registry**：`helm push slurm-platform-1.0.0.tgz oci://ghcr.io/<user>/charts`
+
+對學術專題是錦上添花；對開源散播是必要。
+
+### R18 ★（新）：缺端到端 chaos / failure injection 測試 — 差異化機會
+
+`chart/tests/` 有 28 條 helm-unittest，但全部是「render output 對不對」。**沒有任何 e2e 測試在驗證「故障 → 恢復」**。
+
+可以加的（按 thesis 價值排序）：
+
+| 場景 | 怎麼觸發 | 期望行為 |
+|---|---|---|
+| Worker pod 中途被 K8s evict（preStop hook 是否生效） | `kubectl delete pod` mid-job | Operator 偵測、scale-up 補位、job 自動 requeue |
+| Controller pod restart | `kubectl delete pod slurm-controller-0` | StateSaveLocation PVC restore、restart < 30s、queue 不丟 |
+| NFS server 短暫離線 | `kubectl scale deploy nfs-server --replicas=0; sleep 60; scale=1` | 寫 ckpt 的 job hang 但不 fail、恢復後續寫成功 |
+| Operator pod restart 期間提交 job | `kubectl delete pod slurm-operator-0; sbatch ...` | 重啟後 cooldown 從 annotation 還原、第一個 poll 把 pending 處理掉 |
+| 同時提交 50 個 mps:25 job | 壓力測試 | bin-packing 正確、所有 job 能在合理時間內完成 |
+| Image pull 失敗（模擬 registry 掛） | `kubectl drain` + 改 image tag | Operator 不會把 pool 永遠卡在 provisioning |
+
+**為什麼出色：** 沒有任何 Slurm-on-K8s 開源方案做這個。Slinky / SUNK 文件全部沒有 chaos test 章節。對 thesis evaluation 是「我能量化我的容錯主張」。
+
+實作建議：寫 `scripts/chaos/*.sh`，每個是一個情境，能獨立跑；CI 跑其中一兩個快的當 smoke test。
+
+### Helm 5-A 已完成的後續清理項目
+
+- `verify-helm.sh` 還在，但 legacy parity diff 段已移除 — 確認沒遺留
+- chart `Chart.yaml` 的 `appVersion` 應寫 Slurm 版本（如 `21.08.5` 或將來升 23.11.x），目前還是 placeholder
+
+---
+
+## 8. Operator 設計
+
+### R6 重複（見 §3）：single replica + 無 leader election
+
+### Operator polling vs K8s watch — 性能盲點
+
+`operator/app.py` 是 polling-based（15s 一輪）。對 cluster < 50 pod 完全 OK，但**任何 K8s 事件（pod evicted、node NotReady）都要等下一輪 poll 才被看到**。Phase 7 真要做 OTel trace 端到端 latency 量測時，這 15s 會變成最大誤差源。
+
+**改進方向（不是 P0，但 thesis 寫 systems contribution 可以提）：**
+
+- 用 `kubernetes.client.watch.Watch` watch StatefulSet + Pod events，event-driven 處理 + 定時 reconcile（k8s controller 標準模式）
+- Polling 從 15s 降到 60s（reconcile 兜底），event-driven 處理瞬時事件
+
+工程量約 1 週，但**這個改造會讓 trace 的 scale-up latency 從 15s 誤差降到 < 1s**，對 R16 的 trace 品質有質的提升。
+
+---
+
+## 9. 升級路徑與技術債
+
+### R13（新）：Slurm 21.08 是長期技術債
+
+我們鎖在 21.08 是因為 Ubuntu 22.04 base image 預設 apt 版本就是它。但：
+
+| 議題 | 21.08 行為 | 23.11+ 行為 |
+|---|---|---|
+| cgroup v2 | 不完整支援、所以走 linuxproc | 完整支援、能切 task/cgroup |
+| `--gres=gpu:rtx4070:1,mps:25` 混合 GRES | ❌ 拒絕（cons_tres 不支援組合） | ✅ 支援 |
+| slurmrestd v0.0.40+ | 沒有 | 有，scheduler 操作更豐富 |
+| AccountingStorageTRES 對 mps 的 reporting | 部分 buggy | fixed |
+
+**升級路徑：**
+- `docker/controller/Dockerfile` 與 `docker/worker/Dockerfile` 換 base 到 Ubuntu 24.04（apt 預設 23.11.x）
+- 或 build from source（已有 lmod 範例可參考），鎖 23.11.10
+- helm-unittest 加 regression 測試確保 slurm.conf 對新版本還合法
+
+對 thesis 不急，但寫進「未來工作」章節有分量。
+
+### R19 ★（新）：sbatch wrapper / submit plugin — 差異化機會
+
+接 §9 ML runtime predictor + §8 Lua submit plugin。把使用者的 `sbatch foo.sh` 自動補：
+
+- `--time` ← runtime predictor
+- `--mem` ← 預測 + 歷史 max memory
+- 適合的 `--partition` ← 根據 GRES 推
+- `--qos` ← 根據使用者 / 帳號自動
+
+**為什麼出色：** AWS ParallelCluster / Slinky 都沒做。HPC 中心（NERSC、ALCF）有做但不開源。
+
+---
+
+## 10. 業界比較（v4 更新）
+
+| 面向 | 本專案 v4（Phase 5 完成） | Slinky | SUNK | AWS ParallelCluster | Volcano |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Helm 一條指令部署 | ✅ | ⚠️（多 chart） | ✅ | n/a | ✅ |
+| GPU MPS sharing | ✅（GPU Operator） | ⚠️（只 timeSlicing） | ✅ | ✅ | ✅ |
+| 端到端 Job lifecycle trace（OTel） | ❌（Phase 7-A） | ❌ | ❌ | ❌ | ❌ |
+| Per-job × per-GPU × full-lifecycle dashboard | ❌（R20） | ❌ | ❌ | ⚠️ | ❌ |
+| ML-aware scheduling（runtime / score） | ❌（Phase 6 / R17）| ❌ | ❌ | ❌ | ⚠️ |
+| Chaos / failure injection test suite | ❌（R18） | ❌ | ❌ | ⚠️ | ❌ |
+| Checkpoint-aware scale-down | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Drain timeout（hang job 不卡死） | ❌（R1） | ⚠️ | ✅ | ✅ | ✅ |
+| Fairshare / QoS 啟用 | ❌ | ✅ | ✅ | ✅ | ✅ |
+| HA Controller | ❌ | ✅ | ✅ | ✅ | ✅ |
+| 共享 FS | NFS（瓶頸） | StorageClass | Lustre | FSx | StorageClass |
+
+**競爭力分析：**
+
+- 已勝出：**Checkpoint-aware scale-down**（沒人做）、**MPS env propagation via TaskProlog**（這個專案是我看過的開源裡寫得最完整的）、**Helm cutover 完整度**
+- 容易補上、補了會勝出：**OTel trace（R16）**、**per-job dashboard（R20）**、**chaos suite（R18）**、**ML-aware scheduling（R17 / R19）**
+- 短期沒打算追平：HA controller（3-C）、Fairshare（4-B）、共享 FS 升級
+
+**結論：** 把 R16-R20 五個 ★ 項目做掉一兩個，這個專案就有獨家賣點足以發學術論文 / 上社群分享。具體最高 CP 值組合是 **R16（OTel trace）+ R20（per-job dashboard）**：兩者技術上強相關、加起來大概 3 週工期、產出視覺化 demo 力強。
+
+---
+
+## 11. 改進優先順序總表（v4）
+
+僅列**仍開放**項目；安全章節整段省略。★ 是「做了會出色」而非「不做會壞」。
+
+| 優先 | 項目 | 類別 | 難度 | 對應動機 |
+|:---:|---|---|:---:|:---:|
+| **P0** | R1：Operator drain timeout（v3 N8 沿用） | 彈性 | 中 | 彈性 |
+| **P0** | R3：ConfigMap checksum annotation → controller rolling restart | 維運 | 低 | — |
+| **P0** | R4：node label drift（CronJob reconcile） | GPU | 低 | 利用率 |
+| **P1** | R2：image-puller DaemonSet | 彈性 | 低 | 彈性 |
+| **P1** | R5：DCGM exporter + Grafana panel | 觀測 | 中 | 利用率（驗證） |
+| **P1** | R6：Operator leader election（短期：reduce restart RTO；長期：active-passive） | 可靠度 | 中 | 容錯 |
+| **P1** | R7：Workers 加 resources.requests/limits | K8s | 低 | 容錯 |
+| **P1** | R10：StatefulSet OnDelete + operator rolling | 維運 | 中 | 彈性 |
+| **P1** | R14：NFS mountOptions tuning | 儲存 | 低 | DDP I/O |
+| **P1** | 2-C：MySQL 備份 CronJob（沿用） | 儲存 | 低 | Fairshare 持久 |
+| **P1** | 3-C：StateSaveLocation snapshot CronJob（沿用） | 容錯 | 低 | 容錯 |
+| **P2** | R8：gres.conf Cores= | 排程 | 低 | NCCL 親和性 |
+| **P2** | R9：cgroup v2 / proctrack/cgroup（前置 R13） | Slurm | 中 | — |
+| **P2** | R11：Login pod resource limit | K8s | 低 | — |
+| **P2** | R12：slurmd log level | 維運 | 低 | — |
+| **P2** | R15：Checkpoint guard 多 pattern | 彈性 | 低 | 容錯 |
+| **P2** | 4-A/B/C：QoS / Preempt / Fairshare 啟用（Phase 6 前置） | 排程 | 中 | — |
+| **P2** | 5-C：Lmod conflict + NCCL 模組（沿用） | HPC | 中 | — |
+| **P3** | R13：Slurm 升 23.11.x（換 base image） | tech debt | 高 | — |
+| **P3** | 5-D：Multi-host 才做的 Multus / Cilium / SR-IOV（建議從 roadmap 移除） | 網路 | 高 | DDP（multi-host） |
+| **★** | R16：OTel job-lifecycle trace（Phase 7-A） | 差異化 | 高 | 可觀測性 |
+| **★** | R17：Score-based / ML-aware scheduling（Phase 6） | 差異化 | 高 | 利用率 / 排程 |
+| **★** | R18：Chaos / failure injection test suite | 差異化 | 中 | 容錯（驗證） |
+| **★** | R19：sbatch wrapper 自動填 --time / --mem | 差異化 | 中 | 易用性 |
+| **★** | R20：Per-job × per-GPU × full-lifecycle dashboard | 差異化 | 中 | 利用率（視覺化） |
+
+---
+
+## 12. 給校內專題（thesis）的建議切入順序
+
+整理上面所有 P0/P1/★ 後，對單人 1 學期工程量的最務實順序：
+
+```
+Week 1–2：把 P0 全做完（R1 / R3 / R4）— 系統穩定性基線
+Week 3–4：R5 + R20 — DCGM + per-job dashboard，視覺化「能講故事」
+Week 5–7：R16 OTel trace（Phase 7-A 起步）— 取得 trace 資料
+Week 8–10：R17 score-based scheduling（Phase 6 起步）— 用 trace 資料當輸入
+Week 11–12：R18 chaos suite — evaluation 章節的容錯數字
+Week 13–14：寫 thesis、跑 trace replay、整理數字
 ```
 
-監控/exporter image 也要同樣處理（`scripts/bootstrap-monitoring.sh` 應自查）。
+**論文角度的單一最強組合：R5 + R20 + R16 + R17。**
+
+R5/R20 給你「能看的數字」；R16 給你「能聯動的時序資料」；R17 給你「演算法貢獻」。四個一起，evaluation 章節有：
+
+1. **基線比較**：FCFS vs 你的 score function vs 簡化 Gandiva 重排，看 JCT / utilization / fairness
+2. **可解釋性**：trace + dashboard 直接展示 score function 在做什麼
+3. **容錯主張**：R18 chaos test 給你的 ablation 章節
+4. **runtime 預測（R19）**：bonus，做得完就放，做不完不影響主軸
 
 ---
 
-## 七、可觀測性
-
-### ✅ 7-0. Prometheus + Grafana（沿用 v2 Phase 4）
-
-### 7-A. 缺 GPU 指標（沿用）
-
-⚠️ **v3 強化：** README 動機一宣稱「utilization 從 < 20% 提升至 70%+」，但目前**沒有任何 metric 在量這個比例**。要兌現這個敘述，DCGM Exporter + Grafana panel `DCGM_FI_DEV_GPU_UTIL{job=...}` 是不可省略的。Phase 4 的 dashboard 已有 a10/h100 panel 雛形（v3 改名為 rtx4070 / rtx4080），但 datasource 是 slurm-exporter 而非 DCGM；目前 panel 顯示的「GPU utilization」其實是 slurm 視角的「allocated GPU 數」，不是真正的 SM 使用率。Dashboard 文件需明示這點。
-
-### 7-B. 無 per-job tracking（沿用）
-
----
-
-## 八、Helm Chart 規劃 5-A 審查
-
-`docs/note.md §5-A` 已採 Monolithic chart + `pools` 為有序 list 的設計。從 HPC + GitOps 角度的補充意見：
-
-| 議題 | 建議 |
-|-----|-----|
-| `_helpers.tpl` 產生的 `slurm.conf` 是 ConfigMap 一個 key，**改一個 pool replicaMax 就會 rolling update 所有 worker** | 把 slurm.conf 拆成兩個 ConfigMap：`slurm-config-static`（ClusterName/Auth/Plugin）+ `slurm-config-nodes`（NodeName/PartitionName）；worker 只 mount 後者 |
-| `pools` 為 list 在 Helm `--set` CLI 改起來很痛（`--set 'pools[1].maxReplicas=2'`） | 在 chart 加 `pools.json` 形式的 ConfigMap + initContainer 渲染，或提供 `values-dev.yaml` 預設模板讓使用者 fork |
-| 沒提到 chart test (`helm test`) | `templates/tests/` 加一個 Pod 跑 `scontrol ping` + `sinfo`，整合進 CI |
-| 沒提到 chart 版本與 Slurm 版本綁定 | `Chart.yaml` 的 `appVersion` 欄位寫 Slurm 版本（如 `23.11.7`），升 Slurm 時透過 chart upgrade 觸發 rolling restart |
-| 兩個 values overlay (`values-k3s.yaml` / `values-dev.yaml`) 會與 GPU sharing config 強相關 | 建議把 GPU device-plugin sharing config 也納入 chart（subdir `templates/gpu/`），不要再用獨立 `manifests/gpu/` |
-
-長期來看，`render-core.py` + `worker-pools.json` 應在 Helm 上線後**完整刪除**（含 bootstrap.sh 中所有 render 邏輯），避免兩條 source of truth。
-
----
-
-## 九、k3s 第一次部署 Checklist（v3 新增）
-
-把上述各項從 SRE 操作面整理成必修清單：
-
-| # | 項目 | 來源 | 狀態 |
-|---|------|------|:----:|
-| 1 | 把 `slurm` namespace 標為 `pod-security.kubernetes.io/enforce=baseline`（N1 移除 hostIPC 後 baseline 已足夠）| N9 | ✅ |
-| 2 | NetworkPolicy operator egress 加 6443 | N5 | ✅ |
-| 3 | bootstrap.sh operator/exporter image 對 k3s 走 `k3s ctr images import` | N4 | ✅ |
-| 4 | 改用 `nvidia-device-plugin` `sharing.mps` 模式，移除自建 MPS DaemonSet | N1 | ✅ |
-| 5 | `worker-pools.json` 移除 `devicePath` 欄位（或全改 `/dev/nvidia0`）| N2 | ✅ |
-| 6 | `maxNodes` 對齊 device-plugin 的 sharing replicas | N3 | ⬜ |
-| 7 | slurm.conf 加 `AccountingStorageTRES=gres/gpu,gres/mps` | N6 | ✅ |
-| 8 | `--real-gpu` 同時切 `ProctrackType=proctrack/cgroup` | N11 | ⬜ |
-| 9 | `partition` 從單一 `debug` 拆成 `cpu` / `gpu-rtx4070` / `gpu-rtx4080` | N7 | ✅ |
-| 10 | Operator scale-down 加 drain timeout | N8 | ⬜ |
-| 11 | verify-gpu.sh 補 MPS 驗證 step | N12 | ✅ |
-| 12 | 確認 K8s 1.35 Workload API feature gate 名稱 | N13 | ⬜ |
-| 13 | `fix_node_addr()` 整合到 operator scale-up 路徑 | 3-E v3 強化 | ⬜ |
-
-建議在 Linux 機器跑 `bash scripts/bootstrap.sh` 之前，**先把 1 / 2 / 3 / 9 改完**（這四項直接影響第一次部署能不能成功）；4 / 5 / 6 / 10 在 GPU 工作真正運行前必須改完；其餘項目可在後續驗證階段補。
-
----
-
-## 十、業界比較（沿用 + 微調）
-
-| 面向 | 本專案（mps-migration） | Volcano | OpenOnDemand+Slurm | AWS ParallelCluster |
-|------|:---:|:---:|:---:|:---:|
-| Gang Scheduling | ⚠️ 基礎設施就緒 | ✓ | ✗ | ✓ |
-| GPU 資源感知（device-plugin sharing） | ❌（自建 MPS 設計衝突）| ✓ | ✓ | ✓ |
-| MPS 整合 | ⚠️ 設定到位但 K8s 整合錯 | n/a | 手動 | ✓ |
-| Fairshare | 前置缺（N6） | ✓ | ✓ | ✓ |
-| 縮容前 Drain | ✓（無 timeout，N8） | n/a | ✓ | ✓ |
-| HA Controller | ✗ | ✓ | ✓ | ✓ |
-| 共享 FS | NFS（瓶頸） | StorageClass | Lustre/GPFS | FSx |
-| Helm 化 | 規劃中（5-A）| ✓ | n/a | n/a |
-
----
-
-## 改進優先順序總表（v3）
-
-| 優先 | 項目 | 類別 | 難度 | 對應 README 動機 | 狀態 |
-|:---:|------|-----|:---:|:---:|:---:|
-| **P0** | N1：device-plugin `sharing.mps` 取代自建 MPS DaemonSet | GPU | 中 | 利用率 | ✅ |
-| **P0** | N2：移除 / 統一 `devicePath=/dev/nvidia0` | GPU | 低 | 利用率 | ✅ |
-| **P0** | N4：bootstrap.sh operator image 走 k3s 路徑 | k3s migration | 低 | — | ✅ |
-| **P0** | N5：NetworkPolicy operator egress 加 6443 | k3s migration | 低 | — | ✅ |
-| **P0** | N9：namespace label baseline（顯式設定） | k3s migration | 低 | — | ✅ |
-| **P0** | 1-A：`SlurmUser=root` | 安全 | 低 | — | ⬜ |
-| **P1** | N3：maxNodes 對齊 sharing replicas | GPU | 低 | 利用率 | ⬜ |
-| **P1** | N6：`AccountingStorageTRES` | 排程 | 低 | Fair-Share | ✅ |
-| **P1** | N7：partition 拆 cpu/gpu-rtx4070/gpu-rtx4080 | 排程 | 低 | 隔離性 | ✅ |
-| **P1** | N8：drain timeout | 彈性 | 中 | 彈性 | ⬜ |
-| **P1** | N10：device-plugin sharing config | GPU | 中 | 利用率 | ✅ |
-| **P1** | 1-B：JWT lifespan 1 天 + 輪換 | 安全 | 中 | — |
-| **P1** | 6-A：所有 Pod 加 resources.requests/limits | K8s 整合 | 低 | 容錯 |
-| **P2** | N11：ProctrackType=proctrack/cgroup | Slurm 設定 | 低 | — |
-| **P2** | N12：verify-gpu.sh 補 MPS step | 驗證 | 低 | 利用率 | ✅ |
-| **P2** | N13：覆核 K8s 1.35 Gang feature gate 名 | 排程 | 低 | — |
-| **P2** | 4-A/B/C：QoS / Preemption / Fairshare 啟用 | 排程 | 中 | Fair-Share |
-| **P2** | 7-A：DCGM Exporter + Grafana | 可觀測性 | 中 | 利用率（驗證） |
-| **P2** | 5-C：Lmod conflict + NCCL 模組 | HPC | 中 | — |
-| **P3** | Helm chart 5-A 完整化 | 部署 | 高 | 易部署 |
-| **P3** | 3-C：HA Backup Controller | 故障恢復 | 高 | 容錯 |
-| **P3** | 2-C：MySQL 備份 CronJob | 儲存 | 低 | Fair-Share 持久 |
-| **P3** | Lustre/BeeGFS 取代 NFS | 儲存 | 高 | 容錯（DDP I/O）|
-| **P3** | 5-D：Cilium + Multus + SR-IOV | 網路 | 高 | DDP |
-
----
-
-*v3 審核以 mps-migration 分支與 Linux + k3s 上線前的可預見風險為主軸。本文件為學習用途架構審查；上線後待新增 v4，補充實機觀測到的非預期行為。*
+*v4 審核以 Phase 5（Lmod + Helm cutover）完成後的真實系統為基礎。安全章節依使用者要求暫不審；下次 v5 預定 Phase 7-A 動工後重審觀測縱深。*
