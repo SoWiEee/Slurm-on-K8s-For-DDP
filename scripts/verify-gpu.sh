@@ -26,6 +26,7 @@ GPU_CONSTRAINT=${GPU_CONSTRAINT:-gpu-rtx4070}
 GPU_GRES=${GPU_GRES:-gpu:rtx4070:1}
 JOB_TIMEOUT=${JOB_TIMEOUT:-120}
 PARTITION=${PARTITION:-gpu-rtx4070}
+CLEANUP_STALE_VERIFY_JOBS=${CLEANUP_STALE_VERIFY_JOBS:-true}
 # MPS test (only meaningful on the rtx4070 pool, which has sharing.mps enabled).
 MPS_PARTITION=${MPS_PARTITION:-gpu-rtx4070}
 MPS_GRES=${MPS_GRES:-mps:25}
@@ -42,6 +43,97 @@ login_exec() {
   pod=$(kubectl -n "$NAMESPACE" get pod -l app=slurm-login \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "slurm-controller-0")
   kubectl -n "$NAMESPACE" exec "pod/${pod}" -- bash -lc "$1"
+}
+
+fix_node_addr() {
+  local nodename="$1"
+  local pod_ip
+  pod_ip=$(kubectl -n "$NAMESPACE" get pod "$nodename" \
+    -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+  if [[ -n "$pod_ip" ]]; then
+    login_exec "scontrol update NodeName=${nodename} NodeAddr=${pod_ip} 2>/dev/null || true" >/dev/null
+  fi
+}
+
+wait_slurm_node_responding() {
+  local nodename="$1" timeout_s="${2:-90}"
+  local deadline state elapsed sighup_sent
+  deadline=$(( $(date +%s) + timeout_s ))
+  elapsed=0
+  sighup_sent=0
+
+  while true; do
+    state=$(login_exec "sinfo -N -h -n '${nodename}' -o '%T' 2>/dev/null" \
+      2>/dev/null | tr -d '\r\n' || true)
+    if [[ -n "$state" && "$state" != *"*" ]]; then
+      echo "  ${nodename}: ${state}"
+      return 0
+    fi
+    fix_node_addr "$nodename"
+    if echo "$state" | grep -qiE "down|drain|fail|unknown"; then
+      login_exec "scontrol update NodeName=${nodename} State=RESUME 2>/dev/null || true" >/dev/null
+    fi
+    echo "  ${nodename}: ${state:-unknown} (waiting for slurmd heartbeat)"
+    if (( $(date +%s) >= deadline )); then
+      return 1
+    fi
+    elapsed=$(( elapsed + 3 ))
+    if [[ "$elapsed" -ge 30 && "$sighup_sent" -eq 0 ]]; then
+      echo "  ${nodename}: refreshing NodeAddr and SIGHUP slurmd"
+      fix_node_addr "$nodename"
+      kubectl -n "$NAMESPACE" exec "pod/${nodename}" -- \
+        bash -lc 'kill -HUP $(pgrep slurmd) 2>/dev/null || true' >/dev/null 2>&1 || true
+      sighup_sent=1
+    fi
+    sleep 3
+  done
+}
+
+cancel_job_quietly() {
+  local jobid="$1"
+  [[ -n "$jobid" ]] || return 0
+  login_exec "scancel ${jobid} 2>/dev/null || true" >/dev/null 2>&1 || true
+}
+
+cleanup_verify_jobs() {
+  [[ "$CLEANUP_STALE_VERIFY_JOBS" == "true" ]] || return 0
+  login_exec "scancel --name=gpu-verify --partition=${PARTITION} 2>/dev/null || true; scancel --name=mps-verify --partition=${MPS_PARTITION} 2>/dev/null || true" \
+    >/dev/null 2>&1 || true
+
+  local deadline remaining
+  deadline=$(( $(date +%s) + 30 ))
+  while true; do
+    remaining=$(login_exec \
+      "squeue -h -p ${PARTITION},${MPS_PARTITION} -o '%j' 2>/dev/null | grep -Ec '^(gpu-verify|mps-verify)$' || true" \
+      2>/dev/null | tr -d '\r' | tail -n1 || echo "0")
+    [[ "${remaining:-0}" == "0" ]] && return 0
+    (( $(date +%s) >= deadline )) && return 0
+    sleep 2
+  done
+}
+
+wait_gpu_pool_responding() {
+  local timeout_s="${1:-120}"
+  local deadline gpu_nodes nodename ok
+  deadline=$(( $(date +%s) + timeout_s ))
+
+  while true; do
+    gpu_nodes=$(kubectl -n "$NAMESPACE" get pod -l "app=${GPU_POOL_STS}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    if [[ -n "$gpu_nodes" ]]; then
+      ok=true
+      while IFS= read -r nodename; do
+        [[ -n "$nodename" ]] || continue
+        wait_slurm_node_responding "$nodename" 45 || ok=false
+      done <<< "$gpu_nodes"
+      [[ "$ok" == "true" ]] && return 0
+    else
+      echo "  waiting for ${GPU_POOL_STS} pod(s) to exist"
+    fi
+
+    (( $(date +%s) >= deadline )) && return 1
+    sleep 3
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -81,6 +173,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== [3] nvidia-smi in GPU worker pod ==="
+cleanup_verify_jobs
 gpu_pod=$(kubectl -n "$NAMESPACE" get pod -l "app=${GPU_POOL_STS}" \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 if [[ -z "$gpu_pod" ]]; then
@@ -111,11 +204,24 @@ else
   warn "no GPU GRES in sinfo (check gres.conf / slurm.conf)"
 fi
 
+echo ""
+echo "=== [4b] Slurm GPU worker heartbeat ==="
+if ! kubectl -n "$NAMESPACE" get pod -l "app=${GPU_POOL_STS}" \
+  -o jsonpath='{.items[0].metadata.name}' >/dev/null 2>&1; then
+  warn "no ${GPU_POOL_STS} pods to check"
+else
+  wait_gpu_pool_responding 90 \
+    || fail "${GPU_POOL_STS} stayed NOT_RESPONDING; check slurmd logs and NetworkPolicy"
+  pass "GPU Slurm worker nodes are responding"
+fi
+
 # ---------------------------------------------------------------------------
 # [5] sbatch GPU job — nvidia-smi inside Slurm job
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== [5] sbatch GPU job (nvidia-smi) ==="
+
+cleanup_verify_jobs
 
 submit_pod=$(kubectl -n "$NAMESPACE" get pod -l app=slurm-login \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "slurm-controller-0")
@@ -132,6 +238,7 @@ JOB_SCRIPT="#!/bin/bash
 #SBATCH --output=${JOB_OUT_DIR}/%j.out
 #SBATCH --error=${JOB_OUT_DIR}/%j.err
 #SBATCH --time=00:02:00
+#SBATCH --no-requeue
 nvidia-smi --query-gpu=name,driver_version,utilization.gpu --format=csv,noheader
 echo \"CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES}\"
 echo \"SLURM_JOB_GPUS=\${SLURM_JOB_GPUS}\""
@@ -143,8 +250,11 @@ EOF_JOB
 sbatch --parsable /tmp/gpu-verify.sbatch" 2>/dev/null | tr -d '\r' | tail -n1)
 
 echo "  Submitted job: ${jid}"
+wait_gpu_pool_responding 150 \
+  || warn "${GPU_POOL_STS} did not become Slurm-ready before job polling"
 
 deadline=$(( $(date +%s) + JOB_TIMEOUT ))
+timed_out=false
 while true; do
   state=$(kubectl -n "$NAMESPACE" exec "pod/${submit_pod}" -- \
     bash -lc "scontrol show job ${jid} 2>/dev/null | grep -oP 'JobState=\K\w+'" \
@@ -155,6 +265,8 @@ while true; do
   esac
   if (( $(date +%s) >= deadline )); then
     warn "timed out waiting for GPU job ${jid}"
+    timed_out=true
+    cancel_job_quietly "$jid"
     break
   fi
   sleep 4
@@ -192,6 +304,12 @@ elif [[ "$state" == "COMPLETED" ]]; then
     warn "job completed but ExitCode='${exit_code}' or no GPU GRES in scontrol (${gpu_tres})"
   fi
 else
+  if [[ "$timed_out" == "true" ]]; then
+    job_reason=$(kubectl -n "$NAMESPACE" exec "pod/${submit_pod}" -- \
+      bash -lc "scontrol show job ${jid} 2>/dev/null | grep -oP 'Reason=\K[^ ]+' || true" \
+      2>/dev/null | tr -d '\r' | tail -n1 || true)
+    [[ -n "$job_reason" ]] && echo "  Last pending reason: ${job_reason}"
+  fi
   fail "GPU job did not complete (state=${state})"
 fi
 
@@ -213,6 +331,7 @@ else
 #SBATCH --output=${MPS_OUT_DIR}/%j.out
 #SBATCH --error=${MPS_OUT_DIR}/%j.err
 #SBATCH --time=00:02:00
+#SBATCH --no-requeue
 echo \"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=\${CUDA_MPS_ACTIVE_THREAD_PERCENTAGE:-unset}\"
 echo \"CUDA_MPS_PIPE_DIRECTORY=\${CUDA_MPS_PIPE_DIRECTORY:-unset}\"
 echo \"CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-unset}\"
@@ -226,6 +345,8 @@ EOF_MPS
 sbatch --parsable /tmp/mps-verify.sbatch" 2>/dev/null | tr -d '\r' | tail -n1)
 
   echo "  Submitted MPS job: ${mps_jid}"
+  wait_gpu_pool_responding 150 \
+    || warn "${GPU_POOL_STS} did not become Slurm-ready before MPS job polling"
 
   mps_deadline=$(( $(date +%s) + JOB_TIMEOUT ))
   while true; do
@@ -238,6 +359,7 @@ sbatch --parsable /tmp/mps-verify.sbatch" 2>/dev/null | tr -d '\r' | tail -n1)
     esac
     if (( $(date +%s) >= mps_deadline )); then
       warn "timed out waiting for MPS job ${mps_jid}"
+      cancel_job_quietly "$mps_jid"
       break
     fi
     sleep 4

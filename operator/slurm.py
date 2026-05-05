@@ -87,12 +87,16 @@ class SlurmRestClient:
             return False
 
     def list_jobs(self, partition: str) -> list[dict]:
-        """Return all PENDING and RUNNING jobs in the given partition."""
+        """Return active jobs in the given partition.
+
+        COMPLETING still needs a live slurmd to acknowledge epilog and batch
+        script completion, so the operator must treat it as busy.
+        """
         data = self._get(f"/slurm/{self.api_version}/jobs")
         return [
             j for j in data.get("jobs", [])
             if j.get("partition") == partition
-            and j.get("job_state") in ("PENDING", "RUNNING")
+            and j.get("job_state") in ("PENDING", "RUNNING", "COMPLETING")
         ]
 
     def list_nodes(self) -> list[dict]:

@@ -115,10 +115,12 @@ class ClusterStateCollector:
         return None
 
     def _jobs_by_pool_and_state(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
-        """Fetch all PENDING and RUNNING jobs for a partition.
+        """Fetch all active jobs for a partition.
 
         Uses REST API when available; falls back to a single squeue exec otherwise.
         Returns {worker_statefulset: {"PENDING": [...], "RUNNING": [...]}}.
+        COMPLETING jobs are counted in the RUNNING bucket because scaling down
+        their worker can leave Slurm stuck waiting for the final completion ack.
         """
         if self._rest is not None:
             return self._jobs_by_pool_and_state_rest(partition)
@@ -132,19 +134,19 @@ class ClusterStateCollector:
         }
         for job in self._rest.list_jobs(partition):
             state = job.get("job_state", "")
-            if state not in ("PENDING", "RUNNING"):
+            if state not in ("PENDING", "RUNNING", "COMPLETING"):
                 continue
             fields = SlurmRestClient._normalize_job(job)
             pool = self._classify_job(fields)
             if pool is None:
                 continue
             bucket = result.setdefault(pool.worker_statefulset, {"PENDING": [], "RUNNING": []})
-            bucket[state].append(fields)
+            bucket["RUNNING" if state == "COMPLETING" else state].append(fields)
         return result
 
     def _jobs_by_pool_and_state_exec(self, partition: str) -> dict[str, dict[str, list[dict[str, str]]]]:
         output = self.client.exec_in_controller(
-            f"squeue -h -p {partition} -t PENDING,RUNNING -o '%i|%T|%N|%f|%b' || true"
+            f"squeue -h -p {partition} -t PENDING,RUNNING,COMPLETING -o '%i|%T|%N|%f|%b' || true"
         )
         result: dict[str, dict[str, list[dict[str, str]]]] = {
             p.worker_statefulset: {"PENDING": [], "RUNNING": []}
@@ -168,8 +170,8 @@ class ClusterStateCollector:
             if pool is None:
                 continue
             bucket = result.setdefault(pool.worker_statefulset, {"PENDING": [], "RUNNING": []})
-            if state in ("PENDING", "RUNNING"):
-                bucket[state].append(fields)
+            if state in ("PENDING", "RUNNING", "COMPLETING"):
+                bucket["RUNNING" if state == "COMPLETING" else state].append(fields)
         return result
 
     def get_busy_nodes(self, partition_cfg: PartitionConfig) -> int:
@@ -191,7 +193,7 @@ class ClusterStateCollector:
     def _get_busy_nodes_exec(self, partition_cfg: PartitionConfig) -> int:
         prefix = partition_cfg.worker_statefulset
         output = self.client.exec_in_controller(
-            rf"sinfo -h -p {partition_cfg.partition} -N -o '%N %T' 2>/dev/null | awk '$1 ~ /^{prefix}(-|$)/ && $2 ~ /ALLOCATED|MIXED|COMPLETING/ {{count++}} END {{print count+0}}'"
+            rf"sinfo -h -p {partition_cfg.partition} -N -o '%N %T' 2>/dev/null | awk 'tolower($1) ~ /^{prefix}(-|$)/ && tolower($2) ~ /allocated|mixed|completing/ {{count++}} END {{print count+0}}'"
         )
         # Take the last non-empty line in case sinfo emits warnings before the count.
         lines = [ln for ln in (output or "").splitlines() if ln.strip()]
