@@ -18,6 +18,10 @@ class PartitionConfig:
     checkpoint_path: str = ""
     max_checkpoint_age_seconds: int = 600
     checkpoint_grace_seconds: int = 0
+    # R1: Once a node has been DRAINed for this many seconds, the operator force-kills
+    # remaining jobs on it (scancel --nodelist) and marks it DOWN, so a hung srun step
+    # cannot keep the pool pinned at max replicas forever.
+    drain_timeout_seconds: int = 1800
     match_features: tuple[str, ...] = field(default_factory=tuple)
     match_gres: tuple[str, ...] = field(default_factory=tuple)
     fallback: bool = False
@@ -40,6 +44,7 @@ class Config:
     default_checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "")
     default_max_checkpoint_age_seconds: int = int(os.getenv("MAX_CHECKPOINT_AGE_SECONDS", "600"))
     default_checkpoint_grace_seconds: int = int(os.getenv("CHECKPOINT_GRACE_SECONDS", "0"))
+    default_drain_timeout_seconds: int = int(os.getenv("DRAIN_TIMEOUT_SECONDS", "1800"))
     # Slurm REST API (slurmrestd).  When set, the operator queries jobs/nodes via
     # HTTP instead of kubectl exec, eliminating fork overhead and exec timeouts.
     # Leave empty to fall back to the legacy kubectl exec path.

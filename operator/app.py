@@ -24,6 +24,7 @@ from metrics import (
     _CHECKPOINT_GUARD_BLOCKS_TOTAL,
     _CIRCUIT_BREAKER_ERRORS,
     _CURRENT_REPLICAS,
+    _DRAIN_TIMEOUT_TOTAL,
     _DRAIN_TOTAL,
     _PODS_READY,
     _POLL_DURATION,
@@ -85,6 +86,10 @@ class OperatorApp:
         # Drain-then-scale: pool → set of node names that have been drained and are
         # waiting for running jobs to finish before replicas are patched down.
         self._draining_nodes: dict[str, set[str]] = {}
+        # R1: pool → {node_name → epoch when it first entered DRAIN}.  Used to
+        # force-kill jobs once drain_timeout_seconds elapses so a hung srun step
+        # cannot pin the pool at max_replicas indefinitely.
+        self._draining_started: dict[str, dict[str, float]] = {}
         # Checkpoint missing-since tracking: pool → timestamp when file was first not found.
         # Used to implement grace period before blocking scale-down on missing checkpoint.
         self._checkpoint_missing_since: dict[str, float] = {}
@@ -222,6 +227,7 @@ class OperatorApp:
     def _do_scale_up(self, partition_cfg: PartitionConfig, state, decision, key: str, now: float) -> None:
         # If nodes were draining for a previous scale-down, cancel so they can accept jobs again.
         draining = self._draining_nodes.pop(key, set())
+        self._draining_started.pop(key, None)
         for node_name in draining:
             try:
                 self.client.resume_slurm_node(node_name)
@@ -279,12 +285,15 @@ class OperatorApp:
             for i in range(decision.target_replicas, state.current_replicas)
         }
         draining = self._draining_nodes.get(key, set())
+        started = self._draining_started.setdefault(key, {})
         new_nodes = nodes_to_drain - draining
+        now_ts = time.time()
         for node_name in new_nodes:
             try:
                 self.client.drain_slurm_node(node_name)
             except Exception:  # noqa: BLE001
                 pass
+            started[node_name] = now_ts
         if new_nodes:
             draining = draining | new_nodes
             self._draining_nodes[key] = draining
@@ -298,10 +307,47 @@ class OperatorApp:
                 target_replicas=decision.target_replicas,
             )
 
-        all_idle = all(self.client.get_node_cpu_alloc(n) == 0 for n in draining)
+        # R1: force-kill any node whose drain has exceeded drain_timeout_seconds.
+        # Otherwise a hung srun step keeps cpu_alloc != 0 forever and the pool
+        # never shrinks.
+        timeout = partition_cfg.drain_timeout_seconds
+        force_killed: set[str] = set()
+        if timeout > 0:
+            for node_name in list(draining):
+                drain_started = started.get(node_name)
+                if drain_started is None:
+                    continue
+                if self.client.get_node_cpu_alloc(node_name) == 0:
+                    continue
+                age = now_ts - drain_started
+                if age <= timeout:
+                    continue
+                try:
+                    self.client.cancel_jobs_on_node(node_name)
+                    self.client.down_slurm_node(node_name, reason="drain-timeout")
+                except Exception:  # noqa: BLE001
+                    pass
+                force_killed.add(node_name)
+                _DRAIN_TIMEOUT_TOTAL.labels(pool=key, node=node_name).inc()
+                self.logger.emit(
+                    "drain_timeout_force_kill",
+                    level="WARN",
+                    policy=self.cfg.policy_name,
+                    partition=partition_cfg.partition,
+                    statefulset=partition_cfg.worker_statefulset,
+                    node=node_name,
+                    drained_for_seconds=int(age),
+                    drain_timeout_seconds=timeout,
+                )
+
+        all_idle = all(
+            n in force_killed or self.client.get_node_cpu_alloc(n) == 0
+            for n in draining
+        )
         if all_idle:
             self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
             self._draining_nodes.pop(key, None)
+            self._draining_started.pop(key, None)
             _SCALE_DOWN_TOTAL.labels(pool=key).inc()
             self.logger.emit(
                 "scale_action",

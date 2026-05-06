@@ -107,6 +107,23 @@ class K8sClient:
             f"scontrol update NodeName={node_name} State=RESUME || true"
         )
 
+    def cancel_jobs_on_node(self, node_name: str) -> None:
+        """Force-cancel every job currently running on `node_name`.
+
+        Used by the drain-timeout path (R1): once a node has been DRAINed past
+        the configured timeout we no longer wait for the job to checkpoint —
+        we kill it so the pool can shrink instead of staying pinned forever.
+        """
+        self.exec_in_controller(
+            f"scancel --nodelist={node_name} --signal=TERM || true"
+        )
+
+    def down_slurm_node(self, node_name: str, reason: str = "drain-timeout") -> None:
+        """Mark a Slurm node DOWN so slurmctld stops considering it allocatable."""
+        self.exec_in_controller(
+            f"scontrol update NodeName={node_name} State=DOWN Reason='{reason}' || true"
+        )
+
     def get_node_cpu_alloc(self, node_name: str) -> int:
         """Return the number of CPUs currently allocated on a node (0 = safe to remove)."""
         output = self.exec_in_controller(

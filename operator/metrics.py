@@ -53,6 +53,11 @@ _DRAIN_TOTAL = Counter(
     "Total drain-then-wait cycles initiated before a scale-down, by pool",
     ["pool"],
 )
+_DRAIN_TIMEOUT_TOTAL = Counter(
+    "slurm_operator_drain_timeout_total",
+    "Times a draining node hit drain_timeout and was force-killed, by pool and node",
+    ["pool", "node"],
+)
 _CIRCUIT_BREAKER_ERRORS = Gauge(
     "slurm_operator_consecutive_errors",
     "Consecutive error count in main poll loop — non-zero means circuit is open",

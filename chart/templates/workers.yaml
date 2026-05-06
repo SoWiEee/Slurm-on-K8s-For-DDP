@@ -54,6 +54,13 @@ metadata:
 spec:
   serviceName: {{ $pool.statefulset }}
   replicas: {{ $pool.replicas }}
+  # R10: do NOT let `helm upgrade` rebuild worker pods automatically — the
+  # default RollingUpdate strategy walks ordinals high→low and would kill
+  # every running training job. With OnDelete the operator (or a human)
+  # must drain → delete a pod, which keeps job NODE_FAIL out of the upgrade
+  # path. New pods come up on the new spec only when explicitly recreated.
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       app: {{ $pool.appLabel }}

@@ -95,6 +95,22 @@ tests:
           path: metadata.name
           value: slurm-worker-cpu
 
+  - it: workers use OnDelete updateStrategy so helm upgrade does not kill running jobs (R10)
+    template: workers.yaml
+    asserts:
+      - equal:
+          path: spec.updateStrategy.type
+          value: OnDelete
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - equal:
+          path: spec.updateStrategy.type
+          value: OnDelete
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+
   - it: slurmd command no longer hardcodes -Dvvv (R12)
     template: workers.yaml
     asserts:

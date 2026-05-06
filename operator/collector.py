@@ -32,6 +32,7 @@ class PartitionConfigLoader:
                     checkpoint_path=cfg.default_checkpoint_path,
                     max_checkpoint_age_seconds=cfg.default_max_checkpoint_age_seconds,
                     checkpoint_grace_seconds=cfg.default_checkpoint_grace_seconds,
+                    drain_timeout_seconds=cfg.default_drain_timeout_seconds,
                     fallback=True,
                 )
             ]
@@ -54,6 +55,9 @@ class PartitionConfigLoader:
                     checkpoint_path=item.get("checkpoint_path", ""),
                     max_checkpoint_age_seconds=int(item.get("max_checkpoint_age_seconds", 600)),
                     checkpoint_grace_seconds=int(item.get("checkpoint_grace_seconds", 0)),
+                    drain_timeout_seconds=int(item.get(
+                        "drain_timeout_seconds", cfg.default_drain_timeout_seconds
+                    )),
                     match_features=tuple(item.get("match_features", [])),
                     match_gres=tuple(item.get("match_gres", [])),
                     fallback=bool(item.get("fallback", False)),

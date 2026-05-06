@@ -36,6 +36,42 @@ tests:
           path: kind
           value: Deployment
 
+  - it: DRAIN_TIMEOUT_SECONDS env + per-pool drain_timeout_seconds in PARTITIONS_JSON (R1)
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DRAIN_TIMEOUT_SECONDS
+            value: "1800"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"drain_timeout_seconds":1800'
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: drainTimeoutSeconds value override flows to env + PARTITIONS_JSON (R1)
+    set:
+      operator.drainTimeoutSeconds: 600
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DRAIN_TIMEOUT_SECONDS
+            value: "600"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="PARTITIONS_JSON")].value
+          pattern: '"drain_timeout_seconds":600'
+        documentSelector:
+          path: kind
+          value: Deployment
+
   - it: operator Service exposes port 8000 for Prometheus scraping
     asserts:
       - equal:

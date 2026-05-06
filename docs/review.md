@@ -38,7 +38,7 @@ Phase 5 完成後，**部署可重複性（Helm cutover）和 GPU 共享（GPU O
 
 | # | 議題 | 類別 | 嚴重度 | 性質 | 狀態 |
 |---|---|---|:---:|:---:|:---:|
-| R1 | Operator scale-down 仍無 drain timeout（v3 N8 沿用） | 彈性 | 🔴 P0 | bug | ⬜ |
+| ~~R1~~ | ~~Operator scale-down 仍無 drain timeout（v3 N8 沿用）~~ | ~~彈性~~ | ~~🔴 P0~~ | ~~bug~~ | ✅ |
 | ~~R2~~ | ~~scale-up 冷啟 image pull 沒 preload，第一次擴 GPU pod 30–60s~~ | ~~彈性~~ | ~~🟠 P1~~ | ~~性能~~ | ✅ |
 | ~~R3~~ | ~~slurm.conf 改變後沒有自動 `scontrol reconfigure`，需手動或 pod 重建~~ | ~~維運~~ | ~~🟠 P1~~ | ~~bug~~ | ✅ |
 | ~~R4~~ | ~~`nvidia.com/device-plugin.config` node label 由 post-install Job 一次性打，節點重建即遺失~~（NFD NodeFeatureRule 取代） | ~~GPU~~ | ~~🟠 P1~~ | ~~bug~~ | ✅ |
@@ -47,7 +47,7 @@ Phase 5 完成後，**部署可重複性（Helm cutover）和 GPU 共享（GPU O
 | R7 | Workers 沒設 `resources.requests/limits`（v3 6-A 沿用），對 cgroup accounting 失效 | K8s | 🟠 P1 | 沿用 | ⬜ |
 | ~~R8~~ | ~~`gres.conf` 缺 `Cores=` 拓撲宣告，cons_tres 沒法做 GPU↔CPU 親和性 binding~~ | ~~排程~~ | ~~🟡 P2~~ | ~~性能~~ | ✅ |
 | R9 | `proctrack/cgroup` + `task/cgroup` 在 PSS=baseline pod 撞 dbus systemd-scope，**deferred 到 R13 完成才有意義** | Slurm 設定 | 🟡 P2 | blocked-by-R13 | 🔒 |
-| R10 | StatefulSet `RollingUpdate` 預設策略，chart upgrade 會中斷 running job | 維運 | 🟡 P2 | bug | ⬜ |
+| ~~R10~~ | ~~StatefulSet `RollingUpdate` 預設策略，chart upgrade 會中斷 running job~~ | ~~維運~~ | ~~🟡 P2~~ | ~~bug~~ | ✅ |
 | R11 | Login pod 無 resource limit，使用者可 fork bomb 拖垮整個 node | K8s | 🟡 P2 | 沿用變體 | ⬜ |
 | ~~R12~~ | ~~`slurmd -Dvvv`（DEBUG3）長期跑會把 log volume 灌爆~~ | ~~維運~~ | ~~🟡 P2~~ | ~~雜訊~~ | ✅ |
 | R13 | Slurm 21.08 → 23.11 升級嘗試後 deferred — 23.11 slurmstepd 強制走 dbus systemd scope，**現有 PSS=baseline 環境不可行** | 升級路徑 | 🟡 P2 | blocked-by-PSS | 🔒 |
@@ -102,7 +102,17 @@ spec:
 
 ## 2. 故障恢復與可靠性
 
-### R1：Operator scale-down 仍無 drain timeout
+### ~~R1：Operator scale-down 仍無 drain timeout~~ ✅ 已修（2026-05-06）
+
+**修法（已實作）：**
+
+- `operator/models.py` `PartitionConfig.drain_timeout_seconds`（預設 1800s，可由 `DRAIN_TIMEOUT_SECONDS` env 或 PARTITIONS_JSON 個別 pool 覆蓋）
+- `operator/app.py` 在 `_do_scale_down` 內維護 `_draining_started: dict[pool, dict[node, ts]]`；對於 `cpu_alloc != 0` 且 drain 已超過 `drain_timeout_seconds` 的 node 走 force-kill 路徑：`scancel --nodelist=<node>` + `scontrol update NodeName=<n> State=DOWN Reason='drain-timeout'`，然後將該 node 視為 idle 一起放行 patch_replicas
+- `operator/k8s.py` 加 `cancel_jobs_on_node()` / `down_slurm_node()`
+- 新 metric `slurm_operator_drain_timeout_total{pool, node}` + JSON log event `drain_timeout_force_kill` (level=WARN)
+- chart `templates/operator.yaml` 將 `.Values.operator.drainTimeoutSeconds` 同時注入 `DRAIN_TIMEOUT_SECONDS` env 與 PARTITIONS_JSON 每個 pool object（cluster default + per-pool override 都可用）
+
+**原始描述（保留以備查）：**
 
 `operator/app.py` 仍是「等所有 draining node `cpu_alloc=0` 才縮」。一個 hang 的 srun step 會把整個 pool 永遠卡在 max replicas。
 
@@ -286,7 +296,23 @@ resources:
     memory: {{ printf "%dMi" (mul $pool.realMemory 2) }}  # 2x burst headroom
 ```
 
-### R10：StatefulSet RollingUpdate 預設策略中斷 running job
+### ~~R10：StatefulSet RollingUpdate 預設策略中斷 running job~~ ✅ 已修（2026-05-06）
+
+**修法（已實作）：**
+
+`chart/templates/workers.yaml` 對 worker StatefulSet 加上：
+
+```yaml
+spec:
+  updateStrategy:
+    type: OnDelete
+```
+
+`helm upgrade` 改 worker pod template（image / env / volume）後，K8s 不再自動 rolling — 必須由 operator 或 maintainer 主動 drain → `kubectl delete pod`，新 pod 才會以新 spec 起來。配套 operator 的 R1 drain timeout 路徑已就緒，未來實作 `rolling_upgrade_pool(pool_id)` 可直接呼叫現有 drain → patch_replicas（縮 1 → 等 ready → 放回）流程，不需重寫。
+
+> **Note**：controller StatefulSet 維持預設策略 — 它沒有跑 user job，重啟成本低；slurmctld 重啟由 controller pod 的 `terminationGracePeriodSeconds` + state PVC 處理。
+
+**原始描述（保留以備查）：**
 
 ```yaml
 # chart/templates/workers.yaml — 沒設 updateStrategy
