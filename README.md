@@ -7,6 +7,7 @@
 - K8s 叢集規格文件：[`docs/cluster.md`](docs/cluster.md)
 - 監控系統實作規格：[`docs/monitoring.md`](docs/monitoring.md)
 - Slurm 優化排程研究：[`docs/scheduler.md`](docs/scheduler.md)
+  - [Phase6 Roadmap](docs/scheduler.md#phase-6-roadmap--score-based-scheduling-%E9%96%8B%E7%99%BC%E8%BF%BD%E8%B9%A4r17)
 - AI Review 紀錄：[`docs/review.md`](docs/review.md) (Update after Phase5)
 
 ---
