@@ -843,6 +843,8 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 
 > sensitivity log 第一筆已寫進 `docs/scheduler-score-spec.md` §6 — M3 baseline 的 weights 是 α=0.40 / β=0.20 / γ=0 / δ=0.20 / ε=0（γ、ε 等 M5+M7 才打開）
 
+> M3 邊界： 還是純 job_desc + chart values 的計算，沒接 live cluster state。當 mps=50 + 真實 cluster 已半空 vs 全空，目前公式給同一個 frag penalty。M7 (Gandiva-lite) 會由 operator 寫一份 `/shared/scheduler-state.json`，再由 lua io.open 讀進來算真 stddev。
+
 ## M4：Trace replay simulator（5 天）
 
 ### 目標
