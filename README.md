@@ -587,6 +587,7 @@ helm install slurm-platform ./chart -f chart/values-dev.yaml
 # 📝 References
 
 - [Slurm Workload Manager Documentation](https://slurm.schedmd.com/)
+  - [Slurm Plugin API](https://slurm.schedmd.com/plugins.html)
 - [PyTorch Distributed Elastic](https://docs.pytorch.org/docs/stable/distributed.elastic.html)
 - [Kubernetes Operator Pythonic Framework (Kopf)](https://github.com/nolar/kopf)
 - [Converged Computing: Integrating HPC and Cloud Native](https://www.computer.org/csdl/magazine/cs/2024/03/10770850/22fgId5NFpC)
@@ -598,6 +599,6 @@ helm install slurm-platform ./chart -f chart/values-dev.yaml
 - [Prometheus Slurm Exporter](https://github.com/vpenso/prometheus-slurm-exporter)
 - [AWS ParallelCluster](https://github.com/aws/aws-parallelcluster)
 - [Lmod: An Environment Module System](https://github.com/TACC/Lmod)
-- [Spack: A Flexible Package Manager](https://github.com/spack/spack)
+- [kube-scheduler Scoring](https://kubernetes.io/docs/reference/scheduling/config/)
 - [Grafana](https://grafana.com/)
 - [Kube State Metrics](https://github.com/kubernetes/kube-state-metrics)
