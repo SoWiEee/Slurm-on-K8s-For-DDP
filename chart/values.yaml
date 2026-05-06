@@ -191,6 +191,32 @@ slurm:
     lifespanSeconds: 86400                         # used by Stage B+ controller scripts
   fairshare:
     enabled: false                                 # P1+ feature
+  # M1 (Phase 6): Slurm built-in scheduling knobs. The defaults below match
+  # Slurm's built-in behaviour for selectTypeParameters (CR_Core, no Pack)
+  # and turn on backfill + multifactor priority — both already on in stock
+  # Slurm 21.08, just made explicit here so values.yaml is the single source
+  # of truth. Preempt is OFF by default (M7 turns it on after the
+  # checkpoint-aware requeue lands). See docs/scheduler.md §5.1.
+  scheduling:
+    # sched/backfill is strictly better than sched/builtin for our mixed
+    # workload (long DDP + short cpu jobs). Override to sched/builtin only
+    # for A/B comparisons.
+    schedulerType: sched/backfill
+    # bf_window=720 → look 12h ahead; bf_resolution=30 → 30s slot grain;
+    # bf_continue → don't restart backfill on every new submission;
+    # bf_max_job_test=200 → cap per-cycle job evaluations.
+    schedulerParameters: "bf_window=720,bf_resolution=30,bf_continue,bf_max_job_test=200"
+    priorityType: priority/multifactor
+    priorityWeights:
+      age: 1000           # 1 hour wait ≈ 1000 priority points
+      fairshare: 0        # off until slurmdbd-driven fairshare lands
+      jobSize: 500        # mild preference for larger jobs (helps DDP)
+      partition: 1000     # partition.PriorityTier still dominates
+      qos: 2000           # QOS dominates jobSize/age
+    preempt:
+      enabled: false      # M7 flips this on after checkpoint+requeue plumb
+      type: preempt/qos
+      mode: REQUEUE
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:

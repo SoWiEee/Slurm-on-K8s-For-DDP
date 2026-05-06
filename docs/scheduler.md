@@ -709,7 +709,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 
 | # | Milestone | 對應節 | 工期 | 狀態 |
 |---|---|---|:---:|:---:|
-| M1 | Slurm 內建調度旋鈕（chart values） | §1, §5.1 | 2 天 | ⬜ |
+| M1 | Slurm 內建調度旋鈕（chart values） | §1, §5.1 | 2 天 | ✅ |
 | M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ⬜ |
 | M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ⬜ |
 | M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ⬜ |
@@ -759,6 +759,14 @@ slurm:
 
 ### 風險
 - `CR_Pack_Nodes` 在某些 partition 配置下會讓 fragmentation 暫時更糟（先 pack 滿一台才開下一台）— evaluation 時要量測 baseline vs M1 的 utilization 比例
+
+### 實機驗收（2026-05-06，custom-sched）
+
+- 5 條 helm-unittest 全綠（67/67 total）；`SchedulerType=sched/backfill` / `SchedulerParameters=bf_window=720,...` / `PriorityType=priority/multifactor` / `PriorityWeight{Age,JobSize,Partition,QOS}` 全部從 `scontrol show config` 回讀對齊 values
+- `verify.sh` baseline 全綠（單機 srun + sbatch / scale-up→4 / scale-down→1 / PMI2 / OpenMPI / GPU pool）
+- 5 條 cpu sleep job：4 條同時跑在 cpu-0 / cpu-1，第 5 條 PENDING(Resources)，operator scale-up 觸發後排空 → backfill + 既有 elastic loop 沒互打架
+- `CR_Pack_Nodes` 暫不打開（roadmap 預設仍 `CR_Core`），等 M3 fragmentation_penalty 上線後再做 baseline vs pack 的 A/B
+- preempt 維持 `enabled: false`，slurm.conf 不出 `PreemptType` / `PreemptMode`；M7 才會翻
 
 ## M2：Score function 規格 + Lua submit plugin scaffold（3 天）
 
@@ -1002,7 +1010,7 @@ Phase 7 OTel 端到端 trace 會把每個 job 的：
 ## 起手第一步
 
 ```bash
-git checkout -b phase6/m1-slurm-knobs
+git checkout -b custom-sched
 # 1. chart/values.yaml 把 §5.1 的 ini 全部 expose 成 yaml
 # 2. helper / configmap 接好
 # 3. helm-unittest 加 3 條
