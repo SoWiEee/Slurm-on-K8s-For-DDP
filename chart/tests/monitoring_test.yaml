@@ -32,6 +32,34 @@ tests:
           path: data["prometheus.yml"]
           pattern: "job_name: kube-state-metrics"
 
+  - it: prometheus scrapes DCGM exporter when monitoring.dcgmExporter.enabled (R5)
+    template: monitoring/prometheus.yaml
+    set:
+      monitoring.enabled: true
+    documentSelector:
+      path: metadata.name
+      value: prometheus-config
+    asserts:
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "job_name: dcgm-exporter"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400"
+
+  - it: DCGM scrape job suppressed when monitoring.dcgmExporter.enabled=false (R5)
+    template: monitoring/prometheus.yaml
+    set:
+      monitoring.enabled: true
+      monitoring.dcgmExporter.enabled: false
+    documentSelector:
+      path: metadata.name
+      value: prometheus-config
+    asserts:
+      - notMatchRegex:
+          path: data["prometheus.yml"]
+          pattern: "job_name: dcgm-exporter"
+
   - it: alertmanager defaults to dev-null receiver, slack when webhook set
     template: monitoring/alertmanager.yaml
     set:
@@ -77,3 +105,5 @@ tests:
           path: data["operator.json"]
       - exists:
           path: data["sla-efficiency.json"]
+      - exists:
+          path: data["gpu.json"]

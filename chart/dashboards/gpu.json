@@ -1,0 +1,198 @@
+{
+  "uid": "slurm-k8s-gpu",
+  "title": "GPU Utilisation (DCGM)",
+  "description": "Real GPU SM%, VRAM, temperature, and power per device, sourced from nvidia-dcgm-exporter (R5). Replaces the misleading Slurm-allocated-count panel.",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "tags": ["slurm", "gpu", "dcgm"],
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "GPU SM Utilisation (%)",
+      "description": "DCGM_FI_DEV_GPU_UTIL — true streaming-multiprocessor busy percentage. NOT the Slurm allocated GPU count.",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "legendFormat": "{{Hostname}} gpu={{gpu}} {{modelName}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "VRAM Used (MiB)",
+      "description": "DCGM_FI_DEV_FB_USED — frame-buffer (VRAM) bytes in use, per device.",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decmbytes",
+          "min": 0,
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED",
+          "legendFormat": "{{Hostname}} gpu={{gpu}} used",
+          "refId": "A"
+        },
+        {
+          "expr": "DCGM_FI_DEV_FB_FREE",
+          "legendFormat": "{{Hostname}} gpu={{gpu}} free",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Memory Copy Utilisation (%)",
+      "description": "DCGM_FI_DEV_MEM_COPY_UTIL — fraction of time the memory controller was active. Useful for spotting bandwidth-bound DDP runs.",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_MEM_COPY_UTIL",
+          "legendFormat": "{{Hostname}} gpu={{gpu}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "GPU Temperature (°C)",
+      "description": "DCGM_FI_DEV_GPU_TEMP — die temperature. 4070 thermal throttle around 83°C.",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 83 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "legendFormat": "{{Hostname}} gpu={{gpu}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "GPU Power Draw (W)",
+      "description": "DCGM_FI_DEV_POWER_USAGE — instantaneous board power. Idle 4070 ≈ 8 W, full load ≈ 200 W.",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "watt", "min": 0 }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_POWER_USAGE",
+          "legendFormat": "{{Hostname}} gpu={{gpu}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "GPU Util (Now)",
+      "description": "Current SM utilisation per device.",
+      "gridPos": { "x": 0, "y": 15, "w": 12, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "green", "value": 30 },
+              { "color": "orange", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "legendFormat": "{{Hostname}} gpu{{gpu}} {{modelName}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "VRAM Used (Now)",
+      "gridPos": { "x": 12, "y": 15, "w": 12, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "decmbytes", "min": 0 }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED",
+          "legendFormat": "{{Hostname}} gpu{{gpu}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

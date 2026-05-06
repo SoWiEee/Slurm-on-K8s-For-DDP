@@ -325,6 +325,16 @@ monitoring:
     # finally executed (Slurm 23.11+), bump to v0.0.40.
     restApiVersion: v0.0.37
     scrapeIntervalSeconds: 15
+  # R5: scrape the GPU Operator's bundled DCGM exporter for true SM% / VRAM /
+  # Tensor Core utilisation. The DCGM DaemonSet is enabled by
+  # scripts/install-gpu-operator.sh (`--set dcgmExporter.enabled=true`); this
+  # block only wires Prometheus to the Service it creates. Disable if running
+  # without GPUs.
+  dcgmExporter:
+    enabled: true
+    namespace: gpu-operator
+    serviceName: nvidia-dcgm-exporter
+    port: 9400
 
 # -- Shared storage add-on (Stage E) -----------------------------------------
 # Deploys the NFS subdir external provisioner (in its own namespace) and a

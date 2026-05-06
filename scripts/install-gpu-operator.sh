@@ -83,8 +83,13 @@ helm_args=(
   --set devicePlugin.config.name="$DEVICE_PLUGIN_CONFIG"
   --set devicePlugin.config.default="$DEFAULT_CONFIG_KEY"
   --set mps.root="$MPS_ROOT"
-  # DCGM and migManager are off until Phase 5-B observability work.
-  --set dcgmExporter.enabled=false
+  # R5: DCGM exporter on so Prometheus can scrape real DCGM_FI_DEV_GPU_UTIL
+  # (true SM%), DCGM_FI_DEV_FB_USED (VRAM), DCGM_FI_PROF_PIPE_TENSOR_ACTIVE
+  # (Tensor Core busy%) instead of inferring GPU usage from Slurm allocation
+  # counts. ServiceMonitor stays off — we use plain Prometheus, the slurm
+  # chart adds a static_configs scrape job pointed at the dcgm Service.
+  --set dcgmExporter.enabled=true
+  --set dcgmExporter.serviceMonitor.enabled=false
   --set migManager.enabled=false
   --set nodeStatusExporter.enabled=false
   # Validator's CUDA workload is useful as a smoke test; leave on by default.

@@ -43,6 +43,17 @@ data:
       - job_name: kube-state-metrics
         static_configs:
           - targets: ['kube-state-metrics.{{ $mNs }}.svc.cluster.local:8080']
+      {{- if .Values.monitoring.dcgmExporter.enabled }}
+      # R5: DCGM exporter (deployed by GPU Operator into gpu-operator namespace).
+      # Provides DCGM_FI_DEV_GPU_UTIL (real SM%), DCGM_FI_DEV_FB_USED (VRAM
+      # bytes), DCGM_FI_PROF_PIPE_TENSOR_ACTIVE (Tensor Core busy ratio) —
+      # these replace the misleading "GPU utilisation = Slurm-allocated count"
+      # panel in Grafana.
+      - job_name: dcgm-exporter
+        static_configs:
+          - targets:
+              - '{{ .Values.monitoring.dcgmExporter.serviceName }}.{{ .Values.monitoring.dcgmExporter.namespace }}.svc.cluster.local:{{ .Values.monitoring.dcgmExporter.port }}'
+      {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap

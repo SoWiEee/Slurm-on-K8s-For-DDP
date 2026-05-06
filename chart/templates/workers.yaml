@@ -87,13 +87,24 @@ spec:
         - name: slurm-worker
           image: {{ $.Values.image.worker }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
-          {{- if $useNvidiaRuntime }}
+          # R7: pin CPU/memory to the same numbers Slurm sees (NodeName CPUs= /
+          # RealMemory=) so K8s cgroup accounting matches Slurm's view, putting
+          # the pod into the Guaranteed QoS class. Without this, slurmd reports
+          # 4 cores but the cgroup has no CPU reservation — burst contention from
+          # neighbour pods shows up as "stragglers" in DDP all-reduce.
           resources:
-            limits:
-              nvidia.com/gpu: {{ $gpuCount | quote }}
             requests:
+              cpu: {{ $pool.cpus | quote }}
+              memory: {{ printf "%dMi" (int $pool.realMemory) | quote }}
+              {{- if $useNvidiaRuntime }}
               nvidia.com/gpu: {{ $gpuCount | quote }}
-          {{- end }}
+              {{- end }}
+            limits:
+              cpu: {{ $pool.cpus | quote }}
+              memory: {{ printf "%dMi" (int $pool.realMemory) | quote }}
+              {{- if $useNvidiaRuntime }}
+              nvidia.com/gpu: {{ $gpuCount | quote }}
+              {{- end }}
           command:
             - /bin/bash
             - -lc

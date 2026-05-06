@@ -95,6 +95,50 @@ tests:
           path: metadata.name
           value: slurm-worker-cpu
 
+  - it: workers carry CPU+memory requests/limits matching pool.cpus / realMemory (R7)
+    template: workers.yaml
+    set:
+      cluster.runtime: k3s
+    asserts:
+      # CPU pool: 4 cpu / 3500Mi — Guaranteed QoS (requests == limits)
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "4"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+          value: "4"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.memory
+          value: "3500Mi"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: "3500Mi"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-cpu
+      # GPU pool keeps nvidia.com/gpu alongside cpu/memory
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests["nvidia.com/gpu"]
+          value: "1"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "4"
+        documentSelector:
+          path: metadata.name
+          value: slurm-worker-gpu-rtx4070
+
   - it: workers use OnDelete updateStrategy so helm upgrade does not kill running jobs (R10)
     template: workers.yaml
     asserts:
