@@ -217,6 +217,25 @@ slurm:
       enabled: false      # M7 flips this on after checkpoint+requeue plumb
       type: preempt/qos
       mode: REQUEUE
+  # M2 (Phase 6): Lua submit plugin scaffold. Disabled by default — when
+  # enabled, slurm.conf gets `JobSubmitPlugins=lua` and the controller
+  # mounts /etc/slurm/job_submit.lua from the slurm-config-job-submit
+  # ConfigMap. The shipped scaffold only logs job_desc fields; M3 fills
+  # in the score factors. See docs/scheduler-score-spec.md.
+  jobSubmit:
+    enabled: false
+    # debugLog: write per-call summary to slurmctld.log at level info.
+    # Useful for M2/M3 plumbing tests; turn off in steady state to avoid
+    # log spam.
+    debugLog: true
+    # demoBoostPriority: when > 0, the scaffold sets job_desc.priority to
+    # this value for any job whose name starts with "score-demo-". Lets
+    # M2 verify the plugin can write back to job_desc without needing the
+    # full scoring stack. Set to 0 to disable.
+    demoBoostPriority: 9999
+    # scoreGain: M3+ multiplier converting the [0,1] score into a Slurm
+    # priority delta. Kept here so M2 has a forward-compatible value.
+    scoreGain: 1000
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:

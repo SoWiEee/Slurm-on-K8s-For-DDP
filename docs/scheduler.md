@@ -710,7 +710,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | # | Milestone | 對應節 | 工期 | 狀態 |
 |---|---|---|:---:|:---:|
 | M1 | Slurm 內建調度旋鈕（chart values） | §1, §5.1 | 2 天 | ✅ |
-| M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ⬜ |
+| M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ✅ |
 | M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ⬜ |
 | M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ⬜ |
 | M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ⬜ |
@@ -796,10 +796,18 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 ```
 
 ### 驗收條件
-- [ ] spec 文件含每個 factor 的 input、output、邊界 case 表
-- [ ] `helm-unittest` 60+ 條全綠
-- [ ] 進 controller pod `tail -f /var/log/slurm/slurmctld.log`，sbatch 一個 job 看到 lua plugin invoke 成功
-- [ ] lua 改一個值（e.g. 硬寫 `job_desc.priority = 9999`），sbatch 後 squeue 看到該 priority
+- [x] spec 文件含每個 factor 的 input、output、邊界 case 表
+- [x] `helm-unittest` 60+ 條全綠
+- [x] 進 controller pod `tail -f /var/log/slurm/slurmctld.log`，sbatch 一個 job 看到 lua plugin invoke 成功
+- [x] lua 改一個值（e.g. 硬寫 `job_desc.priority = 9999`），sbatch 後 squeue 看到該 priority
+
+### 實機驗收（2026-05-06，custom-sched）
+
+- 75/75 helm-unittest 全綠（M2 加 8 條，含 ConfigMap gating / mount 條件 / lua scaffold inline 值）
+- `verify.sh` 在 `jobSubmit.enabled=true` 下 baseline 全綠（單機 srun + sbatch / scale-up→4 / scale-down→1 / PMI2 / GPU pool）
+- `scripts/verify-lua-submit.sh` 全綠 — sbatch `score-demo-*` job，`scontrol show job` 回讀 `Priority=9999`（plugin 寫回成功）
+- slurmctld.log 三條 lua 線都有：`submit name=...`、`demo-boost name=... priority=9999`、`shadow_score=0.3000`（5 個 stub factor 各回 0.5 → 0.4·0.5 + 0.2·0.5 + 0.15·0.5 - 0.2·0.5 + 0.05·0.5 = 0.30）
+- 規格文件 `docs/scheduler-score-spec.md`：5 個 factor 的 input/output/邊界 case 表 + I/O schema + busted 測試骨架 + sensitivity log
 
 ## M3：Score v1 — mps_fit + vram_fit + fragmentation（5 天）
 

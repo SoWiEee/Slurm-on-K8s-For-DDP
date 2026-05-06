@@ -233,6 +233,17 @@ PreemptType={{ $sched.preempt.type }}
 PreemptMode={{ $sched.preempt.mode }}
 {{- end }}
 {{- end }}
+{{- /*
+M2 (Phase 6): Lua submit plugin. When jobSubmit.enabled, slurmctld loads
+/etc/slurm/job_submit.lua from the slurm-config-job-submit ConfigMap
+mounted on the controller pod.
+*/}}
+{{- $js := $s.jobSubmit | default dict }}
+{{- if $js.enabled }}
+
+# Job submit plugin (Phase 6 M2)
+JobSubmitPlugins=lua
+{{- end }}
 
 Include /etc/slurm/slurm.nodes.conf
 {{- end -}}

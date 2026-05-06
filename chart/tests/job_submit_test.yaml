@@ -1,0 +1,106 @@
+suite: job_submit lua plugin (Phase 6 M2)
+templates:
+  - configmap-job-submit.yaml
+  - configmap-static.yaml
+  - configmap-nodes.yaml
+  - controller.yaml
+tests:
+  - it: ConfigMap is omitted when jobSubmit.enabled=false (default)
+    template: configmap-job-submit.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: slurm.conf does not emit JobSubmitPlugins when disabled (default)
+    template: configmap-static.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["slurm.conf"]
+          pattern: "JobSubmitPlugins=lua"
+
+  - it: ConfigMap is rendered when jobSubmit.enabled=true
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: slurm-config-job-submit
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "function slurm_job_submit"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "function slurm_job_modify"
+
+  - it: slurm.conf adds JobSubmitPlugins=lua when enabled
+    template: configmap-static.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "JobSubmitPlugins=lua"
+
+  - it: lua scaffold inlines demoBoostPriority + scoreGain values
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.demoBoostPriority: 4242
+      slurm.jobSubmit.scoreGain: 750
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "DEMO_BOOST_PRIORITY = 4242"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "SCORE_GAIN         = 750"
+
+  - it: lua scaffold respects debugLog=false
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.debugLog: false
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "DEBUG_LOG          = false"
+
+  - it: controller mounts /etc/slurm/job_submit.lua only when enabled
+    template: controller.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: slurm-config-job-submit
+            mountPath: /etc/slurm/job_submit.lua
+            subPath: job_submit.lua
+        documentSelector:
+          path: kind
+          value: StatefulSet
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: slurm-config-job-submit
+            configMap:
+              name: slurm-config-job-submit
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: controller does NOT mount job_submit.lua when disabled (default)
+    template: controller.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: slurm-config-job-submit
+            mountPath: /etc/slurm/job_submit.lua
+            subPath: job_submit.lua
+        documentSelector:
+          path: kind
+          value: StatefulSet
