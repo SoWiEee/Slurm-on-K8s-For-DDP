@@ -62,3 +62,22 @@ _CIRCUIT_BREAKER_ERRORS = Gauge(
     "slurm_operator_consecutive_errors",
     "Consecutive error count in main poll loop — non-zero means circuit is open",
 )
+# R21: event-driven operator metrics.
+_EVENT_LAG_SECONDS = Histogram(
+    "slurm_operator_event_lag_seconds",
+    "Seconds from when an event was enqueued (K8s watch / Slurm diff / timer) "
+    "to when the reconcile actually started — measures responsiveness of the "
+    "event loop. Target p95 < 1s under normal load.",
+    ["source"],
+    buckets=[0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+)
+_RECONCILES_TOTAL = Counter(
+    "slurm_operator_reconciles_total",
+    "Total reconcile runs by trigger source (k8s-sts / k8s-pod / slurm-diff / timer)",
+    ["pool", "source"],
+)
+_QUEUE_DEDUP_DROPS = Counter(
+    "slurm_operator_queue_dedup_drops_total",
+    "Times an event was dropped because the pool already had a pending reconcile",
+    ["pool", "source"],
+)

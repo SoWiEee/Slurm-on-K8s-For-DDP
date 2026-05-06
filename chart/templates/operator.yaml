@@ -98,6 +98,14 @@ spec:
                 {{ include "slurm-platform.partitionsJson" . | trim }}
             - name: POLL_INTERVAL_SECONDS
               value: {{ .Values.operator.pollIntervalSeconds | quote }}
+            # R21: event-driven loop. Slurm diff cadence (1s default) +
+            # safety-net reconcile timer (60s default). With the K8s watch
+            # threads handling sts/pod events, POLL_INTERVAL_SECONDS is
+            # only used by legacy code paths and can be raised.
+            - name: SLURM_POLL_INTERVAL_SECONDS
+              value: {{ .Values.operator.slurmPollIntervalSeconds | quote }}
+            - name: RECONCILE_PERIOD_SECONDS
+              value: {{ .Values.operator.reconcilePeriodSeconds | quote }}
             - name: SCALE_DOWN_COOLDOWN_SECONDS
               value: {{ .Values.operator.scaleDownCooldownSeconds | quote }}
             # R1: cluster-wide default. Per-pool override via PARTITIONS_JSON.

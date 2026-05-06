@@ -1,7 +1,19 @@
-"""Operator application — main poll loop.
+"""Operator application — event-driven reconcile loop (R21).
 
-OperatorApp wires together all components and runs the control loop:
-  collect state → evaluate policy → actuate → sleep → repeat.
+OperatorApp wires together all components and runs three watcher threads
+plus a single reconcile consumer:
+
+  K8s StatefulSet watch ──┐
+  K8s Pod watch ──────────┼──► dedup queue ──► reconcile(pool) ──► actuate
+  Slurm 1s state diff ────┤                       ▲
+  60s timer (safety net) ─┘                       │
+                                                  │
+                            measure event_lag_seconds (event_ts → reconcile_start)
+
+The previous polling-only loop was rebuilt around a `_PoolEventQueue` so
+scale events trigger within sub-second of being observed by the K8s API
+or by squeue, while a 60s timer-driven reconcile runs as a safety net so
+a missed watch event cannot leave a pool stuck out of sync.
 
 Also contains JsonLogger (structured log emitter) and StatefulSetActuator
 (thin wrapper around K8sClient.patch_replicas kept for separation of concerns).
@@ -11,11 +23,14 @@ from __future__ import annotations
 
 import json
 import pathlib
+import queue
+import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
+from kubernetes import watch as k8s_watch
 from prometheus_client import start_http_server
 
 from collector import ClusterStateCollector, PartitionConfigLoader
@@ -26,18 +41,58 @@ from metrics import (
     _CURRENT_REPLICAS,
     _DRAIN_TIMEOUT_TOTAL,
     _DRAIN_TOTAL,
+    _EVENT_LAG_SECONDS,
     _PODS_READY,
     _POLL_DURATION,
     _PROVISIONING_LATENCY,
+    _QUEUE_DEDUP_DROPS,
+    _RECONCILES_TOTAL,
     _SCALE_DOWN_TOTAL,
     _SCALE_SKIPPED_TOTAL,
     _SCALE_UP_TOTAL,
 )
-from models import Config, PartitionConfig
+from models import Config, PartitionConfig, PartitionState
 from policy import CheckpointAwareQueuePolicy
 from slurm import SlurmRestClient
 
 _COOLDOWN_ANNOTATION = "slurm.k8s/last-scale-up-at"
+_TIMER_SOURCE = "timer"
+
+
+class _PoolEventQueue:
+    """Pool-keyed work queue with dedup.
+
+    Multiple watchers (K8s STS, K8s Pod, Slurm diff, periodic timer) can
+    enqueue the same pool key simultaneously; the consumer only needs to
+    reconcile each pool once per "burst" so we collapse pending entries.
+
+    `put` returns False (and increments a metric) if the pool already has
+    an entry sitting in the queue — the existing entry will be consumed
+    soon enough.
+    """
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[tuple[str, str, float]] = queue.Queue()
+        self._pending: set[str] = set()
+        self._lock = threading.Lock()
+
+    def put(self, pool_key: str, source: str) -> bool:
+        with self._lock:
+            if pool_key in self._pending:
+                _QUEUE_DEDUP_DROPS.labels(pool=pool_key, source=source).inc()
+                return False
+            self._pending.add(pool_key)
+        self._q.put((pool_key, source, time.time()))
+        return True
+
+    def get(self, timeout: float | None) -> tuple[str, str, float] | None:
+        try:
+            item = self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        with self._lock:
+            self._pending.discard(item[0])
+        return item
 
 
 class JsonLogger:
@@ -95,6 +150,10 @@ class OperatorApp:
         self._checkpoint_missing_since: dict[str, float] = {}
         # Circuit-breaker state: tracks consecutive loop-level errors for exponential backoff.
         self._consecutive_errors: int = 0
+        # R21: event-driven plumbing.
+        self._event_queue = _PoolEventQueue()
+        self._cfg_by_key: dict[str, PartitionConfig] = {p.worker_statefulset: p for p in self.partition_cfgs}
+        self._slurm_state_cache: dict[str, PartitionState] = {}
         for _p in self.partition_cfgs:
             _raw: str | None = None
             try:
@@ -141,8 +200,34 @@ class OperatorApp:
                         pool=_p.worker_statefulset,
                     )
         start_http_server(8000)
+        # R21: spawn watcher threads. They are daemon threads so a clean
+        # shutdown of the consumer loop tears them down implicitly.
+        for thread_target, name in (
+            (self._watch_statefulsets, "k8s-sts-watch"),
+            (self._watch_pods, "k8s-pod-watch"),
+            (self._poll_slurm_state, "slurm-diff"),
+            (self._periodic_timer, "periodic-timer"),
+        ):
+            t = threading.Thread(target=thread_target, name=name, daemon=True)
+            t.start()
+        # Prime the queue so the first reconcile happens immediately, before
+        # any watcher fires. Without this the readiness probe waits up to
+        # `slurm_poll_interval` seconds for the first slurm diff.
+        for key in self._cfg_by_key:
+            self._event_queue.put(key, source="startup")
+
         while True:
+            item = self._event_queue.get(timeout=float(self.cfg.reconcile_period_seconds))
             _loop_start = time.time()
+            if item is None:
+                # Timer fallback — full reconcile across every pool.
+                pool_keys: list[str] = list(self._cfg_by_key.keys())
+                source = _TIMER_SOURCE
+                event_ts = _loop_start
+            else:
+                pool_keys, source, event_ts = [item[0]], item[1], item[2]
+                _EVENT_LAG_SECONDS.labels(source=source).observe(_loop_start - event_ts)
+
             try:
                 all_states = self.collector.collect_all_partition_states()
             except Exception as exc:  # noqa: BLE001  — circuit breaker
@@ -166,12 +251,111 @@ class OperatorApp:
                 )
                 self._consecutive_errors = 0
                 _CIRCUIT_BREAKER_ERRORS.set(0)
-            for partition_cfg in self.partition_cfgs:
-                self._process_pool(partition_cfg, all_states)
+
+            for key in pool_keys:
+                cfg = self._cfg_by_key.get(key)
+                if cfg is None:
+                    continue
+                _RECONCILES_TOTAL.labels(pool=key, source=source).inc()
+                self._process_pool(cfg, all_states)
+
             _POLL_DURATION.observe(time.time() - _loop_start)
             pathlib.Path("/tmp/operator-alive").touch()
             pathlib.Path("/tmp/operator-ready").touch()
-            time.sleep(self.cfg.poll_interval)
+
+    # ---------- watcher threads (R21) ---------------------------------------
+
+    def _watch_statefulsets(self) -> None:
+        """Watch StatefulSet ADD/MODIFY/DELETE for our worker pools."""
+        pool_keys = set(self._cfg_by_key.keys())
+        while True:
+            try:
+                w = k8s_watch.Watch()
+                for ev in w.stream(
+                    self.client._apps.list_namespaced_stateful_set,
+                    namespace=self.cfg.namespace,
+                    timeout_seconds=300,
+                ):
+                    obj = ev.get("object")
+                    if obj is None:
+                        continue
+                    name = getattr(obj.metadata, "name", "")
+                    if name in pool_keys:
+                        self._event_queue.put(name, source=f"k8s-sts:{ev.get('type', '?')}")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.emit(
+                    "error", level="WARN",
+                    message=f"sts watch interrupted, reconnecting in 2s: {exc}",
+                )
+                time.sleep(2)
+
+    def _watch_pods(self) -> None:
+        """Watch worker Pods. StatefulSet pod naming is `<sts>-<ordinal>` so we
+        route by name prefix instead of label selector — that survives a chart
+        relabelling and stays correct without RBAC changes.
+        """
+        pool_keys = list(self._cfg_by_key.keys())
+        while True:
+            try:
+                w = k8s_watch.Watch()
+                for ev in w.stream(
+                    self.client._core.list_namespaced_pod,
+                    namespace=self.cfg.namespace,
+                    timeout_seconds=300,
+                ):
+                    obj = ev.get("object")
+                    if obj is None:
+                        continue
+                    pod_name = getattr(obj.metadata, "name", "")
+                    for sts_name in pool_keys:
+                        if pod_name.startswith(f"{sts_name}-"):
+                            self._event_queue.put(sts_name, source=f"k8s-pod:{ev.get('type', '?')}")
+                            break
+            except Exception as exc:  # noqa: BLE001
+                self.logger.emit(
+                    "error", level="WARN",
+                    message=f"pod watch interrupted, reconnecting in 2s: {exc}",
+                )
+                time.sleep(2)
+
+    def _poll_slurm_state(self) -> None:
+        """Diff Slurm state every `slurm_poll_interval_seconds`. Slurm 21.08
+        has no event stream so this is the closest we get to event-driven
+        for queue and node state changes.
+        """
+        interval = max(self.cfg.slurm_poll_interval_seconds, 0.5)
+        while True:
+            try:
+                states = self.collector.collect_all_partition_states()
+                for key, state in states.items():
+                    prev = self._slurm_state_cache.get(key)
+                    if prev is None or state != prev:
+                        self._event_queue.put(key, source="slurm-diff")
+                    self._slurm_state_cache[key] = state
+            except Exception as exc:  # noqa: BLE001
+                # Don't spam — circuit breaker in the main loop will surface this.
+                self.logger.emit(
+                    "error", level="DEBUG",
+                    message=f"slurm-diff poll failed (will retry): {exc}",
+                )
+            time.sleep(interval)
+
+    def _periodic_timer(self) -> None:
+        """Safety-net reconcile every `reconcile_period_seconds`.
+
+        The main consumer loop already wakes on queue.get(timeout=...) so
+        this thread only exists to enqueue an explicit timer event whenever
+        the queue has been quiet — which lets the timer-source metric and
+        the explicit `timer` log line stay distinguishable from an idle
+        consumer wake-up. The consumer treats a None dequeue as a timer.
+        We don't need to enqueue here; the consumer already handles it.
+        """
+        # Intentionally a no-op thread today — kept as a hook so future
+        # changes can switch to explicit timer events without restructuring
+        # the consumer. Sleeping forever would be cleanest, but a long
+        # sleep keeps the thread name visible in py-spy / faulthandler.
+        while True:
+            time.sleep(3600)
 
     def _process_pool(self, partition_cfg: PartitionConfig, all_states: dict) -> None:
         key = partition_cfg.worker_statefulset

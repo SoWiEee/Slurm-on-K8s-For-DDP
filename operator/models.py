@@ -32,6 +32,13 @@ class Config:
     namespace: str = os.getenv("NAMESPACE", "slurm")
     controller_pod: str = os.getenv("CONTROLLER_POD", "slurm-controller-0")
     poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
+    # R21: event-driven loop. `slurm_poll_interval` is the diff cadence for
+    # squeue/sinfo state (Slurm 21.08 has no event stream); `reconcile_period`
+    # is the timer-driven full reconcile that runs even when no events arrive,
+    # acting as a safety net so a missed watch event cannot leave a pool
+    # stuck out of sync forever.
+    slurm_poll_interval_seconds: float = float(os.getenv("SLURM_POLL_INTERVAL_SECONDS", "1"))
+    reconcile_period_seconds: int = int(os.getenv("RECONCILE_PERIOD_SECONDS", "60"))
     policy_name: str = os.getenv("SCALING_POLICY", "checkpoint_aware_queue")
     checkpoint_guard_enabled: bool = os.getenv("CHECKPOINT_GUARD_ENABLED", "true").lower() == "true"
     default_partition: str = os.getenv("SLURM_PARTITION", "cpu")

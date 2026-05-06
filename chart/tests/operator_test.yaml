@@ -72,6 +72,25 @@ tests:
           path: kind
           value: Deployment
 
+  - it: event-driven loop env wired (R21)
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SLURM_POLL_INTERVAL_SECONDS
+            value: "1"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RECONCILE_PERIOD_SECONDS
+            value: "60"
+        documentSelector:
+          path: kind
+          value: Deployment
+
   - it: operator Service exposes port 8000 for Prometheus scraping
     asserts:
       - equal:
