@@ -5,3 +5,4 @@ Dockerfile text eol=lf
 *.md text eol=lf
 
 /scripts/*.sh linguist-vendored
+/assets/* linguist-vendored
