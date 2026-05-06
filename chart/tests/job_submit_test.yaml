@@ -1,4 +1,4 @@
-suite: job_submit lua plugin (Phase 6 M2)
+suite: job_submit lua plugin (Phase 6 M2 + M3)
 templates:
   - configmap-job-submit.yaml
   - configmap-static.yaml
@@ -56,7 +56,7 @@ tests:
           pattern: "DEMO_BOOST_PRIORITY = 4242"
       - matchRegex:
           path: data["job_submit.lua"]
-          pattern: "SCORE_GAIN         = 750"
+          pattern: "SCORE_GAIN          = 750"
 
   - it: lua scaffold respects debugLog=false
     template: configmap-job-submit.yaml
@@ -66,7 +66,55 @@ tests:
     asserts:
       - matchRegex:
           path: data["job_submit.lua"]
-          pattern: "DEBUG_LOG          = false"
+          pattern: "DEBUG_LOG           = false"
+
+  - it: M3 default scoreApply=true and weights inline (mpsFit=0.40, vramFit=0.20)
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "SCORE_APPLY         = true"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "local A = 0\\.4"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "local B = 0\\.2"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "local D = 0\\.2"
+
+  - it: M3 vramTiers list inlines into VRAM_TIERS
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.vramTiers: [8, 16, 40]
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "VRAM_TIERS = \\{\\s*8, 16, 40"
+
+  - it: M3 scoreApply=false (shadow mode) preserves apply=false in scaffold
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.scoreApply: false
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "SCORE_APPLY         = false"
+
+  - it: M3 mpsPerNode override flows through
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.mpsPerNode: 200
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "MPS_PER_NODE        = 200"
 
   - it: controller mounts /etc/slurm/job_submit.lua only when enabled
     template: controller.yaml

@@ -234,8 +234,35 @@ slurm:
     # full scoring stack. Set to 0 to disable.
     demoBoostPriority: 9999
     # scoreGain: M3+ multiplier converting the [0,1] score into a Slurm
-    # priority delta. Kept here so M2 has a forward-compatible value.
+    # priority delta. Roughly equal to PriorityWeightAge / hour so a
+    # perfect score buys ~1 hour of age.
     scoreGain: 1000
+    # M3: scoreApply controls whether the computed score is applied to
+    # job_desc.priority. Set to false for shadow-mode evaluation (the
+    # plugin still logs `[score-m3] score=...` so we can compare against
+    # baseline without changing scheduling behaviour). Default true now
+    # that the factors are real (M2 was always shadow).
+    scoreApply: true
+    # M3: factor coefficients (α/β/γ/δ/ε in docs/scheduler-score-spec.md).
+    # γ (topology) and ε (predicted runtime) stay at 0 until M5+M7 wire
+    # them in — keeping their slots here means M3 evaluation isn't biased
+    # by uninitialised factors.
+    scoreWeights:
+      mpsFit: 0.40           # α
+      vramFit: 0.20          # β
+      topology: 0.00         # γ — M7
+      fragmentation: 0.20    # δ
+      predRuntime: 0.00      # ε — M5+M6
+    # M3: VRAM tiers used by f_vram_fit. Sorted ascending. The smallest
+    # tier ≥ job's vram constraint is treated as the ideal placement; the
+    # plugin penalises over-provisioning (sending a 12g job to a 24g
+    # node). Derive these from .Values.pools when M7 lands; for M3 we
+    # keep the values explicit so the lua doesn't need to walk pools.
+    vramTiers: [12, 24]
+    # M3: assumed MPS slots per GPU node. Slurm's gres.conf sets mps
+    # Count=100 for our pools; embed it here so f_mps_fit / f_fragmentation
+    # don't hard-code 100.
+    mpsPerNode: 100
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:

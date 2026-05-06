@@ -711,7 +711,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 |---|---|---|:---:|:---:|
 | M1 | Slurm 內建調度旋鈕（chart values） | §1, §5.1 | 2 天 | ✅ |
 | M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ✅ |
-| M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ⬜ |
+| M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ✅ |
 | M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ⬜ |
 | M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ⬜ |
 | M6 | Predictor → Lua → backfill 端到端 | §9.3 | 3 天 | ⬜ |
@@ -831,6 +831,17 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 
 ### 風險
 - Lua 沒 native MPS 計算 API — 從 sinfo / scontrol show node 字串解析。寫個小工具函式 + cache 1 秒避免 hot path 卡 slurmctld
+
+### 實機驗收（2026-05-06，custom-sched）
+
+- 79/79 helm-unittest 全綠（M3 加 4 條：scoreApply / weights inline / vramTiers / mpsPerNode）
+- 27/27 pure-lua unit test 全綠 — `tests/lua/score_test.lua` 跑在 controller pod 內 lua5.2，覆蓋 5 個 factor + 解析器邊界
+- `verify.sh` baseline 全綠（jobSubmit.enabled=true 時無 regress）
+- 5 條 sbatch mix（不同 mps：100 / 50 / 25 / 10 / cpu-only）priority 排序：wholeNode=500、cpuOnly=500、halfFrag=100、twoTen=68、smallPack=50；對 lua 公式手算結果完全吻合
+- slurmctld.log 每筆提交都有 `[score-m3] score=X.XXXX delta=N mps_fit=... vram_fit=... topo=... frag=... pred=...` 五因子拆解
+- M3 範圍仍是純 `job_desc` + chart values 的 score；live cluster state（per-node mps_free 等）的接入排在 M7 fragmentation detector
+
+> sensitivity log 第一筆已寫進 `docs/scheduler-score-spec.md` §6 — M3 baseline 的 weights 是 α=0.40 / β=0.20 / γ=0 / δ=0.20 / ε=0（γ、ε 等 M5+M7 才打開）
 
 ## M4：Trace replay simulator（5 天）
 
