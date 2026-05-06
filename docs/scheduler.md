@@ -692,3 +692,322 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 - Verma et al., "Large-scale cluster management at Google with Borg", EuroSys 2015
 - Tirmazi et al., "Borg: the next generation", EuroSys 2020
 - Microsoft Singularity — https://arxiv.org/abs/2202.07848
+
+---
+
+# Phase 6 Roadmap — Score-based Scheduling 開發追蹤（R17）
+
+> **Owner**: 你（單人專題）
+> **起手日**: 2026-05-06（R21 event-driven operator 完成後立刻可起）
+> **預計總工期**: 7–10 週（必做 M1–M8 ≈ 7–8 週、含 ★ M9 ≈ 10 週）
+> **依賴**: R5（DCGM）✅、R7（resources/limits）✅、R21（event-driven loop）✅
+> **review.md 對應**: R17（score-based scheduling）+ R19（runtime predictor）
+
+把 §5–9 拆成可勾選的 milestone。每個 milestone 列：**目標、產出檔案、驗收條件、預估工期**。順序按依賴 + 工程成本遞增排，前一個沒做下一個沒法做。
+
+## 進度總覽
+
+| # | Milestone | 對應節 | 工期 | 狀態 |
+|---|---|---|:---:|:---:|
+| M1 | Slurm 內建調度旋鈕（chart values） | §1, §5.1 | 2 天 | ⬜ |
+| M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ⬜ |
+| M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ⬜ |
+| M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ⬜ |
+| M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ⬜ |
+| M6 | Predictor → Lua → backfill 端到端 | §9.3 | 3 天 | ⬜ |
+| M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ⬜ |
+| M8 | Evaluation：JCT / utilization / makespan / fairness | §9.5 | 7 天 | ⬜ |
+| M9 ★ | （可選）Contextual bandit / PPO weight tuning | §7.5 | 10 天 | ⬜ |
+
+★ = 加分項，做不完不影響畢業/上線。
+
+## M1：Slurm 內建調度旋鈕（2 天）
+
+### 目標
+把 §5.1 的 ini 設定走 chart values，確認對既有 workload 沒有 regress。**不寫程式就能拿到的免費收益**，也是後面所有 milestone 的 baseline。
+
+### 產出檔案
+- `chart/values.yaml` — 新 `slurm.scheduling.{selectTypeParameters, schedulerParameters, priorityWeights, preempt}` 段
+- `chart/templates/_helpers.tpl` — `slurm-platform.slurmConf` helper render 進 slurm.conf
+- `chart/templates/configmap-static.yaml` — 透過 helper 自動帶入
+- `chart/tests/slurm_conf_test.yaml` — 至少 3 條：default 不變、`CR_Pack_Nodes` 開時 SelectTypeParameters 對、preempt 預設關
+- `docs/scheduler.md` — 在 §5.1 加 ✅ + 實機觀察的 backfill 命中率
+
+### 預設值（建議）
+```yaml
+slurm:
+  scheduling:
+    selectTypeParameters: "CR_Core,CR_Pack_Nodes"
+    schedulerParameters: "bf_window=720,bf_resolution=30,bf_continue,bf_max_job_test=200"
+    priorityWeights:
+      age: 1000
+      fairshare: 0
+      jobSize: 500
+      partition: 1000
+      qos: 2000
+    preempt:
+      enabled: false      # 等 M7 才打開（要 application 配合 checkpoint）
+      type: preempt/qos
+      mode: REQUEUE
+```
+
+### 驗收條件
+- [ ] `helm-unittest` 全綠（含 3 條新測試）
+- [ ] `verify.sh` 全綠 — 既有 workload 無 regress
+- [ ] sbatch 5 個 cpu job，sinfo 觀察 backfill 命中率 ≥ 0（沒 worse than baseline）
+- [ ] `scontrol show config | grep -E "SchedulerParameters|SelectTypeParameters|PriorityWeight"` 對得上 values
+
+### 風險
+- `CR_Pack_Nodes` 在某些 partition 配置下會讓 fragmentation 暫時更糟（先 pack 滿一台才開下一台）— evaluation 時要量測 baseline vs M1 的 utilization 比例
+
+## M2：Score function 規格 + Lua submit plugin scaffold（3 天）
+
+### 目標
+- 把 §7.1 的 score 公式寫成可執行規格（**規格不是 code**）
+- 接 Slurm Lua submit plugin，**先什麼都不算**，只證明 `slurmctld` 能呼叫 lua、能讀 job_desc 各欄位、能寫回 priority/time_limit
+- 預留呼叫外部 HTTP service 的 hook（M6 用）
+
+### 產出檔案
+- `docs/scheduler-score-spec.md`（新）— 公式、變數定義、係數初值、I/O schema、單元測試 case
+- `chart/templates/configmap-job-submit.yaml`（新）— ConfigMap 包 `job_submit.lua`
+- `chart/templates/controller.yaml` — 新 mount `/etc/slurm/job_submit.lua`，slurm.conf 加 `JobSubmitPlugins=lua`
+- `chart/values.yaml` — `slurm.jobSubmit.{enabled, lua}`（預設 enabled=false 直到 M3）
+- `chart/tests/job_submit_test.yaml`（新）— 5 條
+- `scripts/verify-lua-submit.sh`（新）— `lua -e 'dofile(...)'` syntax check + 進 controller pod 看 plugin 加載 log
+
+### Score function 規格雛形
+```
+score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
+            + β·f_vram_fit(J,P)       ∈ [0,1]   VRAM 餘裕
+            + γ·f_topology(J,P)       ∈ [0,1]   NCCL 拓撲親和性
+            - δ·f_fragmentation(J,P)  ∈ [0,1]   放完後碎片化代價
+            + ε·f_pred_runtime(J)     ∈ [0,1]   預測 runtime（M5 之後加）
+
+初值（一階段手調）: α=0.40, β=0.20, γ=0.15, δ=0.20, ε=0.05
+（變更係數要動 sensitivity analysis，記在 spec 文件裡）
+```
+
+### 驗收條件
+- [ ] spec 文件含每個 factor 的 input、output、邊界 case 表
+- [ ] `helm-unittest` 60+ 條全綠
+- [ ] 進 controller pod `tail -f /var/log/slurm/slurmctld.log`，sbatch 一個 job 看到 lua plugin invoke 成功
+- [ ] lua 改一個值（e.g. 硬寫 `job_desc.priority = 9999`），sbatch 後 squeue 看到該 priority
+
+## M3：Score v1 — mps_fit + vram_fit + fragmentation（5 天）
+
+### 目標
+把 M2 規格中前 4 個 factor（除 `f_pred_runtime`）真的算出來。**先單機 + 假資料過 unit test，再上真機驗證。**
+
+### 產出檔案
+- `chart/scripts/job_submit.lua`（從 ConfigMap 移到實體檔，方便 lint / test）
+  - `f_mps_fit`：解析 `job_desc.tres_per_node`（`gpu:rtx4070:1,mps:25`），對 sinfo 拿到的 free MPS slot 比
+  - `f_vram_fit`：簡化版 — `node_features` 含 `vram-12g` / `vram-24g` 標籤，job 用 `--constraint=vram-12g+`
+  - `f_fragmentation`：放完後 GPU MPS slot 餘裕 stddev（越大越碎）
+- `tests/lua/score_test.lua`（新，`busted`）— 10–15 case 測每個 factor 邊界
+- `scripts/render-score-trace.py`（新）— sbatch + score 過程序列化成 JSONL，方便 M8 evaluation
+- `chart/dashboards/scheduler.json`（新 panel）— `slurm_lua_score{factor=...}` histogram、`slurm_score_decision_total`
+
+### 驗收條件
+- [ ] `busted` lua unit test 全綠
+- [ ] sbatch 5 個 mix（不同 mps、不同 vram constraint），squeue 順序與 score 排序一致
+- [ ] Grafana panel score histogram，p50 在 [0.3, 0.7]
+- [ ] `verify.sh` 沒 regress
+
+### 風險
+- Lua 沒 native MPS 計算 API — 從 sinfo / scontrol show node 字串解析。寫個小工具函式 + cache 1 秒避免 hot path 卡 slurmctld
+
+## M4：Trace replay simulator（5 天）
+
+### 目標
+真機規模太小（2 GPU、3 pool），有統計意義的比較必須走 trace replay。挑 **Philly trace**（~400 GPU、3000 jobs，2 個月）。
+
+### 產出檔案
+- `sim/`（新目錄）
+  - `sim/loader.py` — 讀 Philly tar.gz，正規化成 `(job_id, user, gpu_count, gpu_type, submit_ts, runtime, mem_req)`
+  - `sim/cluster.py` — 模擬 cluster：N 個 GPU、可掛 MPS、track free slots
+  - `sim/scheduler/{fcfs,multifactor,score}.py` — 三個 baseline + 我們的 score
+  - `sim/runner.py` — 跑 trace、收集 metric、輸出 CSV
+  - `sim/metrics.py` — JCT / makespan / utilization / slowdown
+- `sim/tests/` — pytest，至少 3 個 sanity test
+- `docs/sim-readme.md` — 怎麼下 trace、怎麼跑
+
+### 驗收條件
+- [ ] 1000-job subsample of Philly，FCFS 跑完輸出 metric CSV
+- [ ] 同一 trace 跑 FCFS vs multifactor vs score(M3 版)，三者 metric 都有合理數字
+- [ ] `sim/runner.py --scheduler score --trace philly_subsample.json` < 60 秒跑完
+
+### 風險
+- Philly trace 沒 MPS 資訊（純整 GPU）— augment 假設「每張 GPU 4 個 MPS slot」，evaluation 章節要說明
+
+## M5：Runtime predictor service（7 天）
+
+### 目標
+§9 — 給 backfill 一個比 user `--time` 準的 runtime 預測。**先做 service + 訓練 pipeline，暫時不接 lua（M6 才接）**。
+
+### 產出檔案
+- `services/runtime-predictor/`（新）
+  - `app.py` — FastAPI，`/predict` `/retrain` `/healthz`
+  - `train.py` — LightGBM regressor，log-runtime MAE，hold-out CV
+  - `features.py` — 抽 user / partition / gres / cpus / hour-of-week / past-N-runs
+  - `requirements.txt` — fastapi, lightgbm, scikit-learn, pandas, sqlalchemy, prometheus-client
+  - `Dockerfile`, `tests/`
+- `chart/templates/runtime-predictor/`（新）
+  - `deployment.yaml` — Service + Deployment + PVC
+  - `cronjob.yaml` — 每週日 03:00 retrain
+  - `network-policy.yaml` — 允許 controller pod → predictor:8080
+- `chart/values.yaml` — `runtimePredictor.{enabled, image, schedule, modelPvc}`
+- `chart/tests/runtime_predictor_test.yaml` — 8 條
+- `scripts/verify-runtime-predictor.sh`
+
+### 驗收條件
+- [ ] `train.py` 拿 Philly subsample 訓練，hold-out MAE on log(runtime+1) < 1.0
+- [ ] FastAPI `/predict` p95 < 50ms
+- [ ] CronJob 跑成功，model artifact 被替換、舊 model 保留 1 份備份
+- [ ] `verify-runtime-predictor.sh` 全綠
+
+### 風險
+- Cold start：bootstrap_with_prior，預設回 `min(user_time_limit, 4*3600)` 直到累積 ≥ 100 sample
+- sacct 抽資料連 MySQL — chart 加 read-only ServiceAccount
+
+## M6：Predictor → Lua → backfill 端到端（3 天）
+
+### 目標
+把 M5 service 接到 M2 lua plugin。Lua sbatch 時呼叫 predictor，把回傳 seconds 寫成 `job_desc.time_limit`（user 沒填或填得超大時才覆蓋）。
+
+### 產出檔案
+- `chart/scripts/job_submit.lua` — 加 HTTP call（`socket.http` + `lua-cjson`）
+- `chart/templates/configmap-job-submit.yaml` — 注入 `predictor_url`
+- `chart/values.yaml` — `slurm.jobSubmit.predictor.{enabled, url, timeoutMs, fallbackHours}`
+- `chart/tests/job_submit_test.yaml` — 加 2 條
+
+### 驗收條件
+- [ ] sbatch 一個 job，controller log 確認 lua 拿到預測值 + 寫進 time_limit
+- [ ] `bf_*` Slurm metric 顯示 backfill scheduling rate 上升（vs M1 baseline）
+- [ ] predictor 掛掉時 lua fallback 不影響 sbatch（`pcall` 包 HTTP call）
+
+### 風險
+- slurmctld lua plugin 是 in-process call，HTTP timeout 卡住整個排程器 — 必須設 `timeoutMs=200` 上限
+
+## M7：Fragmentation detector + 自動 requeue（5 天）
+
+### 目標
+§5.2 — Operator 加「fragmentation 偵測 + 主動 requeue」迴圈。發現 pending high-prio job 被卡住 + 有可被 kill 的 low-prio job 能解卡時，主動 `scontrol requeue`，由 sbatch wrapper 處理 resume。
+
+### 產出檔案
+- `operator/fragmentation.py`（新）
+  - `class FragmentationDetector` — 每 5s 從 collector 拿 squeue + sinfo，算 free GPU slot 分布、pending 需求、可解卡 low-prio set
+  - `class RequeueDecider` — fragmentation snapshot → 「kill 哪幾個 low-prio」
+- `operator/app.py` — 加新 reconcile source `fragmentation`，event-driven 觸發（R21 framework 已有）
+- `operator/metrics.py` — `slurm_operator_fragmentation_score` gauge、`slurm_operator_requeue_total{reason}` counter
+- `chart/templates/configmap-task-prolog.yaml` — sbatch wrapper 加 `resume_from_checkpoint()`
+- `chart/values.yaml` — `operator.fragmentation.{enabled, minIntervalSeconds, maxRequeuesPerHour}`
+- `chart/tests/operator_test.yaml` — 新 env 驗證
+
+### 驗收條件
+- [ ] 模擬 fragmentation：4 個 mps:25 占滿 → 1 個 mps:50（pending）→ operator 偵測 + requeue 1 個 mps:25 → 大 job 開始跑（log 看得到 `requeue_decision`）
+- [ ] requeued job 自己 resume，loss 從 ckpt 接續（DDP MNIST or 小 LLaMA toy）
+- [ ] rate-limit 生效：強制觸發 6 次/小時，第 6 次 reject + warn
+- [ ] `verify.sh` 全綠
+
+### 風險
+- 「以為能解卡，requeue 完 GPU 被別 job 搶走」— mitigation：requeue 後 5 秒內若 pending 還沒 start，回滾 + log
+- ckpt resume 依賴 user code — 提供 reference template，evaluation 用 reference workload 跑
+
+## M8：Evaluation（7 天）
+
+### 目標
+產出 thesis evaluation 章節的所有圖表 + 數字。**不寫新 code，純跑實驗 + 出圖**。
+
+### 產出檔案
+- `eval/scripts/run_all.sh` — 跑齊 baseline + 我們的版本
+- `eval/results/` — 每組實驗 raw CSV
+- `eval/figures/` — matplotlib PNG + PDF
+- `docs/eval-writeup.md` — 圖 + 結論寫成 thesis 草稿
+
+### 實驗矩陣
+| 實驗 | scheduler | trace | 主要指標 | 預期結論 |
+|---|---|---|---|---|
+| E1 baseline | FCFS | Philly 1k | JCT, util | 上界（worst） |
+| E2 vendor | multifactor | Philly 1k | 同上 | Slurm 預設 |
+| E3 our v0 | M3 score（無 predictor） | Philly 1k | 同上 | 改善多少 |
+| E4 our v1 | M3 score + M5 predictor | Philly 1k | 同上 + bf_rate | predictor 邊際價值 |
+| E5 our v2 | E4 + M7 fragmentation | Philly 1k | 同上 + 解卡次數 | requeue 邊際價值 |
+| E6 sensitivity | E4 跑 9 組 (α,β,γ,δ) | Philly 1k | JCT 等 | 證明係數可調 |
+| E7 真機 | E4 vs E2 | 自製 50-job mix | wall-clock JCT | sim → 真機可重現 |
+
+### 驗收條件
+- [ ] 7 組實驗 raw data 齊全
+- [ ] 7 張圖出爐（CDF of JCT、box of slowdown、line of utilization over time）
+- [ ] eval-writeup.md 約 8–12 頁、每張圖 1 段論述
+
+### 風險
+- 結論不顯著（score ≈ multifactor）— M3 / M6 之後就先跑 mini-eval 抓問題，不要拖到 M8 才發現
+
+## M9 ★（可選）：Bandit / PPO weight tuning（10 天）
+
+### 目標
+§7.3 第三階段。把 score function 的 (α, β, γ, δ, ε) 當 RL action，state = cluster snapshot，reward = -JCT。
+
+### 產出檔案
+- `services/weight-tuner/`（新）
+  - `bandit.py` — LinUCB / EXP3
+  - `ppo.py` — Stable-Baselines3 PPO + 自製 gym env（包 `sim/`）
+  - `tests/`
+- `chart/templates/weight-tuner/` — Service + PVC（policy artifact）
+- `chart/values.yaml` — `weightTuner.enabled` 預設關
+- 接到 Lua：lua 從 weight-tuner pull 最新 weight（每 60s cache）
+
+### 驗收條件
+- [ ] PPO 在 sim 上 1000 episode 後，eval JCT 比 fixed weight 改善 > 5%（如果沒，記錄 negative result，仍是論文章節）
+- [ ] 在線（真機）4 hours，policy lag 不超過 60s
+- [ ] 不影響既有 acceptance criteria（爆掉時自動 fallback fixed weight）
+
+## 排程依賴圖
+
+```
+M1 ──┐
+     ├──► M2 ──► M3 ──┬──► M4 ──┬──► M8
+     │                 │         │
+     │                 └──► M5 ──┼──► M6 ──┘
+     │                           │
+     │                           └──► M7 ──┘
+     │                                     │
+     └─────────────────────────────────────► M9 (★)
+```
+
+- M1 是先決條件（沒它後面 baseline 不對）
+- M2/M3/M4/M5 可並行（不同檔案）
+- M6 / M7 都吃 M3 + 自己的依賴（M5 / 無）
+- M8 在 M3 + M5 + M6 + M7 完成後跑
+
+## 與 Phase 7（R16 OTel）的關係
+
+Phase 7 OTel 端到端 trace 會把每個 job 的：
+1. submit (login pod) → submitted (slurmctld)
+2. submitted → priority computed (lua + score function 回傳)
+3. priority computed → scheduled to node (backfill 決定)
+4. scheduled → first epoch (worker)
+5. first epoch → checkpoint
+6. checkpoint → completion / requeue (M7 觸發)
+
+每個 step span 內會帶上 score 各 factor 的值、predictor MAE、fragmentation snapshot。**Phase 6 寫 trace span 的成本接近 0**（lua emit log line + operator emit metric 已經有了），等 Phase 7 起手時把這些 log/metric 包成 OTel span 即可。
+
+## 維護準則
+
+1. **每完成一個 milestone 就更新本節進度總覽**（⬜ → ✅，註記 commit hash）
+2. **每個 milestone 最後 5% 是寫測試 + 文件**，不要跳過 — Phase 6 evaluation 章節要靠這些當「reproducibility appendix」
+3. **不要先做 M9**。M9 RL novelty 只在 M1–M8 跑出 baseline 數字後才有意義
+4. **scheduler.md §1–9 是研究筆記**（不會再大改），**這節 Phase 6 Roadmap 是執行清單**（每天會勾）— 兩個分工不要混
+
+## 起手第一步
+
+```bash
+git checkout -b phase6/m1-slurm-knobs
+# 1. chart/values.yaml 把 §5.1 的 ini 全部 expose 成 yaml
+# 2. helper / configmap 接好
+# 3. helm-unittest 加 3 條
+# 4. helm upgrade + verify.sh，確認沒 regress
+# 5. commit "Phase 6 M1: expose Slurm scheduling knobs in chart values"
+```
+
+完成 M1 後回來把這節進度總覽勾掉，附上 commit hash。
