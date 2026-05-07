@@ -142,6 +142,37 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
+### 步驟 9：跑 Phase 6 M8 evaluation（離線模擬 + 出圖）
+
+論文 evaluation 章節的 7 張圖跟主表，純跑在離線 simulator 上，**不需要 cluster
+跑著**。約 5 分鐘出齊全部 raw data + figures。
+
+```bash
+# 一次性：venv + 依賴
+uv venv .venv-m5
+uv pip install --python .venv-m5/bin/python pytest matplotlib
+
+# 1. 跑 E1..E6（FCFS / multifactor / score-M3 / score-M5 / score-M7 +
+#    9-cell sensitivity grid），輸出到 eval/results/
+bash eval/scripts/run_all.sh
+
+# 2. 出圖到 eval/figures/{fig1..fig7}.{png,pdf}
+.venv-m5/bin/python eval/scripts/plot_all.py
+
+# 3. 印主表到 stdout
+.venv-m5/bin/python eval/scripts/print_summary.py
+
+# 4. （可選）E7 真機 50-job mix —— 需要 kubeconfig 指到一個跑 chart 的 cluster
+bash eval/scripts/run_e7_live.sh our      # 我們的 stack (M3+M5+M7)
+# 翻成 vendor baseline 後再跑一次：
+# helm upgrade ... -f vendor-baseline.yaml
+bash eval/scripts/run_e7_live.sh vendor
+```
+
+論述跟結論寫在 `docs/eval-writeup.md`（headline：mean JCT 12.6h → 2.62h，
+比 Slurm vendor multifactor 多砍 28.6%）。`eval/results/` 已 gitignore，
+重跑 `run_all.sh` 會重產。
+
 ### 清理環境
 
 ```bash
