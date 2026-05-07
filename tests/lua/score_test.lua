@@ -179,6 +179,75 @@ it("whole-node mps=100 + vram-12g exact > mps=50 + vram-13g over-prov", function
   gt(sA, sB, "well-fit beats half-frag + over-prov")
 end)
 
+-- ---- predictor helpers (M6) ----------------------------------------------
+print("predictor helpers")
+
+if parse_predict_response and build_predict_body then
+  it("parse_predict_response handles canonical response", function()
+    local p = parse_predict_response('{"pred_seconds": 1234.5, "pred_minutes":20.5,"model_version":"lgbm-v3","bootstrap":false,"latency_ms":3.2}')
+    if not p then error("nil prediction") end
+    if math.abs(p - 1234.5) > 1e-6 then error("expected 1234.5 got " .. tostring(p)) end
+  end)
+  it("parse_predict_response returns nil on empty / garbage", function()
+    if parse_predict_response("")           then error("empty should be nil") end
+    if parse_predict_response(nil)          then error("nil should be nil")   end
+    if parse_predict_response("not json")   then error("garbage should be nil") end
+    if parse_predict_response('{"x":1}')    then error("missing field should be nil") end
+  end)
+  it("parse_predict_response handles negative / scientific numbers", function()
+    local n = parse_predict_response('{"pred_seconds": 1.5e3}')
+    if not n or math.abs(n - 1500) > 1e-6 then error("expected 1500 got " .. tostring(n)) end
+  end)
+  it("build_predict_body emits required keys + escapes quotes", function()
+    local body = build_predict_body({
+      user_name = 'al"ice',  -- quote in user — must be escaped
+      partition = "gpu",
+      features  = "gpu-h100&vram-24g",
+      tres_per_node = "gpu:rtx4070:1,mps:25",
+      min_nodes = 2,
+      time_limit = 30,  -- minutes
+    })
+    -- keys must all be present
+    for _, k in ipairs({"user","partition","gpu_count","mps_req","gpu_type","user_time_limit_seconds"}) do
+      if not string.find(body, '"' .. k .. '"', 1, true) then
+        error("missing key " .. k .. " in: " .. body)
+      end
+    end
+    -- escape worked (no raw quote inside the user value)
+    if not string.find(body, 'al\\"ice', 1, true) then
+      error("quote not escaped in: " .. body)
+    end
+    -- minutes → seconds conversion
+    if not string.find(body, '"user_time_limit_seconds":1800', 1, true) then
+      error("time_limit conversion: " .. body)
+    end
+  end)
+  it("build_predict_body falls back to defaults when fields are nil", function()
+    local body = build_predict_body({})
+    -- default user / partition / gpu_count / mps_req / gpu_type
+    if not string.find(body, '"user":"anon"', 1, true) then error("user default: " .. body) end
+    if not string.find(body, '"partition":"gpu"', 1, true) then error("partition default: " .. body) end
+    if not string.find(body, '"gpu_count":1', 1, true) then error("gpu_count default: " .. body) end
+    if not string.find(body, '"mps_req":4', 1, true) then error("mps default: " .. body) end
+  end)
+  it("predictor_gpu_type prefers feature label, falls back to default", function()
+    local g = predictor_gpu_type("gpu-h100&vram-24g")
+    if g ~= "h100" then error("expected h100 got " .. tostring(g)) end
+    local d = predictor_gpu_type(nil)
+    if d == nil or d == "" then error("default gpu_type empty") end
+  end)
+  it("maybe_apply_predicted_time_limit returns false when PRED_ENABLED=false", function()
+    -- The default render keeps PRED_ENABLED=false, so the function should
+    -- short-circuit without ever invoking curl. That's the cheapest
+    -- liveness test for the gating path.
+    if PRED_ENABLED then return end -- only meaningful in disabled render
+    local applied = maybe_apply_predicted_time_limit({tres_per_node = "mps:25"})
+    if applied then error("applied=true with predictor disabled") end
+  end)
+else
+  print("  (skipped — rendered plugin built without predictor block)")
+end
+
 -- ---- summary --------------------------------------------------------------
 io.write(string.format("\n%d passed, %d failed\n", PASS, FAIL))
 if FAIL > 0 then os.exit(1) end

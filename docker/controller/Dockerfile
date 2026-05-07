@@ -13,7 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lmod \
     tini \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# curl is required by the M6 job_submit Lua plugin — slurmctld is linked
+# against liblua5.1 (no socket.http / lua-cjson in jammy `main`), so the
+# predictor wiring shells out to `curl --max-time` as the bound on any
+# single call. See chart/templates/configmap-job-submit.yaml.
 
 # Register /opt/modulefiles as an Lmod search path.
 RUN mkdir -p /etc/lmod && echo '/opt/modulefiles' > /etc/lmod/modulespath

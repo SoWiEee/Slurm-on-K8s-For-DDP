@@ -22,6 +22,7 @@ Reference: docs/scheduler-score-spec.md.
 {{- if .Values.slurm.jobSubmit.enabled }}
 {{- $js := .Values.slurm.jobSubmit }}
 {{- $w := $js.scoreWeights | default dict }}
+{{- $pr := $js.predictor | default dict }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -56,6 +57,24 @@ data:
     }
     -- Largest tier — used to normalise over-provisioning penalty.
     local VRAM_MAX = VRAM_TIERS[#VRAM_TIERS]
+
+    -- ------------------------------------------------------------------
+    -- Predictor (Phase 6 M6) — out-of-process call via curl, bounded by
+    -- --max-time so a hung service can't stall slurmctld. The whole call
+    -- is wrapped in pcall at use site so a parse / shell error degrades
+    -- to "no override" rather than failing the sbatch.
+    -- ------------------------------------------------------------------
+    local PRED_ENABLED          = {{ if $pr.enabled }}true{{ else }}false{{ end }}
+    local PRED_URL              = {{ default "http://runtime-predictor:8080/predict" $pr.url | quote }}
+    local PRED_TIMEOUT_S        = {{ default 200 $pr.timeoutMs }} / 1000.0
+    local PRED_FALLBACK_HOURS   = {{ default 4 $pr.fallbackHours }}
+    local PRED_FALLBACK_SECONDS = PRED_FALLBACK_HOURS * 3600
+    local PRED_APPLY_TIME_LIMIT = {{ if hasKey $pr "applyTimeLimit" }}{{ if $pr.applyTimeLimit }}true{{ else }}false{{ end }}{{ else }}true{{ end }}
+    -- Default GPU-type label sent to the predictor when the job's
+    -- features don't carry one. Tunable per-deployment so values-k3s.yaml
+    -- (RTX 4070 lab) and the chart's vanilla install (Slurm-only)
+    -- emit different gpu_type signals to the model.
+    local PRED_DEFAULT_GPU_TYPE = {{ default "rtx4070" $pr.defaultGpuType | quote }}
 
     -- ------------------------------------------------------------------
     -- Parsing helpers (also exercised by tests/lua/score_test.lua).
@@ -144,6 +163,102 @@ data:
     end
 
     -- ------------------------------------------------------------------
+    -- Predictor helpers. Pure functions, exercised by tests/lua/score_test.lua.
+    -- ------------------------------------------------------------------
+
+    -- Best-effort GPU-type derivation from --constraint features. Falls
+    -- back to PRED_DEFAULT_GPU_TYPE so the predictor always receives a
+    -- non-empty alphabet member (the M5 model one-hots over a fixed set
+    -- and routes anything unknown to the "other" bucket).
+    function predictor_gpu_type(features)
+      if not features or features == "" then return PRED_DEFAULT_GPU_TYPE end
+      local g = string.match(features, "gpu%-([%w]+)")
+      if g and g ~= "" then return g end
+      return PRED_DEFAULT_GPU_TYPE
+    end
+
+    -- Manual JSON encoder — controller image carries lua5.1 with no
+    -- cjson, and the request payload is small enough that a string.format
+    -- is both safer (escaped " and \) and dependency-free.
+    function build_predict_body(job_desc)
+      local function esc(s)
+        s = tostring(s or "")
+        s = string.gsub(s, "\\", "\\\\")
+        s = string.gsub(s, '"',  '\\"')
+        return s
+      end
+      local user      = esc((job_desc and job_desc.user_name) or "anon")
+      local partition = esc((job_desc and job_desc.partition) or "gpu")
+      local features  = (job_desc and job_desc.features) or ""
+      local gpu_type  = esc(predictor_gpu_type(features))
+      local gpu_count = tonumber((job_desc and job_desc.min_nodes) or 1) or 1
+      local mps       = parse_mps_req(job_desc and job_desc.tres_per_node)
+      if mps == 0 then mps = 4 end -- whole-GPU when not specified
+      -- Slurm time_limit is in MINUTES; convert to seconds for the predictor.
+      local user_tlim_min = tonumber((job_desc and job_desc.time_limit) or 0) or 0
+      if user_tlim_min < 0 then user_tlim_min = 0 end
+      return string.format(
+        '{"user":"%s","partition":"%s","gpu_count":%d,"mps_req":%d,"gpu_type":"%s","user_time_limit_seconds":%d}',
+        user, partition, gpu_count, mps, gpu_type, user_tlim_min * 60)
+    end
+
+    -- Single-shot regex over the JSON response — avoid a full parser to
+    -- keep the plugin stdlib-only. Returns nil on missing field.
+    function parse_predict_response(text)
+      if not text or text == "" then return nil end
+      local s = string.match(text, '"pred_seconds"%s*:%s*([%-%d%.eE]+)')
+      if not s then return nil end
+      return tonumber(s)
+    end
+
+    -- Wraps the curl invocation. Returns (ok, pred_seconds, err).
+    -- ok=false implies the caller should NOT mutate job_desc; we still
+    -- return any text the caller might want to log.
+    function call_predictor(job_desc)
+      if not PRED_ENABLED then return false, nil, "disabled" end
+      local body = build_predict_body(job_desc)
+      -- Single-quoted shell with embedded single-quote escape.
+      local body_q = "'" .. string.gsub(body, "'", "'\\''") .. "'"
+      local cmd = string.format(
+        "curl -fsS --max-time %.3f -X POST -H 'Content-Type: application/json' -d %s %q 2>/dev/null",
+        PRED_TIMEOUT_S, body_q, PRED_URL)
+      local fh = io.popen(cmd, "r")
+      if not fh then return false, nil, "popen-failed" end
+      local resp = fh:read("*a") or ""
+      fh:close()
+      local pred = parse_predict_response(resp)
+      if not pred or pred <= 0 then return false, nil, "no-prediction" end
+      return true, pred, nil
+    end
+
+    -- Applies pred_seconds → job_desc.time_limit (minutes) when:
+    --   - predictor enabled and applyTimeLimit=true
+    --   - user did not set --time, or set it to a value > 2× prediction
+    -- Returns (applied, pred_minutes, reason).
+    function maybe_apply_predicted_time_limit(job_desc)
+      if not (PRED_ENABLED and PRED_APPLY_TIME_LIMIT) then
+        return false, nil, "apply-disabled"
+      end
+      -- pcall(f, ...) returns (true, f's returns…) on success, or
+      -- (false, errmsg) on a Lua error. call_predictor returns 3 values.
+      local ok, success, pred_seconds, reason = pcall(call_predictor, job_desc)
+      if not ok then return false, nil, "lua-error" end
+      if not success or not pred_seconds or pred_seconds <= 0 then
+        return false, nil, reason or "predictor-unavailable"
+      end
+      local pred_min = math.ceil(pred_seconds / 60)
+      local fallback_min = math.floor(PRED_FALLBACK_SECONDS / 60)
+      if pred_min > fallback_min then pred_min = fallback_min end
+      if pred_min < 1 then pred_min = 1 end
+      local user_min = tonumber((job_desc and job_desc.time_limit) or 0) or 0
+      if user_min > 0 and user_min < pred_min * 2 then
+        return false, pred_min, "user-time-tighter"
+      end
+      job_desc.time_limit = pred_min
+      return true, pred_min, "applied"
+    end
+
+    -- ------------------------------------------------------------------
     -- Slurm hooks. log_summary / slurm_job_submit / slurm_job_modify.
     -- The `slurm` global is provided by slurmctld; tests stub it out.
     -- ------------------------------------------------------------------
@@ -183,6 +298,20 @@ data:
       log_info(string.format(
         "[score-m3] score=%.4f delta=%d mps_fit=%.2f vram_fit=%.2f topo=%.2f frag=%.2f pred=%.2f apply=%s",
         s, delta, f_m, f_v, f_g, f_f, f_p, tostring(SCORE_APPLY)))
+
+      -- Phase 6 M6 — out-of-process runtime prediction.
+      if PRED_ENABLED then
+        local applied, pred_min, reason = maybe_apply_predicted_time_limit(job_desc)
+        if applied then
+          log_info(string.format(
+            "[predictor] applied predicted time_limit=%d min (was=%s)",
+            pred_min, tostring(job_desc and job_desc._user_time_limit or "n/a")))
+        else
+          log_info(string.format(
+            "[predictor] skipped (%s, pred_min=%s)",
+            tostring(reason), tostring(pred_min)))
+        end
+      end
 
       if SCORE_APPLY and delta > 0 then
         -- Slurm overlays multifactor priority on top of any explicit

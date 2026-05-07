@@ -263,6 +263,34 @@ slurm:
     # Count=100 for our pools; embed it here so f_mps_fit / f_fragmentation
     # don't hard-code 100.
     mpsPerNode: 100
+    # M6: Predictor wiring. The lua plugin shells out to curl with --max-time
+    # so a hung service can't stall slurmctld; the call is wrapped in pcall,
+    # and a missing/empty response degrades to "no override". When enabled
+    # without a reachable predictor the only effect is a single
+    # `[predictor] skipped (...)` line per submission, so leaving this on by
+    # mistake is safe — but the controller image MUST carry curl
+    # (docker/controller/Dockerfile installs it on top of the slurm bundle).
+    predictor:
+      enabled: false
+      # In-cluster Service URL — matches the chart's runtime-predictor
+      # Service when runtimePredictor.enabled=true. Override per env if
+      # the predictor lives in a different namespace.
+      url: "http://runtime-predictor:8080/predict"
+      # Hard timeout passed to `curl --max-time`. Keep small (≤200 ms).
+      # slurmctld is single-threaded over the lua plugin call, so any
+      # blocking here delays *every* sbatch.
+      timeoutMs: 200
+      # Cap on the override applied to job_desc.time_limit (minutes).
+      # The lua clamps `pred_minutes` at fallbackHours·60 so a runaway
+      # prediction can't ask for a 100-hour walltime.
+      fallbackHours: 4
+      # When true, the lua mutates job_desc.time_limit. Set false for
+      # shadow-mode evaluation — the plugin still logs the prediction
+      # but leaves walltime untouched.
+      applyTimeLimit: true
+      # GPU-type label sent when the job's --constraint doesn't carry
+      # one. Aligns with the predictor's one-hot alphabet.
+      defaultGpuType: rtx4070
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:

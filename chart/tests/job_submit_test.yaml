@@ -152,3 +152,56 @@ tests:
         documentSelector:
           path: kind
           value: StatefulSet
+
+  - it: M6 predictor disabled by default — PRED_ENABLED=false in lua
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_ENABLED          = false"
+
+  - it: M6 predictor enabled — URL + timeout + fallback inlined
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.predictor.enabled: true
+      slurm.jobSubmit.predictor.url: "http://predictor.svc.local:9000/predict"
+      slurm.jobSubmit.predictor.timeoutMs: 150
+      slurm.jobSubmit.predictor.fallbackHours: 6
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_ENABLED          = true"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: 'PRED_URL              = "http://predictor.svc.local:9000/predict"'
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_TIMEOUT_S        = 150 / 1000.0"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_FALLBACK_HOURS   = 6"
+
+  - it: M6 predictor applyTimeLimit=false leaves walltime untouched
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.predictor.enabled: true
+      slurm.jobSubmit.predictor.applyTimeLimit: false
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_APPLY_TIME_LIMIT = false"
+
+  - it: M6 predictor defaultGpuType propagates to lua
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.predictor.enabled: true
+      slurm.jobSubmit.predictor.defaultGpuType: "h100"
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: 'PRED_DEFAULT_GPU_TYPE = "h100"'
