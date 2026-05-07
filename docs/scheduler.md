@@ -1050,8 +1050,19 @@ PRED_DEFAULT_GPU_TYPE = "rtx4070"
   `max_requeues_per_hour`（sliding window，不需持久化；operator 重啟後等一小時
   自動恢復額度）。
 - Slurm REST adapter（`jobs_from_slurm_rest`、`nodes_from_slurm_rest`）解析
-  `gres_used="gpu:rtx4070:1,mps:75"` 推 `free_mps`、`tres_per_node="mps:25"`
-  推 `mps_req`，跟 lua plugin 的 `parse_mps_req` 行為對齊。
+  欄位的優先序對齊 live cluster 真實 schema（見 docs/note.md 問題 14）：
+  - **總量**：節點配置 `gres="gpu:rtx4070:1,mps:rtx4070:100"` 取出 100 為
+    `total_mps`；節點若沒有 mps gres token（CPU-only pool），總量直接給 0，
+    避免 detector 把 CPU node 當作 MPS job 可塞之處。
+  - **已用 slot**：優先讀 `tres_used="cpu=4,gres/mps=50"` 的 `gres/mps=N`
+    （這才是 slot 數）；fallback 才看 `gres_used`，因為 live `gres_used` 是
+    `mps:rtx4070:1(IDX:0)` 形態，那個 `1` 是裝置數不是 slot 數。
+  - **節點可用性**：`state` 含 drain / down / drain* / not_responding 等
+    任一字面都直接 `free_mps=0`，不讓 detector 把 drained node 當作可放
+    置目標（`_node_is_available` + `_UNAVAILABLE_NODE_STATES` 處理 list /
+    `"DOWN+NOT_RESPONDING"` / 單字串三種 schema）。
+  - **job 端**：`tres_per_node="gres:mps:25"` 推 `mps_req`，跟 lua plugin 的
+    `parse_mps_req` 行為對齊。
 - `app.py` 整合：獨立 daemon thread (`fragmentation-reconciler`)，跟主 reconcile
   queue 分離 — 一個慢 `scontrol requeue` 不會卡 scale-up/down 的決策。預設
   `FRAGMENTATION_SHADOW_MODE=true`，跑一個 release cycle 觀察 log/metric 後
@@ -1065,10 +1076,21 @@ PRED_DEFAULT_GPU_TYPE = "rtx4070"
   export `SLURM_RESUME_HELPER` 給 user sbatch `source` — 真實 ckpt resume 由 user
   code 用 `$RESUME_FROM_CHECKPOINT` 接（reference template 留給 M8 workload）。
 
-> **M7 邊界**：實機 `scontrol requeue` 還沒在 live cluster 跑過，因為要重 build
-> operator image 並翻掉 shadowMode。所有 plumbing 已 commit，cluster 只要
-> `helm upgrade --set operator.fragmentation.enabled=true --set operator.fragmentation.shadowMode=true`
-> 就會看到 `requeue_decision` JSON log；shadow=false 之前再走一次 verify。
+> **M7 邊界**：shadow-mode plumbing 已在 k3s + RTX 4070 live cluster 驗證通過
+> （2026-05-07）。情境 small1 mps:25 RUNNING + score-demo-bigfit mps:80
+> PENDING priority 9999 + gpu-rtx4070-1 drained，operator 每 15s 吐：
+>
+> ```
+> event_type=requeue_decision  score=1.0  blocked=["86"]
+> reason="unblock 86 (priority 9999, mps_req 80) on slurm-worker-gpu-rtx4070-0:
+>         requeue 1 job(s) freeing ~25 slots"
+> shadow=true  target_jobs=["85"]  unblocks=["86"]  requeued_jobs=[]
+> ```
+>
+> 過程踩到的 adapter 三處對 schema 認知錯誤（`gres_used` ≠ slot 數、CPU-only
+> 節點 total_mps 該為 0、drained 節點該排除）已修並補 unit test，詳細
+> root cause + 修法見 docs/note.md 問題 14。實機 `scontrol requeue`（翻
+> shadowMode=false 把真正 actuator 接上）排在 M8 evaluation 一起做。
 
 ## M8：Evaluation（7 天）
 

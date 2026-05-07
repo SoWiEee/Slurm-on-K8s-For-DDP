@@ -199,6 +199,51 @@ class TestSlurmRestAdapter:
         assert nodes[1].free_mps == 100
         assert nodes[2].free_mps == 100
 
+    def test_unavailable_nodes_have_free_mps_zeroed(self):
+        rest = [
+            {"name": "n0", "gres_used": "mps:25", "state": "ALLOCATED"},
+            {"name": "n1", "gres_used": "mps:0",  "state": "DRAIN"},
+            {"name": "n2", "gres_used": "mps:0",  "state": ["IDLE", "DRAIN"]},
+            {"name": "n3", "gres_used": "mps:0",  "state": "DOWN+NOT_RESPONDING"},
+            {"name": "n4", "gres_used": "mps:0",  "state": "IDLE"},
+        ]
+        nodes = nodes_from_slurm_rest(rest, mps_per_node=100)
+        free = {n.node_id: n.free_mps for n in nodes}
+        assert free == {"n0": 75, "n1": 0, "n2": 0, "n3": 0, "n4": 100}
+
+    def test_cpu_only_node_without_mps_gres_reports_zero_capacity(self):
+        rest = [
+            {"name": "cpu0", "gres": "", "tres_used": "cpu=2", "state": "IDLE"},
+            {
+                "name": "gpu0", "gres": "gpu:rtx4070:1,mps:rtx4070:100",
+                "tres_used": "cpu=2,gres/mps=25", "state": "MIXED",
+            },
+        ]
+        nodes = nodes_from_slurm_rest(rest, mps_per_node=100)
+        cap = {n.node_id: (n.free_mps, n.total_mps) for n in nodes}
+        assert cap == {"cpu0": (0, 0), "gpu0": (75, 100)}
+
+    def test_tres_used_is_preferred_over_gres_used(self):
+        # Live-cluster shape: gres_used reports devices, tres_used carries
+        # the MPS slot count. Adapter must prefer tres_used.
+        rest = [
+            {
+                "name": "n0",
+                "gres_used": "gpu:rtx4070:0(IDX:N/A),mps:rtx4070:1(IDX:0)",
+                "tres_used": "cpu=4,gres/mps=50",
+                "state": "ALLOCATED",
+            },
+            {
+                "name": "n1",
+                "gres_used": "gpu:rtx4070:0(IDX:N/A),mps:rtx4070:0(IDX:N/A)",
+                "tres_used": "",
+                "state": "IDLE",
+            },
+        ]
+        nodes = nodes_from_slurm_rest(rest, mps_per_node=100)
+        free = {n.node_id: n.free_mps for n in nodes}
+        assert free == {"n0": 50, "n1": 100}
+
     def test_node_list_range_expansion(self):
         from fragmentation import _parse_node_list
         assert _parse_node_list("slurm-worker-gpu-[0-2]") == (

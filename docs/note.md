@@ -324,6 +324,71 @@ batch step 與 srun step 都拿到 socket 路徑，CUDA runtime 真的會走 MPS
 2. 替換 ConfigMap 後 kubelet 大約要 60 秒才把 symlink 切到新內容，期間 prolog 還是舊版。要 `until grep -q <new-marker> /etc/slurm/prolog.d/10-mps-env.sh; do sleep 5; done` 才能確認生效。
 3. operator 預設 cooldown 60s + preStop 會 DRAIN，導致驗證 job 一直 NODE_FAIL。debug 期間先 `kubectl scale deploy slurm-elastic-operator --replicas=0` 把 operator 停掉，避免它在驗證中途縮容。驗證完記得 scale 回 1。
 
+## 問題 14：M7 fragmentation 在 live cluster 上 `requeue_decision` 永遠不觸發
+
+Phase 6 M7 加入的 `FragmentationReconciler` 在 unit test 全綠、daemon thread 也有正常啟動（log 看得到 `fragmentation_started`），但實際在 k3s 上跑 small1 (mps:25 RUNNING) + bigfit (mps:80 PENDING priority 9999) 場景，`requeue_decision` JSON log 一直不出現 — operator 只持續輸出 `loop_observation`，fragmentation 那條 thread 形同沒在動。
+
+**根因（三層）**
+
+`operator/fragmentation.py` 的 `nodes_from_slurm_rest` adapter 從 slurmrestd 解析節點 MPS 容量的方式跟 live cluster 真實的欄位 schema 對不起來，導致 detector 把 fragmentation 當成沒發生：
+
+1. **`gres_used` 不是 slot 數，是裝置數。**  unit test fixture 用的是簡化字串 `"mps:25"`，能被 `mps[:=](\d+)` regex 命中；但 slurmrestd 實際輸出是 `mps:rtx4070:1(IDX:0)` —「rtx4070 type 的 mps 裝置 1 顆，index 0」，那個 `1` 跟 slot 數完全無關。canonical 的 slot 配置實際上躺在 `tres_used` 欄位裡，格式為 `cpu=4,gres/mps=50`。adapter 一直讀錯欄位，於是把已經被佔掉 25 slot 的節點當成 100 全 free。
+2. **CPU-only 節點被誤判為「能塞下 MPS job」。** detector 的 `_fits_anywhere` 是把所有節點當同質池檢查；`slurm-worker-cpu-0` 完全沒有 mps gres，但 adapter 預設 `total_mps=mps_per_node=100` + `used=0` → free=100，造成 bigfit「在 cpu node 上可以塞」→ blocked 為空 → no-fragmentation。
+3. **DRAIN/DOWN 節點先前未被排除。** node-1 被 drain 起來當作「永遠塞不下 bigfit」的條件，但原本的 adapter 沒看 `state`，照樣回報 free=100，等於 bigfit 永遠「可在 node-1 上跑」，又回到 no-fragmentation。
+
+**修法**（`operator/fragmentation.py`）
+
+新增三個 helper，把 adapter 換成從正確欄位取資料：
+
+```python
+_UNAVAILABLE_NODE_STATES = frozenset({
+    "drain","drained","draining","down","fail","failing","maint",
+    "reserved","powering_down","powered_down","future",
+    "not_responding","no_respond",
+})
+
+def _node_is_available(node):  # state 可能是 list / "DOWN+NOT_RESPONDING" / "ALLOCATED"
+    raw = node.get("state","")
+    states = ([str(s).lower() for s in raw] if isinstance(raw, list)
+              else [s.strip().lower() for s in str(raw).replace("+", ",").split(",") if s.strip()])
+    return not any(s in _UNAVAILABLE_NODE_STATES for s in states)
+
+def _parse_tres_mps(tres_used):       # "cpu=4,gres/mps=50" → 50
+    m = re.search(r"gres/mps=(\d+)", tres_used or "")
+    return int(m.group(1)) if m else None
+
+def _parse_node_total_mps(gres):      # "gpu:rtx4070:1,mps:rtx4070:100" → 100
+    m = re.search(r"(?:^|,)\s*mps(?::[A-Za-z0-9_-]+)?:(\d+)", gres or "")
+    return int(m.group(1)) if m else None
+```
+
+`nodes_from_slurm_rest` 改為：
+
+- `total_mps` 優先讀節點配置 `gres`；找不到 mps token 就回 0（CPU-only 節點 → 0/0），只有完全沒有 `gres` key 的舊 fixture 才 fallback 到 `mps_per_node` 預設值。
+- `used` 優先讀 `tres_used` 的 `gres/mps=N`；fallback 才看 `gres_used`，維持舊 unit test 的相容性。
+- `_node_is_available(node)==False` 時直接把 `free=0`，確保 drained / down 節點不會被當作可放置目標。
+
+新增三條 unit test 把這三條路徑都鎖住（`test_unavailable_nodes_have_free_mps_zeroed`、`test_tres_used_is_preferred_over_gres_used`、`test_cpu_only_node_without_mps_gres_reports_zero_capacity`），現在 19/19 綠。
+
+**Live 驗證**
+
+修完 rebuild 進 k3s containerd → 重啟 operator → 維持原情境（small1 prio 1039 mps:25 RUNNING on gpu-rtx4070-0、bigfit prio 9999 mps:80 PENDING、gpu-rtx4070-1 drained），每 15 秒 fragmentation tick 都吐：
+
+```
+event_type=requeue_decision  score=1.0  blocked=["86"]
+reason="unblock 86 (priority 9999, mps_req 80) on slurm-worker-gpu-rtx4070-0:
+        requeue 1 job(s) freeing ~25 slots"
+shadow=true  target_jobs=["85"]  unblocks=["86"]  requeued_jobs=[]
+```
+
+`shadow=true` 因為 `FRAGMENTATION_SHADOW_MODE=true`，actuator 沒被叫到，`requeued_jobs=[]` 對應正確；plumbing 全通，等切到非 shadow 模式就會發 `scontrol requeue 85`。
+
+**踩坑插曲（live debug 過程）**
+
+1. 一開始把 gpu-rtx4070 max_replicas 留 2，operator 看到高優先級 PENDING 就把 pool 從 1 sclae 到 2，slurmd 一註冊 node-1 就清掉 drain marker，bigfit 直接跑到 node-1 上，根本沒有 fragmentation 可偵測。要把 `PARTITIONS_JSON` 裡 gpu-rtx4070.max_replicas 改成 1，operator 才不會跟我們搶 node-1。
+2. 期間因為反覆 down/up node，slurmctld 的 AllocTRES 卡在 `gres/mps=100` (zombie state)，新 sbatch 一直 `Reason=Resources` 起不來。`scontrol reconfigure` 一次就沖掉。
+3. 該節點記憶體只有 3500Mi → 一個 small job 就吃滿全部 RealMemory，原計畫的「兩個 small + 一個 bigfit」其實只能塞一個 small；但 fragmentation detector 是看 MPS slot 不看 memory，所以「一個 small (25 slot) + 一個 bigfit (80 slot)」一樣形成 fragmentation（free=75 < 80），場景照樣成立。
+
 ---
 
 # Phase 4 Plan（已完成）

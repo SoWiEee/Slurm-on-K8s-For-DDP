@@ -339,6 +339,39 @@ def _parse_mps_req(tres_per_node: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _parse_node_total_mps(gres: str) -> Optional[int]:
+    """Parse a node's configured ``gres`` field for its total MPS slots.
+
+    Slurm exposes the per-node configured GRES as ``gpu:rtx4070:1,mps:rtx4070:100``
+    (typed) or ``mps:100`` (untyped). Returns ``None`` when the node has
+    no MPS gres configured at all — caller treats those as 0/0 so the
+    detector won't conclude that a CPU-only node "fits" an MPS-tagged
+    pending job.
+    """
+    if not gres:
+        return None
+    import re
+    m = re.search(r"(?:^|,)\s*mps(?::[A-Za-z0-9_-]+)?:(\d+)", gres)
+    return int(m.group(1)) if m else None
+
+
+def _parse_tres_mps(tres_used: str) -> Optional[int]:
+    """Parse Slurm's ``tres_used`` field for ``gres/mps=N``.
+
+    On a live cluster the canonical MPS-slot allocation lives in
+    ``tres_used`` (e.g. ``cpu=4,gres/mps=50``) — ``gres_used`` carries
+    a different shape (``mps:<TYPE>:<count>(IDX:<indices>)``) where the
+    bare number after the first colon is the *device count*, not the
+    slot count. Returns ``None`` when no ``gres/mps=`` token appears so
+    the caller can fall back to ``gres_used``.
+    """
+    if not tres_used:
+        return None
+    import re
+    m = re.search(r"gres/mps=(\d+)", tres_used)
+    return int(m.group(1)) if m else None
+
+
 def _parse_node_list(node_list: str) -> Tuple[str, ...]:
     """``slurm-worker-cpu-[0-2]`` → (slurm-worker-cpu-0, slurm-worker-cpu-1, slurm-worker-cpu-2).
 
@@ -405,6 +438,23 @@ def jobs_from_slurm_rest(rest_jobs: Iterable[dict], *, mps_per_node: int = 100) 
     return out
 
 
+_UNAVAILABLE_NODE_STATES = frozenset({
+    "drain", "drained", "draining", "down", "fail", "failing",
+    "maint", "reserved", "powering_down", "powered_down", "future",
+    "not_responding", "no_respond",
+})
+
+
+def _node_is_available(node: dict) -> bool:
+    raw = node.get("state", "")
+    states: List[str]
+    if isinstance(raw, list):
+        states = [str(s).lower() for s in raw]
+    else:
+        states = [s.strip().lower() for s in str(raw).replace("+", ",").split(",") if s.strip()]
+    return not any(s in _UNAVAILABLE_NODE_STATES for s in states)
+
+
 def nodes_from_slurm_rest(rest_nodes: Iterable[dict], *, mps_per_node: int = 100) -> List[NodeView]:
     """Map ``SlurmRestClient.list_nodes()`` output into ``NodeView``.
 
@@ -412,18 +462,50 @@ def nodes_from_slurm_rest(rest_nodes: Iterable[dict], *, mps_per_node: int = 100
     string like ``gpu:rtx4070:1,mps:75`` (75 of 100 MPS slots used). We
     parse that to derive ``free_mps`` per node; nodes without ``mps``
     GRES report 0 used (treated as full ``mps_per_node`` free).
+
+    Nodes in DRAIN / DOWN / MAINT / RESERVED states are reported with
+    ``free_mps=0`` so the detector won't conclude that a blocked
+    pending job "fits there" — Slurm's scheduler won't place jobs on
+    them either.
     """
     out: List[NodeView] = []
     for n in rest_nodes:
-        gres_used = n.get("gres_used") or ""
-        if isinstance(gres_used, list):
-            gres_used = ",".join(gres_used)
-        used = _parse_mps_req(str(gres_used))
-        free = max(0, mps_per_node - used)
+        # Per-node total MPS comes from the node's configured ``gres``;
+        # nodes without an mps gres (e.g. CPU-only pools) get 0/0 so they
+        # never look like a place an MPS-tagged pending job could fit.
+        has_gres_key = "gres" in n
+        gres_cfg = n.get("gres") or ""
+        if isinstance(gres_cfg, list):
+            gres_cfg = ",".join(gres_cfg)
+        total = _parse_node_total_mps(str(gres_cfg))
+        if total is None:
+            # Node provided gres metadata but it doesn't mention MPS →
+            # this node has no MPS capacity. Only fall back to the
+            # cluster-wide default when a fixture omits the field
+            # entirely (older test data has no "gres" key at all).
+            total = 0 if has_gres_key else mps_per_node
+
+        # Prefer tres_used's "gres/mps=N" — that's the actual slot-count
+        # allocation. Fall back to gres_used for back-compat with fixtures
+        # that supply a bare "mps:N" string.
+        tres_used = n.get("tres_used") or ""
+        if isinstance(tres_used, list):
+            tres_used = ",".join(tres_used)
+        used_from_tres = _parse_tres_mps(str(tres_used))
+        if used_from_tres is not None:
+            used = used_from_tres
+        else:
+            gres_used = n.get("gres_used") or ""
+            if isinstance(gres_used, list):
+                gres_used = ",".join(gres_used)
+            used = _parse_mps_req(str(gres_used))
+        free = max(0, total - used)
+        if not _node_is_available(n):
+            free = 0
         out.append(NodeView(
             node_id=str(n.get("name", "")),
             free_mps=free,
-            total_mps=mps_per_node,
+            total_mps=total,
         ))
     return out
 
