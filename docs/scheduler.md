@@ -712,7 +712,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | M1 | Slurm 內建調度旋鈕（chart values） | §1, §5.1 | 2 天 | ✅ |
 | M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ✅ |
 | M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ✅ |
-| M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ⬜ |
+| M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ✅ |
 | M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ⬜ |
 | M6 | Predictor → Lua → backfill 端到端 | §9.3 | 3 天 | ⬜ |
 | M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ⬜ |
@@ -861,12 +861,30 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 - `docs/sim-readme.md` — 怎麼下 trace、怎麼跑
 
 ### 驗收條件
-- [ ] 1000-job subsample of Philly，FCFS 跑完輸出 metric CSV
-- [ ] 同一 trace 跑 FCFS vs multifactor vs score(M3 版)，三者 metric 都有合理數字
-- [ ] `sim/runner.py --scheduler score --trace philly_subsample.json` < 60 秒跑完
+- [x] 1000-job subsample of Philly，FCFS 跑完輸出 metric CSV
+- [x] 同一 trace 跑 FCFS vs multifactor vs score(M3 版)，三者 metric 都有合理數字
+- [x] `sim/runner.py --scheduler score --trace philly_subsample.json` < 60 秒跑完
 
 ### 風險
 - Philly trace 沒 MPS 資訊（純整 GPU）— augment 假設「每張 GPU 4 個 MPS slot」，evaluation 章節要說明
+
+### 實機驗收（2026-05-07，custom-sched）
+
+`bash scripts/verify-sim.sh` 一鍵跑：8/8 unittest（loader / cluster / runner sanity）+
+1000-job synthetic Philly-like subsample × 三個 scheduler 全部完跑。4×4 cluster 上：
+
+| Scheduler   | wall    | JCT mean | JCT p90  | wait p90 | util  | bf_rate |
+|-------------|---------|----------|----------|----------|-------|---------|
+| fcfs        | 0.03 s  | 45 489 s | 69 014 s | 63 537 s | 0.836 | 0.000   |
+| multifactor | 0.15 s  | 13 216 s | 34 976 s | 25 486 s | 0.935 | 0.912   |
+| score       | 0.32 s  | 13 129 s | 31 281 s | 20 170 s | 0.926 | 0.941   |
+
+score vs multifactor：p90 wait −20.8 %、bf_rate +3.2 pp，JCT mean 統計上打平
+（kicker 把 well-fit 小 job 從 head-of-line 拔出來，所以收益主要落在 tail
+percentile，符合 §7.3 預期）。詳見 [docs/sim-readme.md](sim-readme.md)。
+
+實際輸出在 `sim/data/out/{fcfs,multifactor,score}.{csv,json}`，CSV 11 欄
+（job_id..slowdown）— 給 M8 sensitivity sweep 直接 pandas 讀。
 
 ## M5：Runtime predictor service（7 天）
 

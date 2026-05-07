@@ -191,8 +191,9 @@ describe "score (composite)" {
 |------------|---------------------------------------|------------------|-----------|-------|
 | 2026-05-06 | M2 scaffold (no factors active)       | verify.sh        |     0%    | Baseline; lua plugin loaded but every factor returns 0.5 |
 | 2026-05-06 | M3 (α=0.40, β=0.20, δ=0.20, γ=ε=0)    | sbatch 5-mix     |    n/a    | 27/27 lua unit + 79/79 helm-unittest green; live priorities matched manual compute (wholeNode=500, halfFrag=100, smallPack=50, twoTen=68, cpuOnly=500). Whole-node mps=100 dominates; mid-fraction (mps=50) penalised most by δ. |
+| 2026-05-07 | M4 simulator baseline (α=0.40, β=0.20, δ=0.20) | Philly-like 1k @ 4×4 | jct_mean −0.7 % vs multifactor; **wait_p90 −20.8 %**; bf_rate +3.2 pp | Score kicker reordering small well-fit jobs ahead of head-of-line big jobs; 3 schedulers each < 0.4 s wall. CSV in `sim/data/out/`. |
 
-(M4+ entries appended here as evaluation runs.)
+(M5+ entries appended here as evaluation runs.)
 
 ## 7. Boundary policies
 
