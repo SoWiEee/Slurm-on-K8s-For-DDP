@@ -1,0 +1,107 @@
+{{/*
+Phase 6 M5 — runtime-predictor service.
+
+  PVC          → /models, RWO, holds predictor.pkl + .bak
+  Deployment   → uvicorn FastAPI on :8080 (cold-start fallback baked in)
+  Service      → ClusterIP, port 8080, scraped at /metrics by Prometheus
+                 when monitoring is enabled (handled in network-policy.yaml)
+
+Disabled by default. The M2 lua plugin (M6) reads
+slurm.predictor.url and falls back gracefully when this Deployment is
+absent — see scheduler.md M6 risks.
+*/}}
+{{- if .Values.runtimePredictor.enabled }}
+{{- $rp := .Values.runtimePredictor -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $rp.modelPvc.name }}
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: runtime-predictor
+spec:
+  accessModes: [ {{ $rp.modelPvc.accessMode | quote }} ]
+  resources:
+    requests:
+      storage: {{ $rp.modelPvc.size }}
+  {{- if $rp.modelPvc.storageClassName }}
+  storageClassName: {{ $rp.modelPvc.storageClassName | quote }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-predictor
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: runtime-predictor
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # PVC is RWO, can't rolling-update
+  selector:
+    matchLabels:
+      app: runtime-predictor
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.selectorLabels" . | nindent 8 }}
+        app: runtime-predictor
+    spec:
+      containers:
+        - name: predictor
+          image: "{{ $rp.image.repository }}:{{ $rp.image.tag }}"
+          imagePullPolicy: {{ $rp.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: MODEL_PATH
+              value: {{ $rp.retrain.modelPath | quote }}
+            - name: MIN_TRAIN_SAMPLES
+              value: {{ $rp.minTrainSamples | quote }}
+            - name: BOOTSTRAP_FLOOR_SECONDS
+              value: {{ $rp.bootstrapFloorSeconds | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml $rp.resources | nindent 12 }}
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ $rp.modelPvc.name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: runtime-predictor
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: runtime-predictor
+spec:
+  type: ClusterIP
+  selector:
+    app: runtime-predictor
+  ports:
+    - name: http
+      port: {{ $rp.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

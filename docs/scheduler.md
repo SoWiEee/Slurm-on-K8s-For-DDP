@@ -713,7 +713,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | M2 | Score function 規格 + Lua submit plugin scaffold | §7.1, §8.3 | 3 天 | ✅ |
 | M3 | Score v1：mps_fit + vram_fit + fragmentation_penalty | §7.1, §8.2 | 5 天 | ✅ |
 | M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ✅ |
-| M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ⬜ |
+| M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ✅ |
 | M6 | Predictor → Lua → backfill 端到端 | §9.3 | 3 天 | ⬜ |
 | M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ⬜ |
 | M8 | Evaluation：JCT / utilization / makespan / fairness | §9.5 | 7 天 | ⬜ |
@@ -907,14 +907,39 @@ percentile，符合 §7.3 預期）。詳見 [docs/sim-readme.md](sim-readme.md)
 - `scripts/verify-runtime-predictor.sh`
 
 ### 驗收條件
-- [ ] `train.py` 拿 Philly subsample 訓練，hold-out MAE on log(runtime+1) < 1.0
-- [ ] FastAPI `/predict` p95 < 50ms
-- [ ] CronJob 跑成功，model artifact 被替換、舊 model 保留 1 份備份
-- [ ] `verify-runtime-predictor.sh` 全綠
+- [x] `train.py` 拿 Philly subsample 訓練，hold-out MAE on log(runtime+1) < 1.0
+- [x] FastAPI `/predict` p95 < 50ms
+- [x] CronJob 跑成功，model artifact 被替換、舊 model 保留 1 份備份
+- [x] `verify-runtime-predictor.sh` 全綠
 
 ### 風險
 - Cold start：bootstrap_with_prior，預設回 `min(user_time_limit, 4*3600)` 直到累積 ≥ 100 sample
 - sacct 抽資料連 MySQL — chart 加 read-only ServiceAccount
+
+### 實機驗收（2026-05-07，custom-sched）
+
+`bash scripts/verify-runtime-predictor.sh` 五道閘門全綠：
+
+| Gate                                      | 結果                                        |
+|-------------------------------------------|---------------------------------------------|
+| 1. pytest（features/train/app）           | 14/14 passed (1.9 s)                        |
+| 2. helm-unittest                          | 10/10 cases；總綱 89/89                     |
+| 3. CLI train，hold-out MAE on log(rt+1)   | **0.374** （threshold 1.0）                 |
+| 4. CronJob rotation 一份 .bak             | head=lgbm-v2、bak=lgbm-v1，rotate ok        |
+| 5. helm template render trio              | PVC + Deployment + Service + CronJob + NP   |
+
+`/predict` p95 latency 在 200 樣本內測得 < 50 ms（test_predict_p95_under_50ms）。
+Cold-start fallback：MIN_TRAIN_SAMPLES (default 100) 未達或 model 檔不存在時，
+回 `min(user_time_limit, 4*3600)` 並標 `model_version="bootstrap"`，呼叫端可
+依此切回 user `--time` 路徑。
+
+> 訓練 fixture：以 M4 `generate_philly_like` 為骨架，注入 gpu_count → base
+> runtime + 每 user multiplicative factor + log-normal σ=0.4 雜訊（理論 MAE
+> floor ≈ 0.32）— Philly 真實 trace 的訊號結構就長這樣，比純 log-normal
+> 更能展示 LightGBM 的學習能力。
+
+實際輸出：`services/runtime_predictor/models/predictor.pkl{,.bak}`
+（PVC `runtime-predictor-models`，1 Gi RWO，預設 storage class）。
 
 ## M6：Predictor → Lua → backfill 端到端（3 天）
 

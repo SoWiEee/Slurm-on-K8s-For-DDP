@@ -1,0 +1,74 @@
+{{/*
+Weekly retrain CronJob — see scheduler.md M5 acceptance bullet #3.
+
+The pod runs ``python -m runtime_predictor.train --rotate`` against a
+trace JSON exported to the shared NFS mount (Slurm controller dumps it
+hourly via prolog/epilog or sacct → /shared/jobs/trace.json — wiring
+lives in the controller image, not in this chart). The trainer rotates
+the existing model artifact to ``<output>.bak`` before writing, so
+exactly one previous version is retained.
+*/}}
+{{- if and .Values.runtimePredictor.enabled .Values.runtimePredictor.retrain.enabled }}
+{{- $rp := .Values.runtimePredictor -}}
+{{- $rt := $rp.retrain -}}
+{{- $sharedPvc := default (default "" .Values.storage.sharedPvc.name) $rt.sharedPvc -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: runtime-predictor-retrain
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: runtime-predictor
+spec:
+  schedule: {{ $rt.schedule | quote }}
+  suspend: {{ $rt.suspend }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $rt.backoffLimit }}
+      activeDeadlineSeconds: {{ $rt.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "slurm-platform.selectorLabels" . | nindent 12 }}
+            app: runtime-predictor
+            component: retrain
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: trainer
+              image: "{{ $rp.image.repository }}:{{ $rp.image.tag }}"
+              imagePullPolicy: {{ $rp.image.pullPolicy }}
+              command: ["python", "-m", "runtime_predictor.train"]
+              args:
+                - --trace
+                - {{ $rt.tracePath | quote }}
+                - --output
+                - {{ $rt.modelPath | quote }}
+                - --n-estimators
+                - {{ $rt.nEstimators | quote }}
+                - --holdout-frac
+                - {{ $rt.holdoutFrac | quote }}
+                - --rotate
+              resources:
+                {{- toYaml $rp.resources | nindent 16 }}
+              volumeMounts:
+                - name: models
+                  mountPath: /models
+                {{- if $sharedPvc }}
+                - name: shared
+                  mountPath: /shared
+                {{- end }}
+          volumes:
+            - name: models
+              persistentVolumeClaim:
+                claimName: {{ $rp.modelPvc.name }}
+            {{- if $sharedPvc }}
+            - name: shared
+              persistentVolumeClaim:
+                claimName: {{ $sharedPvc }}
+            {{- end }}
+{{- end }}
