@@ -41,18 +41,22 @@ class ScoreScheduler(MultifactorScheduler):
         alpha: float = 0.40,    # mps_fit
         beta: float = 0.20,     # vram_fit
         delta: float = 0.20,    # fragmentation (subtractive)
+        epsilon: float = 0.0,   # f_runtime_short (M5 predictor); 0 = predictor disabled
         score_gain: float = 1000.0,
         vram_tiers=_DEFAULT_TIERS_GB,
         mps_per_node: int = MPS_PER_GPU,  # per-GPU slot count
+        runtime_horizon: float = 3600.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.alpha = alpha
         self.beta = beta
         self.delta = delta
+        self.epsilon = epsilon
         self.score_gain = score_gain
         self.vram_tiers = sorted(vram_tiers)
         self.mps_per_node = mps_per_node
+        self.runtime_horizon = runtime_horizon
 
     # ---- factor implementations ------------------------------------
     def f_mps_fit(self, j: Job) -> float:
@@ -85,11 +89,20 @@ class ScoreScheduler(MultifactorScheduler):
         spread = statistics.pstdev(free) / max(1.0, statistics.fmean(free))
         return min(1.0, 0.5 * local + 0.5 * spread)
 
+    def f_runtime_short(self, j: Job) -> float:
+        # SJF kicker fed by the M5 predictor. Sim assumes a perfect predictor
+        # (uses j.runtime as the prediction); E4 ablation only flips epsilon.
+        # 1.0 for an instant job, decays to ~0 for a job >> runtime_horizon.
+        if j.runtime <= 0 or self.runtime_horizon <= 0:
+            return 1.0
+        return self.runtime_horizon / (self.runtime_horizon + j.runtime)
+
     def score(self, j: Job, cluster: Cluster) -> float:
         s = (
             self.alpha * self.f_mps_fit(j)
             + self.beta * self.f_vram_fit(j)
             - self.delta * self.f_fragmentation(j, cluster)
+            + self.epsilon * self.f_runtime_short(j)
         )
         return max(0.0, min(1.0, s))
 

@@ -6,3 +6,4 @@ sim/data/philly_subsample.json
 .venv-m5/
 .venv*/
 services/runtime-predictor/models/
+eval/results/
