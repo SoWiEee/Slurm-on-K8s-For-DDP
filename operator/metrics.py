@@ -81,3 +81,23 @@ _QUEUE_DEDUP_DROPS = Counter(
     "Times an event was dropped because the pool already had a pending reconcile",
     ["pool", "source"],
 )
+# Phase 6 M7: fragmentation detector + requeue decider metrics. The gauge
+# is populated each fragmentation reconcile pass; the counter increments
+# only on successful (non-rate-limited) requeue decisions.
+_FRAGMENTATION_SCORE = Gauge(
+    "slurm_operator_fragmentation_score",
+    "Coefficient of variation of free MPS slots across nodes — 0 = balanced, 1 = worst",
+)
+_FRAGMENTATION_BLOCKED_JOBS = Gauge(
+    "slurm_operator_fragmentation_blocked_jobs",
+    "Pending jobs that fit no current node at the last fragmentation snapshot",
+)
+_REQUEUE_TOTAL = Counter(
+    "slurm_operator_requeue_total",
+    "Times the operator issued a requeue decision, by reason bucket",
+    ["reason"],   # "unblock" | "rate-limited" | "no-fragmentation" | "no-victims"
+)
+_REQUEUE_VICTIMS = Counter(
+    "slurm_operator_requeue_victims_total",
+    "Individual jobs requeued by the fragmentation reconciler",
+)

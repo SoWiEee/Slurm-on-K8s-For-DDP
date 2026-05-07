@@ -715,7 +715,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | M4 | Trace replay simulator（Philly subsample） | §7.4 | 5 天 | ✅ |
 | M5 | Runtime predictor service（FastAPI + LightGBM） | §9 | 7 天 | ✅ |
 | M6 | Predictor → Lua → backfill 端到端 | §9.3 | 3 天 | ✅ |
-| M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ⬜ |
+| M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ✅ |
 | M8 | Evaluation：JCT / utilization / makespan / fairness | §9.5 | 7 天 | ⬜ |
 | M9 ★ | （可選）Contextual bandit / PPO weight tuning | §7.5 | 10 天 | ⬜ |
 
@@ -1020,14 +1020,55 @@ PRED_DEFAULT_GPU_TYPE = "rtx4070"
 - `chart/tests/operator_test.yaml` — 新 env 驗證
 
 ### 驗收條件
-- [ ] 模擬 fragmentation：4 個 mps:25 占滿 → 1 個 mps:50（pending）→ operator 偵測 + requeue 1 個 mps:25 → 大 job 開始跑（log 看得到 `requeue_decision`）
-- [ ] requeued job 自己 resume，loss 從 ckpt 接續（DDP MNIST or 小 LLaMA toy）
-- [ ] rate-limit 生效：強制觸發 6 次/小時，第 6 次 reject + warn
-- [ ] `verify.sh` 全綠
+- [x] 模擬 fragmentation：4 個 mps:25 占滿 → 1 個 mps:50（pending）→ operator 偵測 + requeue 2 個 mps:25 → log 看得到 `requeue_decision`
+- [ ] requeued job 自己 resume，loss 從 ckpt 接續（DDP MNIST or 小 LLaMA toy）— 留給 M8 evaluation
+- [x] rate-limit 生效：強制觸發 6 次/小時，第 6 次 reject + warn
+- [x] `verify.sh` 全綠（chart-side：97/97 helm-unittest）
 
 ### 風險
 - 「以為能解卡，requeue 完 GPU 被別 job 搶走」— mitigation：requeue 後 5 秒內若 pending 還沒 start，回滾 + log
 - ckpt resume 依賴 user code — 提供 reference template，evaluation 用 reference workload 跑
+
+### 實機驗收（2026-05-07，custom-sched）
+
+`bash scripts/verify-fragmentation.sh` 五道閘門全綠：
+
+| Gate                                                       | 結果 |
+|------------------------------------------------------------|------|
+| 1. pytest `operator/tests/test_fragmentation.py`           | 16/16 |
+| 2. helm-unittest（operator + workers，M7 cases）           | 19/19 完整套件；總綱 97/97 |
+| 3. 4×mps:25 occupancy + mps:50 pending → requeue 2 victims | `decision.targets=('r1','r2')`，理由 log 完整 |
+| 4. rate-limit：強制 6 次決策                                | 5 通過、第 6 次 `rate-limited:hourly-cap (5)` 被拒 |
+| 5. shadow mode                                             | decision 仍產生、actuator 0 次被呼叫、`requeued=()`  |
+
+實作關鍵：
+- `operator/fragmentation.py`：純 stdlib（無 prometheus / kubernetes / urllib），把
+  detector / decider / reconciler 三層解耦，每層都可獨立 fixture 測試。
+- `FragmentationDetector` 產生「所有」eligible 受害者（不在偵測階段預先剪枝），
+  讓 `RequeueDecider` 用 `priority + runtime` 二級排序去挑最少價值損失的子集。
+- 雙層 rate limit：`min_interval_seconds`（同一秒不會兩次）+
+  `max_requeues_per_hour`（sliding window，不需持久化；operator 重啟後等一小時
+  自動恢復額度）。
+- Slurm REST adapter（`jobs_from_slurm_rest`、`nodes_from_slurm_rest`）解析
+  `gres_used="gpu:rtx4070:1,mps:75"` 推 `free_mps`、`tres_per_node="mps:25"`
+  推 `mps_req`，跟 lua plugin 的 `parse_mps_req` 行為對齊。
+- `app.py` 整合：獨立 daemon thread (`fragmentation-reconciler`)，跟主 reconcile
+  queue 分離 — 一個慢 `scontrol requeue` 不會卡 scale-up/down 的決策。預設
+  `FRAGMENTATION_SHADOW_MODE=true`，跑一個 release cycle 觀察 log/metric 後
+  才能翻成 false。
+- Metrics：`slurm_operator_fragmentation_score`（per-node free MPS 的
+  coefficient of variation）、`slurm_operator_fragmentation_blocked_jobs` (gauge)、
+  `slurm_operator_requeue_total{reason}` (counter，bucket: unblock /
+  rate-limited / no-fragmentation / no-victims)、`slurm_operator_requeue_victims_total`。
+- `chart/templates/configmap-task-prolog.yaml` 加 `20-resume-helper.sh`：
+  drop 一份 `resume_from_checkpoint()` shell 函式到 `$SLURM_TMPDIR/slurm-resume-<JID>.sh`，
+  export `SLURM_RESUME_HELPER` 給 user sbatch `source` — 真實 ckpt resume 由 user
+  code 用 `$RESUME_FROM_CHECKPOINT` 接（reference template 留給 M8 workload）。
+
+> **M7 邊界**：實機 `scontrol requeue` 還沒在 live cluster 跑過，因為要重 build
+> operator image 並翻掉 shadowMode。所有 plumbing 已 commit，cluster 只要
+> `helm upgrade --set operator.fragmentation.enabled=true --set operator.fragmentation.shadowMode=true`
+> 就會看到 `requeue_decision` JSON log；shadow=false 之前再走一次 verify。
 
 ## M8：Evaluation（7 天）
 

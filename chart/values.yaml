@@ -395,6 +395,33 @@ operator:
     enabled: true
     maxAgeSeconds: 600
     graceSeconds: 300
+  # Phase 6 M7: fragmentation detector + requeue decider. Disabled by
+  # default; even when enabled, ``shadowMode`` defaults true so the
+  # decider runs end-to-end (logs + metrics) without actually requeueing
+  # any job. Flip to false only after a release cycle of shadow data
+  # confirms the decisions are sane.
+  fragmentation:
+    enabled: false
+    shadowMode: true
+    # Cadence for the periodic reconcile thread. Doubles as the decider's
+    # min-interval rate limit, so two ticks back-to-back can't both fire
+    # a requeue.
+    minIntervalSeconds: 60
+    # Sliding-window cap on requeue decisions per hour.
+    maxRequeuesPerHour: 5
+    # Maximum number of low-priority victims requeued in a single decision.
+    maxTargetsPerDecision: 4
+    # Required priority gap (target.priority - victim.priority) before a
+    # running job is eligible for preemption. 0 = any positive gap; bump
+    # to e.g. 500 to require a more decisive lead.
+    priorityGap: 0
+    # MPS slots per node — must match Slurm's gres.conf ``Count=…`` for
+    # the ``mps`` GRES. Override per pool when a deployment uses a
+    # different slot count.
+    mpsPerNode: 100
+    # Restrict reconciliation to specific Slurm partitions. Empty list
+    # means "all partitions present in PARTITIONS_JSON".
+    partitions: []
 
 # -- Runtime predictor (Phase 6 M5) ------------------------------------------
 # Optional FastAPI + LightGBM service that returns predicted runtime to the

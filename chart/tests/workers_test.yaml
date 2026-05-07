@@ -170,3 +170,23 @@ tests:
         documentSelector:
           path: metadata.name
           value: slurm-worker-cpu
+
+  - it: M7 task-prolog 20-resume-helper.sh omitted when fragmentation disabled (default)
+    template: configmap-task-prolog.yaml
+    asserts:
+      - notExists:
+          path: data["20-resume-helper.sh"]
+
+  - it: M7 task-prolog 20-resume-helper.sh present when fragmentation enabled
+    template: configmap-task-prolog.yaml
+    set:
+      operator.fragmentation.enabled: true
+    asserts:
+      - exists:
+          path: data["20-resume-helper.sh"]
+      - matchRegex:
+          path: data["20-resume-helper.sh"]
+          pattern: "resume_from_checkpoint"
+      - matchRegex:
+          path: data["20-resume-helper.sh"]
+          pattern: "SLURM_RESUME_HELPER"

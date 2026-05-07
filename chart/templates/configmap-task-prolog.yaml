@@ -44,3 +44,48 @@ data:
       [ -n "$val" ] && echo "export ${var}=${val}"
     done
     exit 0
+{{- if .Values.operator.fragmentation.enabled }}
+  20-resume-helper.sh: |
+    #!/bin/sh
+    # Phase 6 M7: ship a resume helper into the user's job environment.
+    # The actual resume logic lives in checkpoint-aware user code; this
+    # prolog drops a shell function library onto the worker's per-job
+    # tmpdir and exports its path so the sbatch script can `source` it.
+    #
+    # User contract (sbatch):
+    #
+    #     source "$SLURM_RESUME_HELPER"
+    #     resume_from_checkpoint "/shared/ckpts/$SLURM_JOB_ID/last.pt"
+    #     # ... torch.distributed.run / python train.py ...
+    #
+    # When the operator's fragmentation reconciler issues `scontrol
+    # requeue $SLURM_JOB_ID`, the job comes back PENDING and is later
+    # rescheduled with the same ID — at which point the same checkpoint
+    # path is found and the helper exports RESUME_FROM_CHECKPOINT for
+    # user code to honour.
+    HELPER_DIR=${SLURM_TMPDIR:-/tmp}
+    HELPER="$HELPER_DIR/slurm-resume-${SLURM_JOB_ID:-$$}.sh"
+    cat > "$HELPER" <<'HELP'
+    #!/bin/sh
+    # Sourced from user sbatch — must not exit/return outside a function.
+    resume_from_checkpoint() {
+      _ckpt="${1:-}"
+      if [ -z "$_ckpt" ]; then
+        echo "[resume] usage: resume_from_checkpoint <path>" >&2
+        return 2
+      fi
+      if [ -f "$_ckpt" ]; then
+        export RESUME_FROM_CHECKPOINT="$_ckpt"
+        echo "[resume] found checkpoint: $_ckpt"
+        return 0
+      else
+        unset RESUME_FROM_CHECKPOINT
+        echo "[resume] no checkpoint at $_ckpt — fresh start"
+        return 1
+      fi
+    }
+    HELP
+    chmod +x "$HELPER" 2>/dev/null || true
+    echo "export SLURM_RESUME_HELPER=$HELPER"
+    exit 0
+{{- end }}

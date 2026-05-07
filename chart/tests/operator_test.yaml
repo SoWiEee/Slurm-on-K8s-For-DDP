@@ -99,3 +99,92 @@ tests:
         documentSelector:
           path: kind
           value: Service
+
+  - it: M7 fragmentation env disabled by default
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_ENABLED
+            value: "false"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_SHADOW_MODE
+            value: "true"
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: M7 fragmentation env wires through chart values
+    set:
+      operator.fragmentation.enabled: true
+      operator.fragmentation.shadowMode: false
+      operator.fragmentation.minIntervalSeconds: 30
+      operator.fragmentation.maxRequeuesPerHour: 10
+      operator.fragmentation.maxTargetsPerDecision: 2
+      operator.fragmentation.priorityGap: 500
+      operator.fragmentation.mpsPerNode: 200
+      operator.fragmentation.partitions:
+        - gpu-rtx4070
+        - gpu-h100
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_ENABLED
+            value: "true"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_SHADOW_MODE
+            value: "false"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_MIN_INTERVAL_SECONDS
+            value: "30"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_MAX_REQUEUES_PER_HOUR
+            value: "10"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_PRIORITY_GAP
+            value: "500"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_MPS_PER_NODE
+            value: "200"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FRAGMENTATION_PARTITIONS
+            value: "gpu-rtx4070,gpu-h100"
+        documentSelector:
+          path: kind
+          value: Deployment
