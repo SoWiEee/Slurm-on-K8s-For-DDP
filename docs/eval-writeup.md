@@ -1,8 +1,9 @@
 # Phase 6 M8 — Evaluation Writeup
 
 > 對應 thesis evaluation 章節草稿。
-> 圖表來源：`eval/figures/`，原始資料：`eval/results/`，重現：
-> `bash eval/scripts/run_all.sh && .venv-m5/bin/python eval/scripts/plot_all.py`。
+> 圖表來源：[`eval/figures/`](../eval/figures/)，原始資料：[`eval/results/`](../eval/results/)
+
+> 重現：`bash eval/scripts/run_all.sh && .venv-m5/bin/python eval/scripts/plot_all.py`。
 
 ## 1. 實驗設定
 
@@ -48,31 +49,31 @@ E5 的 fragmentation 模式 mirror 了 `operator/fragmentation.py`：每個 even
 
 ### 3.1 fig1 — JCT mean / p90 / p95（柱狀）
 
-`eval/figures/fig1_jct_bars.png`
+<img src="../eval/figures/fig1_jct_bars.png"/>
 
 E1 那根柱子壓著其他四個一個量級。E2..E5 之間的差距才是這個論文要講的故事 —— backfill 不是 thesis 的 contribution（Slurm 本來就有），所以章節會把焦點放在 E2 vs E5。
 
 ### 3.2 fig2 — JCT CDF（log x-axis）
 
-`eval/figures/fig2_jct_cdf.png`
+<img src="../eval/figures/fig2_jct_cdf.png"/>
 
 每條線代表「P(JCT ≤ x) 的累積分布」。E1 的 CDF 在低 x 處遠左於其他，意味著就算是「最快的 50% jobs」也比 E2..E5 慢一個量級。E5 的線在整個 quantile range 都壓在 E4 下方，這比單一個 mean 數字更有說服力 —— 不是只有 outlier 改善。
 
 ### 3.3 fig3 — Slowdown 箱型圖
 
-`eval/figures/fig3_slowdown_box.png`
+<img src="../eval/figures/fig3_slowdown_box.png"/>
 
 Slowdown = JCT / max(runtime, 60s)。E1 的 box 大概在 [10, 100] 區間，E5 的 box 收到 [1, 10]，IQR 變窄一個量級。長尾被 fragmentation requeue 救回來。
 
 ### 3.4 fig4 — Utilisation timeline
 
-`eval/figures/fig4_util_time.png`
+<img src="../eval/figures/fig4_util_time.png"/>
 
 把整段 simulated time 切 200 個 bin，每個 bin 內把所有當時 RUNNING 的 (mps × gpu_count) 加總除以 cluster total。E1 的線在 0.4–0.9 之間劇烈震盪；E5 平穩在 0.9 上方。fragmentation requeue 的副作用之一就是「節點不會閒著」。
 
 ### 3.5 fig5 — E6 sensitivity heatmap
 
-`eval/figures/fig5_e6_heatmap.png`
+<img src="../eval/figures/fig5_e6_heatmap.png"/>
 
 3×3 grid，固定 β=0.20 ε=0.30，掃 α ∈ {0.20, 0.40, 0.60}, δ ∈ {0.10, 0.20, 0.30}。jct_mean 的範圍是 2.91–3.08h（max/min ≈ 1.06）—— 證明結果對 weight choice 並不敏感（差距 < ±5%）。最佳格子是 α=0.40, δ=0.30（2.91h），最差是 α=0.40, δ=0.10 / α=0.60, δ=0.20（3.07h）。
 
@@ -80,13 +81,13 @@ Slowdown = JCT / max(runtime, 60s)。E1 的 box 大概在 [10, 100] 區間，E5 
 
 ### 3.6 fig6 — backfill rate 與 M7 requeue count
 
-`eval/figures/fig6_bf_rate.png`
+<img src="../eval/figures/fig6_bf_rate.png"/>
 
 雙 y 軸：左藍是 bf_rate（fraction of jobs that started while an earlier job was pending），右紅是 M7 requeue 次數。E1 bf_rate=0 是 sanity check（FCFS 不 backfill）；E2..E5 都 ≥ 0.91。E5 的 1856 requeue 對應 mean JCT 多砍 12% —— 平均一次 requeue 換來的 JCT 改善是有 measurable 價值的。
 
 ### 3.7 fig7 — Mean-JCT 改善（vs E1 normalise）
 
-`eval/figures/fig7_jct_normalised.png`
+<img src="../eval/figures/fig7_jct_normalised.png"/>
 
 E1 = 0%，E2 +71.0%、E3 +71.1%、E4 +76.4%、E5 +79.3%。對照 thesis claim「組合 M3+M5+M7 比 vendor multifactor 多砍 28.6%」—— 是 (3.671 − 2.621) / 3.671 ≈ 28.6%，這是 thesis 主結論的單一數字。
 
@@ -100,7 +101,8 @@ E1 = 0%，E2 +71.0%、E3 +71.1%、E4 +76.4%、E5 +79.3%。對照 thesis claim「
 | **C4** M7 fragmentation reconciler 提供額外 12% mean JCT 改善與 27% utilization 提升的 long-tail 收尾 | E4 vs E5，fig3 box / fig4 utilization |
 | **C5** Score weight 的 sensitivity 是 ±5%，當前預設值已足夠 robust，不需 RL tuning 才能用 | E6 heatmap fig5 |
 
-> 兩個尚未被證據支撐的命題 — (a) E7 sim→真機可重現性、(b) RL weight tuning 的真正邊際價值 — 屬於 M9 (★ optional) 的範圍，留給 future work。
+> [!IMPORTANT]
+> 兩個尚未被證據支撐的命題：E7 sim→真機可重現性、RL weight tuning 的真正邊際價值。兩者屬於 M9 的範圍，留給 future work。
 
 ## 5. 風險與限制
 
