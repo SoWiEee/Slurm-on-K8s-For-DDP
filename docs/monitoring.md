@@ -20,6 +20,7 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 │                                                                 │
 │  slurm-exporter  ──→  /metrics（Slurm queue / node states）    │
 │  slurm-elastic-operator  ──→  /metrics（scale events, guard）  │
+│  nvidia-dcgm-exporter（gpu-operator ns）──→ /metrics（GPU SM/VRAM）│
 └────────────────────────────┬────────────────────────────────────┘
                              │ scrape
 ┌────────────────────────────▼────────────────────────────────────┐
@@ -31,7 +32,8 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 │  Grafana                                                        │
 │    ├─ Bridge Overview Dashboard（主 demo 看板）                  │
 │    ├─ Slurm Cluster State Dashboard                            │
-│    └─ K8s Operator Dashboard                                   │
+│    ├─ K8s Operator Dashboard                                   │
+│    └─ GPU Utilisation (DCGM) Dashboard                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,6 +96,47 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 
 **Port：** `8000`（`/metrics` endpoint）
 
+### 4. NVIDIA DCGM exporter
+
+**來源：** NVIDIA GPU Operator 內建的 `nvidia-dcgm-exporter`
+
+**部署方式：** `scripts/install-gpu-operator.sh` 安裝 GPU Operator 時開啟：
+
+```bash
+--set dcgmExporter.enabled=true
+--set dcgmExporter.serviceMonitor.enabled=false
+```
+
+ServiceMonitor 維持關閉，因為本專案使用 chart 內建 Prometheus；Prometheus 透過
+`chart/templates/monitoring/prometheus.yaml` 的 static scrape job 抓：
+`nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400`。
+
+**Chart 開關：**
+
+```yaml
+monitoring:
+  dcgmExporter:
+    enabled: true
+    namespace: gpu-operator
+    serviceName: nvidia-dcgm-exporter
+    port: 9400
+```
+
+**核心 metrics：**
+
+| Metric | 類型 | 說明 |
+|--------|------|------|
+| `DCGM_FI_DEV_GPU_UTIL` | Gauge | 真實 GPU SM 使用率，不是 Slurm allocated GPU count |
+| `DCGM_FI_DEV_FB_USED` | Gauge | VRAM 已用量 |
+| `DCGM_FI_DEV_FB_FREE` | Gauge | VRAM 可用量 |
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | Gauge | Memory controller active ratio，可抓 bandwidth-bound workload |
+| `DCGM_FI_DEV_GPU_TEMP` | Gauge | GPU 溫度 |
+| `DCGM_FI_DEV_POWER_USAGE` | Gauge | GPU 板卡功耗 |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Gauge | Tensor Core busy ratio；硬體/driver 支援時可用 |
+
+DCGM 指標補上了 Slurm-only monitoring 的盲點：Slurm 知道「GPU 被分配」，
+但不知道該 GPU 是否真的在算、VRAM 是否接近 OOM、或是否只是 idle allocation。
+
 ---
 
 ## 檔案結構
@@ -124,6 +167,9 @@ phase4/
 └── scripts/
     ├── bootstrap-monitoring.sh            # 一鍵部署監控堆疊
     └── verify-monitoring.sh               # 驗證 metrics 可正常抓取
+chart/
+└── dashboards/
+    └── gpu.json                           # GPU Utilisation (DCGM) dashboard
 ```
 
 ---
@@ -162,6 +208,24 @@ phase4/
 - Scale event timeline（scale-up / scale-down / skipped / guard-blocked，以 annotations 標記）
 - Checkpoint Guard 攔截事件計數
 - 各 pool 的 replica count 時序（cpu / gpu-a10 / gpu-h100）
+
+### GPU Utilisation (DCGM) Dashboard
+
+`chart/dashboards/gpu.json` 提供真實 GPU 使用狀態，dashboard uid 為
+`slurm-k8s-gpu`，title 為 `GPU Utilisation (DCGM)`。
+
+**Panels：**
+
+- GPU SM Utilisation (%)：`DCGM_FI_DEV_GPU_UTIL`
+- VRAM Used / Free (MiB)：`DCGM_FI_DEV_FB_USED`、`DCGM_FI_DEV_FB_FREE`
+- Memory Copy Util (%)：`DCGM_FI_DEV_MEM_COPY_UTIL`
+- GPU Temperature (°C)：`DCGM_FI_DEV_GPU_TEMP`
+- GPU Power Draw (W)：`DCGM_FI_DEV_POWER_USAGE`
+- GPU Util (Now)：目前各 GPU 的 SM% stat panel
+- VRAM Used (Now)：目前各 GPU 的 VRAM 使用量 stat panel
+
+這個 dashboard 取代早期用 Slurm allocation count 推估 GPU utilization 的做法。
+Slurm allocation count 只能表示「排程器分配了 GPU」，DCGM 才能回答「硬體實際忙不忙」。
 
 ---
 
@@ -217,6 +281,10 @@ scrape_configs:
     static_configs:
       - targets: ['kube-state-metrics.monitoring.svc.cluster.local:8080']
 
+  - job_name: dcgm-exporter
+    static_configs:
+      - targets: ['nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400']
+
   - job_name: kubernetes-pods
     kubernetes_sd_configs:
       - role: pod
@@ -260,6 +328,22 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000
 # Prometheus（debug 用）
 kubectl -n monitoring port-forward svc/prometheus 9090:9090
 # http://localhost:9090
+```
+
+### DCGM 驗證
+
+```bash
+# 確認 GPU Operator 有部署 DCGM exporter
+kubectl -n gpu-operator get svc nvidia-dcgm-exporter
+kubectl -n gpu-operator get pods -l app=nvidia-dcgm-exporter
+
+# 直接看 raw metrics
+kubectl -n gpu-operator port-forward svc/nvidia-dcgm-exporter 9400:9400
+curl -s http://localhost:9400/metrics | grep -E 'DCGM_FI_DEV_GPU_UTIL|DCGM_FI_DEV_FB_USED|DCGM_FI_DEV_POWER_USAGE' | head
+
+# Prometheus 查詢
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+# 在 Prometheus UI 查 DCGM_FI_DEV_GPU_UTIL / DCGM_FI_DEV_FB_USED
 ```
 
 ---
