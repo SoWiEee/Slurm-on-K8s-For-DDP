@@ -411,7 +411,7 @@ graph TD
 | 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出；多節點 E2E 驗證通過（含 slurmctld IP cache 修正） |
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
 | 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合至 Phase 1（images + modulefile ConfigMap + `--with-lmod` render）、`/shared/jobs/` 路徑、Worker preStop Hook；**Helm chart cutover**（`chart/`，monolithic + values overlay，Stage A–F 全部完成；`render-core.py` / `bootstrap*.sh` / `manifests/core/*.yaml` 廢棄；`chart/tests/` 28 條 helm-unittest 案例覆蓋 slurm.conf / workers / operator / gpu / monitoring / storage / login）|
-| 6：自訂 Slurm 排程 | 🔒 預留 | 計畫加入針對 DDP / MPS / 多 GPU 共用情境的自訂排程策略（細節 TBD） |
+| 6：自訂 Slurm 排程 | ✅ M1-M8 完成 | Score-based scheduling、runtime predictor、fragmentation requeue、trace replay simulator 與 evaluation 已落地；進階排程功能預設仍以 Helm flag 關閉，需按環境逐項啟用 |
 | 7：分散式追蹤 + SSH Login | 📋 規劃中 | OpenTelemetry job lifecycle trace（Tempo + Operator span + Prometheus exemplar）；Login pod 開放 SSH NodePort 取代 `kubectl exec` |
 
 ---
@@ -550,7 +550,7 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 # 🔭 Roadmap
 
-> Phase 5 已完成（Lmod + Helm chart cutover）；下一步分為兩塊：Phase 6 預留給自訂 Slurm 排程策略，Phase 7 補齊使用者體驗（端到端 trace + SSH Login）。
+> Phase 5 已完成（Lmod + Helm chart cutover）；Phase 6 的 score-based scheduling 主線已完成到 M8 evaluation。下一步重點是 Phase 7 補齊使用者體驗（端到端 trace + SSH Login），以及把 Phase 6 的 live-cluster E7 驗證與 production rollout policy 補完。
 > 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為更後期擴充方向。
 
 ## Phase 5：Lmod + Helm 封裝 ✅ 完成
@@ -569,12 +569,15 @@ helm install slurm-platform ./chart -f chart/values-dev.yaml
 
 詳細設計見 [`docs/note.md §5-A`](docs/note.md)。
 
-## Phase 6：自訂 Slurm 排程策略 🔒 預留
+## Phase 6：自訂 Slurm 排程策略 ✅ M1-M8 完成
 
-> 預留階段，細節待定。目標方向是針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的排程邏輯（例如 MPS slot 與整卡獨佔的協調、DDP gang-aware placement、與 K8s scheduler 的互動）。
+> 目標是針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的排程邏輯。詳細 roadmap 與驗收紀錄見 [`docs/scheduler.md`](docs/scheduler.md#phase-6-roadmap--score-based-scheduling-開發追蹤r17)，evaluation writeup 見 [`docs/eval-writeup.md`](docs/eval-writeup.md)。
 
-- 目前**不開工**：先讓 Phase 7 把可觀測性與登入體驗補齊，等 trace 資料能呈現現行排程瓶頸後，再決定要解決哪些具體案例。
-- 任何排程改動的設計與決策會寫進 `docs/note.md` 的 Phase 6 段落（目前是 placeholder）。
+- **M1-M3：Slurm + Lua score path**：Helm values expose backfill / multifactor knobs；`job_submit.lua` 實作 `mps_fit`、`vram_fit`、fragmentation proxy，將 score 作為 priority kicker。
+- **M4-M6：trace replay + runtime predictor**：`sim/` 可離線重播 Philly-like trace；FastAPI + LightGBM predictor 可由 Lua submit plugin 呼叫並覆寫過鬆的 `--time`。
+- **M7：fragmentation requeue**：Operator 加入 fragmentation detector / decider，預設 `shadowMode=true`，可觀察解卡決策後再開實際 `scontrol requeue`。
+- **M8：evaluation**：`eval/results/`、`eval/figures/` 與 `docs/eval-writeup.md` 已產出；目前主要結論是 E5（score + predictor + fragmentation）相對 vendor multifactor mean JCT 改善約 28.6%。
+- **仍待補強**：E7 live-cluster 50-job 驗證、checkpoint resume cost 實測、更多 trace / sensitivity sweep，以及 M9 optional weight tuner。
 
 ## Phase 7：分散式追蹤 + SSH Login 📋 規劃中
 

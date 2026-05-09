@@ -498,22 +498,28 @@ chart/
 
 # Phase 6 Plan
 
-> **狀態：** 🔒 預留階段，目前不開工。
+> **狀態：** ✅ M1-M8 已完成；production 進階功能仍預設關閉，依環境逐項啟用。
 
-針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的自訂排程策略。可能方向（待 Phase 7 trace 資料佐證後再收斂）：
+針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的自訂排程策略。目前 Phase 6 已經從原本的 placeholder 收斂成 `R17 score-based scheduling + R19 runtime predictor` 主線：
 
-- MPS slot 與整卡獨佔的協調（避免 mps job 與 gpu:rtx4070:1 互相 head-of-line block）
-- DDP gang-aware placement：`--nodes=N` 的 job 確保所有 worker pod 同時 ready 才開跑，否則 backoff 而非部分啟動
-- 與 K8s scheduler 的互動（Workload-Aware / Gang Scheduling feature gate 已就緒，見 `docs/review.md`）
-- Operator 擴縮策略與排程決策的協同（例如「為了排這個 gang job，主動把 cpu pool 縮一格騰 quota」）
+- M1-M3：Slurm backfill / multifactor knobs 走 Helm values，Lua `job_submit.lua` 計算 `mps_fit`、`vram_fit`、fragmentation proxy，並把 score 作為 priority kicker。
+- M4：`sim/` trace replay simulator 可跑 FCFS / multifactor / score 三線 baseline。
+- M5-M6：FastAPI + LightGBM runtime predictor 與 Lua submit plugin 接通，可在 predictor 可用時覆寫過鬆的 `--time`，不可用時 fallback。
+- M7：Operator fragmentation detector + requeue decider 已接入，預設 `shadowMode=true`，實際 requeue 需明確翻 flag。
+- M8：`eval/results/`、`eval/figures/`、`docs/eval-writeup.md` 已產出。主結論：score + predictor + fragmentation 相對 vendor multifactor mean JCT 改善約 28.6%，但 E5 的 requeue 數字尚未扣 checkpoint resume 成本。
 
-設計與決策會逐項補在本節。
+尚未完成或不該宣稱已解決的部分：
+
+- E7 live-cluster 50-job 驗證仍是 harness 狀態，需要在實際 k3s + Slurm chart 上跑 vendor vs our stack。
+- M7 實際 `shadowMode=false` 的 requeue 行為需要搭配 checkpoint-aware workload 驗證，避免 sim 的 0-cost resume 高估收益。
+- DDP gang-aware placement、K8s scheduler gang scheduling、跨 pool quota 讓渡仍是 future work，沒有併入 Phase 6 M1-M8。
+- M9 contextual bandit / PPO weight tuning 是 optional future work；M8 sensitivity 顯示目前 fixed weights 已足夠 robust。
 
 ---
 
 # Phase 7 Plan
 
-> **狀態：** 📋 規劃中。Phase 6 預留期間先做這兩塊讓使用者體驗收斂。
+> **狀態：** 📋 規劃中。Phase 6 M1-M8 完成後，Phase 7 回到使用者體驗與端到端可觀測性。
 >
 > 開發順序：**OpenTelemetry（7-A）→ SSH Login（7-B）**
 
@@ -1213,4 +1219,3 @@ dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
 - [SURF MPS for Slurm GitHub](https://github.com/basvandervlies/surf_slurm_mps) — 荷蘭國家超算中心的 MPS Prolog/Epilog 完整實作
 - [NVIDIA GPU Operator MPS 文件](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html) — ClusterPolicy ConfigMap `sharing.mps` 設定
 - [MIG vs Time-Slicing vs MPS 比較](https://www.kubenatives.com/p/mig-vs-time-slicing-vs-mps-which) — 三種機制的適用場景分析
-
