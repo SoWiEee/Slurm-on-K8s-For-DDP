@@ -1139,6 +1139,31 @@ score 本身主要改善 tail；M5 predictor 是最大單點收益；M7 fragment
 改善。限制是 E1-E6 都是 simulator，E5 requeue 未扣真實 checkpoint reload
 cost，E7 live-cluster 驗證仍待跑。
 
+### 後續改進 / handoff 給 Claude Code
+
+1. **先補 E7 live-cluster 驗證。** 目前 M8 主結論來自 simulator；下一步應用
+   `eval/scripts/run_e7_live.sh` 跑 50-job mix，比較 vendor multifactor vs
+   our stack。輸出至少要包含 wall-clock JCT、p90 wait、bf_rate、operator
+   requeue log，以及 `scontrol show job` 的 priority/time_limit evidence。
+2. **量 checkpoint resume cost。** E5 的 1856 次 requeue 是最大風險；目前
+   simulator 沒扣 checkpoint reload / warmup。請用 DDP MNIST 或小 LLaMA toy
+   workload 實測每次 requeue 的 reload cost，然後把成本模型加回 `sim/runner.py`
+   或 evaluation writeup，不要直接把 2.621h 當 production claim。
+3. **做受控 rollout，而不是直接開 `shadowMode=false`。** 建議先新增
+   `values-phase6-shadow.yaml` 與 `values-phase6-live.yaml`：shadow profile 只開
+   Lua score / predictor log / fragmentation decision metrics；live profile 才允許
+   `scontrol requeue`，並保留 `maxRequeuesPerHour`、`priorityGap`、
+   `maxTargetsPerDecision` 的保守預設。
+4. **擴充 trace coverage。** Philly-like 1k 只是一個 deterministic sample；
+   至少再跑一個 burst-heavy trace 或 ALI-Cluster normalized trace。目標是驗證
+   E5 vs E2 的 28.6% mean-JCT 改善不是單一 sample artifact。
+5. **加大 sensitivity sweep，但先不要做 M9。** M8 的 3×3 grid 顯示 fixed
+   weights 已足夠 robust；若要補強，先做 5×5×5 + ε scan。M9 RL tuner 只有在
+   多 trace、多 workload 下仍看到可觀 weight sensitivity 時才值得做。
+6. **把 production claim 分層寫清楚。** 文件和簡報要分成 simulator result、
+   shadow-mode live observation、live requeue result 三層。E7 完成前，不要宣稱
+   Phase 6 已在真機證明 fragmentation requeue 的完整收益。
+
 ### 風險
 - 結論不顯著（score ≈ multifactor）— M3 / M6 之後就先跑 mini-eval 抓問題，不要拖到 M8 才發現
 
