@@ -43,23 +43,13 @@
 
 # 🚀 Getting Started
 
-從 Phase 5-A Stage F 起，部署統一走 Helm。基線在 `chart/values.yaml`（Kind dev / 無 GPU）；
-生產環境用 `chart/values-k3s.yaml` overlay（k3s + RTX4070 + RTX4080，已驗證）。
-
-| 路徑 | 環境 | GPU | 主要 overlay |
-|------|------|-----|--------------|
-| **[A] Linux + k3s](#a-linux--k3s--real-gpu)** | Ubuntu 24.04 + k3s v1.34 | NVIDIA RTX 4070/4080 | `chart/values-k3s.yaml` |
-| **[B] Kind（本機模擬）](#b-kind-本機開發模擬)** | Docker Desktop + kind | 無 | 預設 `values.yaml` |
+部署統一使用 Helm，baseline 在 `chart/values.yaml`（Kind dev / 無 GPU），生產環境用 `chart/values-k3s.yaml` overlay。
 
 > Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，獨立用 `scripts/install-gpu-operator.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
 
----
+> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 595 ✅️
 
-## A. Linux + k3s + Real GPU
-
-> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 535/595（兩者皆通過）
-
-### 步驟 1：主機準備
+## 1. 主機準備
 
 安裝 NVIDIA Container Toolkit + k3s + helm，並複製 kubeconfig：
 
@@ -72,7 +62,7 @@ kubectl get nodes
 helm version --short    # 需要 v3.16+
 ```
 
-### 步驟 2：建置容器映像並匯入 k3s
+## 2. 建置容器映像並匯入 k3s
 
 ```bash
 docker build -t slurm-controller:latest         -f docker/controller/Dockerfile         docker/controller
@@ -85,20 +75,20 @@ for img in slurm-controller:latest slurm-worker:latest slurm-elastic-operator:la
 done
 ```
 
-### 步驟 3：建立 secrets（munge / ssh / JWT）
+## 3. 建立 secrets (munge/ssh/JWT)
 
 ```bash
-bash scripts/create-secrets.sh        # 一次建好 slurm-munge-key / slurm-ssh-key / slurm-jwt-secret
+bash scripts/create-secrets.sh
 ```
 
-### 步驟 4：套用必要的 cluster-scoped 資源 + accounting 後端
+## 4. 套用必要的 cluster-scoped 資源 + accounting 後端
 
 ```bash
 kubectl apply -f manifests/gpu/runtime-class.yaml          # NVIDIA RuntimeClass（GPU pool 用）
 kubectl apply -f manifests/core/slurm-accounting.yaml      # mysql + slurmdbd（chart 之外的 prerequisite）
 ```
 
-### 步驟 5：（可選）主機 NFS server + LAN exports
+## 5. 主機 NFS server + LAN exports (Optional)
 
 ```bash
 sudo bash scripts/setup-nfs-server.sh
@@ -106,7 +96,7 @@ cat /etc/exports                       # 必須含 pod CIDR (10.0.0.0/8) AND LAN
 sudo exportfs -ra
 ```
 
-### 步驟 6：`helm install` 部署整套平台
+## 6. 透過 Helm 部署整套平台
 
 ```bash
 helm install slurm-platform ./chart \
@@ -123,7 +113,7 @@ helm install slurm-platform ./chart \
 
 LAN IP 不一樣時用 `--set storage.nfsServer=<your-ip>` 覆寫。
 
-### 步驟 7：安裝 NVIDIA GPU Operator（提供 device-plugin DaemonSet）
+## 7. 安裝 NVIDIA GPU Operator
 
 ```bash
 bash scripts/install-gpu-operator.sh    # 進 gpu-operator namespace，PSS=privileged
@@ -131,7 +121,7 @@ bash scripts/install-gpu-operator.sh    # 進 gpu-operator namespace，PSS=privi
 
 腳本是 idempotent 的，重跑等於 helm upgrade。`--set driver.enabled=false --set toolkit.enabled=false` 因為 host 已經由 setup-linux-gpu.sh 裝好驅動。
 
-### 步驟 8：驗證
+## 8. 驗證
 
 ```bash
 KUBE_CONTEXT=default bash scripts/verify-helm.sh           # chart 渲染 + dry-run + helm-unittest
@@ -142,10 +132,9 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
-### 步驟 9：跑 Phase 6 M8 evaluation（離線模擬 + 出圖）
+## 9. 執行 Phase 6 M8 evaluation（離線模擬 + 出圖）
 
-論文 evaluation 章節的 7 張圖跟主表，純跑在離線 simulator 上，**不需要 cluster
-跑著**。約 5 分鐘出齊全部 raw data + figures。
+論文 evaluation 章節的 7 張圖跟主表，純跑在離線模擬器上，不需要 cluster 跑著。約 5 分鐘出齊全部 raw data + figures。
 
 ```bash
 # 一次性：venv + 依賴
@@ -173,11 +162,11 @@ bash eval/scripts/run_e7_live.sh vendor
 比 Slurm vendor multifactor 多砍 28.6%）。`eval/results/` 已 gitignore，
 重跑 `run_all.sh` 會重產。
 
-### 清理環境
+## 🗑️ 清理環境
 
 ```bash
 helm uninstall slurm-platform -n slurm
-helm uninstall gpu-operator   -n gpu-operator     # 保險，install-gpu-operator.sh 也是 helm release
+helm uninstall gpu-operator   -n gpu-operator
 kubectl delete -f manifests/core/slurm-accounting.yaml
 kubectl delete namespace slurm gpu-operator monitoring nfs-provisioner
 # 主機層
@@ -189,61 +178,12 @@ sudo systemctl stop nfs-kernel-server
 
 ---
 
-## B. Kind（本機開發模擬）
-
-> 環境需求：Docker Desktop + kind + kubectl + helm v3.16+
-
-### 快速部署
-
-```bash
-# 1. 建立 Kind 叢集
-kind create cluster --name slurm-lab
-
-# 2. 建 image 並 load 進 Kind
-docker build -t slurm-controller:latest       -f docker/controller/Dockerfile docker/controller
-docker build -t slurm-worker:latest           -f docker/worker/Dockerfile     docker/worker
-docker build -t slurm-elastic-operator:latest -f docker/operator/Dockerfile   .
-for img in slurm-controller:latest slurm-worker:latest slurm-elastic-operator:latest; do
-  kind load docker-image "$img" --name slurm-lab
-done
-
-# 3. secrets + accounting prerequisite
-bash scripts/create-secrets.sh
-kubectl apply -f manifests/core/slurm-accounting.yaml
-
-# 4. helm install（預設 values.yaml = Kind baseline，無 GPU、無監控、無 NFS）
-helm install slurm-platform ./chart -n slurm --create-namespace
-
-# 5. verify
-bash scripts/verify-helm.sh
-bash scripts/verify.sh
-```
-
-預設 values 把 `gpu.enabled` / `monitoring.enabled` / `storage.enabled` 都關掉，純驗證排程邏輯。
-
-要在 Kind 上開監控：`helm upgrade slurm-platform ./chart -n slurm --set monitoring.enabled=true`。
-
-### 清理環境
-
-```bash
-helm uninstall slurm-platform -n slurm
-kubectl delete -f manifests/core/slurm-accounting.yaml
-kind delete cluster --name slurm-lab
-```
-
----
-
-## 通用步驟（兩種路徑都適用）
-
 ## 部署監控
 
 `monitoring.enabled=true`（k3s overlay 預設打開，Kind baseline 預設關閉）。
 
 ```bash
-# Kind 上事後打開：
-helm upgrade slurm-platform ./chart -n slurm --set monitoring.enabled=true
-
-# 存取 Grafana（admin / admin）
+# 存取 Grafana
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 # 驗證 Prometheus 抓得到 slurm-exporter / operator / kube-state-metrics
@@ -320,8 +260,6 @@ bash scripts/verify-lmod.sh
 
 ---
 
----
-
 # 🏗️ System Architecture
 
 用一句話說：你提交一個 Slurm job，系統自動把需要的節點準備好，跑完之後再把資源還回去。
@@ -344,47 +282,10 @@ bash scripts/verify-lmod.sh
 
 ## 系統架構
 
-```mermaid
-graph TD
-    User["使用者\n(sbatch / srun)"] --> Login["Login Pod"]
-    Login --> SlurmCtld["Slurm Controller\n(StatefulSet)"]
-
-    subgraph "Kubernetes Cluster (Kind)"
-        SlurmCtld
-        Operator["Elastic Operator\n(Python)"]
-
-        subgraph "Worker Pools（動態伸縮）"
-            CPU["slurm-worker-cpu\n(min=1, max=4)"]
-            A10["slurm-worker-gpu-a10\n(min=0, max=4)"]
-            H100["slurm-worker-gpu-h100\n(min=0, max=4)"]
-        end
-
-        NFS["共享儲存 /shared\n(NFS + RWX PVC)"]
-        StatePVC["slurmctld state PVC\n(job queue 持久化)"]
-        slurmdbd["slurmdbd\n(會計 daemon)"]
-        MySQL["MySQL\n(會計資料庫)"]
-    end
-
-    Operator -->|"監聽 Queue\n決定 replicas"| SlurmCtld
-    Operator -->|"drain → 等待 → patch"| CPU
-    Operator -->|"drain → 等待 → patch"| A10
-    Operator -->|"drain → 等待 → patch"| H100
-    CPU & A10 & H100 -->|掛載| NFS
-    Login -->|讀取輸出| NFS
-    SlurmCtld -->|"/var/spool/slurmctld"| StatePVC
-    SlurmCtld -->|"job 會計資料"| slurmdbd
-    slurmdbd -->|"儲存"| MySQL
-
-    style Operator fill:#f9f,stroke:#333,stroke-width:2px
-    style SlurmCtld fill:#bbf,stroke:#333,stroke-width:2px
-    style NFS fill:#bfb,stroke:#333,stroke-width:2px
-```
-
-
 <img width="4400" height="2280" alt="圖片" src="https://github.com/user-attachments/assets/5d27ca15-525c-4936-a447-252a8a081934" />
 
 
-> 最新架構圖請看 [`architecture.html`](assets/architecture.html)
+> 完整架構圖請看 [`architecture.html`](assets/architecture.html)
 
 ### 主要元件說明
 
@@ -410,53 +311,9 @@ graph TD
 | 2-E：雙網路拓撲 | ✅ MVP 完成 | 透過 Multus 增加第二張網卡（`net2`），DDP collective traffic（NCCL/Gloo）走獨立網路 |
 | 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出；多節點 E2E 驗證通過（含 slurmctld IP cache 修正） |
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
-| 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合至 Phase 1（images + modulefile ConfigMap + `--with-lmod` render）、`/shared/jobs/` 路徑、Worker preStop Hook；**Helm chart cutover**（`chart/`，monolithic + values overlay，Stage A–F 全部完成；`render-core.py` / `bootstrap*.sh` / `manifests/core/*.yaml` 廢棄；`chart/tests/` 28 條 helm-unittest 案例覆蓋 slurm.conf / workers / operator / gpu / monitoring / storage / login）|
+| 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合、`/shared/jobs/` 路徑、Worker preStop Hook；Helm chart |
 | 6：自訂 Slurm 排程 | ✅ M1-M8 完成 | Score-based scheduling、runtime predictor、fragmentation requeue、trace replay simulator 與 evaluation 已落地；進階排程功能預設仍以 Helm flag 關閉，需按環境逐項啟用 |
 | 7：分散式追蹤 + SSH Login | 📋 規劃中 | OpenTelemetry job lifecycle trace（Tempo + Operator span + Prometheus exemplar）；Login pod 開放 SSH NodePort 取代 `kubectl exec` |
-
----
-
-## 提交一個 Job 長什麼樣子？
-
-部署完成後，你可以直接 `kubectl exec` 進 login pod 提交任務：
-
-```bash
-kubectl -n slurm exec -it deploy/slurm-login -- bash
-```
-
-寫一個簡單的 job script：
-
-```bash
-cat > /shared/my-job.sbatch << 'EOF'
-#!/bin/bash
-#SBATCH -J my-first-job
-#SBATCH -p cpu
-#SBATCH -N 1
-#SBATCH --cpus-per-task=2
-#SBATCH -o /shared/out-%j.txt
-#SBATCH -e /shared/err-%j.txt
-
-echo "Hello from $(hostname)"
-echo "I have $SLURM_CPUS_ON_NODE CPUs"
-sleep 10
-EOF
-
-sbatch /shared/my-job.sbatch
-```
-
-提交後查看狀態，等任務完成再讀取輸出：
-
-```bash
-squeue                          # 查看 queue
-cat /shared/out-<JOBID>.txt     # 讀取輸出（從任何 pod 都能讀）
-```
-
-GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應的 GPU worker 擴充起來：
-
-```bash
-#SBATCH --constraint=gpu-a10
-#SBATCH --gres=gpu:a10:1
-```
 
 ---
 
@@ -467,9 +324,6 @@ GPU 任務只需加上 `--constraint` 或 `--gres`，Operator 會自動把對應
 ```bash
 # 查看所有 pod 狀態
 kubectl -n slurm get pods -o wide
-
-# 觀察 worker pool 伸縮
-kubectl -n slurm get statefulset -w
 
 # 查看 Operator 決策日誌（結構化 JSON）
 kubectl -n slurm logs deployment/slurm-elastic-operator -f | python3 -m json.tool
@@ -492,30 +346,6 @@ kubectl -n slurm get pods -l app=mysql
 kubectl -n slurm exec -it deploy/slurm-login -- bash
 ```
 
-## Monitoring
-
-```bash
-# 開啟 Grafana（admin / admin）
-kubectl -n monitoring port-forward svc/grafana 3000:3000
-
-# 開啟 Prometheus（raw metrics / 查詢）
-kubectl -n monitoring port-forward svc/prometheus 9090:9090
-
-# 直接確認 operator 是否正在輸出 metrics
-kubectl -n slurm port-forward svc/slurm-elastic-operator 8000:8000
-# → curl http://localhost:8000/metrics | grep slurm_operator
-
-# 直接確認 slurm-exporter 是否正在輸出 metrics
-kubectl -n slurm port-forward svc/slurm-exporter 9341:9341
-# → curl http://localhost:9341/metrics | grep slurm_queue
-
-# 查看所有監控元件狀態
-kubectl -n monitoring get pods -o wide
-
-# 查看 slurm-exporter 日誌（確認是否能連到 slurmrestd）
-kubectl -n slurm logs deployment/slurm-exporter --tail=30
-```
-
 ---
 
 # 📊 Evaluation Metrics
@@ -533,14 +363,14 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 | 類別 | 工具 |
 |------|------|
-| 環境 | Ubuntu 24.04 + k3s（生產）／Windows 11 + Docker Desktop + Kind（本機開發） |
+| 環境 | Ubuntu 24.04 + k3s |
 | 容器編排 | Kubernetes |
 | HPC 排程器 | Slurm (slurmctld + slurmd)，MpiDefault=pmi2 |
 | 節點認證 | Munge |
 | Elastic Operator | Python 3.11 + Slurm REST API (slurmrestd) + Kubernetes Python SDK |
 | 會計後端 | slurmdbd + MySQL 8.0（job CPU-hours / 使用者統計 / Fair-Share 前置）|
 | 共享儲存 | NFS + nfs-subdir-external-provisioner + RWX PVC |
-| DDP 網路 | Multus CNI + secondary NIC (net2) |
+| 網路介面 | Multus CNI + secondary NIC (net2) |
 | MPI | OpenMPI 4.1.2 + Slurm PMI2 整合 |
 | 模組系統 | Lmod 6.6；modulefile 以 K8s ConfigMap 管理，掛載至 `/opt/modulefiles/` |
 | 監控 | Prometheus + Grafana + slurm-exporter + kube-state-metrics + Alertmanager |
@@ -552,22 +382,6 @@ kubectl -n slurm logs deployment/slurm-exporter --tail=30
 
 > Phase 5 已完成（Lmod + Helm chart cutover）；Phase 6 的 score-based scheduling 主線已完成到 M8 evaluation。下一步重點是 Phase 7 補齊使用者體驗（端到端 trace + SSH Login），以及把 Phase 6 的 live-cluster E7 驗證與 production rollout policy 補完。
 > 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為更後期擴充方向。
-
-## Phase 5：Lmod + Helm 封裝 ✅ 完成
-
-- **Lmod**：modulefile 以 ConfigMap 管理，掛載至 worker `/opt/modulefiles/`，sbatch 內 `module load` 開機即可用。
-- **Helm chart cutover（`chart/`）**：`worker-pools.json` + `render-core.py` 全部由 `values.yaml` + `_helpers.tpl` 取代；slurm.conf 拆 `slurm-config-static` / `slurm-config-nodes` 兩個 ConfigMap，pool 變動只 rolling 受影響的 StatefulSet。Monitoring / storage / GPU 用 `enabled` flag 控制；GPU Operator 仍走獨立安裝（PSS 隔離理由見 `docs/note.md §5-A 修訂版 3`）。
-- **驗證**：`chart/tests/` 28 條 helm-unittest + `verify-helm.sh` k3s server-side dry-run 全綠；廢棄的 12 個 legacy 檔案已移除。
-
-```bash
-# k3s + 真實 GPU + MPS
-helm install slurm-platform ./chart -f chart/values-k3s.yaml
-
-# Kind 本機開發（無 GPU）
-helm install slurm-platform ./chart -f chart/values-dev.yaml
-```
-
-詳細設計見 [`docs/note.md §5-A`](docs/note.md)。
 
 ## Phase 6：自訂 Slurm 排程策略 ✅ M1-M8 完成
 

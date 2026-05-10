@@ -1,7 +1,7 @@
 # Development Notes
 
 1. [採坑紀錄](#debug-record)
-2. 開發規劃：[監控系統](#phase-4-plan已完成)、[階段五計畫](#phase-5-plan)
+2. 開發規劃：[階段五計畫](#phase-5-plan--完成)、[階段六計畫](#phase-6-plan)、[階段五計畫](#phase-7-plan)
 3. [工作和硬體資源的分配關係](#工作和硬體資源的分配關係)
 4. [GPU MPS 完整實作指南](#gpu-mps-完整實作指南)
 5. [參考資料](#-參考來源)
@@ -391,49 +391,15 @@ shadow=true  target_jobs=["85"]  unblocks=["86"]  requeued_jobs=[]
 
 ---
 
-# Phase 4 Plan（已完成）
-
-## Prometheus + Grafana 監控
-
-詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
-
-| 來源 | 取得方式 | 關鍵指標 |
-|------|---------|---------|
-| slurm-exporter | scrape slurmrestd（REST API） | queue_pending, nodes_idle, nodes_alloc |
-| kube-state-metrics | K8s 原生 | StatefulSet replicas, Pod ready |
-| operator 自定義 | prometheus_client HTTP server（port 8000） | scale_up/down_total, guard_blocks, poll_duration |
-
-已經部署 Prometheus + Grafana + slurm-exporter + kube-state-metrics。Grafana 提供三個看板：
-- **Bridge Overview**：視覺化 Slurm queue depth 與 K8s StatefulSet replicas 的聯動關係
-- **Slurm Cluster State**：node states 圓餅圖、各 partition queue depth 時序
-- **K8s Operator**：scale event timeline、poll duration histogram、guard block 計數
-
-部署指令：`bash scripts/bootstrap-monitoring.sh`  
-驗證指令：`bash scripts/verify-monitoring.sh`
-
----
-
 # Phase 5 Plan ✅ 完成
 
-> **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 **Phase 7**。
+> **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 Phase 7。
 >
 > 本節以下保留 5-A 的設計與決策記錄，作為 chart 結構的歷史脈絡；活躍的下一階段請看 [`# Phase 6 Plan`](#phase-6-plan) 與 [`# Phase 7 Plan`](#phase-7-plan)。
 
 ---
 
 ## 5-A：Helm Chart 封裝
-
-> **修訂版 5（2026-04-29，Stage F 完成 — Phase 5-A 收尾）：** 真實環境驗證通過後，正式 cutover 到 helm。本表「廢棄的檔案」段所列的 12 個檔案全部移除（`scripts/{render-core.py,bootstrap.sh,bootstrap-gpu.sh,bootstrap-monitoring.sh}`、`manifests/core/{slurm-static.yaml,worker-pools.json,slurm-ddp-runtime.yaml}`、`manifests/gpu/{nvidia-device-plugin.yaml,mps-daemonset.yaml}`）；`scripts/{bootstrap-storage.sh,bootstrap-lmod.sh}` 與 `manifests/core/lmod-modulefiles.yaml` 不在原始廢棄表內因此保留。`verify-helm.sh` 移除 legacy parity diff 區段（`manifests/core/slurm-static.yaml` 已不存在）。`chart/tests/` 加入 6 個 `*_test.yaml` 共 28 條 helm-unittest 案例，覆蓋 slurm.conf / workers / operator / gpu / monitoring / storage。README 的「🚀 Getting Started」整段重寫為 helm install 流程；`manifests/core/slurm-accounting.yaml`（mysql + slurmdbd）標註為 chart 之外的 prerequisite。
->
-> **修訂版 4（2026-04-29，Stage E 完成）：** monitoring + storage 進 chart，`enabled` flag 控制。Monitoring stack（Prometheus / Alertmanager / Grafana / kube-state-metrics + slurm-exporter）拆到 `templates/monitoring/`；Grafana dashboards 從 `chart/dashboards/*.json` 用 `Files.Glob.AsConfig` 灌進 ConfigMap。Storage stack（NFS subdir external provisioner + StorageClass + RWX PVC）放在 `templates/storage.yaml`，`storage.enabled=true` 但缺 `nfsServer` 直接 `fail` 終止 render；`storageClassName` 與 `provisionerName` 跟 legacy `manifests/storage/*.yaml` 完全一致（provisioner 名 `k8s-sigs.io/slurm-nfs-subdir-external-provisioner` 是 immutable，必須對齊現有 cluster）。Cross-namespace 流量由 `network-policy.yaml` 在 `monitoring.enabled=true` 時額外加三條：`allow-prometheus-scrape-operator`、`allow-prometheus-scrape-exporter`、`allow-slurm-exporter-egress`。verify-helm.sh 加 14 條 Stage E spot-checks；k3s 1.34 server-side dry-run validate 75 個 resources（default 38 個）全綠。
->
-> **修訂版 3（2026-04-28，Stage D 中）：** 嘗試把 `gpu-operator` 加成 chart dependency 後發現它把所有 DaemonSet hardcode 在 `Release.Namespace`（沒有 namespaceOverride 機制），且需要該 namespace PSS=`privileged` 才能 mount hostPath（`/dev/nvidia*`、`/run/nvidia/mps`、driver libs）。我們的 slurm namespace 走 PSS=`baseline`（NetworkPolicy + secret projection 都依賴此），兩者放同一個 namespace 不乾淨——dropping 到 privileged 會放鬆 slurm pod 的整體安全姿態。
->
-> **改採分離安裝**：`gpu-operator` 不再是 subchart，由 `scripts/install-gpu-operator.sh` 獨立 `helm install` 到自己的 `gpu-operator` namespace（PSS=privileged）。本 chart 只負責放 `device-plugin-config` ConfigMap 進該 namespace + cluster-wide 的 node-labeler Job。`Chart.yaml` 移除 dependencies block；`charts/`、`Chart.lock`、`*.tgz` 都不進 git。部署流程從「一條 helm install」變成「一條 setup-linux-gpu.sh + 一條 install-gpu-operator.sh + 一條 helm install slurm-platform」。
->
-> **修訂版 2（2026-04-28）：** Linux+k3s+RTX4070 路徑驗證後（commit `3eec54f`），確認 `nvidia-device-plugin` 內建 `sharing.mps` 在 v0.15–v0.17.x 全系列因 upstream `cmd.Exec("nvidia-cuda-mps-control", "-d")` daemonize spawn race 而無法啟動（見 [`docs/migration.md`](migration.md)）。本版改為以 GPU Operator 為 GPU 子系統的目標方案——它把 MPS daemon 拆成獨立 `mps-control-daemon` DaemonSet 用前景模式跑，繞過 spawn race。〔修訂版 3 把它從 dependency 改成獨立安裝。〕
->
-> **修訂版 1（2026-04-27）：** 本節原稿寫於 N1 / N7 修復前，`mps.enabled` flag、`partition: debug`、rtx4080 `devicePath: /dev/nvidia1` 已隨 `mps-migration` 分支上線而過時。先對齊：sharing.mps（N1 / N10）、三 partition 拆分（N7）、`/dev/nvidia0` 一律（N2）、`AccountingStorageTRES`（N6）、namespace PSS=baseline（N9）、k3s `ctr images import`（N4）、NetworkPolicy 6443（N5）。
 
 ### 設計方向
 
