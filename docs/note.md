@@ -1,7 +1,7 @@
 # Development Notes
 
 1. [採坑紀錄](#debug-record)
-2. 開發規劃：[階段五計畫](#phase-5-plan--完成)、[階段六計畫](#phase-6-plan)、[階段五計畫](#phase-7-plan)
+2. 開發規劃：[階段五計畫](#phase-5-plan--完成)、[階段六計畫](#phase-6-plan)、[階段七計畫](#phase-7-plan)
 3. [工作和硬體資源的分配關係](#工作和硬體資源的分配關係)
 4. [GPU MPS 完整實作指南](#gpu-mps-完整實作指南)
 5. [參考資料](#-參考來源)
@@ -421,6 +421,80 @@ M8 完成時主表寫 E5（M7 fragmentation）mean JCT = 2.621h，vs E2 multifac
 - 第一次跑 SEEDS="42 43" SYNTH_JOBS=200 smoke 結果所有 exp 完全相同 — 因為 200 jobs × 16 GPU × 100 MPS = 1600 slots，util 只有 0.20，沒有 contention 讓 scheduler 表現差異。換回 1000 jobs 後立即看到 paired CIs。
 - E5b 是新增的 control：原本只想用來算 ckpt cost 占比，意外發現「即使 ckpt cost = 0，M7 仍比 E4 差 22%」— 證明問題本質不在 reload cost 而在 lost progress（victim 整段重跑）。這給 future work 一個明確方向：改 preempt+suspend，保留 GPU memory state。
 - 寫進 paired-diff 的時候因 Student-t 表只到 n=10，n=5 用 2.776；後面如果加到 10 seeds 要記得查表或直接用 scipy。
+
+## 問題 16：E7 live cluster 兩 pass 之間，叢集會卡進無法自己復原的死結
+
+**症狀（2026-05-11）：**
+E7 要在實機跑 vendor (multifactor) vs our (M3 score) 兩 pass。每次切換 `slurm.jobSubmit.enabled` 都要 `helm upgrade`、controller 會 rolling restart。重啟的副作用拖到後續 pass：worker 拿不到 slurmctld 心跳、in-flight job 卡 COMPLETING 不釋放、operator 看到 ghost job 不肯 scale up、squeue 全部 PENDING 寫著 `ReqNodeNotAvail, UnavailableNodes:slurm-worker-gpu-rtx4070-[0-1]`。整個 cluster 進入「pod 都沒了但 Slurm 認為還有 job 在跑」的死結，drain 永遠等不到 0。
+
+這不是單一 bug，是好幾個元件的設計交互。本節按照「踩到順序 + 修法 + 哪一層的責任」記錄。
+
+### 16.1 helm post-upgrade hook 失敗，整次 upgrade 被當失敗
+
+- 觸發：`helm upgrade slurm-platform ...` 任何一次。
+- 表象：`Error: UPGRADE FAILED: post-upgrade hooks failed: job slurm-platform-gpu-labeler failed: BackoffLimitExceeded`。chart 本體的資源其實 *已經* 套上去了（controller 真的有重啟、values 真的有變），但 helm 把 release 標 FAILED，下次 `helm get values` 跟 status 都不可信。
+- 根因：gpu-labeler 是 one-shot job，只在「第一次 install」需要跑（給 GPU 節點貼 `nvidia.com/device-plugin.config` label），它的 RBAC 用 `kubectl label` 但有時 backoff retry 限制太小。每次 upgrade 都重跑 = 每次都可能撞 backoff。
+- 修法：`helm upgrade --no-hooks ...`。GPU label 已經貼好了，不需要重跑。
+- 責任層：chart。長線可以把這個 hook 改成 `helm.sh/hook: post-install` 而不是 `post-upgrade`，或加 idempotency guard。
+
+### 16.2 controller restart → workers NOT_RESPONDING → in-flight jobs 卡 COMPLETING
+
+- 觸發：`kubectl rollout restart sts/slurm-controller` 或 helm upgrade 觸發的 controller 重建。
+- 表象：sinfo 看到 `slurm-worker-gpu-rtx4070-0 idle*` 或 `completing*`，`*` 是 NOT_RESPONDING。`scontrol show node` 上 `State=IDLE+COMPLETING+NOT_RESPONDING`。已經跑到一半的 job 永遠停在 COMPLETING、squeue 不會掉。
+- 根因：slurmctld 重啟後 in-memory state 重建，但 slurmd 還停留在「上一個 controller 連線」。心跳 timeout 後 controller 把 node 標 NOT_RESPONDING，但 in-flight job 的 epilog 還沒被確認，於是 job 永遠 COMPLETING。
+- 修法 A（短期）：`scontrol update NodeName=... State=DOWN` 再 `State=RESUME`，強制 controller 把 node 狀態重置，這會清掉 stuck completing。
+- 修法 B（更徹底）：直接 `kubectl delete pod slurm-controller-0`，讓 slurmctld 從 state save 檔重建。這個動作意外地比上面溫和——重建後 controller 會 re-read state、跟 slurmd 重新 handshake，stuck COMPLETING 全部清掉。
+- 責任層：Slurm 21.08 / 部署設計。Slurm 本來預期 slurmctld 重啟是稀有事件；K8s 把它變家常便飯，但 chart 沒處理過渡期。
+
+### 16.3 Operator scale-down 把 ghost job 當 running，永遠 keep replicas=0
+
+- 觸發：上面 16.2 的 stuck COMPLETING job 持續存在。
+- 表象：operator log 重複出現
+  `"event_type": "scale_skipped", "from_replicas": 0, "to_replicas": 0, "reason": "no_pending_jobs", "pending_jobs": 0, "running_jobs": 1`
+  Job 1 是 ghost、pod 已經沒了，但 operator 從 slurmrestd 看到的 job state 仍是 RUNNING / COMPLETING。它的 policy 是「只看 pending」、看到 0 pending 就不 scale up。於是新提交的 job 都 PENDING (ReqNodeNotAvail)、又因為 0 pending（前面那 1 個 ghost running）所以 scale up 不會發生。死結。
+- 修法：人手做 16.2 修法 B（delete controller pod）清掉 ghost job 之後，operator 才會看到正確狀態。
+- 責任層：operator policy。建議加一個 detector：「running_jobs > 0 但 sts replicas = 0 且 pod = 0」是不一致狀態，要 escalate（例如 log warning + 強制 scale up 至少 1 個 pod 來吸收 ghost 或讓 epilog 跑完）。
+
+### 16.4 AllocTRES zombie：MPS slot 沒被釋放
+
+- 觸發：一個 mps:100 job 結束（或被 scancel）但 slurmd 還沒對 controller 報完 epilog 就被中斷。
+- 表象：`scontrol show node slurm-worker-gpu-rtx4070-1` 顯示 `State=IDLE` 但 `AllocTRES=gres/mps=50`。下一個需要 mps:100 的 job 看到 50 slot 已分配、顯示 `Pending (Resources)`，但實際上沒有任何 job 在跑。
+- 修法：`scontrol reconfigure` 會強制 controller 重新從 slurmd 收集 TRES，AllocTRES 清空、blocked job 立刻 dispatch。**注意 reconfigure 本身會 timeout（`slurm_reconfigure error: Socket timed out`）但其實有生效，可以忽略錯誤訊息。**
+- 責任層：Slurm 21.08 bug。GRES（特別是 MPS）的 accounting 跟 job state machine 沒完全同步，在快速 churn 或 slurmd 不穩時會殘留。21.08 之後（22.05+）的 release notes 有提到類似 fix，升級可以解決。
+
+### 16.5 sacct 從 login pod 連 slurmdbd 失敗、但 controller pod OK
+
+- 表象：`kubectl -n slurm exec deploy/slurm-login -- sacct ...` 回 `slurm_persist_conn_open_without_init: failed to open persistent connection to host:slurmdbd.slurm.svc.cluster.local:6819: Connection refused`。同時間從 controller pod 跑 sacct 完全正常。
+- 根因：slurmdbd 重啟後（之前的 controller cascade restart 觸發），login pod 的 munge auth socket 跟 slurmdbd 之間的 persistent connection 失效，但 sacct 沒重連邏輯，直接報錯。controller pod 因為 munge 跟 slurmctld 共享 socket，路徑不同所以沒受影響。
+- 修法：所有 sacct dump 改從 controller pod 跑（已 patch 進 `eval/scripts/e7_one_pass.sh::dump_sacct`）。
+- 責任層：slurm 21.08 + chart 部署。可能是 NetworkPolicy 沒對 login pod 完整放行 slurmdbd，或 munge ConfigMap mount 在 login 跟 controller 上有微差。沒深追。
+
+### 16.6 GPU pool 兩個 worker pod 共享同一塊實體卡
+
+- 表象：sts `slurm-worker-gpu-rtx4070` replicas = 2，但實機只有 1 張 RTX 4070。兩個 pod 都拿到 `nvidia.com/gpu: 1` resource、都 1/1 Running。
+- 根因：NVIDIA device plugin 配 `replicas: 2` 的 time-slicing，把一塊實體 GPU 切成 2 個 logical device 給 K8s 排程。Slurm 看到 2 個 GPU node、配置 200 mps slot；實際上兩個 pod 共用 SM、context-switch 由 NVIDIA driver 負責。
+- 影響：一個 pod 跑爆 GPU 時，另一個 pod 的 job 也會變慢（共享 SM）。Slurm 排程把 200 slot 當獨立資源 schedule，但實際吞吐量是 100 slot 等級。對 E7 的影響：vendor pass 跟 our pass 的 wall-clock 都受同樣的共享 cost 影響，paired diff 還算 fair，但絕對吞吐量比 sim 預測的差一倍。
+- 修法：沒修。這是 chart `values-k3s.yaml::pools.gpu-rtx4070.replicas: 2` + device plugin time-slicing 設計給的能力。要拿到乾淨的單卡 baseline 得改 `replicas: 1`。
+
+### 16.7 死結復原 SOP（給下次踩到的人）
+
+按順序試，能停就停：
+
+1. `sudo kubectl -n slurm exec deploy/slurm-login -- scancel --user=root`（清掉所有 pending）
+2. `sudo kubectl -n slurm exec slurm-controller-0 -- scontrol update NodeName=slurm-worker-gpu-rtx4070-[0-1] State=DOWN Reason=reset; sleep 2; scontrol update NodeName=... State=RESUME`
+3. 還沒救：`sudo kubectl -n slurm delete pod slurm-controller-0`（slurmctld 重啟，stuck COMPLETING 會清掉）
+4. 等 controller Ready、`sinfo` 不再出現 `*` 跟 `down/drain` 才能送新 job
+5. 送 job 後檢查 `scontrol show node ... | grep AllocTRES`，若有殘留 mps slot 但實際沒 job 在跑，`scontrol reconfigure`（忽略 timeout 訊息）
+
+### 16.8 對 operator 設計的建議
+
+E7 兩次撞死結之後，我認為 operator 有一個值得加的功能：**inconsistency detector**。loop 內如果同時看到：
+- `current_replicas == 0`（pod 不存在）
+- `running_jobs > 0`（slurmrestd 報有 job 在跑）
+
+代表那些 running job 是 ghost，應該 emit 一個 `ghost_jobs_detected` warning event。可以選擇 (a) escalate 給 human、(b) 強制 scale up 1 個 pod 來吸收 epilog 收尾、(c) 自動觸發 `scontrol update State=DOWN/RESUME`。
+
+這不在當前 Phase 6 scope，但留作 future operator hardening 的方向。
 
 ---
 
