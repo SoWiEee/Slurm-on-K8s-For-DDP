@@ -41,6 +41,7 @@ def run(
     scheduler_kwargs=None,
     fragmentation: bool = False,
     fragmentation_priority_gap: float = 100.0,
+    ckpt_reload_cost: float = 0.0,
 ) -> Tuple[MetricCollector, Cluster]:
     """Run the trace through the simulator.
 
@@ -55,6 +56,13 @@ def run(
     scheduler = make_scheduler(scheduler_name, **(scheduler_kwargs or {}))
     metrics = MetricCollector()
     requeue_count = 0
+    requeue_cost_total = 0.0
+    # extra wall-clock charged to a job because it was requeued under
+    # fragmentation: each kick adds `ckpt_reload_cost` to its next end_ts.
+    # This represents checkpoint reload + CUDA-context warmup; lost
+    # progress is already accounted for separately (the runner restarts
+    # the victim from scratch on re-allocate).
+    cost_pending: dict = {}
 
     pending: List[Job] = []
     by_id = {j.job_id: j for j in jobs}
@@ -86,7 +94,7 @@ def run(
             if cluster.try_allocate(j) is not None:
                 pending.remove(j)
                 metrics.record_start(j.job_id, now)
-                end_ts = now + j.runtime
+                end_ts = now + j.runtime + cost_pending.pop(j.job_id, 0.0)
                 heapq.heappush(events, (end_ts, seq, "end", j.job_id))
                 # remember per-job priority so the fragmentation reconciler
                 # can compare victims fairly (it can't re-call _priority on
@@ -108,7 +116,7 @@ def run(
         scheduler's own priority bookkeeping (a victim that just got
         kicked has the freshest submit_ts and won't be the head).
         """
-        nonlocal requeue_count, seq
+        nonlocal requeue_count, requeue_cost_total, seq
         if not fragmentation or not pending:
             return
         ordered = scheduler.order(pending, cluster, now)
@@ -135,18 +143,25 @@ def run(
                 if kind == "end" and payload == jid:
                     events[i] = (events[i][0], events[i][1], "_cancelled", payload)
                     break
-            # re-submit victim at `now` (loses any progress — Gandiva-lite
-            # assumes resume from checkpoint, so this is the conservative
-            # upper-bound on cost)
+            # Re-submit victim at `now`. The runner restarts the job from
+            # scratch (loses all progress) — this is the conservative
+            # upper bound on lost work. Additionally charge `ckpt_reload_cost`
+            # on the next start to model checkpoint reload + warmup.
+            # NOTE: we deliberately preserve metrics.records[jid].submit_ts
+            # so JCT counts from the *original* submit, not the requeue
+            # time. The scheduler sees vj.submit_ts=now so fairness/age
+            # bookkeeping resets correctly.
             old = by_id[jid]
             vj = dataclasses.replace(old, submit_ts=now)
             by_id[jid] = vj
-            metrics.records[jid].submit_ts = now
             metrics.records[jid].start_ts = None
             metrics.records[jid].end_ts = None
             pending.append(vj)
             requeue_attempts[jid] = requeue_attempts.get(jid, 0) + 1
             requeue_count += 1
+            if ckpt_reload_cost > 0:
+                cost_pending[jid] = cost_pending.get(jid, 0.0) + ckpt_reload_cost
+                requeue_cost_total += ckpt_reload_cost
             if cluster.can_allocate(head):
                 return
 
@@ -169,6 +184,7 @@ def run(
 
     metrics.sample_util(now, cluster.utilization())
     metrics.requeue_count = requeue_count
+    metrics.requeue_cost_total = requeue_cost_total
     return metrics, cluster
 
 
@@ -191,6 +207,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary-json", help="write summary dict as JSON to this path")
     p.add_argument("--fragmentation", action="store_true",
                    help="enable M7-style fragmentation requeue reconciler")
+    p.add_argument("--ckpt-reload-cost", type=float, default=0.0,
+                   help="seconds charged per requeue for checkpoint reload "
+                        "+ warmup (additive to lost-progress cost; only "
+                        "applies when --fragmentation is set)")
     p.add_argument("--alpha", type=float, default=None)
     p.add_argument("--beta", type=float, default=None)
     p.add_argument("--delta", type=float, default=None)
@@ -227,6 +247,7 @@ def main(argv=None) -> int:
         mps_per_gpu=args.mps_per_gpu,
         scheduler_kwargs=sched_kwargs or None,
         fragmentation=args.fragmentation,
+        ckpt_reload_cost=args.ckpt_reload_cost,
     )
     wall = time.monotonic() - t0
 
@@ -236,7 +257,10 @@ def main(argv=None) -> int:
     summary["nodes"] = args.nodes
     summary["gpus_per_node"] = args.gpus_per_node
     summary["fragmentation"] = args.fragmentation
+    summary["ckpt_reload_cost"] = args.ckpt_reload_cost
     summary["requeue_count"] = getattr(metrics, "requeue_count", 0)
+    summary["requeue_cost_total"] = getattr(metrics, "requeue_cost_total", 0.0)
+    summary["synth_seed"] = args.synth_seed if args.synth_jobs > 0 else None
     summary.update({k: v for k, v in sched_kwargs.items()})
 
     if args.output:

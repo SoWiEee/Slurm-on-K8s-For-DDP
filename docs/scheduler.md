@@ -1120,24 +1120,37 @@ PRED_DEFAULT_GPU_TYPE = "rtx4070"
 - [x] 7 張圖出爐（CDF of JCT、box of slowdown、line of utilization over time）
 - [x] eval-writeup.md 約 8–12 頁、每張圖 1 段論述
 
-### 實驗結果（2026-05-07）
+### 實驗結果（2026-05-07，2026-05-11 修訂）
 
 M8 已產出 `eval/results/`、`eval/figures/fig{1..7}.{png,pdf}` 與
-`docs/eval-writeup.md`。主表摘要：
+`docs/eval-writeup.md`。
 
-| exp | 配置 | mean JCT | p90 JCT | util | bf_rate | requeues |
-|---|---|---:|---:|---:|---:|---:|
-| E1 | FCFS | 12.636 h | 19.171 h | 0.836 | 0.000 | 0 |
-| E2 | multifactor + backfill | 3.671 h | 9.715 h | 0.935 | 0.912 | 0 |
-| E3 | score (M3) | 3.647 h | 8.689 h | 0.926 | 0.941 | 0 |
-| E4 | score + predictor (M5) | 2.986 h | 6.575 h | 0.928 | 0.963 | 0 |
-| E5 | score + predictor + fragmentation (M7) | 2.621 h | 5.745 h | 0.940 | 0.945 | 1856 |
+**2026-05-11 修訂**：原始 M8 結果有兩個方法論問題已被修正——
+1. M7 fragmentation 在 sim 中 requeue victim 時把 `metrics.submit_ts` reset 成 `now`，
+   導致 JCT 只計算「重排隊之後」這段，**人為低估**了 victim JCT。
+2. 每組 exp 只有 1 個 deterministic sample，沒有 cross-seed variance。
 
-主要結論：vendor multifactor/backfill 已經比 FCFS mean JCT 改善 71%；M3
-score 本身主要改善 tail；M5 predictor 是最大單點收益；M7 fragmentation 再
-多降低 mean JCT 約 12%。E5 相對 E2 的 thesis claim 是 mean JCT 約 28.6%
-改善。限制是 E1-E6 都是 simulator，E5 requeue 未扣真實 checkpoint reload
-cost，E7 live-cluster 驗證仍待跑。
+修正後改為 5 seeds × 1000 jobs synthetic Philly-like trace + `--ckpt-reload-cost`
+（E5=60s, E5b=0s）。新主表：
+
+| exp | 配置 | jct_mean (h, mean±std) | paired vs prev exp | 結論 |
+|---|---|---:|---:|---|
+| E1 | FCFS | 15.78 ± 12.44 | — | baseline |
+| E2 | multifactor + backfill | 4.49 ± 2.60 | −72% vs E1 | vendor 已吃掉大部分 |
+| E3 | score (M3) | 4.71 ± 3.18 | +4.9% vs E2（noise） | 純 score 沒幫忙 |
+| E4 | + predictor (M5) | **3.43 ± 1.61** | **−20.1% vs E2 (95% CI ±12%)** | **statistically significant win** |
+| E5 | + fragmentation (M7), 60s ckpt | 4.55 ± 2.12 | **+33.1% vs E4 (95% CI ±5.2%)** | **regression** |
+| E5b | E5 但 ckpt cost=0 | 4.20 ± 1.70 | +22.5% vs E4 | 純 lost-progress 已足以讓 M7 net negative |
+
+**主要結論（修訂版）**：
+- M5 runtime predictor 是排程 quality 的最大實際推進力（paired −20% vs vendor，significant）。
+- M7 fragmentation 在這份 trace 是 **negative result**：victim 純按 priority 選會把已執行很久的 job 也踢掉，losts > gains。
+- 即使把 ckpt reload cost 設 0（E5b），M7 仍比 E4 差 22% — 問題不在 cost 而在 lost progress。
+- E5 vs E2 已不再是「−28.6% 改善」；paired 結果是 +6% 沒有 statistical significance。
+
+Future work for M7 救援方向：(1) victim selection 加「已執行時間 penalty」；
+(2) 只在 head 預估比 victim 剩餘時間短時觸發；(3) 改 preempt+suspend
+保留 GPU memory 取代 full requeue。詳見 `docs/eval-writeup.md` §4。
 
 ### 後續改進 / handoff 給 Claude Code
 

@@ -393,6 +393,37 @@ shadow=true  target_jobs=["85"]  unblocks=["86"]  requeued_jobs=[]
 
 # Phase 5 Plan ✅ 完成
 
+## 問題 15：M8 evaluation 主結論被「JCT 重設 bug」與「單一 seed」放大成假象
+
+**症狀（2026-05-11）：**
+M8 完成時主表寫 E5（M7 fragmentation）mean JCT = 2.621h，vs E2 multifactor 改善 28.6%。看起來是強烈正結果，準備寫進 thesis。實際上這個數字是兩個方法論問題疊在一起的 artefact。
+
+**根因：**
+1. `sim/runner.py::try_fragmentation_reconcile` 把 victim requeue 時做了 `metrics.records[jid].submit_ts = now`。Victim 的 JCT 公式是 `end_ts - submit_ts`，這行讓 JCT 只計算「最後一次重排隊到完成」的時間，**完全沒算原本排隊與重做的成本**。M7 越激進、被踢的 job 越多，這個低估就越大 — E5 的 1856 次 requeue 等於把 ~19% 的 jobs 的 JCT 重設過。
+2. E1..E5 各只跑一次 deterministic Philly subsample，沒有任何 cross-seed variance estimate。無法分辨「真改善」vs「sample artefact」。
+3. Sim 不收 checkpoint reload cost，1856 次 requeue 完全免費。
+
+**修法：**
+1. `try_fragmentation_reconcile` 刪掉那行 `submit_ts = now`（保留原始 submit_ts），只重設 `start_ts/end_ts`。`vj` 給 scheduler 看的 submit_ts 仍是 `now`（fairness 應該如此），但 metrics 看的是原始 submit。
+2. 新增 `--ckpt-reload-cost`（default 60s，僅 fragmentation 模式生效）；用 `cost_pending` dict 在下次 allocate 時把成本加進 end_ts。`metrics.requeue_cost_total` 報告整體開銷。
+3. `eval/scripts/run_all.sh` 改用 `SEEDS="42..46"` 跑 5 個 synthetic Philly-like traces（同 generator 不同 seed，per-seed 1000 jobs）。
+4. 新增 `eval/scripts/aggregate_seeds.py` 計算 mean ± std + Student-t 95% CI；`print_summary.py` 加 paired same-seed diff（CI 比 unpaired 緊一個量級）。
+
+**修正後的真結果：**
+| 比較 | Δ mean JCT | 95% CI | 顯著性 |
+|---|---:|---:|---|
+| E4 (predictor) vs E2 (vendor) | −20.1% | ±11.95% | ✅ significant |
+| E5 (M7) vs E4 (predictor) | **+33.1%** | ±5.22% | ❌ regression（significant） |
+| E5 vs E2 | +6.3% | ±15.42% | not significant |
+| E5b (no ckpt cost) vs E5 | −5.8% | ±8.83% | ckpt cost 僅佔 ~6% |
+
+**踩坑插曲：**
+- 第一次跑 SEEDS="42 43" SYNTH_JOBS=200 smoke 結果所有 exp 完全相同 — 因為 200 jobs × 16 GPU × 100 MPS = 1600 slots，util 只有 0.20，沒有 contention 讓 scheduler 表現差異。換回 1000 jobs 後立即看到 paired CIs。
+- E5b 是新增的 control：原本只想用來算 ckpt cost 占比，意外發現「即使 ckpt cost = 0，M7 仍比 E4 差 22%」— 證明問題本質不在 reload cost 而在 lost progress（victim 整段重跑）。這給 future work 一個明確方向：改 preempt+suspend，保留 GPU memory state。
+- 寫進 paired-diff 的時候因 Student-t 表只到 n=10，n=5 用 2.776；後面如果加到 10 seeds 要記得查表或直接用 scipy。
+
+---
+
 > **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 Phase 7。
 >
 > 本節以下保留 5-A 的設計與決策記錄，作為 chart 結構的歷史脈絡；活躍的下一階段請看 [`# Phase 6 Plan`](#phase-6-plan) 與 [`# Phase 7 Plan`](#phase-7-plan)。

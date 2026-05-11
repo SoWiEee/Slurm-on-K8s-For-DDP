@@ -29,24 +29,45 @@ RESULTS = os.path.join(ROOT, "eval", "results")
 FIGS = os.path.join(ROOT, "eval", "figures")
 os.makedirs(FIGS, exist_ok=True)
 
-EXP_ORDER = ["e1", "e2", "e3", "e4", "e5"]
+EXP_ORDER = ["e1", "e2", "e3", "e4", "e5", "e5b"]
 EXP_LABEL = {
     "e1": "E1 FCFS",
     "e2": "E2 multifactor",
     "e3": "E3 score (M3)",
     "e4": "E4 score+pred (M5)",
-    "e5": "E5 score+pred+frag (M7)",
+    "e5": "E5 +frag (ckpt cost)",
+    "e5b": "E5b +frag (no cost)",
 }
 
 
 def load_summary():
+    """Load per-seed flat summaries."""
     with open(os.path.join(RESULTS, "all_summaries.json")) as fh:
         return json.load(fh)
 
 
+def load_aggregated():
+    path = os.path.join(RESULTS, "agg_by_run.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
 def primary_run(summaries, exp):
-    """Pick the canonical run for an experiment (E1..E5 only have one)."""
+    """Pick a representative per-seed run for an experiment (for CSV plots).
+    Multi-seed data may have many — we use the lowest seed for determinism."""
     rows = [s for s in summaries if s["experiment"] == exp]
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda r: r.get("synth_seed") or 0)
+    return rows[0]
+
+
+def agg_for(agg, exp):
+    if not agg:
+        return None
+    rows = [s for s in agg if s["experiment"] == exp]
     return rows[0] if rows else None
 
 
@@ -62,26 +83,39 @@ def save(fig, name):
     print(f"  wrote eval/figures/{name}.{{png,pdf}}")
 
 
-def fig1_jct_bars(summaries):
+def fig1_jct_bars(summaries, agg):
+    """Mean/p90/p95 JCT bars with 95% CI error bars across seeds."""
     means, p90s, p95s, labels = [], [], [], []
+    err_mean, err_p90, err_p95 = [], [], []
     for exp in EXP_ORDER:
+        a = agg_for(agg, exp) if agg else None
         s = primary_run(summaries, exp)
-        if s is None:
+        if s is None and a is None:
             continue
         labels.append(EXP_LABEL[exp])
-        means.append(s["jct_mean"] / 3600.0)
-        p90s.append(s["jct_p90"] / 3600.0)
-        p95s.append(s["jct_p95"] / 3600.0)
+        if a is not None:
+            means.append(a["jct_mean_mean"] / 3600.0)
+            p90s.append(a["jct_p90_mean"] / 3600.0)
+            p95s.append(a["jct_p95_mean"] / 3600.0)
+            err_mean.append(a["jct_mean_ci95"] / 3600.0)
+            err_p90.append(a["jct_p90_ci95"] / 3600.0)
+            err_p95.append(a["jct_p95_ci95"] / 3600.0)
+        else:
+            means.append(s["jct_mean"] / 3600.0)
+            p90s.append(s["jct_p90"] / 3600.0)
+            p95s.append(s["jct_p95"] / 3600.0)
+            err_mean.append(0); err_p90.append(0); err_p95.append(0)
     x = np.arange(len(labels))
     w = 0.27
-    fig, ax = plt.subplots(figsize=(9.5, 4.5))
-    ax.bar(x - w, means, w, label="mean")
-    ax.bar(x, p90s, w, label="p90")
-    ax.bar(x + w, p95s, w, label="p95")
+    fig, ax = plt.subplots(figsize=(10.5, 4.8))
+    ax.bar(x - w, means, w, yerr=err_mean, capsize=3, label="mean")
+    ax.bar(x,     p90s,  w, yerr=err_p90,  capsize=3, label="p90")
+    ax.bar(x + w, p95s,  w, yerr=err_p95,  capsize=3, label="p95")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
     ax.set_ylabel("Job Completion Time (hours)")
-    ax.set_title("JCT — mean / p90 / p95 across schedulers")
+    n = (agg[0]["n_seeds"] if agg else 1)
+    ax.set_title(f"JCT — mean / p90 / p95 across schedulers (error bars = 95% CI, n={n} seeds)")
     ax.legend()
     ax.grid(axis="y", linestyle=":", alpha=0.6)
     save(fig, "fig1_jct_bars")
@@ -183,8 +217,12 @@ def fig4_util_time(summaries):
     save(fig, "fig4_util_time")
 
 
-def fig5_e6_heatmap(summaries):
-    rows = [s for s in summaries if s["experiment"] == "e6"]
+def fig5_e6_heatmap(summaries, agg):
+    rows = [s for s in (agg or []) if s["experiment"] == "e6"]
+    field_mean = "jct_mean_mean"
+    if not rows:
+        rows = [s for s in summaries if s["experiment"] == "e6"]
+        field_mean = "jct_mean"
     if not rows:
         return
     alphas = sorted({float(s["alpha"]) for s in rows})
@@ -193,7 +231,7 @@ def fig5_e6_heatmap(summaries):
     for s in rows:
         i = deltas.index(float(s["delta"]))
         j = alphas.index(float(s["alpha"]))
-        z[i, j] = s["jct_mean"] / 3600.0
+        z[i, j] = s[field_mean] / 3600.0
     fig, ax = plt.subplots(figsize=(6.5, 5))
     im = ax.imshow(z, origin="lower", cmap="viridis", aspect="auto")
     ax.set_xticks(range(len(alphas)))
@@ -211,15 +249,20 @@ def fig5_e6_heatmap(summaries):
     save(fig, "fig5_e6_heatmap")
 
 
-def fig6_bf_rate(summaries):
+def fig6_bf_rate(summaries, agg):
     labels, bf, requeues = [], [], []
     for exp in EXP_ORDER:
+        a = agg_for(agg, exp) if agg else None
         s = primary_run(summaries, exp)
-        if s is None:
+        if s is None and a is None:
             continue
         labels.append(EXP_LABEL[exp])
-        bf.append(s.get("bf_rate", 0.0))
-        requeues.append(s.get("requeue_count", 0))
+        if a is not None:
+            bf.append(a.get("bf_rate_mean", 0.0))
+            requeues.append(a.get("requeue_count_mean", 0))
+        else:
+            bf.append(s.get("bf_rate", 0.0))
+            requeues.append(s.get("requeue_count", 0))
     x = np.arange(len(labels))
     fig, ax1 = plt.subplots(figsize=(9, 4.5))
     ax1.bar(x - 0.18, bf, 0.36, color="C0", label="bf_rate")
@@ -236,26 +279,30 @@ def fig6_bf_rate(summaries):
     save(fig, "fig6_bf_rate")
 
 
-def fig7_jct_normalised(summaries):
-    base = primary_run(summaries, "e1")
-    if base is None:
-        return
-    base_mean = base["jct_mean"]
-    labels, vals = [], []
+def fig7_jct_normalised(summaries, agg):
+    base_a = agg_for(agg, "e1") if agg else None
+    base_s = primary_run(summaries, "e1")
+    base_mean = base_a["jct_mean_mean"] if base_a else base_s["jct_mean"]
+    labels, vals, errs = [], [], []
     for exp in EXP_ORDER:
+        a = agg_for(agg, exp) if agg else None
         s = primary_run(summaries, exp)
-        if s is None:
+        if s is None and a is None:
             continue
         labels.append(EXP_LABEL[exp])
-        vals.append(1.0 - s["jct_mean"] / base_mean)
+        m = a["jct_mean_mean"] if a else s["jct_mean"]
+        vals.append(1.0 - m / base_mean)
+        errs.append((a["jct_mean_ci95"] / base_mean) if a else 0.0)
     x = np.arange(len(labels))
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    colors = ["#888"] + ["C0", "C2", "C3", "C4"][: len(labels) - 1]
-    ax.bar(x, [v * 100 for v in vals], color=colors)
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    colors = ["#888", "C0", "C2", "C3", "C4", "C5"][: len(labels)]
+    ax.bar(x, [v * 100 for v in vals], color=colors,
+           yerr=[e * 100 for e in errs], capsize=3)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
     ax.set_ylabel("Mean-JCT improvement vs E1 (%)")
-    ax.set_title("Mean-JCT reduction relative to FCFS baseline")
+    n = (agg[0]["n_seeds"] if agg else 1)
+    ax.set_title(f"Mean-JCT reduction relative to FCFS baseline (95% CI, n={n} seeds)")
     ax.grid(axis="y", linestyle=":", alpha=0.6)
     for xi, v in zip(x, vals):
         ax.text(xi, v * 100, f"{v*100:.1f}%", ha="center",
@@ -265,13 +312,14 @@ def fig7_jct_normalised(summaries):
 
 def main() -> int:
     summaries = load_summary()
-    fig1_jct_bars(summaries)
+    agg = load_aggregated()
+    fig1_jct_bars(summaries, agg)
     fig2_jct_cdf(summaries)
     fig3_slowdown_box(summaries)
     fig4_util_time(summaries)
-    fig5_e6_heatmap(summaries)
-    fig6_bf_rate(summaries)
-    fig7_jct_normalised(summaries)
+    fig5_e6_heatmap(summaries, agg)
+    fig6_bf_rate(summaries, agg)
+    fig7_jct_normalised(summaries, agg)
     return 0
 
 
