@@ -179,6 +179,24 @@ data:
               description: >
                 The last Slurm scheduler cycle took {{ "{{ $value | printf \"%.1f\" }}" }}s.
                 This may cause job dispatch delays. Check slurmctld logs for contention.
+
+          - alert: GhostJobsWedge
+            expr: max by (pool) (slurm_operator_ghost_jobs_present) == 1
+            for: 2m
+            labels:
+              severity: critical
+              component: operator
+            annotations:
+              summary: "Pool {{ "{{ $labels.pool }}" }} wedged with ghost running jobs"
+              description: >
+                slurmrestd reports running jobs for pool {{ "{{ $labels.pool }}" }} but the
+                StatefulSet has scaled to zero and no pod is Ready. The cluster will not
+                self-recover — operator's scale-up policy treats the ghost jobs as
+                in-progress and refuses to add workers, creating a deadlock.
+              runbook: >
+                See docs/note.md §16 — try `scontrol update NodeName=<pool>-[0-N] State=DOWN`
+                then `State=RESUME`; if that fails, `kubectl -n {{ $sNs }} delete pod
+                slurm-controller-0` to rebuild slurmctld state from disk.
 ---
 apiVersion: apps/v1
 kind: Deployment

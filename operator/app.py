@@ -53,6 +53,8 @@ from metrics import (
     _EVENT_LAG_SECONDS,
     _FRAGMENTATION_BLOCKED_JOBS,
     _FRAGMENTATION_SCORE,
+    _GHOST_DETECTED_TOTAL,
+    _GHOST_JOBS_PRESENT,
     _PODS_READY,
     _POLL_DURATION,
     _PROVISIONING_LATENCY,
@@ -533,6 +535,39 @@ class OperatorApp:
                 if ready >= prov_target:
                     _PROVISIONING_LATENCY.labels(pool=key).observe(time.time() - prov_start)
                     del self._provisioning[key]
+
+            # E7 hardening — ghost-job detector. If slurmrestd reports
+            # running jobs but the StatefulSet has scaled to zero AND no
+            # pod is Ready, those "running" jobs are orphaned: their
+            # worker pod died without slurmd reporting the epilog, so
+            # the controller's job table is wedged. Left untreated this
+            # blocks every future scale-up (no pending → scheduler hands
+            # off → no pod → loop). We surface it via metric + log so
+            # alerting can page; we deliberately don't auto-recover
+            # because the safe recovery (scontrol DOWN/RESUME on each
+            # node, or `kubectl delete pod slurm-controller-0`) has a
+            # non-trivial blast radius if mis-fired during a real burst.
+            ghost = (state.current_replicas == 0 and ready == 0
+                     and state.running_jobs > 0)
+            _GHOST_JOBS_PRESENT.labels(pool=key).set(1 if ghost else 0)
+            if ghost:
+                _GHOST_DETECTED_TOTAL.labels(pool=key).inc()
+                self.logger.emit(
+                    "ghost_jobs_detected",
+                    policy=self.cfg.policy_name,
+                    partition=partition_cfg.partition,
+                    statefulset=key,
+                    running_jobs=state.running_jobs,
+                    current_replicas=state.current_replicas,
+                    ready_replicas=ready,
+                    severity="warning",
+                    remediation=(
+                        "scontrol update NodeName=<pool>-[0-N] State=DOWN; "
+                        "sleep 2; State=RESUME — or kubectl delete pod "
+                        "slurm-controller-0 to force slurmctld state rebuild. "
+                        "See docs/note.md #16."
+                    ),
+                )
 
             checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
 
