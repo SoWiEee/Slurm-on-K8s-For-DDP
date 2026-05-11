@@ -1,40 +1,45 @@
 <div align="center">
-
-# 🌿 Kelp
-
+  
+# 〰️ Kelpflux
+ 
 ### Elastic Slurm scheduling on Kubernetes for shared GPU AI workloads.
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Slurm-on-K8s-For-DDP)
-![Slurm](https://img.shields.io/badge/Slurm-23.11-blue)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-1.34-326CE5)
-![Helm](https://img.shields.io/badge/Helm-3.16+-0F1689)
-![License](https://img.shields.io/badge/license-MIT-green)
-
-Kelp brings HPC-grade batch scheduling to Kubernetes, so AI researchers can
+ 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SoWiEee/Kelpflux)
+![Slurm](https://img.shields.io/badge/Slurm-23.11-2E86AB?logo=data:image/svg+xml;base64,)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-1.34-326CE5?logo=kubernetes&logoColor=white)
+![Helm](https://img.shields.io/badge/Helm-3.16+-0F1689?logo=helm&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-1B4332?logoColor=white)
+ 
+*A resilient forest of compute — scheduled by Slurm, scaled by Kubernetes.*
+ 
+Kelpflux brings HPC-grade batch scheduling to Kubernetes, so AI researchers can
 submit `sbatch` jobs against a cloud-native cluster that auto-scales CPU and
 GPU pools on demand — with MPS-based GPU sharing, checkpoint-aware draining,
 and full Prometheus observability.
-
+ 
 [快速開始](#-getting-started) ·
 [叢集規格](docs/cluster.md) ·
 [優化排程研究](docs/scheduler.md) ·
 [採坑紀錄和實作筆記](docs/note.md)
-
+ 
 </div>
+ 
 <div align="left">
-
-## What is Kelp?
-
-Kelp is a cloud-native AI workload platform that runs **Slurm on Kubernetes**.
+  
+## What is Kelpflux?
+ 
+Kelpflux is a cloud-native AI workload platform that runs **Slurm on Kubernetes**.
 Researchers submit jobs with familiar `sbatch` commands; the platform handles
 the rest — elastic CPU/GPU pool autoscaling, MPS-based GPU sharing,
 checkpoint-aware draining, and end-to-end observability.
-
-The name comes from kelp forests: many independent fronds anchored to a shared
-seabed, growing and retreating with the tides. That is exactly how Kelp
-schedules workloads — independent worker pools sharing a common control plane,
-scaling with demand.
-
+ 
+The name fuses two ideas: *kelp forests*, where many independent fronds anchor
+to a shared seabed and grow or retreat with the tides; and *flux*, the
+continuous flow of compute demand through GPU pools. Together they describe
+exactly what Kelpflux does — independent worker pools sharing a common Slurm
+control plane, with job throughput flowing dynamically across resources as
+demand rises and falls.
+ 
 </div>
 
 ---
