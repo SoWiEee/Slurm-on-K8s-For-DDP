@@ -225,9 +225,69 @@ raw artifacts：
 - `E6_GRID=DENSE` (5×5) 或 `SMALL` (3×3 legacy)
 - `CKPT_COST=60.0` E5 的 checkpoint reload cost
 
-## 7. M8 驗收
+## 7. E7 — Live cluster paired comparison
 
-- [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs；E7 harness 仍待 live cluster 跑
+把 sim 的 E2（vendor multifactor）vs E3（M3 score，沒接 predictor）放到實機跑一次，看 sim 預測對不對。
+
+### 7.1 設定
+
+| 項目 | 值 |
+|---|---|
+| Cluster | k3s + 1 × RTX 4070（透過 NVIDIA device plugin time-slicing 切成 2 個 logical GPU；2 worker pod 共享同一塊實體卡，100 mps slot each in slurm.conf）|
+| Workload | 20 jobs：12 短（mps:25, 60–120s）+ 6 中（mps:50, 180–300s）+ 2 大（mps:100, 240–360s），同一 seed 兩 pass 重現 |
+| Vendor pass | `slurm.jobSubmit.enabled=false`，純 Slurm multifactor + backfill |
+| Our pass | `slurm.jobSubmit.enabled=true`，M3 score 加進 priority（沒裝 predictor service，所以 ε=0、相當於 sim 的 E3）|
+| 兩 pass 之間 | `helm upgrade --reuse-values --no-hooks --set slurm.jobSubmit.enabled=...` 切換、`kubectl delete pod slurm-controller-0` 強制 slurmctld 用乾淨狀態啟動 |
+| 數據來源 | `sacct` 從 controller pod 直接取，filter by job name prefix |
+
+> 為什麼這只能對應 sim 的 E3 不是 E4：M5 predictor service 還沒部署到這個 cluster（需要 trained model + cronjob retrain pipeline）。所以 live 只能驗證「score 因子接上後對 mean JCT 的影響」，不包含 predictor 的 SJF kicker。
+
+### 7.2 數字
+
+| pass | mean JCT | p90 JCT | max JCT | mean wait |
+|---|---:|---:|---:|---:|
+| vendor | 932.6s | 2125.5s | 3200.0s | 776.5s |
+| our | 394.5s | 781.7s | 1053.0s | 238.4s |
+
+**Paired same-job diff (our − vendor): mean = −538.1s (−57.70%)，18/20 jobs 改善**。
+
+### 7.3 為什麼這個數字要打折看
+
+跑 vendor pass 中段叢集進了一個壞狀態（一個 mps:100 大 job 卡 COMPLETING，AllocTRES 殘留 50 slot 沒釋放，後續 mediums 全 PENDING (Resources)），我手動 `scontrol reconfigure` 救活。整個 freeze 約 30 min，全打在 vendor 的 mediums + larges 的 wait time 上。
+
+把 wait time 拆開看就清楚：
+
+| 子集 | vendor mean wait | our mean wait | paired Δ |
+|---|---:|---:|---:|
+| 12 個 short job（mps:25） | 233s | 91s | **−61%** |
+| 6 個 medium job（mps:50） | 1157s | 352s | −70%（含 freeze）|
+| 2 個 large job（mps:100） | 2881s | 745s | −74%（含 freeze）|
+| **short 排除 0-s/1-s 兩個 outlier**（cluster 啟動期再多等了 7 分鐘） | **189s** | **116s** | **−38.6%** |
+
+最後一列是我認為**唯一能放進論文 main result 的數字**：cluster 已經穩定、job 已經開始正常 dispatch 後的 small job 平均 wait time，**ours 比 vendor 少 38.6%**。這跟 sim 的 E3 vs E2「不顯著」結論不一致——可能原因：
+
+1. Live 的 workload 對 1 張 GPU 來說 contention 比 sim 設定高得多（sim 是 16 個 GPU 等效、live 是 1 個）。Contention 高的時候 score 因子（特別是 f_mps_fit 把 whole-GPU job 後排、讓 fractional MPS job 先過）會有 sim 看不到的價值。
+2. Sim 假設每個 scheduler 都跑在 100% 健康的 cluster；live 的 vendor pass 撞到的 freeze 是 sim 模擬不出來的。
+3. 樣本太小（n=10 小 job）導致 paired CI 寬，可能其實只是 noise。
+
+### 7.4 Caveats
+
+- **單一 cluster snapshot**：兩 pass 之間有 helm upgrade 加 slurmctld pod 刪除重啟，這個 cluster reset 本身可能影響後續行為。
+- **共享 GPU**：兩個 worker pod 透過 device plugin time-slicing 共用同一塊 RTX 4070，實際 SM 與 memory 的吞吐量瓶頸跟 sim 模型不一樣。
+- **沒裝 predictor**：對應的是 sim 的 E3，不是更值得的 E4。沒辦法 live 驗證 M5 預測短 job 的價值。
+- **沒測 M7 fragmentation**：M8 sim 已證 M7 在三個 trace 都 net negative，沒必要在這個更不穩的單卡 cluster 上再跑一次。
+
+### 7.5 紀錄保留
+
+- 原始 sacct: `eval/results/e7/vendor.csv`、`eval/results/e7/our.csv`
+- 比較輸出: `eval/results/e7/compare.txt`
+- 兩 pass 的 log: `eval/results/e7_vendor.log`、`eval/results/e7_our.log`
+- Orchestrator: `eval/scripts/e7_one_pass.sh` 跑單 pass、`eval/scripts/e7_run_both.sh` 跑兩 pass（後者經過幾輪 debug，目前 require slurmctld pod 在每 pass 之間重啟才穩）
+
+## 8. M8 驗收
+
+- [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs
 - [x] **8 張圖出爐** — fig1 bar、fig2 CDF、fig3 box、fig4 utilization、fig5 heatmap、fig6 bf+requeue、fig7 normalised、fig8 cross-trace
-- [x] **negative result 跨 distribution 驗證** — M7 在 philly / burst / ali 三種完全不同 distribution 上一致 net negative，不是單 trace artefact
-- [x] **eval-writeup.md** — 本檔 §1–§7；每張圖都有 1–2 段論述
+- [x] **negative result 跨 distribution 驗證** — M7 在 philly / burst / ali 三種 distribution 上一致 net negative
+- [x] **E7 live cluster paired** — 20 jobs × 2 pass 完成；short job clean subset 看到 ours 比 vendor 快 38.6%
+- [x] **eval-writeup.md** — 本檔 §1–§8
