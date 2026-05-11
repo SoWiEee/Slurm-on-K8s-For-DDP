@@ -1,419 +1,322 @@
-# Phase 6 M8 — Evaluation Writeup
+# Kubeflux — Scheduler Evaluation（Phase 6 M8 thesis chapter draft）
 
-> 對應 thesis evaluation 章節草稿。
-> 圖表來源：[`eval/figures/`](../eval/figures/)，原始資料：[`eval/results/`](../eval/results/)
-
-> 重現：`bash eval/scripts/run_all.sh && .venv-m5/bin/python eval/scripts/plot_all.py`。
-
-> [!IMPORTANT]
-> **2026-05-11 更新**：本章節因兩輪修正而大幅改寫，請以此版為準。
+> 對應 thesis evaluation 章節。圖表 → [`eval/figures/`](../eval/figures/)；原始資料 → [`eval/results/`](../eval/results/)；完整 milestone 規格 → [`docs/scheduler.md`](scheduler.md)。
 >
-> 第一輪（方法論修正）：
-> 1. 修掉 sim 內 requeue 時 reset `metrics.submit_ts` 的 bug。原本 victim JCT 只算重排後那段，低估真實等待。改後保留原始 submit_ts。
-> 2. 每組 exp 從單一 deterministic sample 改成 5 個 synthetic seed（42–46），所有指標報 mean ± std 加 paired 95% CI。
-> 3. Sim 加上 `--ckpt-reload-cost`（預設 60s/次）。E5 用 60s、E5b 跑 0s 當樂觀 upper bound。
->
-> 第二輪（trace 廣度）：把實驗從單一 Philly-like trace 擴成三種 workload family（philly / burst / ali，共 3 × 5 = 15 個 sample），驗證結論是否 generalises。
->
-> 結論：M5 predictor 在「有 contention 的 trace」上是 statistically significant 的 win（burst −28.7%、philly −20.1%、ali 因為 util 才 0.30 沒空間優化）。M7 fragmentation 在三個 trace 都是 net negative，philly +33%、burst +61%、ali +6%。舊版「E5 −28.6% vs vendor」是 submit_ts reset bug 加上單 sample 造成的人為結果。
+> 重現實驗：`bash eval/scripts/run_all.sh && .venv-m5/bin/python eval/scripts/plot_all.py`（sim）、`bash eval/scripts/e7_one_pass.sh <tag>`（live）。
 
-## 1. 實驗設定
+---
 
-| 設定項 | 值 | 來源 |
+## 摘要
+
+Kubeflux 把 Slurm 跑在 Kubernetes 上做 GPU/MPS workload 排程，並用一組可調權重的 score function 取代 Slurm 內建 multifactor priority。本章驗證五件事：
+
+1. **vendor backfill 已經做了大部分功**（FCFS 12.6h → multifactor 4.5h mean JCT，−72%），剩下空間有限。
+2. **M5 runtime predictor 是真正的 win**：在三個 synthetic trace（philly、burst、ali）上跑 5 seeds × 3 family，paired same-seed 比較顯示 predictor 在有 contention 的 trace 上 statistically significant 改善 mean JCT 20–29%（CI 不跨 0）。
+3. **M7 fragmentation reconciler 在所有三個 trace 上都是 net negative**（philly +33%、burst +61%、ali +6%）。這個 negative result 跨 distribution 一致，不是單一 trace artefact，且問題出在 victim 的 lost progress 大於排程改善。
+4. **動態 weight tuning（M9 UCB1）能用 1/3 sim 預算找到接近 M8 grid 最佳的權重組合**。但因為 oracle vs 靜態最佳只差 2.5%，contextual tuning（LinUCB、PPO）沒有發揮空間。
+5. **Live cluster 驗證 M3 score 部署無誤**，但因為 workload runtime 只跨 6× 範圍（vs sim 的 100×），predictor 的 ε·f_runtime_short 信號被 score 其他因子蓋過。Predictor 在 production 環境裡能不能發揮，取決於三件事：workload 本身夠 heterogeneous、predictor 在 matched distribution 上 retrain、score weights 配合 workload 跨度調整。少一個就看不到改善。
+
+整套 evaluation 跨 465 sim runs（3 trace × 5 seed × 31 config）+ 4 live passes（vendor / our M3 / our_pred / hetero v2）+ 360 M9 bandit pulls，附 8 張 figure 加 cross-trace 比較。所有 raw data + 腳本 + 模型訓練流程都 commit 在 repo 內可重現。
+
+---
+
+## 1. 動機與貢獻
+
+### 1.1 問題
+
+用 Slurm 排程 HPC workload 已經是標準做法，但有兩個現實沒被內建 scheduler 直接處理：
+
+1. **GPU 共用透過 NVIDIA MPS**。一張卡可切成 100 個 mps slot 給多個 job 同時跑。Slurm 預設 priority 不知道「mps:25 的小 job 應該比 mps:100 的大 job 先排」，所以容易讓一個大 job 卡住一堆小 job。
+2. **Job runtime 不可預知**。同一個 user 提交相似 job 的實際時間可以差兩個數量級（幾分鐘到幾小時）。FCFS 跟 multifactor 都假設 runtime 不可知，SJF 反過來要求先知道誰短。
+
+我們想回答的問題：**一個簡單可解釋的 score function 加上 runtime predictor，能不能在 GPU/MPS workload 上打贏 Slurm 預設？** 哪個因子貢獻最多、哪些子組件其實沒幫上忙？
+
+### 1.2 我們做了什麼
+
+1. **M3 五因子 score function**：`priority = α·f_mps_fit + β·f_vram_fit − δ·f_fragmentation + ε·f_runtime_short`。每個因子都是 [0, 1]，可解釋、可獨立 ablation。
+2. **M5 runtime predictor service**：LightGBM 模型 + FastAPI service，從 sacct 歷史 train、預測 (user, gpu, mps, hour) → runtime。lua plugin 在 sbatch 時呼叫。
+3. **M7 fragmentation reconciler**：Slurm 沒看到的死角——當 head pending job 被卡住而某個低 priority running job 釋放就能放它過去時，主動 requeue 那個 victim。Operator 端做 detect → decide → actuate，預設 shadow mode。
+4. **M8 evaluation 基建**：discrete-event simulator 跑三個 trace family、5 seeds 每組、paired CIs；live cluster 4 個 pass 驗證部署。
+5. **M9 weight tuning**：UCB1 + LinUCB 在 sim 上比靜態 grid search 省 sim 預算。
+6. **Operator hardening**：根據 live 實驗踩到的 wedge 狀態，加 ghost-job detector + 對應 Prometheus alert。
+
+### 1.3 主要結論一覽
+
+| Claim | 證據 | 狀態 |
 |---|---|---|
-| Trace 家族 | 三個 synthetic family，各 1000 jobs × 5 seeds | `sim.runner --trace-family {philly,burst,ali} --synth-jobs 1000 --synth-seed {42..46}` |
-| └ philly | 寬鬆 Poisson arrival、log-normal runtime（median ~30 min, p95 ~6h） | `sim/loader.py::generate_philly_like` |
-| └ burst | 同樣 job size mix，arrival 集中在每 6h 出現一次的 2h 高峰窗 | `generate_burst_heavy` |
-| └ ali | Alibaba PAI-style：90% 單卡、median runtime ~13 min、60% 單卡 job 用 MPS 切割、晝夜節律 | `generate_ali_like` |
-| Cluster | 4 nodes × 4 GPUs × 100 MPS slot | `sim.runner --nodes 4 --gpus-per-node 4` |
-| Sim 模型 | discrete-event (`sim/runner.py`)，best-fit per-GPU MPS allocator，無 preempt（E5/E5b 啟用 M7 fragmentation requeue） | — |
-| 重複次數 | 5 seeds × 3 traces，主結論報 mean ± std 加 paired same-seed 95% CI；E6 sensitivity 升級到 5×5 grid（25 × 3 × 5 = 375 runs） | — |
-| Checkpoint reload cost | E5 = 60s/次，E5b = 0s/次 | `--ckpt-reload-cost` |
+| C1 vendor backfill 已吃掉大部分改善空間（FCFS → multifactor −72%）| sim cross-trace | ✅ |
+| C2 純 M3 score 不顯著改善 mean JCT | E2 vs E3 paired ≈ 0 | ✅ |
+| **C3 M5 predictor 在 contention-heavy trace 上 −20.1%（philly）/ −28.7%（burst）, CI 不跨 0** | E4 vs E2 paired | ✅ statistically significant |
+| C3b Predictor 在 sparse trace 上沒效（ali −0.08%，util 才 0.30）| E4 vs E2 on ali | ✅ |
+| **C4 M7 fragmentation 在三個 trace 上都 net negative** | paired diffs all CI > 0 | ❌ negative result |
+| C5 Score weight sensitivity 跟 contention pressure 正相關（ali 0.1%、philly 10.6%、burst 28.5%）| E6 5×5 grid | ✅ |
+| C6 UCB1 用 120 sim runs 拿到 +3% vs M8 grid-best 的 375 runs | M9 結果 | ✅ |
+| C7 Live cluster 驗證部署正確，但 e7 workload 跨度不足以讓 predictor 發揮 | 4 個 pass | ✅ scoped |
 
-E1–E6 全部在 simulator 上跑。E7 是 live-cluster 50-job 驗證腳手架，RTX 4070 只有一張，這條路徑只能做 sim→真機 sanity check，主結論仍以 sim 為準。
+---
 
-| 實驗 | scheduler | 額外 flag | 對應 milestone |
-|---|---|---|---|
-| E1 | FCFS（無 backfill） | — | baseline (worst case) |
-| E2 | multifactor + backfill | — | Slurm 預設 |
-| E3 | score (M3) α=0.40, β=0.20, δ=0.20 | ε=0 | M3 完成度 |
-| E4 | score + predictor (M5) | ε=0.30 | M5/M6 邊際價值 |
-| E5 | score + predictor + fragmentation (M7) | `--fragmentation --ckpt-reload-cost 60` | M7 邊際價值（realistic cost） |
-| E5b | E5 但 ckpt cost = 0 | `--ckpt-reload-cost 0` | M7 樂觀 upper bound |
-| E6 | score + predictor，25 組 (α, δ) | 5×5 grid | sensitivity |
+## 2. 系統設計
 
-E5 的 fragmentation 模式 mirror 了 `operator/fragmentation.py`：每個 event 後檢查 head pending job 是否 blocked，是的話就 release 最低優先級的 running job 直到 head 能跑（受 `MAX_REQUEUES_PER_JOB=2` 限制以避免 ping-pong；rate limit、shadow-mode 是 operator-side 的事，sim 直接看 wall-clock 影響）。
+完整設計請看 [`docs/scheduler.md`](scheduler.md)。這節只摘關鍵。
 
-## 2. 主表
+### 2.1 Score function
 
-每個 trace family 各 5 個 seed，下表的 jct_mean 是 5-seed 平均加標準差（單位 h），requeues 是平均每個 run 的 M7 requeue 次數。
-
-### 2.1 philly（baseline workload）
-
-| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run | ckpt_cost (h) |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| E1 FCFS | 15.78 ± 12.44 | 29.32 | 77.94 | 0.742 | 0.000 | 0 | 0.00 |
-| E2 multifactor+bf | 4.49 ± 2.60 | 9.49 | 17.68 | 0.812 | 0.815 | 0 | 0.00 |
-| E3 score (M3) | 4.71 ± 3.18 | 10.83 | 19.39 | 0.808 | 0.842 | 0 | 0.00 |
-| **E4 + predictor (M5)** | **3.43 ± 1.61** | **6.35** | **10.04** | 0.805 | 0.854 | 0 | 0.00 |
-| E5 + fragmentation (M7) | 4.55 ± 2.12 | 9.47 | 14.32 | 0.839 | 0.948 | 349 | 5.81 |
-| E5b M7, 0s ckpt | 4.20 ± 1.70 | 9.18 | 12.34 | 0.827 | 0.950 | 347 | 0.00 |
-
-### 2.2 burst（高峰擠壓 workload）
-
-Job 集中在每 6 小時一次的 2 小時 burst 窗口送進來，pending queue 在 burst 期間爆衝。
-
-| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run |
-|---|---:|---:|---:|---:|---:|---:|
-| E1 FCFS | 17.36 ± 10.71 | 29.38 | 76.15 | 0.708 | 0.000 | 0 |
-| E2 multifactor+bf | 6.36 ± 4.35 | 12.85 | 25.91 | 0.768 | 0.861 | 0 |
-| E3 score (M3) | 6.62 ± 4.37 | 16.54 | 26.88 | 0.766 | 0.896 | 0 |
-| **E4 + predictor (M5)** | **4.24 ± 2.10** | **8.69** | **12.76** | 0.764 | 0.906 | 0 |
-| E5 + fragmentation (M7) | 6.64 ± 3.15 | 14.54 | 20.20 | 0.798 | 0.970 | 356 |
-| E5b M7, 0s ckpt | 6.96 ± 4.72 | 17.14 | 21.18 | 0.784 | 0.966 | 355 |
-
-### 2.3 ali（短 job、稀疏 workload）
-
-ALI 系列 job 多半 ~13 min 跑完，加上 60% 單卡 job 走 MPS 分割，cluster 平均只有 ~30% util，根本沒有 contention。
-
-| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run |
-|---|---:|---:|---:|---:|---:|---:|
-| E1 FCFS | 0.515 ± 0.038 | 1.101 | 1.045 | 0.305 | 0.000 | 0 |
-| E2 multifactor+bf | 0.512 ± 0.037 | 1.098 | 1.026 | 0.305 | 0.031 | 0 |
-| E3 score (M3) | 0.512 ± 0.037 | 1.098 | 1.025 | 0.305 | 0.032 | 0 |
-| E4 + predictor (M5) | 0.512 ± 0.037 | 1.099 | 1.018 | 0.305 | 0.033 | 0 |
-| E5 + fragmentation (M7) | 0.543 ± 0.050 | 1.127 | 1.059 | 0.321 | 0.261 | 92 |
-| E5b M7, 0s ckpt | 0.532 ± 0.047 | 1.118 | 1.037 | 0.316 | 0.231 | 75 |
-
-### 2.4 Paired same-seed comparisons（重點）
-
-同一個 seed 給不同 scheduler 做比較，trace 變動的雜訊被消掉，CI 比 unpaired 緊一個量級。
-
-| trace | E4 vs E2（predictor 邊際） | E5 vs E4（M7 邊際） | E5 vs E2（整體 stack） |
-|---|---:|---:|---:|
-| philly | **−20.06%** ± 11.95% ↓ | **+33.08%** ± 5.22% ↑ | +6.31% ± 15.42%（不顯著） |
-| burst | **−28.71%** ± 11.31% ↓ | **+60.95%** ± 31.71% ↑ | +14.85% ± 30.51%（不顯著） |
-| ali | −0.08% ± 0.09%（不顯著） | **+6.03%** ± 4.48% ↑ | +5.95% ± 4.44% ↑ |
-
-↓/↑ 代表 CI 不跨 0（statistically significant）。
-
-數字怎麼讀：
-- E1→E2：backfill 在 philly / burst 上把 mean JCT 砍 65~72%。Slurm 預設已經拿掉大部分可改善空間，後面任何 scheduler 都只在剩下的 30% 裡爭。
-- E2→E3：純 M3 score 在三個 trace 上都沒有顯著改善 mean JCT。score 因子（mps_fit / vram_fit / fragmentation penalty）本身只是排序，不解決瓶頸。
-- **E3→E4 (M5 predictor)**：是整個 stack 的主要 win。burst 拿到 −28.7%（CI 不跨 0）、philly −20.1%（CI 不跨 0）、ali 只有 −0.08%（util 才 0.30，連 head-of-line 都沒形成，predictor 沒空間發揮）。換句話說，predictor 的價值正比於排隊壓力。
-- **E4→E5 (M7 fragmentation)**：在三個 trace 上全是 net negative。philly +33%、burst +61%、ali +6%。burst 上的損失最大，因為高峰期 head 被擋時 reconciler 觸發頻繁，但被踢的 victim 通常已經跑了一段時間，loss 大於 reschedule 帶來的好處。
-- **E5b 的對照**：把 ckpt reload cost 設成 0 也救不回來。philly 從 +33% 變 +26%、burst 從 +61% 變 +63%、ali 從 +6% 變 +4%。M7 的問題不是 reload overhead，而是 victim 被踢掉後失去的 in-flight progress。
-
-## 3. 圖
-
-圖 1~7 用 philly trace 當代表，fig 8 是跨 trace 的 paired Δ。完整 PNG 在 `eval/figures/`，原始 CSV 在 `eval/results/<trace>/<exp>/`。
-
-### 3.1 fig1 — JCT mean / p90 / p95（柱狀，含 95% CI error bar）
-
-<img src="../eval/figures/fig1_jct_bars.png"/>
-
-E1 那根壓著其他柱子一個量級，所以章節真正要看的差距在 E2..E5 之間。E4 的三根（mean / p90 / p95）都明顯比 E5 矮，error bar 也不重疊。
-
-### 3.2 fig2 — JCT CDF（log x-axis）
-
-<img src="../eval/figures/fig2_jct_cdf.png"/>
-
-每條線是 P(JCT ≤ x)。E1 的 CDF 在低 x 處遠左，意思是連最快的 50% job 都比其他組慢一個量級。E4 的線整段都壓在 E5 下方，p50 / p90 / p95 全勝。
-
-### 3.3 fig3 — Slowdown 箱型圖
-
-<img src="../eval/figures/fig3_slowdown_box.png"/>
-
-Slowdown = JCT / max(runtime, 60s)。E1 的 box 落在 [10, 100]，E4 收到 [1, 10] 左右，IQR 縮了一個量級。E5 的 box 比 E4 高一截，反應 requeue 後重做 lost progress 對短 job 的 slowdown 影響特別大。
-
-### 3.4 fig4 — Utilisation timeline
-
-<img src="../eval/figures/fig4_util_time.png"/>
-
-把 simulated time 切 200 個 bin，每個 bin 內 RUNNING 的 (mps × gpu_count) 總和除以 cluster capacity。E5 比 E4 utilization 高一點點，但這部分高出來的工作量是「重做被 evict 的 job」，是 phantom utilization，不對應到 throughput 改善。
-
-### 3.5 fig5 — E6 sensitivity heatmap（5×5 grid）
-
-<img src="../eval/figures/fig5_e6_heatmap.png"/>
-
-固定 β=0.20、ε=0.30，掃 α ∈ {0.10, 0.25, 0.40, 0.55, 0.70}、δ ∈ {0.05, 0.15, 0.20, 0.30, 0.40}，philly trace 上 jct_mean 範圍 3.28–3.63h，spread 10.6%。burst trace 上 spread 28.5%（重壓力下 weight 比較敏感），ali trace 上 spread 0.1%（沒 contention 就沒差）。三個 trace 的 best cell 都落在 α≤0.25、δ≤0.15 一帶，跟「短 job 多時把 mps_fit 拉低、fragmentation penalty 別太大」的直覺一致。
-
-### 3.6 fig6 — backfill rate 與 M7 requeue count
-
-<img src="../eval/figures/fig6_bf_rate.png"/>
-
-E5/E5b 的 bf_rate 衝到 0.95，但對應的 requeue/run 是 ~349 次（philly）/ ~356 次（burst）/ ~92 次（ali）。看起來 reconciler 確實把節點塞滿了，但塞進去的有相當比例是被踢掉後重新排隊的 job，這是 fig4 phantom utilization 的根源。
-
-### 3.7 fig7 — Mean-JCT 改善（vs E1 normalise，含 CI）
-
-<img src="../eval/figures/fig7_jct_normalised.png"/>
-
-E1 = 0% baseline。philly trace 上 E4 −78%、E5 −71%（E5 比 E4 退步），其他兩條 trace 同樣是 E4 最深、E5 反彈。CI error bar 在 E4 上明顯不跨 0；E5 在 burst 上 CI 比較寬反映 trace-to-trace 變動大。
-
-### 3.8 fig8 — 跨 trace generalisation（新增）
-
-<img src="../eval/figures/fig8_cross_trace.png"/>
-
-三個 trace × 兩個 paired Δ。綠色是 E4 vs E2（M5 predictor 的邊際），紅色是 E5 vs E4（M7 fragmentation 的邊際）。
-
-可以一眼讀出的事情：
-- 綠色在 philly 與 burst 上明顯往下、CI 不跨 0，predictor 是真實的 win。ali 上趴在 0 附近，because 那個 trace 沒有讓 predictor 有發揮空間的 contention。
-- 紅色三根都在 0 以上、CI 都不跨 0。M7 在三個 trace 上都是 net negative，不是 philly-specific artefact。
-
-## 4. 結論與 thesis claim 對應
-
-| Claim | 狀態 | 證據 |
-|---|---|---|
-| **C1** Slurm 內建 multifactor + backfill 已經把 FCFS 的 16h JCT 砍到 4~6h | ✅ paired −65~72% | E1 vs E2，三個 trace 都成立 |
-| **C2** 純 M3 score（沒接 predictor）對 mean JCT 沒有顯著改善 | ✅ paired Δ 都不顯著 | E2 vs E3，三個 trace |
-| **C3** M5 runtime predictor 在有 contention 的 trace 上 statistically significant | ✅ philly −20.1%、burst −28.7% | E2 vs E4 |
-| **C3b** Predictor 的效益正比於排隊壓力：ali（util 0.30）上幾乎沒有差別 | 補充觀察 | E4 vs E2 on ali = −0.08% |
-| **C4** M7 fragmentation reconciler 在三個 trace 上都是 net negative | ✅ generalises | E4 vs E5：philly +33%、burst +61%、ali +6%（CI 都不跨 0） |
-| **C4a** 把 ckpt reload cost 設成 0 也救不回來，主因是 victim lost progress | ✅ | E5b vs E5 改善僅 6% |
-| **C5** Score weight 的 sensitivity 取決於 contention：ali 0.1%、philly 10.6%、burst 28.5% | ✅，比舊版「±5%」精確 | E6 5×5 grid，三個 trace |
-
-> [!IMPORTANT]
-> C4 是 negative result，但它是這份 evaluation 想留下的核心 thesis contribution：在三個 distribution 差距很大的 synthetic trace 上，當前 M7 victim selection 都跑出 net negative。這精確定義了 reconciler 何時不該開——victim selection 純看 priority 時，會把已經跑了一大段的 job 也踢掉，loss 大於排程帶來的好處。
->
-> 救援方向（給 future work）：
->
-> 1. Victim selection 加上「已執行時間 / 已完成比例」penalty，避免踢已經做了一半的 job。
-> 2. 改 preempt + suspend，保留 GPU memory state，把 lost progress 從 100% 降到接近 0。
-> 3. 只在 predictor 估計 head 剩餘時間 < victim 剩餘時間時觸發 reconciler。
-> 4. 把 M7 限縮在「ali 那類短 job heavy」的 trace 上，原本就沒幾次 requeue，傷害有限——但這也意味著 contribution 規模很小。
-
-## 5. 風險與限制
-
-- **三個 trace 都是 synthetic**。philly / burst / ali 是三組不同 distribution 的 generator，已經把 negative result 跨 distribution 確認過，但真實 production trace（如 Helios、Alibaba 公開 trace）仍可能呈現不同的 contention 結構。如果未來有真實 trace 可用，repro 就只是換 `--trace` 參數的事。
-- **Lost-progress 保守假設**。Sim 讓 victim 從零重跑，沒模擬 partial checkpoint resume。E5 已經加 60s reload overhead，但「已完成的 work 100% 重做」這個假設偏悲觀。實際 preempt+suspend（保留 GPU memory）可以把這部分大幅縮小，這也是 C4 future work 的方向 2。
-- **Predictor 假設完美**。Sim 裡 `f_runtime_short(true_runtime)` 等於假設 RMSE = 0。`services/runtime_predictor` 實測 RMSE 約 ±20%，真實環境 E4 改善幅度大概要打 8 折。
-- **mem / IO 沒模擬**。Sim 只追蹤 MPS slot 跟 GPU 數，GPU job 的 IO wait 也是 JCT 顯著貢獻者，這部分被當成 "已內含於 runtime" 處理。
-- **E6 grid 已升級到 5×5**，但仍沒掃 β 跟 ε。如果要進一步聲明 weight robustness 需要 full 4-D scan。
-- **Live cluster 尚未驗證（handoff #1）**。E7 live harness 已寫好但只是 feasibility 規模（單張 RTX 4070），主結論仍 100% 來自 simulator。
-
-## 6. 重現步驟
-
-```bash
-# 0. （第一次跑）裝 venv
-uv venv .venv-m5 && uv pip install --python .venv-m5/bin/python pytest matplotlib
-
-# 1. 跑 E1..E6（< 5 分鐘）
-bash eval/scripts/run_all.sh
-
-# 2. 出圖（< 10 秒）
-.venv-m5/bin/python eval/scripts/plot_all.py
-
-# 3. 看主表
-.venv-m5/bin/python eval/scripts/print_summary.py
-
-# 4. （optional）E7 live cluster — 需要 kubeconfig 指到一個跑 chart 的 k3s
-bash eval/scripts/run_e7_live.sh our      # M3+M5+M7 stack
-helm upgrade ... -f vendor-baseline.yaml  # 翻成 multifactor-only
-bash eval/scripts/run_e7_live.sh vendor
+```
+priority = α · f_mps_fit + β · f_vram_fit − δ · f_fragmentation + ε · f_runtime_short
 ```
 
-raw artifacts：
-- `eval/results/<trace>/<exp>/<run>__seed<N>.csv` 每個 seed 的 per-job
-- `eval/results/<trace>/<exp>/<run>__seed<N>.json` per-run summary
-- `eval/results/all_summaries.json` 全部 465 runs 攤平（3 traces × 5 seeds × 31 configs）
-- `eval/results/agg_by_run.json` 跨 seed 聚合的 mean / std / 95% CI
-- `eval/figures/fig{1..8}.{png,pdf}` 圖
+每個因子的直覺：
 
-可以調整的環境變數：
-- `TRACES="philly burst ali"` 控制要跑哪幾種 trace
-- `SEEDS="42 43 44 45 46"` 控制 seed 列表
-- `E6_GRID=DENSE` (5×5) 或 `SMALL` (3×3 legacy)
-- `CKPT_COST=60.0` E5 的 checkpoint reload cost
+| 因子 | 意義 | 高分代表 |
+|---|---|---|
+| `f_mps_fit` | job 申請的 mps slot vs node 剩餘 slot 的相對配適度 | 小 job 放空隙剛剛好 |
+| `f_vram_fit` | VRAM 需求 vs node tier 的相符程度 | 12g job 放 12g node（不浪費）|
+| `f_fragmentation` | 接受 job 後 cluster 的 free-MPS 分散程度（懲罰項）| 接了它後碎片化會變嚴重 |
+| `f_runtime_short` | `horizon / (horizon + pred_runtime)`，短 job → 接近 1 | 預計很快跑完 |
 
-## 7. E7 — Live cluster paired comparison
+預設權重 (α, β, δ, ε) = (0.40, 0.20, 0.20, 0.30)、β 為次要因子鎖在 0.20。M3 完成時 ε=0、M5 接上後切到 0.30。
 
-把 sim 的 E2（vendor multifactor）vs E3（M3 score，沒接 predictor）放到實機跑一次，看 sim 預測對不對。
+### 2.2 Predictor
 
-### 7.1 設定
+Service 是 FastAPI + LightGBM。Features 取自 `job_desc`：`user_name`、`gpu_count`、`mps_req`、`gpu_type`、`hour_of_week`、`user_freq`、`user_mean_log_rt`。後兩項從歷史 sacct rolling 統計來——所以新 user 會 fallback 到 bootstrap mode（回 `min(user_time_limit, 4h)` 常數）。
+
+lua plugin 用 `curl --max-time 200ms` 呼叫，response timeout / 解析失敗都安全降級（不動 priority）。
+
+### 2.3 Fragmentation reconciler
+
+Operator 每 15 秒 poll slurmrestd：
+
+1. **Detect**：取 pending head 跟所有 running job。
+2. **Decide**：head 卡住 ⇔ 沒有單一 node 容得下，但若 release 某個低 priority running job 就能容下時，挑那個 victim。需通過 `FRAGMENTATION_PRIORITY_GAP` 跟 `FRAGMENTATION_MAX_REQUEUES_PER_HOUR`。
+3. **Actuate**（shadow mode 時只 log；live 才 `scontrol requeue`）。
+
+### 2.4 Architecture（簡圖）
+
+```
+sbatch → [slurm-login] ──► slurmctld ──[lua job_submit]──► [predictor service]
+                                │                                       │
+                                ▼                                       ▼
+                          score → priority                       (user, mps, gpu) → pred_seconds
+                                │
+                                ▼
+       ┌──────── pending queue ──────► slurm scheduler + backfill ──► worker pods
+       │
+       ▼
+   [elastic-operator] ──── poll slurmrestd ──► autoscale StatefulSets
+                       └── fragmentation reconciler (shadow / live requeue)
+```
+
+詳細元件 mapping 在 [`CLAUDE.md`](../CLAUDE.md)。
+
+---
+
+## 3. 評估方法
+
+### 3.1 為什麼用 sim + live 兩條腿走
+
+Sim 跟 live 各補對方的盲點：
+
+- **Sim** 能跑大量 seed × trace 拿 paired CIs，可以負擔 weight sensitivity grid、negative result 跨 trace 驗證。缺點是 predictor 假設 RMSE=0、cluster 沒 instability、checkpoint reload 是參數設的（不是真實測量）。
+- **Live cluster** 拿單卡 RTX 4070 + k3s 驗證「整套 stack 在真機跑得動」、看 lua plugin / netpol / image 等 deployment caveat。缺點是 workload 規模上不去，infrastructure noise (controller restart、AllocTRES zombie、worker NOT_RESPONDING) 在這個尺度上常常 dwarf scheduler signal。
+
+兩邊結果交叉檢查時會碰到一個落差：sim 在 heterogeneous trace 上看到 predictor 顯著 win，live 同條件下看不到。這個落差本身需要解釋，§5 跟 §7 給出 3 條件 framework。
+
+### 3.2 Trace families（sim）
+
+三個 synthetic generator 都在 `sim/loader.py`：
+
+| Family | 特色 | 用來測什麼 |
+|---|---|---|
+| `philly` | Poisson arrival、log-normal runtime（median ~30 min, p95 ~6h）、~75% 單卡、30% 單卡 job 是 MPS-fractional | baseline workload，跟 Microsoft Philly trace shape 近似 |
+| `burst` | 同 job-size mix，arrival 集中在每 6h 一次的 2h 高峰窗 | 高 contention，測 scheduler 在排隊壓力下的行為 |
+| `ali` | Alibaba PAI-like：90% 單卡、median runtime ~13 min、60% 單卡 job MPS-fractional、晝夜節律 | 短 job 為主、低 util，測 scheduler 在沒 contention 時是否會 over-engineer |
+
+每 family 跑 5 seeds（42–46），用 paired same-seed diff 做主要比較。Paired diff 把「不同 seed 帶來的 trace 變動」消掉，CI 比 unpaired 緊一個量級。
+
+### 3.3 實驗矩陣
+
+| 編號 | scheduler | 額外 flag | 對應 milestone |
+|---|---|---|---|
+| E1 | FCFS（無 backfill）| — | baseline (worst) |
+| E2 | multifactor + backfill | — | Slurm 預設 |
+| E3 | score (M3) α=0.40, β=0.20, δ=0.20, ε=0 | — | M3 完成度 |
+| E4 | score + predictor (M5), ε=0.30 | — | M5 邊際價值 |
+| E5 | E4 + M7 fragmentation, 60s ckpt | `--fragmentation --ckpt-reload-cost 60` | M7 邊際價值 |
+| E5b | E5 但 ckpt cost=0 | `--ckpt-reload-cost 0` | M7 樂觀 upper bound |
+| E6 | E4 sweep 25 (α, δ) cells | 5×5 grid | sensitivity |
+
+E1–E6 在 sim 跑（3 traces × 5 seeds × 31 configs = 465 runs）。E7 是 live cluster 4 個 pass：vendor、our (M3 only)、our_pred (M3+M5)、hetero_v2 (M3+M5 with retrained predictor)。
+
+### 3.4 兩個方法論 bug，修了以後結果完全改寫
+
+中途發現舊版 evaluation 的數字不可信，記錄修法：
+
+1. **Sim victim JCT bug**：`try_fragmentation_reconcile` 把 victim 的 `metrics.submit_ts` reset 成 `now`，導致 JCT 只算重排後那段——低估了原始排隊時間，讓 M7 看起來假性 win。修法：保留原始 submit_ts，scheduler 看到的 vj.submit_ts=now 不變（fairness 應該如此）。
+2. **單一 deterministic sample**：原本每個 cell 只跑一次。改成 5 個 seed，所有指標報 mean ± std 加 paired 95% CI。
+
+加碼：
+3. **Checkpoint reload cost 沒模型**：加 `--ckpt-reload-cost`（預設 60s）給 fragmentation 模式用。
+
+這三個修正前後對比寫進 `docs/note.md` Debug Record #15。**舊版「E5 −28.6% vs vendor」是上述 bug 加單 sample 造成的人為結果，新版被推翻**。
+
+---
+
+## 4. Simulator 結果
+
+### 4.1 主表（5 seeds 每 cell，三個 trace）
+
+#### philly（baseline workload）
+
+| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run |
+|---|---:|---:|---:|---:|---:|---:|
+| E1 FCFS | 15.78 ± 12.44 | 29.32 | 77.94 | 0.742 | 0.000 | 0 |
+| E2 multifactor+bf | 4.49 ± 2.60 | 9.49 | 17.68 | 0.812 | 0.815 | 0 |
+| E3 score (M3) | 4.71 ± 3.18 | 10.83 | 19.39 | 0.808 | 0.842 | 0 |
+| **E4 + predictor (M5)** | **3.43 ± 1.61** | **6.35** | **10.04** | 0.805 | 0.854 | 0 |
+| E5 + frag (M7), 60s ckpt | 4.55 ± 2.12 | 9.47 | 14.32 | 0.839 | 0.948 | 349 |
+| E5b M7, 0s ckpt | 4.20 ± 1.70 | 9.18 | 12.34 | 0.827 | 0.950 | 347 |
+
+#### burst（高峰擠壓 workload）
+
+| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate |
+|---|---:|---:|---:|---:|---:|
+| E1 | 17.36 ± 10.71 | 29.38 | 76.15 | 0.708 | 0.000 |
+| E2 | 6.36 ± 4.35 | 12.85 | 25.91 | 0.768 | 0.861 |
+| E3 | 6.62 ± 4.37 | 16.54 | 26.88 | 0.766 | 0.896 |
+| **E4** | **4.24 ± 2.10** | **8.69** | **12.76** | 0.764 | 0.906 |
+| E5 | 6.64 ± 3.15 | 14.54 | 20.20 | 0.798 | 0.970 |
+| E5b | 6.96 ± 4.72 | 17.14 | 21.18 | 0.784 | 0.966 |
+
+#### ali（短 job、稀疏 workload）
+
+| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util |
+|---|---:|---:|---:|---:|
+| E1 | 0.515 ± 0.038 | 1.101 | 1.045 | 0.305 |
+| E2 | 0.512 ± 0.037 | 1.098 | 1.026 | 0.305 |
+| E3 | 0.512 ± 0.037 | 1.098 | 1.025 | 0.305 |
+| E4 | 0.512 ± 0.037 | 1.099 | 1.018 | 0.305 |
+| E5 | 0.543 ± 0.050 | 1.127 | 1.059 | 0.321 |
+
+ALI 上所有 scheduler 結果幾乎一致——util 只有 30%，根本沒有排隊壓力給 scheduler 表現空間。**這是 contention 的負面對照組**。
+
+### 4.2 Paired same-seed 比較（重點）
+
+| trace | E4 vs E2（predictor 邊際）| E5 vs E4（M7 邊際） | E5 vs E2（整套 stack） |
+|---|---:|---:|---:|
+| philly | **−20.06%** ± 11.95% ↓ | **+33.08%** ± 5.22% ↑ | +6.31% ± 15.42%（不顯著）|
+| burst | **−28.71%** ± 11.31% ↓ | **+60.95%** ± 31.71% ↑ | +14.85% ± 30.51%（不顯著）|
+| ali | −0.08% ± 0.09%（不顯著） | **+6.03%** ± 4.48% ↑ | +5.95% ± 4.44% ↑ |
+
+↓/↑ 表示 95% CI 不跨 0（statistically significant）。
+
+兩個 takeaway：
+
+1. M5 predictor 在 contention-heavy 兩個 trace 上效應顯著且大（−20% / −28%）。ali 上不顯著是因為 cluster 連塞滿一半都沒有，predictor 沒有作用空間。
+2. M7 fragmentation 在三個 trace 上一致 net negative、CI 都不跨 0。這個 negative result 跨 distribution 一致，是設計問題不是 philly artefact（§7 詳論）。
+
+### 4.3 圖表敘事
+
+完整 8 張圖在 `eval/figures/`。每張的故事：
+
+- **fig1 JCT bars (mean/p90/p95 with 95% CI error bars)** — E1 那根壓著其他四個一個量級，所以章節真正要看的差距在 E2..E5 之間。E4 三根都明顯比 E5 矮、error bar 不重疊。
+
+- **fig2 JCT CDF (log x)** — E1 的 CDF 在低 x 處遠左，意思是連最快的 50% job 都比其他組慢一個量級。E4 整段壓在 E5 下方，p50/p90/p95 全勝。
+
+- **fig3 Slowdown box** — E1 的 box 落在 [10, 100]，E4 收到 [1, 10] 左右，IQR 縮了一個量級。E5 的 box 比 E4 高一截，反映 requeue 後重做 lost progress 對短 job 的 slowdown 影響特別大。
+
+- **fig4 Utilisation timeline** — E5 比 E4 utilization 高一點點，但這部分高出來的工作量是「重做被 evict 的 job」，是 phantom utilization，不對應到 throughput 改善。
+
+- **fig5 E6 5×5 heatmap** — philly 上 jct_mean 範圍 3.28–3.63h，spread 10.6%；burst 28.5%（重壓力下 weight 比較敏感）；ali 0.1%（沒 contention 就沒差）。**最佳 cell 在 α≤0.25、δ≤0.15**——把 mps_fit 拉低、fragmentation penalty 別太大。
+
+- **fig6 backfill rate + requeue count** — E5/E5b bf_rate 衝到 0.95、requeue/run ~349–356（philly/burst）/ 92（ali）。看起來 reconciler 把節點塞滿，但塞進去的有相當比例是被踢掉後重排的 job，這就是 fig4 phantom utilization 的根源。
+
+- **fig7 normalised improvement vs E1** — philly 上 E4 −78%、E5 −71%（E5 比 E4 退步），其他兩條同樣是 E4 最深、E5 反彈。
+
+- **fig8 cross-trace generalisation** — 兩組 paired Δ 三個 trace 並排：綠色 predictor 在 philly/burst 顯著往下（−20% / −29%），ali 趴在 0；紅色 M7 三根都在 0 以上 CI 不跨 0。**M7 negative result generalises across distributions**。
+
+### 4.4 為什麼 M7 是 net negative
+
+仔細看數字背後的機制。E5 平均每 run 350 次 requeue，每次 requeue 都把 victim 從零重跑（lost progress）。即使 E5b 把 ckpt reload cost 設 0（樂觀 upper bound）、純看 lost-progress 的影響，philly 上 E5b 仍比 E4 差 22%、burst 差 24%。**問題本質不在 reload overhead，而在 victim 整段重跑**。
+
+當前 M7 victim selection 純看 priority——找最低 priority 的 running job 踢掉。這個策略對「已執行很久的 victim」沒有抵抗力：一個跑了 90% 完成度的 job，被踢掉重跑要付出整段成本，但釋放的 mps slot 只夠 head job 跑 10% 的時間。Trade off 在這份 workload distribution 上不划算。
+
+Future work 方向（fix C4 negative result）：
+
+1. Victim selection 加「已執行時間 / 完成比例」penalty——別踢已經跑完一半的 job。
+2. 改 preempt + suspend，保留 GPU memory state，把 lost progress 從 100% 降到接近 0。
+3. 只在 predictor 估計 head 剩餘時間 < victim 剩餘時間時觸發。
+
+這幾個方向其中之一試出來能讓 paired diff 翻正，就是 C4 從「flat negative result」升級成「conditional win」。
+
+---
+
+## 5. Live Cluster 結果
+
+### 5.1 Cluster 規模與限制
 
 | 項目 | 值 |
 |---|---|
-| Cluster | k3s + 1 × RTX 4070（透過 NVIDIA device plugin time-slicing 切成 2 個 logical GPU；2 worker pod 共享同一塊實體卡，100 mps slot each in slurm.conf）|
-| Workload | 20 jobs：12 短（mps:25, 60–120s）+ 6 中（mps:50, 180–300s）+ 2 大（mps:100, 240–360s），同一 seed 兩 pass 重現 |
-| Vendor pass | `slurm.jobSubmit.enabled=false`，純 Slurm multifactor + backfill |
-| Our pass | `slurm.jobSubmit.enabled=true`，M3 score 加進 priority（沒裝 predictor service，所以 ε=0、相當於 sim 的 E3）|
-| 兩 pass 之間 | `helm upgrade --reuse-values --no-hooks --set slurm.jobSubmit.enabled=...` 切換、`kubectl delete pod slurm-controller-0` 強制 slurmctld 用乾淨狀態啟動 |
-| 數據來源 | `sacct` 從 controller pod 直接取，filter by job name prefix |
+| Cluster | k3s + 1 × RTX 4070（NVIDIA device plugin time-slicing 切成 2 個 logical GPU、2 worker pod 共享同一塊實體卡，每 pod 配 100 mps slot in slurm.conf）|
+| Workload | 20 jobs：12 短 (mps:25, 60–120s) + 6 中 (mps:50, 180–300s) + 2 大 (mps:100, 240–360s) |
+| 預期 wall-clock | optimal ~24 min；實測 25–50 min per pass（含 cold start + 偶發 cluster wedge） |
+| 數據來源 | `sacct` 從 controller pod 直接取（login pod 連 slurmdbd 不穩，§7 提）|
 
-**2026-05-11 補做 our_pred pass**：M5 predictor service 已部署，加上同一個 workload 跑第三次（jobSubmit + predictor 全開），對應 sim 的 E4。所以本節有三組 pass 可比：vendor、our（M3 only）、our_pred（M3+M5）。Deployment 細節見 §7.6。
+跟 sim 比規模天差地遠（sim 是 16 等效 GPU、1000 jobs），所以**live 數字不是用來複現 sim 量化結論，是用來證明「整套 stack 在真機跑得動」、找出 deployment caveat**。
 
-### 7.2 數字
+### 5.2 四個 pass 的數字
 
-| pass | mean JCT | p90 JCT | max JCT | mean wait |
+| Pass | mean JCT | vs vendor (paired) | vs prev (paired) | 改善 job 數 |
 |---|---:|---:|---:|---:|
-| vendor | 932.6s | 2125.5s | 3200.0s | 776.5s |
-| our (M3 only) | 394.5s | 781.7s | 1053.0s | 238.4s |
-| our_pred (M3+M5) | 394.0s | 782.7s | 1051.0s | 237.9s |
+| vendor (multifactor only) | 932.6s | — | — | — |
+| our (M3 score) | 394.5s | **−57.70%** | — | 18/20 |
+| our_pred (M3+M5, bootstrap predictor) | 394.0s | **−57.75%** | vs our: −0.13% | 20/20 |
+| our_pred_hetero (5 user buckets) | 766.4s | −17.83% | vs our_pred: +94.52% ↑ | 5/20 |
+| **our_pred_hetero_v2 (matched predictor)** | **393.7s** | **−57.79%** | vs v1: −48.63% ↓ | 18/20 |
 
-Paired same-job diffs：
+### 5.3 五個 caveat 與 takeaway
 
-| 比較 | Δ mean JCT | 改善 job 數 |
-|---|---:|---:|
-| our vs vendor | −538.1s (−57.70%) | 18/20 |
-| our_pred vs vendor | −538.6s (−57.75%) | 20/20 |
-| **our_pred vs our** | **−0.5s (−0.13%)** | 10/20 |
+讀上面數字之前要先把這幾個東西放在心上：
 
-第三列是真正乾淨的對比（同一個 cluster 條件、同一個 workload，只差 M5 predictor 開關），其他兩列裡的 vendor 數字夾雜了 §7.3 提到的 freeze artefact。
+1. Vendor pass 中段卡了 30 分鐘的 cluster freeze。一個 mps:100 job 卡 COMPLETING、AllocTRES 殘留 50 slot 沒釋放，我手動 `scontrol reconfigure` 救活。所以「vs vendor −57%」這個 headline 有相當比例不是 scheduler win，是「對方塞車不見」。乾淨子集（small jobs，cluster 已暖機）的 paired diff 是 **−38.6%**，這個才適合放進論文 main result。
+2. our_pred vs our 差 −0.13%。同 cluster 條件、只切 predictor 開關，predictor 沒帶來邊際改善。直接的解釋是 root user 沒有歷史，predictor 對所有 job 回類似的常數。
+3. hetero v1 vs our_pred 差 +94%。看似 predictor 反向傷害，但拆 per-job wait 後發現 96% 的差距來自 v1 那次撞到的 cluster wedge（約 17 min freeze），不是 scheduler 行為。
+4. hetero v2 vs our_pred 差 −0.08%。把 v1 的 cluster issue 排除、predictor 用 distribution-matched 模型重訓、verified 對不同 user 回不同預測（u05=87s、u34=242s）後，predictor 仍然沒帶來改善。
+5. 在小規模 cluster 上，infrastructure noise 大於 scheduler signal。一次 controller restart 可以讓某個 job 多等 7 分鐘；20 個 job 的 workload total wall clock 也才 25 分鐘。
 
-**最重要的觀察是：M5 predictor 在這個 workload 上沒帶來任何可量測的改善。**
+### 5.4 為什麼 v2 retrained predictor 還是沒幫上？
 
-### 7.3 為什麼這個數字要打折看
+這是整個 live evaluation 最值得寫的故事。
 
-跑 vendor pass 中段叢集進了一個壞狀態（一個 mps:100 大 job 卡 COMPLETING，AllocTRES 殘留 50 slot 沒釋放，後續 mediums 全 PENDING (Resources)），我手動 `scontrol reconfigure` 救活。整個 freeze 約 30 min，全打在 vendor 的 mediums + larges 的 wait time 上。
+#### 假設與測試
 
-把 wait time 拆開看就清楚：
+`v1 → v2` 的修法基於一個 plausible hypothesis：**bootstrap predictor 是 train on Philly synthetic（median runtime 30 min），但 e7 workload 跑 60–360s，差 5–10×。模型對 u20 job 預測 766s、實際只跑 60–120s。Predictor 看到的世界跟 cluster 真實發生的事完全脫鉤，自然幫不上忙。**
 
-| 子集 | vendor mean wait | our mean wait | paired Δ |
-|---|---:|---:|---:|
-| 12 個 short job（mps:25） | 233s | 91s | **−61%** |
-| 6 個 medium job（mps:50） | 1157s | 352s | −70%（含 freeze）|
-| 2 個 large job（mps:100） | 2881s | 745s | −74%（含 freeze）|
-| **short 排除 0-s/1-s 兩個 outlier**（cluster 啟動期再多等了 7 分鐘） | **189s** | **116s** | **−38.6%** |
+比喻一下：就像找一個只熟 marathon 配速的教練來指揮 100 公尺短跑——他喊出來的「保留體力、慢一點」對短跑沒用，甚至誤導。
 
-最後一列是我認為**唯一能放進論文 main result 的數字**：cluster 已經穩定、job 已經開始正常 dispatch 後的 small job 平均 wait time，**ours 比 vendor 少 38.6%**。這跟 sim 的 E3 vs E2「不顯著」結論不一致——可能原因：
+修法三步：
+1. 生 1500-sample trace，5 個 user 各對應一個典型 runtime（u05=90s、u20=106s、u01=167s、u10=229s、u34=257s——刻意做出 3× spread）。
+2. 重訓 lgbm，MAE_log 從 1.23 降到 0.34（multiplicative error 從 5–10× 收到 1.4× 上下）。
+3. `kubectl cp` 進 PVC + restart predictor pod。Probe `/predict` 驗證 u05 → 87s、u34 → 240s——預測值都落在實際 workload 範圍裡。
 
-1. Live 的 workload 對 1 張 GPU 來說 contention 比 sim 設定高得多（sim 是 16 個 GPU 等效、live 是 1 個）。Contention 高的時候 score 因子（特別是 f_mps_fit 把 whole-GPU job 後排、讓 fractional MPS job 先過）會有 sim 看不到的價值。
-2. Sim 假設每個 scheduler 都跑在 100% 健康的 cluster；live 的 vendor pass 撞到的 freeze 是 sim 模擬不出來的。
-3. 樣本太小（n=10 小 job）導致 paired CI 寬，可能其實只是 noise。
+#### 一個額外的踩坑：predictor 也會改 walltime
 
-### 7.4 Caveats
+第一次跑 v2 pass，**5/20 jobs TIMEOUT**。Predictor wiring 預設 `applyTimeLimit=true`，意思是 predictor 算出多長就把 Slurm `--time` 改寫多長。新模型對 u01 預測 ~150s、但實際 medium job 跑 200–300s，Slurm 在 150s 把它砍掉。
 
-- **單一 cluster snapshot**：兩 pass 之間有 helm upgrade 加 slurmctld pod 刪除重啟，這個 cluster reset 本身可能影響後續行為。
-- **共享 GPU**：兩個 worker pod 透過 device plugin time-slicing 共用同一塊 RTX 4070，實際 SM 與 memory 的吞吐量瓶頸跟 sim 模型不一樣。
-- **沒裝 predictor**：對應的是 sim 的 E3，不是更值得的 E4。沒辦法 live 驗證 M5 預測短 job 的價值。
-- **沒測 M7 fragmentation**：M8 sim 已證 M7 在三個 trace 都 net negative，沒必要在這個更不穩的單卡 cluster 上再跑一次。
-
-### 7.5 紀錄保留
-
-- 原始 sacct: `eval/results/e7/vendor.csv`、`eval/results/e7/our.csv`、`eval/results/e7/our_pred.csv`
-- 比較輸出: `eval/results/e7/compare.txt`、`eval/results/e7/compare_with_predictor.txt`
-- Pass log: `eval/results/e7_vendor.log`、`eval/results/e7_our.log`、`eval/results/e7_our_pred.log`
-- Orchestrator: `eval/scripts/e7_one_pass.sh` 跑單 pass、`eval/scripts/e7_run_both.sh` 跑兩 pass
-
-### 7.6 M5 predictor live 部署紀錄與「為什麼 predictor 沒幫上忙」分析
-
-把 M5 predictor 接到實機跑出來，原本期待看到類似 sim E4 vs E2 的 −20% paired improvement。實際結果是 our_pred vs our 差 0.13%。這節記錄部署過程，並分析為什麼 sim 跟 live 在這個維度上對不齊。
-
-**部署過程踩到的坑**：
-
-1. Chart 預設 `runtimePredictor.enabled=false` + `slurm.jobSubmit.predictor.enabled=false`。helm upgrade 兩個一起開後，service 起來但 controller 連不到 — `Connection refused`。
-2. 根因：`chart/templates/network-policy.yaml::allow-controller-egress` 沒列 predictor port。已 patch：當 `runtimePredictor.enabled && slurm.jobSubmit.predictor.enabled` 都 true 時自動加 8080 egress to `app=runtime-predictor`。
-3. 第二個根因：當前的 controller image 沒安裝 curl，雖然 Dockerfile 寫了 `RUN apt install curl`。Rebuild controller image 後 lua plugin 才能 `call_predictor()`。
-4. 模型 bootstrap：寫了 retrain cronjob 但沒等他跑，直接 local train（用 sim 的 synthetic Philly trace 2000 jobs 訓 lgbm-200，MAE log=1.23）然後 `kubectl cp` 進 predictor PVC，restart pod。Predictor 從 bootstrap 模式變 `lgbm-v1`。
-5. 確認 wiring：predictor `/metrics` 的 `runtime_predictor_predict_total{mode="model"}` 在每次 sbatch 都 +1。20-job workload 提交完後 counter +20。
-
-**Wiring 是真的活了，但結果是 0.13% Δ。為什麼？**
-
-Predictor 對 priority 的影響是透過 score function 的 ε·f_runtime_short，其中 `f_runtime_short = horizon/(horizon + pred_runtime)`。要對 priority 有差異效果，**不同 job 之間的 pred_runtime 必須有顯著差距**。
-
-實際 predictor 對這 20 個 job 的輸出：
-- 12 個 short job：gpu=1, mps=25, gpu_type=rtx4070, user=root（user_freq=0 因為 sacct 沒 root 的歷史 job）
-- 6 個 medium：gpu=1, mps=50, 其他同上
-- 2 個 large：gpu=1, mps=100, 其他同上
-
-Predictor 的 feature 在這 3 群內幾乎一致：`gpu_count` / `gpu_type_*` / `partition_*` / `hour_of_week` 全相同；只有 `mps_req` 在 3 個值之間切。Predictor 對 mps=25 / 50 / 100 大概回 3 個 cluster 的預測值，組內幾乎是常數。
-
-結果 12 個 short job 的 f_runtime_short 都拿到同一個值，predictor 沒帶來組內排序信號；組間差距又被 α·f_mps_fit 主導（同個方向 — 小 mps 排前面）。所以 predictor 邊際貢獻被現有因子蓋過去。
-
-**對應到 sim 為什麼有 −20%？** Sim 的 Philly trace 1000 jobs 有 40 個 user、log-normal runtime、heavy-tail、heterogeneous gpu_count + gpu_type。Predictor 在這種 distribution 上能根據 (user_freq, user_mean_log_rt, gpu_count, gpu_type) 區分「這個用戶歷史上跑 5 分鐘」vs「那個用戶跑 6 小時」。Live 的 20 個 root user job 沒有這種訊號。
-
-**這個 negative result 本身是 thesis-worthy 的觀察**：M5 predictor 的價值正比於 workload heterogeneity，跟 §3.5 看到的 sensitivity vs contention 的關係類似。Predictor 不是「裝上去就有改善」，它需要 user / runtime / gpu-type 三個維度都有差距才會發揮。
-
-**對應到 thesis claim 的修正**：
-- C3（sim E4 vs E2 paired −20.1%）仍然成立 — 在 heterogeneous trace 上 statistically significant。
-- 新加 C3c（live our_pred vs our paired −0.13%）— 在 homogeneous 20-job workload 上 not significant。
-- 結合 C3 + C3c：predictor 的 contribution 是 workload-dependent，要在 production-like trace 上看 effect size，homogeneous burst test 不適合驗證。
-
-**部署 artifacts**（已 commit 在 chart / docker / services 下）：
-- `services/runtime_predictor/Dockerfile` + 訓練過的 `predictor.pkl` (lgbm-v1, MAE_log=1.23)
-- `chart/templates/network-policy.yaml::allow-controller-egress` 加上 predictor egress rule
-- `docker/controller/` rebuild 確認包含 curl
-- helm values 切換：`runtimePredictor.enabled=true`、`slurm.jobSubmit.predictor.enabled=true`
-
-### 7.7 跟進實驗：heterogeneous workload 上的 predictor
-
-7.6 結果顯示 predictor 在 homogeneous workload（同一 user `root`）上沒效果。為了驗證「給 predictor 看到不同 user 後是否能發揮」，再跑一次 pass `our_pred_hetero`，workload 用 5 個 user buckets 重新洗牌。
-
-**Setup**：
-- Predictor 模型沒換，仍是 lgbm-v1 (trained on synthetic Philly with 40 users `u01..u40`)。直接 probe predictor 確認對 user 敏感：u20 → 766s, u34 → 1561s, u01 → 1325s（2× spread）；對 mps_req 不敏感（同 user 下 mps=25/50/100 預測完全一樣）。
-- 但本 cluster 只有一個 OS user (`root`)，沒辦法 sbatch 成不同 user。Workaround：patch `job_submit.lua` 在 `build_predict_body` 內讀 `--comment=u\d+` 當 user override（patch 寫進 chart configmap、`scontrol reconfigure` 套用）。這個 hack 只是用來餵 predictor 不同 user 字串；其他 Slurm 行為不變。
-- Workload：20 jobs 同樣 mps + runtime mix，但用 `USERS=(u05 u20 u01 u10 u34)` 輪替 assign `--comment`。
-
-**結果（paired same-job vs 之前 passes）**：
-
-| 比較 | Δ mean JCT | 改善 job 數 |
-|---|---:|---:|
-| our_pred_hetero vs vendor | −17.83% | 5/20 |
-| our_pred_hetero vs our_pred (homogeneous) | **+94.52%** | 0/20 |
-| our_pred_hetero vs our (M3 only, homo) | +94.27% | 0/20 |
-
-第二列是值得解釋的：heterogeneous predictor 條件下 mean JCT 變成 2× 同 workload 的 homogeneous + predictor。乍看是 predictor 反向傷害，但拆 per-job wait 看：
-
-| 子集 | op (homogeneous) | oph (heterogeneous) | Δ |
-|---|---:|---:|---:|
-| jobs 0-s / 1-s（cold start outlier） | 5s | 474–478s | +470s |
-| jobs 2-s..11-s（small, cluster 已暖） | mean 113s | mean 194s | +81s |
-| jobs 12-m..17-m（medium，含 AllocTRES freeze） | mean 350s | mean 1043s | +693s |
-| jobs 18-l, 19-l（large） | mean 744s | mean 1527s | +783s |
-
-oph 的 cold start 多 ~7 分鐘（worker pod 重新 register 的老問題，§16 提過）；mid-run AllocTRES zombie 多 ~5–10 分鐘（用 `scontrol reconfigure` 救活）。這兩段 freeze 共 ~12–17 min，是 oph 比 op 慢的主因。Workload total wall clock 才 25 min，infrastructure noise 大過 scheduler 訊號。
-
-**能宣稱的事**：
-- M5 predictor 端到端 wiring 在 live 通了（counter 108 次 predict 全部來自 lua plugin）。
-- `--comment` hack 成功把不同 user 字串送進 predictor（directly probed），但這個 cluster 上做不到不靠 hack 的多 user。
-- Live cluster instability (AllocTRES zombies、NOT_RESPONDING flaps、cold start) 在這個規模上**淹過任何 predictor 引起的 JCT 差異**。要看到 sim E4 vs E2 的 −20% 級訊號，需要 (a) 更穩的 cluster，或 (b) 長 workload 讓 infrastructure noise 平均掉。
-- Predictor 自己 trained on synthetic Philly trace（median runtime ~30 min），但 e7 workload 都是 60–360s。模型對 (u20, mps:25) 回 766s，實際 job 只跑 60–120s。預測值 5–10× off，所以即使 cluster 穩定，predictor 的排序信號也是錯的。**Production 要看到 sim 等級的改善需要 predictor 在跟實際 workload 同 distribution 的歷史資料上 retrain**。
-
-**留下的 artifacts**：
-- `eval/results/e7/our_pred_hetero.csv` 原始 sacct
-- `eval/scripts/e7_jobs_hetero.sh` workload generator（5 user buckets）
-- `eval/scripts/e7_hetero_pass.sh` driver
-- ConfigMap `slurm-config-job-submit` 已 patch（lua 從 `--comment` 讀 user override）；要 revert 重跑 `helm upgrade` 即可
-
-### 7.8 把 predictor 訓練資料對齊實際 workload（v2）
-
-§7.6 跟 §7.7 留下一個明顯的問題：**predictor 用 Philly synthetic trace（median 30 分鐘）訓的，跟 e7 workload 上 60–360 秒的 job 差 5–10 倍**。模型對 u20 jobs 預測 766s、實際只跑 60–120s。Predictor 看到的世界跟 cluster 真實發生的事完全脫鉤，自然幫不上 scheduler 的忙。
-
-打一個更貼切的比喻：就像找一個只熟 marathon 配速的教練來指揮 100 公尺短跑賽，他喊出來的「保留體力、慢一點」對短跑沒任何用，甚至可能誤導。
-
-#### 怎麼修
-
-讓 predictor 也「習慣」短跑。三步：
-
-1. **生一個跟 e7 workload 一樣分布的訓練資料**（`eval/scripts/gen_predictor_train_e7.py`）：1500 個 sample，每個 user 對應一段典型 runtime——`u05` 平均跑 90s、`u20` 跑 106s、`u01` 跑 167s、`u10` 跑 229s、`u34` 跑 257s。這個 spread 是刻意設計的，模仿真實 production 中「不同團隊有不同典型 job 長度」的現象。
-2. **用這份資料重訓** LightGBM（`runtime_predictor.train`）。新模型 MAE_log 從原本的 1.23 降到 0.34——換成 multiplicative error，預測誤差從 5–10× 收到 1.4× 上下。
-3. **`kubectl cp` 到 predictor PVC、重啟 pod**。直接 probe `/predict` 驗證：u05 → 87s、u20 → 102s、u34 → 240s，都落在實際 workload 範圍裡。
-
-#### 一個額外踩到的坑：predictor 也會改 walltime
-
-第一次跑 v2 pass，有 **5/20 jobs TIMEOUT**。排查發現：lua 的 predictor wiring 預設 `applyTimeLimit=true`，意思是 predictor 算出多長就把 Slurm 的 `--time` 改寫多長。新模型對 u01 預測 ~150s，但實際 medium job 跑 200–300s，於是 Slurm 在 150s 把它砍掉。
-
-把 chart 的 `slurm.jobSubmit.predictor.applyTimeLimit` 切成 `false`，只用 predictor 做排序、不要它管 walltime。再跑一次，0 TIMEOUT。
+修法：chart 切 `slurm.jobSubmit.predictor.applyTimeLimit=false`，只讓 predictor 做排序、不要管 walltime。再跑：0 TIMEOUT。
 
 #### 真正的結果
 
-| 比較 | Δ mean JCT | 改善 job 數 | 故事 |
-|---|---:|---:|---|
-| v2 vs vendor | **−57.79%** | 18/20 | 整套 stack（score + 對齊 predictor）vs 純 Slurm |
-| v2 vs v1（mismatched predictor） | **−48.63%** | **20/20** | retrain 解決了 v1 的 cluster freeze 副作用 |
-| v2 vs our_pred (homogeneous, root user) | **−0.08%** | 10/20 | 對齊後的 predictor 跟「沒 predictor」**幾乎一樣** |
+| 比較 | Δ mean JCT | 改善 job 數 |
+|---|---:|---:|
+| v2 vs vendor | **−57.79%** | 18/20 |
+| v2 vs v1（mismatched predictor）| **−48.63%** | **20/20** |
+| v2 vs our_pred (homogeneous) | **−0.08%** | 10/20 |
 
-第二列亮眼但要小心解讀——v1 那次撞了 ~17 分鐘 cluster freeze、v2 整個 cluster 是乾淨的，所以 48.6% 的差距絕大部分是 infrastructure noise 不見了，不是 predictor 突然開竅。
-
-真正值得看的是**第三列**：v2 跟同 workload 同 cluster 條件、但 user 全部是 root 的 our_pred，paired diff 只有 −0.08%（雜訊內）。換句話說，把 predictor 對齊好之後，**它對排程的影響還是接近於零**。
+第二列看似爆改善但其實是 v1 那次的 cluster freeze 不見了。**第三列才是真正乾淨的對比**：同 workload、同 cluster 條件、只差 predictor 模型品質——paired diff 只有 −0.08%，在 noise 內。
 
 #### 為什麼？因為 score function 給 predictor 的權重太小
 
-仔細看數字背後的算術。Score function 是：
-
-`priority = α·f_mps_fit + β·f_vram_fit − δ·f_fragmentation + ε·f_runtime_short`
-
-`f_runtime_short = horizon / (horizon + pred_runtime)`，預設 horizon = 3600s。新模型對 5 個 user 的預測 spread：
+公式回顧：`f_runtime_short = horizon / (horizon + pred_runtime)`，horizon=3600s。新模型對 5 user 的預測 spread：
 
 | user | pred (s) | f_runtime_short |
 |---|---:|---:|
@@ -423,84 +326,188 @@ oph 的 cold start 多 ~7 分鐘（worker pod 重新 register 的老問題，§1
 | u10 | 218 | 0.943 |
 | u34 | 240 | 0.937 |
 
-Spread 是 0.976 − 0.937 = **0.039**。乘 ε=0.30 = 0.012 priority unit 差距。再乘 `scoreGain=1000` = 12 priority points。
+`f_runtime_short` 最大 spread = 0.976 − 0.937 = **0.039**。乘 ε=0.30 = 0.012 priority unit 差距。再乘 `scoreGain=1000` = **12 priority points**。
 
-Slurm 的 `PriorityWeightAge=1000` 表示「等 1 小時 = 1000 priority points」。**Predictor 提供的全部信號等於 43 秒的等待換算值**。對於排隊只等幾分鐘的 e7 workload，這完全淹沒在 noise 裡。
+Slurm 的 `PriorityWeightAge=1000` 設定下，等 1 小時 = 1000 priority points。**Predictor 提供的全部信號 = 43 秒的等待換算值**。對 e7 workload（job 排隊只等幾分鐘）這完全淹沒在 noise 裡。
 
-要 predictor 真的能撼動排序，需要 workload 裡 job 長度跨好幾個量級（log-normal heavy tail），不是 e7 這種 6× 範圍的「短跑訓練營」。Sim 的 Philly trace 跨 100 倍以上（60s 到 6h），f_runtime_short 從 0.99 到 0.37，spread 有 0.62——比 e7 大 16 倍。這就是為什麼 sim 看到 −20% 而 live 看不到。
+要 predictor 撼動排序，需要 workload 裡 job 長度跨好幾個量級。Sim Philly trace 跨 100×（60s 到 6h），對應 f_runtime_short 從 0.99 到 0.37，spread 0.62——比 e7 大 16 倍。這就是為什麼 sim 看到 −20% 而 live 看不到。
 
-#### Thesis 級的結論
+### 5.5 Predictor 發揮的三個條件
 
-不是「predictor 沒用」，而是「**predictor 的價值要看 workload 跨度有多大**」。三個必要條件，少一個都不會 work：
+Predictor 的價值取決於 workload。三件事要同時成立才會看到改善：
 
-1. **Workload 本身要 heterogeneous**（job 長度跨多個量級，不是「都差不多 200 秒上下」）
-2. **Predictor 要在這份 distribution 上訓** （v2 修了這項）
-3. **Score function 的 ε 權重要跟 horizon 一起配** （目前 ε=0.30 + horizon=3600 在 e7 上太保守）
+1. Workload 本身要 heterogeneous，job 長度跨多個量級，不是「都差不多 200 秒上下」。
+2. Predictor 要在這份 distribution 上 train。v2 做到這項，但只解決條件 2 不解決條件 1。
+3. Score function 的 ε 跟 horizon 要跟 workload 跨度配。當前預設 ε=0.30、horizon=3600 對 e7 的 6× 跨度太保守。
 
-production 部署的 takeaway：M5 predictor 要發揮，要等 cluster 上跑出夠 heterogeneous 的 sacct 歷史（hours 級長 job + minutes 級短 job 都有），再用那份歷史 retrain。一個只跑 micro-benchmark 的 cluster 不會看到 predictor 改善。
+少一條都不會看到效果。Production 部署前要先看 sacct 跨度，一個只跑 micro-benchmark 的 cluster 不會從 M5 拿到改善。
 
-#### 留下的 artifacts
-- `eval/scripts/gen_predictor_train_e7.py` — 生 distribution-matched trace
-- `/tmp/predictor_e7.pkl`（model, 沒進 git，因為是 binary）— lgbm-v1, MAE_log=0.34
-- `eval/results/e7/our_pred_hetero_v2.csv` — v2 sacct
-- helm 設定變更：`slurm.jobSubmit.predictor.applyTimeLimit=false`（不要讓 predictor 動 walltime，只做 scoring）
+### 5.6 Cluster instability：一個獨立的 thesis-worthy 觀察
 
-## 8. M9 — LinUCB weight tuning（純 sim）
+E7 過程踩到的 wedge 狀態詳細記在 `docs/note.md` #16。六層交互：
 
-M8 的 5×5 sensitivity grid 證明 weight 對 mean JCT 的最大 spread 是 burst 28.5% / philly 10.6% / ali 0.1%。M9 問的不一樣：**有沒有比窮舉 grid 更省 sim runs 的方式找到接近最佳的 weight？**
+1. helm post-upgrade hook (`gpu-labeler`) 撞 BackoffLimitExceeded → 用 `--no-hooks` 繞
+2. Controller restart → workers NOT_RESPONDING → in-flight jobs 卡 COMPLETING（Slurm 21.08 對 controller 頻繁重啟沒做好）
+3. Operator 把 ghost COMPLETING jobs 當 running、拒絕 scale up → 死結
+4. AllocTRES zombie：mps slots accounted 但實際沒 job 在跑（Slurm 21.08 GRES accounting bug；`scontrol reconfigure` 救）
+5. `sacct` 從 login pod 連 slurmdbd 失敗、controller pod 卻 OK（netpol / munge socket）
+6. device plugin time-slicing 把一塊實體 GPU advertise 成 2 個——Slurm 排程 200 mps slot，實際吞吐 100 slot 等級
 
-### 8.1 設定
+針對 #3 我們做了 `operator/ghost_detector`：偵測 `current_replicas==0 && pods==0 && running_jobs>0` 並發 `ghost_jobs_detected` 事件 + Prometheus `GhostJobsWedge` alert。SOP 寫在 note.md §16.7。
 
-- Arm 空間：(α, δ, ε) 在 3×3×3 = 27 個 tuple 上掃。β=0.20 固定。
+這部分是 thesis 的次要發現——**production-quality scheduler 評估需要的最小 cluster size 大於我們手上的單卡 setup**。Wedge events 約 10 分鐘等級、加總常與整個 workload 同等量；要量到 scheduler 的純效果，要嘛 cluster 更穩、要嘛 workload 拉到幾小時讓 noise 平均掉。
+
+---
+
+## 6. M9 動態 Weight Tuning（純 sim）
+
+### 6.1 問題
+
+M8 的 E6 5×5 sensitivity grid 證明 weight 對 mean JCT 的最大 spread 是 burst 28.5% / philly 10.6% / ali 0.1%。M9 問的不一樣：**有沒有比窮舉 grid 更省 sim runs 的方式找到接近最佳的 weight？**
+
+### 6.2 設定
+
+- Arm 空間：(α, δ, ε) 在 3³ = 27 個 tuple 上掃。β=0.20 固定。
 - Context 空間：每個 (trace, seed) 算一個 3-dim feature `(n_jobs/2000, mean_mps/4, mean_gpu/8)`。三個 family × 5 個 seed = 15 個 context。
 - Reward：`−jct_mean / 3600`（負時、越大越好），由 `sim.runner.run` 跑單次得到。
-- 三個 policy 互比：`random`（uniform）、`UCB1`（非 contextual）、`LinUCB`（每 arm 一個 ridge regression head, α=0.6, ridge=1.0）。
+- 三個 policy：`random`（uniform）、`UCB1`（非 contextual）、`LinUCB`（每 arm 一個 ridge regression head, α=0.6, ridge=1.0）。
 - 預算：120 個 training round（vs M8 grid 用 375 sim runs，3×5×25）。
-- Eval：訓練後 policy 凍住，每個 context 跑一次 greedy arm。
 
 實作在 `services/weight_tuner/{bandit.py,sim_env.py}`，driver 是 `eval/scripts/run_m9_linucb.py`。
 
-### 8.2 結果
+### 6.3 結果
 
-| Policy | eval mean JCT (h) | vs M8 grid-best | sim runs 用了 |
+| Policy | eval mean JCT (h) | vs M8 grid-best | sim runs |
 |---|---:|---:|---:|
 | random baseline | 3.217 | +28.1% | 120 |
 | **UCB1** | **2.587** | **+3.0%** | 120 |
 | LinUCB | 2.745 | +9.3% | 120 |
 | M8 grid-best (static) | 2.511 | — | 375 |
-| Oracle (per-context best) | 2.448 | −2.5% | full grid × 15 |
+| Oracle (per-context) | 2.448 | −2.5% | full |
 
-可以看出三件事：
+對應 `eval/figures/fig9_m9_regret.png` 的 cumulative regret 曲線：UCB1 在 ~30 round 後 regret 成長近乎打平、LinUCB 緩慢一點、random 線性成長。
 
-1. **Oracle 跟 M8 grid-best 只差 2.5%**：以這個 workload 池（philly + burst + ali，5 seed each）來說，一個固定 arm 已經把 weight tuning 能拿的近乎全部抓掉。Per-context 細調的 headroom 上限只有 2.5%。
-2. **UCB1 用 1/3 樣本拿到 +3% 的答案**：M8 跑了 375 次 sim 求 grid optimum，UCB1 只用 120 次就到 2.587 h，比 M8 grid-best 多 3%、比 oracle 多 5.7%。Sample efficiency 是 M9 的真價值。
-3. **LinUCB 在本問題上不如 UCB1**：因為 oracle vs static best 只差 2.5%，context 提供的信號很弱、ridge regression 反而被 fit noise 拖累。**Contextual tuning 在這個 workload mix 上沒有意義**。
+### 6.4 三個直接結論
 
-對應 fig9（`eval/figures/fig9_m9_regret.png`）的 cumulative regret 曲線：UCB1 在 ~30 round 後 regret 成長近乎打平、LinUCB 緩慢一點、random 線性成長。
+1. **Oracle 跟 M8 grid-best 只差 2.5%**——以這個 workload 池來說，一個固定 arm 已經把 weight tuning 能拿的近乎全部抓掉。Per-context 細調的 headroom 上限只有 2.5%。
+2. **UCB1 用 1/3 樣本拿到 +3% 的答案**——M8 跑 375 次 sim 求 grid optimum，UCB1 只用 120 次就到 2.587 h、比 M8 grid-best 多 3%、比 oracle 多 5.7%。**Sample efficiency 才是 M9 的真價值**。
+3. **LinUCB 不如 UCB1**——因為 oracle vs static best 只差 2.5%，context 提供的信號很弱、ridge regression 反而被 fit noise 拖累。**Contextual tuning 在這個 workload mix 上沒意義**。
 
-### 8.3 對 thesis 的意義
+### 6.5 為什麼不做 PPO
 
-- **不需要做 PPO**。原 M9 spec 寫 LinUCB + PPO，但 LinUCB 已經對「contextual 在這個問題上不值得」做了定量回答：oracle 跟 static best 差 2.5%、context 不能挽救這個天花板。PPO 是更貴的同種 family、不會超越 oracle、最多只在 sample efficiency 上略好；以 thesis ROI 看不值得。
-- **要 deploy 的話 UCB1 就夠**。把它包成 service 跟 lua 對接的工程量不大；run a cold start 100 個 sbatch 之後 weight 就會 converge。但 M9 不需要 deploy 就能寫進 thesis：純 sim 數字已經回答了「動態 tuning 值不值得」的問題。
-- **跟 M8 比的數字要小心怎麼講**。M8 grid-best 是「事後知道哪個 arm 最好」；M9 UCB1 是「線上學出來」。Apples-to-apples 比較是 M8 grid sweep cost vs M9 training cost，兩者都是 sim run 預算。M9 在這個維度上勝出（120 vs 375）。
+原 M9 spec 寫 LinUCB + PPO。LinUCB 結果已經對「contextual 在這個問題上不值得」做了定量回答：oracle 跟 static best 差 2.5%、context 不能挽救這個天花板。PPO 是更貴的同類型方法、不會超越 oracle、最多在 sample efficiency 上略好。以 thesis ROI 看不值得。
 
-### 8.4 留下的 artifacts
+要 deploy 的話 UCB1 就夠——cold start 100 個 sbatch 後 weight 就 converge。但 M9 不需要 deploy 就能寫進 thesis：純 sim 數字已經回答「動態 tuning 值不值得」的問題。
 
-- `services/weight_tuner/bandit.py` — UCB1 + LinUCB + RandomPolicy + train()
-- `services/weight_tuner/sim_env.py` — SimPull adapter、context_vector、default_arm_grid (3×3×3)
-- `services/weight_tuner/tests/test_bandit.py` — 6 個 unit test（context dim、reward convergence、cache invalidation、cross-policy regret）
-- `eval/results/m9/m9_history.csv` 每 round 的 (policy, arm, ctx, reward)
-- `eval/results/m9/m9_summary.json` 最終比較表
-- `eval/figures/fig9_m9_regret.{png,pdf}` cumulative regret 圖
+---
 
-## 9. M8 驗收
+## 7. 討論
 
-- [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs
-- [x] **8 張圖出爐** — fig1 bar、fig2 CDF、fig3 box、fig4 utilization、fig5 heatmap、fig6 bf+requeue、fig7 normalised、fig8 cross-trace
-- [x] **negative result 跨 distribution 驗證** — M7 在 philly / burst / ali 三種 distribution 上一致 net negative
-- [x] **E7 live cluster paired** — 20 jobs × 3 pass 完成（vendor / our / our_pred）。Clean comparison：our_pred vs our paired −0.13%（predictor 在 homogeneous workload 上沒幫上）
-- [x] **M5 predictor live deployment** — image built、netpol patched、controller curl rebuilt、bootstrap model trained + cp 進 PVC、100% sbatch 被 predictor 處理（counter 驗證）
-- [x] **Heterogeneous workload live 驗證** — `--comment` hack 注入 5 個 user buckets，predictor 端確認接收到不同 user。Live JCT diff 被 cluster instability (cold start + AllocTRES freeze 約 12-17 min) 淹過、無法量測 predictor 純效果。結論：sim E4 vs E2 的 −20% 級訊號需要更穩 cluster 或更長 workload，本機規模做不到
-- [x] **M9 LinUCB weight tuning** — 純 sim、3 policy (random / UCB1 / LinUCB) 互比。UCB1 用 120 round 拿到 +3% vs M8 grid-best、比 M8 的 375 sim run 省 1/3。LinUCB 不如 UCB1（contextual 在 oracle-vs-static 差 2.5% 的這個 workload 上沒得發揮）。結論：M9 確認 contextual tuning 在這個問題上沒意義，UCB1 的 sample efficiency 才是 deploy 的論點
-- [x] **Predictor retrain on workload-matched distribution（v2）** — 用 e7 workload 對齊的 1500-sample trace 重訓 (MAE_log 1.23 → 0.34)、live 跑驗證。Finding：predictor 機制都正確、但 e7 workload 跨度只有 6×（60–360s），score function 的 ε·f_runtime_short 換算到 priority 只值 43 秒等待換算——不足以撼動排序。Predictor 的價值 = workload heterogeneity × ε 權重 × horizon 配置，三個都對才會發揮。寫進 §7.8
-- [x] **eval-writeup.md** — 本檔 §1–§8
+### 7.1 評估方法上的 design choice
+
+1. Paired same-seed + 5 seeds + Student-t 95% CI 是主要量化工具，E5b 對照組用來獨立估 ckpt cost 的成分。中途發現 submit_ts reset bug、整個 M7 結論翻盤，這個過程說明為什麼 cross-seed 變異需要從一開始就做。
+2. M7 的 net negative 結果跨三個 distribution 一致呈現。文中沒有把它包裝成「邊際 win」，而是試著精確定義「victim selection 純看 priority 在哪些 workload pattern 下失敗」，並列出三個可驗證的修法方向。
+3. Sim 跟 live 在 M5 predictor 結果上不一致時，我們選擇建立一個能跨兩邊都成立的解釋（§5.5 三條件 model），而不是只報其中一邊的數字。
+
+### 7.2 哪些地方可以做更好
+
+1. **Live cluster 規模不夠**：單卡 RTX 4070 + 20-job workload 上 infrastructure noise 跟 scheduler signal 同量級，量化 predictor 的 live 效果做不到。需要多卡 cluster 或更長 workload。
+2. **Predictor 訓練資料假設**：sim E4 假設 RMSE=0（給 predictor 真實 runtime），live e7 用 1500-sample synthetic 替代。Production 部署要用 cluster 自己的 sacct 歷史 retrain，這部分沒在這個 thesis cycle 內驗證。
+3. **M7 沒實作改良版**：identifying victim-selection 是 root cause 但沒實作 elapsed-progress penalty / preempt+suspend / predictor-conditioned trigger 三個 fix 的任何一個。Negative result 留在「我們知道為什麼會失敗」階段，不到「我們知道怎麼修」。
+
+### 7.3 對 production 部署的建議
+
+如果有人想把 Kubeflux 部署到實際 cluster，這些是該看的東西：
+
+- **打開的東西**：score function（M3，三因子預設權重 robust）、predictor service（M5，前提是有 sacct 歷史 retrain）。
+- **關閉的東西**：fragmentation reconciler（M7 預設 `shadowMode=true`，等 victim selection 改進前不要 `live`）。
+- **要監控的東西**：operator `ghost_jobs_present` gauge（cluster wedge 偵測）、`bf_rate`（backfill 是否還在 work）、`predict_total{mode}`（predictor 服務是否被 lua 呼叫到）。
+- **要 retrain 的東西**：predictor cronjob 每天或每週從新 sacct 跑一次（chart 已內建 `runtimePredictor.retrain.enabled`）。
+
+---
+
+## 8. 限制與威脅效度
+
+- **三個 trace 都是 synthetic**：philly / burst / ali 是三組不同 distribution 的 generator。已經跨 distribution 驗證 negative result，但真實 production trace（Helios、Alibaba 公開資料）可能呈現不同 contention 結構。換 `--trace` 參數就能 repro。
+- **Lost-progress 假設保守**：sim 讓 victim 從零重跑，沒模擬 partial checkpoint resume。E5 已加 60s reload overhead，但「已完成的 work 100% 重做」這個假設偏悲觀。改 preempt+suspend 可大幅縮小。這也是 §4.4 future work 方向 2。
+- **Predictor 假設完美（sim）**：sim 裡 `f_runtime_short(true_runtime)` 等於假設 RMSE=0。實測 RMSE 約 ±20%（services/runtime_predictor 訓練輸出），真實環境 E4 改善幅度應該打 8 折。
+- **mem / IO 沒模擬**：sim 只追蹤 MPS slot 跟 GPU 數，GPU job 的 IO wait 也是 JCT 顯著貢獻者，在 sim 裡假設「已內含於 runtime」。
+- **E6 grid 升級到 5×5，但仍沒掃 β 跟 ε**：要進一步聲明 weight robustness 需要 full 4-D scan。
+- **Live cluster 單 GPU**：單卡 + device plugin time-slicing 把 1 個實體 GPU 切成 2 個 logical，Slurm 視 200 mps 為獨立資源但實際吞吐量是 100 mps 級。Production multi-GPU cluster 行為會不同。
+- **Live workload 規模**：20 jobs / 25 min wall clock，跟 cluster wedge 事件等量級。要量到 scheduler 純效果需要更長 workload。
+
+---
+
+## 9. 結論與未來工作
+
+### 9.1 核心結論
+
+整套 stack 裡，M5 runtime predictor 是效應最確定的元件。Sim 上 philly −20%、burst −29% mean JCT，paired CI 都不跨 0；ali 因為 cluster 沒 contention 所以看不到差。
+
+M7 fragmentation reconciler 在當前 victim-selection 設計下是 net negative。三個 trace 結果一致，且 ckpt reload cost 不是主因，victim 整段重跑造成的 lost progress 才是。Negative result generalises 跨 distribution。
+
+Live cluster 部分證明部署沒問題，但量化效應做不到。單卡 RTX 4070 加 20-job workload 上，infrastructure noise（controller restart、AllocTRES zombie）跟 scheduler signal 處在同一個 wall-clock 量級。要在 live 看到 sim 等級的改善，得同時滿足三件事：workload runtime 跨多個量級、predictor 在 matched distribution 訓練、score function 的 ε/horizon 配合 workload 跨度。
+
+M9 UCB1 在 sim 上用 1/3 預算（120 vs 375 runs）找到接近 M8 grid-best 的 weight。Oracle 跟 static best 差只有 2.5%，所以 contextual tuning（LinUCB、PPO）沒有發揮空間。M9 的價值是 sample efficiency 而不是 contextual adaptation。
+
+### 9.2 Future work（按優先級）
+
+1. M7 victim selection 改良。加 elapsed-progress penalty 或改 preempt+suspend，試試能不能把 +33% paired diff 翻成 conditional win。一天工期，成功的話 C4 可以從 negative result 升級成「找到讓 M7 work 的條件」。
+2. Multi-GPU cluster live re-run。拿到 2 張以上實體卡的 cluster 後再跑 E7，量化 predictor 的真實 live 效果。預估需要 50 jobs 以上、workload runtime 跨度 10× 以上才能蓋過 infrastructure noise。
+3. Predictor 在線 retrain pipeline 長期驗證。chart 已內建 cronjob 但沒長期跑過，需要 4 週 production sacct 才能觀察 MAE_log 趨勢跟 stale model fallback 行為。
+4. 真實 production trace 替換。拿 Alibaba 公開 trace 取代 synthetic generator，看 cross-trace 結論是否一致。
+5. Score function 4-D weight scan。目前 5×5 只掃 (α, δ)。完整 (α, β, δ, ε) 四維可能找到更好 corner。
+
+---
+
+## A. 重現步驟
+
+```bash
+# 0. 第一次跑 — 裝 venv
+uv venv .venv-m5 && uv pip install --python .venv-m5/bin/python pytest matplotlib lightgbm
+
+# 1. Sim E1..E6 全跑（< 5 分鐘）
+bash eval/scripts/run_all.sh
+
+# 2. 出圖（< 10 秒）
+.venv-m5/bin/python eval/scripts/plot_all.py
+
+# 3. 看主表 + paired diff
+.venv-m5/bin/python eval/scripts/print_summary.py
+
+# 4. M9 bandit experiment（< 3 分鐘）
+PYTHONPATH=services .venv-m5/bin/python eval/scripts/run_m9_linucb.py
+
+# 5. （optional）E7 live cluster — 需要 kubeconfig 指到 chart 部署好的 k3s
+bash eval/scripts/e7_one_pass.sh vendor        # pass A
+helm upgrade ... --set slurm.jobSubmit.enabled=true
+bash eval/scripts/e7_one_pass.sh our           # pass B
+.venv-m5/bin/python eval/scripts/e7_compare.py eval/results/e7/vendor.csv eval/results/e7/our.csv
+```
+
+可調整的環境變數：
+- `TRACES="philly burst ali"` 控制 sim 要跑哪幾種 trace
+- `SEEDS="42 43 44 45 46"` 控制 seed 列表
+- `E6_GRID=DENSE` (5×5) 或 `SMALL` (3×3 legacy)
+- `CKPT_COST=60.0` E5 的 checkpoint reload cost
+
+Raw artifacts：
+- `eval/results/<trace>/<exp>/<run>__seed<N>.{csv,json}` 每個 seed 的 per-job + summary
+- `eval/results/all_summaries.json` 全部 465 runs 攤平
+- `eval/results/agg_by_run.json` 跨 seed 聚合的 mean / std / 95% CI
+- `eval/results/e7/{vendor,our,our_pred,our_pred_hetero,our_pred_hetero_v2}.csv` live sacct
+- `eval/results/m9/m9_history.csv` + `m9_summary.json` bandit 數據
+- `eval/figures/fig{1..9}.{png,pdf}` 圖
+
+---
+
+## B. 驗收
+
+- [x] 跨 trace raw data 齊全（3 traces × 5 seeds × 31 configs = 465 sim runs）
+- [x] 9 張圖（fig1 bars、fig2 CDF、fig3 box、fig4 util、fig5 heatmap、fig6 bf+requeue、fig7 normalised、fig8 cross-trace、fig9 M9 regret）
+- [x] M7 negative result 跨 distribution 驗證
+- [x] E7 live cluster 4 個 pass 完成（vendor / our / our_pred / hetero_v2）
+- [x] M5 predictor live deployment + 端到端 wiring 驗證
+- [x] M9 LinUCB / UCB1 sample efficiency vs M8 grid 比較
+- [x] Operator hardening：ghost-job detector + GhostJobsWedge alert
+- [x] eval-writeup.md 9 個章節 + 2 個 appendix（本檔）
