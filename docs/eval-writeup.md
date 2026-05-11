@@ -375,7 +375,63 @@ oph 的 cold start 多 ~7 分鐘（worker pod 重新 register 的老問題，§1
 - `eval/scripts/e7_hetero_pass.sh` driver
 - ConfigMap `slurm-config-job-submit` 已 patch（lua 從 `--comment` 讀 user override）；要 revert 重跑 `helm upgrade` 即可
 
-## 8. M8 驗收
+> **TODO（給下一輪 live 實驗）**：bootstrap predictor 是 train on synthetic Philly（median runtime 30 min），跟 e7 workload（60–360s）差 5–10×。要量化 predictor 真正的 live 效果，需要重新 train 一個 distribution 對齊的模型：
+> 1. 把 e7_jobs_hetero.sh 預期的 runtime 分布（含 mps + user 的對應關係）寫成 trace
+> 2. 用 `services/runtime_predictor/train.py --trace <對齊版>.json --output predictor-e7.pkl` 重訓
+> 3. `kubectl cp predictor-e7.pkl <predictor-pod>:/models/predictor.pkl` + restart
+> 4. 再跑一次 our_pred_hetero pass，跟 vendor / our 比 paired JCT
+>
+> 預期：如果模型對 workload 的 runtime 預測對得上，predictor 的排序信號才會跟「短 job 先跑」一致，paired diff 應該往 sim 的 −20% 方向靠近。當前 bootstrap 模型的預測值跟實際 runtime 5–10× off，signal 本身指錯方向。
+
+## 8. M9 — LinUCB weight tuning（純 sim）
+
+M8 的 5×5 sensitivity grid 證明 weight 對 mean JCT 的最大 spread 是 burst 28.5% / philly 10.6% / ali 0.1%。M9 問的不一樣：**有沒有比窮舉 grid 更省 sim runs 的方式找到接近最佳的 weight？**
+
+### 8.1 設定
+
+- Arm 空間：(α, δ, ε) 在 3×3×3 = 27 個 tuple 上掃。β=0.20 固定。
+- Context 空間：每個 (trace, seed) 算一個 3-dim feature `(n_jobs/2000, mean_mps/4, mean_gpu/8)`。三個 family × 5 個 seed = 15 個 context。
+- Reward：`−jct_mean / 3600`（負時、越大越好），由 `sim.runner.run` 跑單次得到。
+- 三個 policy 互比：`random`（uniform）、`UCB1`（非 contextual）、`LinUCB`（每 arm 一個 ridge regression head, α=0.6, ridge=1.0）。
+- 預算：120 個 training round（vs M8 grid 用 375 sim runs，3×5×25）。
+- Eval：訓練後 policy 凍住，每個 context 跑一次 greedy arm。
+
+實作在 `services/weight_tuner/{bandit.py,sim_env.py}`，driver 是 `eval/scripts/run_m9_linucb.py`。
+
+### 8.2 結果
+
+| Policy | eval mean JCT (h) | vs M8 grid-best | sim runs 用了 |
+|---|---:|---:|---:|
+| random baseline | 3.217 | +28.1% | 120 |
+| **UCB1** | **2.587** | **+3.0%** | 120 |
+| LinUCB | 2.745 | +9.3% | 120 |
+| M8 grid-best (static) | 2.511 | — | 375 |
+| Oracle (per-context best) | 2.448 | −2.5% | full grid × 15 |
+
+可以看出三件事：
+
+1. **Oracle 跟 M8 grid-best 只差 2.5%**：以這個 workload 池（philly + burst + ali，5 seed each）來說，一個固定 arm 已經把 weight tuning 能拿的近乎全部抓掉。Per-context 細調的 headroom 上限只有 2.5%。
+2. **UCB1 用 1/3 樣本拿到 +3% 的答案**：M8 跑了 375 次 sim 求 grid optimum，UCB1 只用 120 次就到 2.587 h，比 M8 grid-best 多 3%、比 oracle 多 5.7%。Sample efficiency 是 M9 的真價值。
+3. **LinUCB 在本問題上不如 UCB1**：因為 oracle vs static best 只差 2.5%，context 提供的信號很弱、ridge regression 反而被 fit noise 拖累。**Contextual tuning 在這個 workload mix 上沒有意義**。
+
+對應 fig9（`eval/figures/fig9_m9_regret.png`）的 cumulative regret 曲線：UCB1 在 ~30 round 後 regret 成長近乎打平、LinUCB 緩慢一點、random 線性成長。
+
+### 8.3 對 thesis 的意義
+
+- **不需要做 PPO**。原 M9 spec 寫 LinUCB + PPO，但 LinUCB 已經對「contextual 在這個問題上不值得」做了定量回答：oracle 跟 static best 差 2.5%、context 不能挽救這個天花板。PPO 是更貴的同種 family、不會超越 oracle、最多只在 sample efficiency 上略好；以 thesis ROI 看不值得。
+- **要 deploy 的話 UCB1 就夠**。把它包成 service 跟 lua 對接的工程量不大；run a cold start 100 個 sbatch 之後 weight 就會 converge。但 M9 不需要 deploy 就能寫進 thesis：純 sim 數字已經回答了「動態 tuning 值不值得」的問題。
+- **跟 M8 比的數字要小心怎麼講**。M8 grid-best 是「事後知道哪個 arm 最好」；M9 UCB1 是「線上學出來」。Apples-to-apples 比較是 M8 grid sweep cost vs M9 training cost，兩者都是 sim run 預算。M9 在這個維度上勝出（120 vs 375）。
+
+### 8.4 留下的 artifacts
+
+- `services/weight_tuner/bandit.py` — UCB1 + LinUCB + RandomPolicy + train()
+- `services/weight_tuner/sim_env.py` — SimPull adapter、context_vector、default_arm_grid (3×3×3)
+- `services/weight_tuner/tests/test_bandit.py` — 6 個 unit test（context dim、reward convergence、cache invalidation、cross-policy regret）
+- `eval/results/m9/m9_history.csv` 每 round 的 (policy, arm, ctx, reward)
+- `eval/results/m9/m9_summary.json` 最終比較表
+- `eval/figures/fig9_m9_regret.{png,pdf}` cumulative regret 圖
+
+## 9. M8 驗收
 
 - [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs
 - [x] **8 張圖出爐** — fig1 bar、fig2 CDF、fig3 box、fig4 utilization、fig5 heatmap、fig6 bf+requeue、fig7 normalised、fig8 cross-trace
@@ -383,4 +439,5 @@ oph 的 cold start 多 ~7 分鐘（worker pod 重新 register 的老問題，§1
 - [x] **E7 live cluster paired** — 20 jobs × 3 pass 完成（vendor / our / our_pred）。Clean comparison：our_pred vs our paired −0.13%（predictor 在 homogeneous workload 上沒幫上）
 - [x] **M5 predictor live deployment** — image built、netpol patched、controller curl rebuilt、bootstrap model trained + cp 進 PVC、100% sbatch 被 predictor 處理（counter 驗證）
 - [x] **Heterogeneous workload live 驗證** — `--comment` hack 注入 5 個 user buckets，predictor 端確認接收到不同 user。Live JCT diff 被 cluster instability (cold start + AllocTRES freeze 約 12-17 min) 淹過、無法量測 predictor 純效果。結論：sim E4 vs E2 的 −20% 級訊號需要更穩 cluster 或更長 workload，本機規模做不到
+- [x] **M9 LinUCB weight tuning** — 純 sim、3 policy (random / UCB1 / LinUCB) 互比。UCB1 用 120 round 拿到 +3% vs M8 grid-best、比 M8 的 375 sim run 省 1/3。LinUCB 不如 UCB1（contextual 在 oracle-vs-static 差 2.5% 的這個 workload 上沒得發揮）。結論：M9 確認 contextual tuning 在這個問題上沒意義，UCB1 的 sample efficiency 才是 deploy 的論點
 - [x] **eval-writeup.md** — 本檔 §1–§8
