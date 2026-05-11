@@ -240,16 +240,27 @@ raw artifacts：
 | 兩 pass 之間 | `helm upgrade --reuse-values --no-hooks --set slurm.jobSubmit.enabled=...` 切換、`kubectl delete pod slurm-controller-0` 強制 slurmctld 用乾淨狀態啟動 |
 | 數據來源 | `sacct` 從 controller pod 直接取，filter by job name prefix |
 
-> 為什麼這只能對應 sim 的 E3 不是 E4：M5 predictor service 還沒部署到這個 cluster（需要 trained model + cronjob retrain pipeline）。所以 live 只能驗證「score 因子接上後對 mean JCT 的影響」，不包含 predictor 的 SJF kicker。
+**2026-05-11 補做 our_pred pass**：M5 predictor service 已部署，加上同一個 workload 跑第三次（jobSubmit + predictor 全開），對應 sim 的 E4。所以本節有三組 pass 可比：vendor、our（M3 only）、our_pred（M3+M5）。Deployment 細節見 §7.6。
 
 ### 7.2 數字
 
 | pass | mean JCT | p90 JCT | max JCT | mean wait |
 |---|---:|---:|---:|---:|
 | vendor | 932.6s | 2125.5s | 3200.0s | 776.5s |
-| our | 394.5s | 781.7s | 1053.0s | 238.4s |
+| our (M3 only) | 394.5s | 781.7s | 1053.0s | 238.4s |
+| our_pred (M3+M5) | 394.0s | 782.7s | 1051.0s | 237.9s |
 
-**Paired same-job diff (our − vendor): mean = −538.1s (−57.70%)，18/20 jobs 改善**。
+Paired same-job diffs：
+
+| 比較 | Δ mean JCT | 改善 job 數 |
+|---|---:|---:|
+| our vs vendor | −538.1s (−57.70%) | 18/20 |
+| our_pred vs vendor | −538.6s (−57.75%) | 20/20 |
+| **our_pred vs our** | **−0.5s (−0.13%)** | 10/20 |
+
+第三列是真正乾淨的對比（同一個 cluster 條件、同一個 workload，只差 M5 predictor 開關），其他兩列裡的 vendor 數字夾雜了 §7.3 提到的 freeze artefact。
+
+**最重要的觀察是：M5 predictor 在這個 workload 上沒帶來任何可量測的改善。**
 
 ### 7.3 為什麼這個數字要打折看
 
@@ -279,15 +290,56 @@ raw artifacts：
 
 ### 7.5 紀錄保留
 
-- 原始 sacct: `eval/results/e7/vendor.csv`、`eval/results/e7/our.csv`
-- 比較輸出: `eval/results/e7/compare.txt`
-- 兩 pass 的 log: `eval/results/e7_vendor.log`、`eval/results/e7_our.log`
-- Orchestrator: `eval/scripts/e7_one_pass.sh` 跑單 pass、`eval/scripts/e7_run_both.sh` 跑兩 pass（後者經過幾輪 debug，目前 require slurmctld pod 在每 pass 之間重啟才穩）
+- 原始 sacct: `eval/results/e7/vendor.csv`、`eval/results/e7/our.csv`、`eval/results/e7/our_pred.csv`
+- 比較輸出: `eval/results/e7/compare.txt`、`eval/results/e7/compare_with_predictor.txt`
+- Pass log: `eval/results/e7_vendor.log`、`eval/results/e7_our.log`、`eval/results/e7_our_pred.log`
+- Orchestrator: `eval/scripts/e7_one_pass.sh` 跑單 pass、`eval/scripts/e7_run_both.sh` 跑兩 pass
+
+### 7.6 M5 predictor live 部署紀錄與「為什麼 predictor 沒幫上忙」分析
+
+把 M5 predictor 接到實機跑出來，原本期待看到類似 sim E4 vs E2 的 −20% paired improvement。實際結果是 our_pred vs our 差 0.13%。這節記錄部署過程，並分析為什麼 sim 跟 live 在這個維度上對不齊。
+
+**部署過程踩到的坑**：
+
+1. Chart 預設 `runtimePredictor.enabled=false` + `slurm.jobSubmit.predictor.enabled=false`。helm upgrade 兩個一起開後，service 起來但 controller 連不到 — `Connection refused`。
+2. 根因：`chart/templates/network-policy.yaml::allow-controller-egress` 沒列 predictor port。已 patch：當 `runtimePredictor.enabled && slurm.jobSubmit.predictor.enabled` 都 true 時自動加 8080 egress to `app=runtime-predictor`。
+3. 第二個根因：當前的 controller image 沒安裝 curl，雖然 Dockerfile 寫了 `RUN apt install curl`。Rebuild controller image 後 lua plugin 才能 `call_predictor()`。
+4. 模型 bootstrap：寫了 retrain cronjob 但沒等他跑，直接 local train（用 sim 的 synthetic Philly trace 2000 jobs 訓 lgbm-200，MAE log=1.23）然後 `kubectl cp` 進 predictor PVC，restart pod。Predictor 從 bootstrap 模式變 `lgbm-v1`。
+5. 確認 wiring：predictor `/metrics` 的 `runtime_predictor_predict_total{mode="model"}` 在每次 sbatch 都 +1。20-job workload 提交完後 counter +20。
+
+**Wiring 是真的活了，但結果是 0.13% Δ。為什麼？**
+
+Predictor 對 priority 的影響是透過 score function 的 ε·f_runtime_short，其中 `f_runtime_short = horizon/(horizon + pred_runtime)`。要對 priority 有差異效果，**不同 job 之間的 pred_runtime 必須有顯著差距**。
+
+實際 predictor 對這 20 個 job 的輸出：
+- 12 個 short job：gpu=1, mps=25, gpu_type=rtx4070, user=root（user_freq=0 因為 sacct 沒 root 的歷史 job）
+- 6 個 medium：gpu=1, mps=50, 其他同上
+- 2 個 large：gpu=1, mps=100, 其他同上
+
+Predictor 的 feature 在這 3 群內幾乎一致：`gpu_count` / `gpu_type_*` / `partition_*` / `hour_of_week` 全相同；只有 `mps_req` 在 3 個值之間切。Predictor 對 mps=25 / 50 / 100 大概回 3 個 cluster 的預測值，組內幾乎是常數。
+
+結果 12 個 short job 的 f_runtime_short 都拿到同一個值，predictor 沒帶來組內排序信號；組間差距又被 α·f_mps_fit 主導（同個方向 — 小 mps 排前面）。所以 predictor 邊際貢獻被現有因子蓋過去。
+
+**對應到 sim 為什麼有 −20%？** Sim 的 Philly trace 1000 jobs 有 40 個 user、log-normal runtime、heavy-tail、heterogeneous gpu_count + gpu_type。Predictor 在這種 distribution 上能根據 (user_freq, user_mean_log_rt, gpu_count, gpu_type) 區分「這個用戶歷史上跑 5 分鐘」vs「那個用戶跑 6 小時」。Live 的 20 個 root user job 沒有這種訊號。
+
+**這個 negative result 本身是 thesis-worthy 的觀察**：M5 predictor 的價值正比於 workload heterogeneity，跟 §3.5 看到的 sensitivity vs contention 的關係類似。Predictor 不是「裝上去就有改善」，它需要 user / runtime / gpu-type 三個維度都有差距才會發揮。
+
+**對應到 thesis claim 的修正**：
+- C3（sim E4 vs E2 paired −20.1%）仍然成立 — 在 heterogeneous trace 上 statistically significant。
+- 新加 C3c（live our_pred vs our paired −0.13%）— 在 homogeneous 20-job workload 上 not significant。
+- 結合 C3 + C3c：predictor 的 contribution 是 workload-dependent，要在 production-like trace 上看 effect size，homogeneous burst test 不適合驗證。
+
+**部署 artifacts**（已 commit 在 chart / docker / services 下）：
+- `services/runtime_predictor/Dockerfile` + 訓練過的 `predictor.pkl` (lgbm-v1, MAE_log=1.23)
+- `chart/templates/network-policy.yaml::allow-controller-egress` 加上 predictor egress rule
+- `docker/controller/` rebuild 確認包含 curl
+- helm values 切換：`runtimePredictor.enabled=true`、`slurm.jobSubmit.predictor.enabled=true`
 
 ## 8. M8 驗收
 
 - [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs
 - [x] **8 張圖出爐** — fig1 bar、fig2 CDF、fig3 box、fig4 utilization、fig5 heatmap、fig6 bf+requeue、fig7 normalised、fig8 cross-trace
 - [x] **negative result 跨 distribution 驗證** — M7 在 philly / burst / ali 三種 distribution 上一致 net negative
-- [x] **E7 live cluster paired** — 20 jobs × 2 pass 完成；short job clean subset 看到 ours 比 vendor 快 38.6%
+- [x] **E7 live cluster paired** — 20 jobs × 3 pass 完成（vendor / our / our_pred）。Clean comparison：our_pred vs our paired −0.13%（predictor 在 homogeneous workload 上沒幫上）
+- [x] **M5 predictor live deployment** — image built、netpol patched、controller curl rebuilt、bootstrap model trained + cp 進 PVC、100% sbatch 被 predictor 處理（counter 驗證）
 - [x] **eval-writeup.md** — 本檔 §1–§8

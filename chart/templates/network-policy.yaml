@@ -250,6 +250,19 @@ spec:
     - ports:
         - protocol: TCP
           port: 2049
+    {{- if and .Values.runtimePredictor.enabled .Values.slurm.jobSubmit.predictor.enabled }}
+    # M6: lua job_submit plugin calls predictor on :8080 via curl.
+    # Gated on BOTH runtimePredictor being deployed AND the plugin
+    # wiring being enabled, so a disabled predictor doesn't leave a
+    # stale rule behind.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: runtime-predictor
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
