@@ -375,13 +375,75 @@ oph 的 cold start 多 ~7 分鐘（worker pod 重新 register 的老問題，§1
 - `eval/scripts/e7_hetero_pass.sh` driver
 - ConfigMap `slurm-config-job-submit` 已 patch（lua 從 `--comment` 讀 user override）；要 revert 重跑 `helm upgrade` 即可
 
-> **TODO（給下一輪 live 實驗）**：bootstrap predictor 是 train on synthetic Philly（median runtime 30 min），跟 e7 workload（60–360s）差 5–10×。要量化 predictor 真正的 live 效果，需要重新 train 一個 distribution 對齊的模型：
-> 1. 把 e7_jobs_hetero.sh 預期的 runtime 分布（含 mps + user 的對應關係）寫成 trace
-> 2. 用 `services/runtime_predictor/train.py --trace <對齊版>.json --output predictor-e7.pkl` 重訓
-> 3. `kubectl cp predictor-e7.pkl <predictor-pod>:/models/predictor.pkl` + restart
-> 4. 再跑一次 our_pred_hetero pass，跟 vendor / our 比 paired JCT
->
-> 預期：如果模型對 workload 的 runtime 預測對得上，predictor 的排序信號才會跟「短 job 先跑」一致，paired diff 應該往 sim 的 −20% 方向靠近。當前 bootstrap 模型的預測值跟實際 runtime 5–10× off，signal 本身指錯方向。
+### 7.8 把 predictor 訓練資料對齊實際 workload（v2）
+
+§7.6 跟 §7.7 留下一個明顯的問題：**predictor 用 Philly synthetic trace（median 30 分鐘）訓的，跟 e7 workload 上 60–360 秒的 job 差 5–10 倍**。模型對 u20 jobs 預測 766s、實際只跑 60–120s。Predictor 看到的世界跟 cluster 真實發生的事完全脫鉤，自然幫不上 scheduler 的忙。
+
+打一個更貼切的比喻：就像找一個只熟 marathon 配速的教練來指揮 100 公尺短跑賽，他喊出來的「保留體力、慢一點」對短跑沒任何用，甚至可能誤導。
+
+#### 怎麼修
+
+讓 predictor 也「習慣」短跑。三步：
+
+1. **生一個跟 e7 workload 一樣分布的訓練資料**（`eval/scripts/gen_predictor_train_e7.py`）：1500 個 sample，每個 user 對應一段典型 runtime——`u05` 平均跑 90s、`u20` 跑 106s、`u01` 跑 167s、`u10` 跑 229s、`u34` 跑 257s。這個 spread 是刻意設計的，模仿真實 production 中「不同團隊有不同典型 job 長度」的現象。
+2. **用這份資料重訓** LightGBM（`runtime_predictor.train`）。新模型 MAE_log 從原本的 1.23 降到 0.34——換成 multiplicative error，預測誤差從 5–10× 收到 1.4× 上下。
+3. **`kubectl cp` 到 predictor PVC、重啟 pod**。直接 probe `/predict` 驗證：u05 → 87s、u20 → 102s、u34 → 240s，都落在實際 workload 範圍裡。
+
+#### 一個額外踩到的坑：predictor 也會改 walltime
+
+第一次跑 v2 pass，有 **5/20 jobs TIMEOUT**。排查發現：lua 的 predictor wiring 預設 `applyTimeLimit=true`，意思是 predictor 算出多長就把 Slurm 的 `--time` 改寫多長。新模型對 u01 預測 ~150s，但實際 medium job 跑 200–300s，於是 Slurm 在 150s 把它砍掉。
+
+把 chart 的 `slurm.jobSubmit.predictor.applyTimeLimit` 切成 `false`，只用 predictor 做排序、不要它管 walltime。再跑一次，0 TIMEOUT。
+
+#### 真正的結果
+
+| 比較 | Δ mean JCT | 改善 job 數 | 故事 |
+|---|---:|---:|---|
+| v2 vs vendor | **−57.79%** | 18/20 | 整套 stack（score + 對齊 predictor）vs 純 Slurm |
+| v2 vs v1（mismatched predictor） | **−48.63%** | **20/20** | retrain 解決了 v1 的 cluster freeze 副作用 |
+| v2 vs our_pred (homogeneous, root user) | **−0.08%** | 10/20 | 對齊後的 predictor 跟「沒 predictor」**幾乎一樣** |
+
+第二列亮眼但要小心解讀——v1 那次撞了 ~17 分鐘 cluster freeze、v2 整個 cluster 是乾淨的，所以 48.6% 的差距絕大部分是 infrastructure noise 不見了，不是 predictor 突然開竅。
+
+真正值得看的是**第三列**：v2 跟同 workload 同 cluster 條件、但 user 全部是 root 的 our_pred，paired diff 只有 −0.08%（雜訊內）。換句話說，把 predictor 對齊好之後，**它對排程的影響還是接近於零**。
+
+#### 為什麼？因為 score function 給 predictor 的權重太小
+
+仔細看數字背後的算術。Score function 是：
+
+`priority = α·f_mps_fit + β·f_vram_fit − δ·f_fragmentation + ε·f_runtime_short`
+
+`f_runtime_short = horizon / (horizon + pred_runtime)`，預設 horizon = 3600s。新模型對 5 個 user 的預測 spread：
+
+| user | pred (s) | f_runtime_short |
+|---|---:|---:|
+| u05 | 87 | 0.976 |
+| u20 | 102 | 0.973 |
+| u01 | 108 | 0.971 |
+| u10 | 218 | 0.943 |
+| u34 | 240 | 0.937 |
+
+Spread 是 0.976 − 0.937 = **0.039**。乘 ε=0.30 = 0.012 priority unit 差距。再乘 `scoreGain=1000` = 12 priority points。
+
+Slurm 的 `PriorityWeightAge=1000` 表示「等 1 小時 = 1000 priority points」。**Predictor 提供的全部信號等於 43 秒的等待換算值**。對於排隊只等幾分鐘的 e7 workload，這完全淹沒在 noise 裡。
+
+要 predictor 真的能撼動排序，需要 workload 裡 job 長度跨好幾個量級（log-normal heavy tail），不是 e7 這種 6× 範圍的「短跑訓練營」。Sim 的 Philly trace 跨 100 倍以上（60s 到 6h），f_runtime_short 從 0.99 到 0.37，spread 有 0.62——比 e7 大 16 倍。這就是為什麼 sim 看到 −20% 而 live 看不到。
+
+#### Thesis 級的結論
+
+不是「predictor 沒用」，而是「**predictor 的價值要看 workload 跨度有多大**」。三個必要條件，少一個都不會 work：
+
+1. **Workload 本身要 heterogeneous**（job 長度跨多個量級，不是「都差不多 200 秒上下」）
+2. **Predictor 要在這份 distribution 上訓** （v2 修了這項）
+3. **Score function 的 ε 權重要跟 horizon 一起配** （目前 ε=0.30 + horizon=3600 在 e7 上太保守）
+
+production 部署的 takeaway：M5 predictor 要發揮，要等 cluster 上跑出夠 heterogeneous 的 sacct 歷史（hours 級長 job + minutes 級短 job 都有），再用那份歷史 retrain。一個只跑 micro-benchmark 的 cluster 不會看到 predictor 改善。
+
+#### 留下的 artifacts
+- `eval/scripts/gen_predictor_train_e7.py` — 生 distribution-matched trace
+- `/tmp/predictor_e7.pkl`（model, 沒進 git，因為是 binary）— lgbm-v1, MAE_log=0.34
+- `eval/results/e7/our_pred_hetero_v2.csv` — v2 sacct
+- helm 設定變更：`slurm.jobSubmit.predictor.applyTimeLimit=false`（不要讓 predictor 動 walltime，只做 scoring）
 
 ## 8. M9 — LinUCB weight tuning（純 sim）
 
@@ -440,4 +502,5 @@ M8 的 5×5 sensitivity grid 證明 weight 對 mean JCT 的最大 spread 是 bur
 - [x] **M5 predictor live deployment** — image built、netpol patched、controller curl rebuilt、bootstrap model trained + cp 進 PVC、100% sbatch 被 predictor 處理（counter 驗證）
 - [x] **Heterogeneous workload live 驗證** — `--comment` hack 注入 5 個 user buckets，predictor 端確認接收到不同 user。Live JCT diff 被 cluster instability (cold start + AllocTRES freeze 約 12-17 min) 淹過、無法量測 predictor 純效果。結論：sim E4 vs E2 的 −20% 級訊號需要更穩 cluster 或更長 workload，本機規模做不到
 - [x] **M9 LinUCB weight tuning** — 純 sim、3 policy (random / UCB1 / LinUCB) 互比。UCB1 用 120 round 拿到 +3% vs M8 grid-best、比 M8 的 375 sim run 省 1/3。LinUCB 不如 UCB1（contextual 在 oracle-vs-static 差 2.5% 的這個 workload 上沒得發揮）。結論：M9 確認 contextual tuning 在這個問題上沒意義，UCB1 的 sample efficiency 才是 deploy 的論點
+- [x] **Predictor retrain on workload-matched distribution（v2）** — 用 e7 workload 對齊的 1500-sample trace 重訓 (MAE_log 1.23 → 0.34)、live 跑驗證。Finding：predictor 機制都正確、但 e7 workload 跨度只有 6×（60–360s），score function 的 ε·f_runtime_short 換算到 priority 只值 43 秒等待換算——不足以撼動排序。Predictor 的價值 = workload heterogeneity × ε 權重 × horizon 配置，三個都對才會發揮。寫進 §7.8
 - [x] **eval-writeup.md** — 本檔 §1–§8
