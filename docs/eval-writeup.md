@@ -335,6 +335,46 @@ Predictor 的 feature 在這 3 群內幾乎一致：`gpu_count` / `gpu_type_*` /
 - `docker/controller/` rebuild 確認包含 curl
 - helm values 切換：`runtimePredictor.enabled=true`、`slurm.jobSubmit.predictor.enabled=true`
 
+### 7.7 跟進實驗：heterogeneous workload 上的 predictor
+
+7.6 結果顯示 predictor 在 homogeneous workload（同一 user `root`）上沒效果。為了驗證「給 predictor 看到不同 user 後是否能發揮」，再跑一次 pass `our_pred_hetero`，workload 用 5 個 user buckets 重新洗牌。
+
+**Setup**：
+- Predictor 模型沒換，仍是 lgbm-v1 (trained on synthetic Philly with 40 users `u01..u40`)。直接 probe predictor 確認對 user 敏感：u20 → 766s, u34 → 1561s, u01 → 1325s（2× spread）；對 mps_req 不敏感（同 user 下 mps=25/50/100 預測完全一樣）。
+- 但本 cluster 只有一個 OS user (`root`)，沒辦法 sbatch 成不同 user。Workaround：patch `job_submit.lua` 在 `build_predict_body` 內讀 `--comment=u\d+` 當 user override（patch 寫進 chart configmap、`scontrol reconfigure` 套用）。這個 hack 只是用來餵 predictor 不同 user 字串；其他 Slurm 行為不變。
+- Workload：20 jobs 同樣 mps + runtime mix，但用 `USERS=(u05 u20 u01 u10 u34)` 輪替 assign `--comment`。
+
+**結果（paired same-job vs 之前 passes）**：
+
+| 比較 | Δ mean JCT | 改善 job 數 |
+|---|---:|---:|
+| our_pred_hetero vs vendor | −17.83% | 5/20 |
+| our_pred_hetero vs our_pred (homogeneous) | **+94.52%** | 0/20 |
+| our_pred_hetero vs our (M3 only, homo) | +94.27% | 0/20 |
+
+第二列是值得解釋的：heterogeneous predictor 條件下 mean JCT 變成 2× 同 workload 的 homogeneous + predictor。乍看是 predictor 反向傷害，但拆 per-job wait 看：
+
+| 子集 | op (homogeneous) | oph (heterogeneous) | Δ |
+|---|---:|---:|---:|
+| jobs 0-s / 1-s（cold start outlier） | 5s | 474–478s | +470s |
+| jobs 2-s..11-s（small, cluster 已暖） | mean 113s | mean 194s | +81s |
+| jobs 12-m..17-m（medium，含 AllocTRES freeze） | mean 350s | mean 1043s | +693s |
+| jobs 18-l, 19-l（large） | mean 744s | mean 1527s | +783s |
+
+oph 的 cold start 多 ~7 分鐘（worker pod 重新 register 的老問題，§16 提過）；mid-run AllocTRES zombie 多 ~5–10 分鐘（用 `scontrol reconfigure` 救活）。這兩段 freeze 共 ~12–17 min，是 oph 比 op 慢的主因。Workload total wall clock 才 25 min，infrastructure noise 大過 scheduler 訊號。
+
+**能宣稱的事**：
+- M5 predictor 端到端 wiring 在 live 通了（counter 108 次 predict 全部來自 lua plugin）。
+- `--comment` hack 成功把不同 user 字串送進 predictor（directly probed），但這個 cluster 上做不到不靠 hack 的多 user。
+- Live cluster instability (AllocTRES zombies、NOT_RESPONDING flaps、cold start) 在這個規模上**淹過任何 predictor 引起的 JCT 差異**。要看到 sim E4 vs E2 的 −20% 級訊號，需要 (a) 更穩的 cluster，或 (b) 長 workload 讓 infrastructure noise 平均掉。
+- Predictor 自己 trained on synthetic Philly trace（median runtime ~30 min），但 e7 workload 都是 60–360s。模型對 (u20, mps:25) 回 766s，實際 job 只跑 60–120s。預測值 5–10× off，所以即使 cluster 穩定，predictor 的排序信號也是錯的。**Production 要看到 sim 等級的改善需要 predictor 在跟實際 workload 同 distribution 的歷史資料上 retrain**。
+
+**留下的 artifacts**：
+- `eval/results/e7/our_pred_hetero.csv` 原始 sacct
+- `eval/scripts/e7_jobs_hetero.sh` workload generator（5 user buckets）
+- `eval/scripts/e7_hetero_pass.sh` driver
+- ConfigMap `slurm-config-job-submit` 已 patch（lua 從 `--comment` 讀 user override）；要 revert 重跑 `helm upgrade` 即可
+
 ## 8. M8 驗收
 
 - [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs
@@ -342,4 +382,5 @@ Predictor 的 feature 在這 3 群內幾乎一致：`gpu_count` / `gpu_type_*` /
 - [x] **negative result 跨 distribution 驗證** — M7 在 philly / burst / ali 三種 distribution 上一致 net negative
 - [x] **E7 live cluster paired** — 20 jobs × 3 pass 完成（vendor / our / our_pred）。Clean comparison：our_pred vs our paired −0.13%（predictor 在 homogeneous workload 上沒幫上）
 - [x] **M5 predictor live deployment** — image built、netpol patched、controller curl rebuilt、bootstrap model trained + cp 進 PVC、100% sbatch 被 predictor 處理（counter 驗證）
+- [x] **Heterogeneous workload live 驗證** — `--comment` hack 注入 5 個 user buckets，predictor 端確認接收到不同 user。Live JCT diff 被 cluster instability (cold start + AllocTRES freeze 約 12-17 min) 淹過、無法量測 predictor 純效果。結論：sim E4 vs E2 的 −20% 級訊號需要更穩 cluster 或更長 workload，本機規模做不到
 - [x] **eval-writeup.md** — 本檔 §1–§8
