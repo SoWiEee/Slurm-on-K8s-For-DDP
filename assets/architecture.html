@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Slurm-on-K8s Architecture (k3s + RTX 4070)</title>
+  <title>Kubeflux Architecture</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -14,15 +14,14 @@
       padding: 2rem;
       color: white;
     }
-    .container { max-width: 1400px; margin: 0 auto; }
+    .container { max-width: 1320px; margin: 0 auto; }
     .header { margin-bottom: 1.5rem; }
     .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
     .pulse-dot {
-      width: 12px; height: 12px;
-      background: #22d3ee; border-radius: 50%;
+      width: 12px; height: 12px; background: #22d3ee; border-radius: 50%;
       animation: pulse 2s infinite;
     }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
     h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
     .subtitle { color: #94a3b8; font-size: 0.875rem; margin-left: 1.75rem; }
     .diagram-container {
@@ -35,9 +34,9 @@
     svg { width: 100%; min-width: 1200px; display: block; }
     .cards {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
       gap: 1rem;
-      margin-top: 1.5rem;
+      margin-top: 2rem;
     }
     .card {
       background: rgba(15, 23, 42, 0.5);
@@ -46,22 +45,19 @@
       padding: 1.25rem;
     }
     .card-header {
-      display: flex; align-items: center; gap: 0.5rem;
-      margin-bottom: 0.75rem;
+      display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;
     }
     .card-dot { width: 8px; height: 8px; border-radius: 50%; }
-    .card-dot.cyan    { background: #22d3ee; }
+    .card-dot.cyan { background: #22d3ee; }
     .card-dot.emerald { background: #34d399; }
-    .card-dot.violet  { background: #a78bfa; }
-    .card-dot.amber   { background: #fbbf24; }
-    .card-dot.rose    { background: #fb7185; }
-    .card-dot.orange  { background: #fb923c; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.amber { background: #fbbf24; }
+    .card-dot.rose { background: #fb7185; }
     .card h3 { font-size: 0.875rem; font-weight: 600; }
     .card ul { list-style: none; color: #94a3b8; font-size: 0.75rem; }
     .card li { margin-bottom: 0.375rem; }
     .footer {
-      text-align: center; margin-top: 1.5rem;
-      color: #475569; font-size: 0.75rem;
+      text-align: center; margin-top: 1.5rem; color: #475569; font-size: 0.75rem;
     }
   </style>
 </head>
@@ -70,474 +66,409 @@
     <div class="header">
       <div class="header-row">
         <div class="pulse-dot"></div>
-        <h1>Slurm-on-K8s Architecture</h1>
+        <h1>Kubeflux — Slurm on k3s for GPU/MPS Scheduling</h1>
       </div>
-      <p class="subtitle">k3s v1.34 + RTX 4070 (driver 595-open) · Helm chart deploy · Phase 5-A verified · 2026-04-29</p>
+      <p class="subtitle">Phase 6 scheduler stack (M2/M3 lua score · M5 predictor · M7 operator reconciler) highlighted in cyan</p>
     </div>
 
     <div class="diagram-container">
-      <svg viewBox="0 0 1280 1180" xmlns="http://www.w3.org/2000/svg">
+      <svg viewBox="0 0 1280 980" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
-          </marker>
-          <marker id="arrowhead-emerald" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/>
+            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
           </marker>
           <marker id="arrowhead-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/>
+            <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee" />
           </marker>
-          <marker id="arrowhead-amber" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24"/>
+          <marker id="arrowhead-emerald" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#34d399" />
           </marker>
           <marker id="arrowhead-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa"/>
+            <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa" />
           </marker>
           <marker id="arrowhead-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185"/>
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185" />
+          </marker>
+          <marker id="arrowhead-amber" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24" />
           </marker>
           <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
             <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
           </pattern>
         </defs>
 
-        <rect width="100%" height="100%" fill="url(#grid)"/>
-
-        <!-- ====== Linux host boundary ====== -->
-        <rect x="20" y="30" width="1240" height="100" rx="12" fill="rgba(251, 191, 36, 0.04)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
-        <text x="40" y="50" fill="#fbbf24" font-size="11" font-weight="600">Linux host (acane: Ubuntu 24.04 + k3s v1.34)</text>
-
-        <!-- User -->
-        <rect x="40" y="62" width="160" height="50" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
-        <text x="120" y="82" fill="white" font-size="11" font-weight="600" text-anchor="middle">Engineer</text>
-        <text x="120" y="100" fill="#94a3b8" font-size="9" text-anchor="middle">kubectl exec / ssh</text>
-
-        <!-- NVIDIA Driver + RTX 4070 -->
-        <rect x="540" y="62" width="240" height="50" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
-        <text x="660" y="80" fill="white" font-size="11" font-weight="600" text-anchor="middle">NVIDIA Driver 595-open</text>
-        <text x="660" y="98" fill="#fbbf24" font-size="9" text-anchor="middle">/dev/nvidia0 — RTX 4070 (12 GB, sm_89)</text>
-
-        <!-- NFS export -->
-        <rect x="970" y="62" width="270" height="50" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
-        <text x="1105" y="80" fill="white" font-size="11" font-weight="600" text-anchor="middle">NFSv4 export</text>
-        <text x="1105" y="98" fill="#94a3b8" font-size="9" text-anchor="middle">/srv/nfs/k8s · 192.168.0.111:2049</text>
-
-        <!-- ====== k3s cluster boundary ====== -->
-        <rect x="20" y="150" width="1240" height="980" rx="12" fill="rgba(251, 191, 36, 0.03)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
-        <text x="40" y="170" fill="#fbbf24" font-size="11" font-weight="600">k3s cluster · helm release: slurm-platform</text>
-
-        <!-- ====== slurm namespace ====== -->
-        <rect x="40" y="190" width="820" height="920" rx="10" fill="rgba(6, 78, 59, 0.18)" stroke="#34d399" stroke-width="1.2" stroke-dasharray="4,3"/>
-        <text x="58" y="208" fill="#34d399" font-size="10" font-weight="600">slurm namespace · PSS=baseline · resource-policy=keep</text>
-
-        <!-- =========== ARROWS (drawn early so boxes overlap them) =========== -->
-
-        <!-- User → login -->
-        <line x1="120" y1="112" x2="120" y2="240" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <text x="130" y="180" fill="#94a3b8" font-size="8">kubectl exec</text>
-
-        <!-- login → controller (sbatch :6817) -->
-        <line x1="200" y1="265" x2="320" y2="265" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
-        <text x="260" y="259" fill="#34d399" font-size="8" text-anchor="middle">sbatch :6817</text>
-
-        <!-- controller → workers (step launch :6818) -->
-        <line x1="400" y1="305" x2="200" y2="395" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
-        <line x1="430" y1="305" x2="380" y2="395" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
-        <line x1="460" y1="305" x2="560" y2="395" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
-        <text x="290" y="345" fill="#34d399" font-size="8">step launch :6818</text>
-
-        <!-- operator → controller (slurmrestd :6820) -->
-        <line x1="680" y1="265" x2="500" y2="265" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
-        <text x="590" y="258" fill="#a78bfa" font-size="8" text-anchor="middle">HTTP :6820 (JWT)</text>
-
-        <!-- operator → workers (patch replicas) -->
-        <line x1="710" y1="295" x2="180" y2="395" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
-        <line x1="730" y1="295" x2="360" y2="395" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
-        <line x1="750" y1="295" x2="540" y2="395" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
-        <text x="630" y="380" fill="#a78bfa" font-size="8">patch replicas (apps/v1)</text>
-
-        <!-- exporter → controller (HTTP :6820) -->
-        <line x1="730" y1="395" x2="500" y2="305" stroke="#fb923c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead)"/>
-        <text x="640" y="350" fill="#fb923c" font-size="8">/jobs /nodes</text>
-
-        <!-- controller → slurmdbd :6819 -->
-        <line x1="430" y1="305" x2="350" y2="650" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
-        <text x="370" y="500" fill="#34d399" font-size="8">acct :6819</text>
-
-        <!-- slurmdbd → mysql :3306 -->
-        <line x1="430" y1="680" x2="500" y2="680" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
-        <text x="465" y="673" fill="#34d399" font-size="8" text-anchor="middle">:3306</text>
-
-        <!-- shared PVC fans out -->
-        <line x1="600" y1="585" x2="160" y2="430" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-        <line x1="600" y1="585" x2="340" y2="430" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-        <line x1="600" y1="585" x2="520" y2="430" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-        <line x1="600" y1="585" x2="120" y2="290" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-        <line x1="600" y1="585" x2="420" y2="305" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-
-        <!-- ctld-state PVC -->
-        <line x1="430" y1="305" x2="375" y2="540" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-
-        <!-- mysql-data PVC -->
-        <line x1="540" y1="710" x2="540" y2="745" stroke="#22d3ee" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
-
-        <!-- secrets/configmap dotted lines (subtle) -->
-        <line x1="160" y1="838" x2="160" y2="290" stroke="#475569" stroke-width="0.8" stroke-dasharray="2,3"/>
-        <line x1="320" y1="838" x2="420" y2="305" stroke="#475569" stroke-width="0.8" stroke-dasharray="2,3"/>
-
-        <!-- Workers → device-plugin (nvidia.com/gpu) -->
-        <line x1="460" y1="395" x2="900" y2="245" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-amber)"/>
-        <text x="700" y="295" fill="#fbbf24" font-size="8">request nvidia.com/gpu × 1</text>
-
-        <!-- Workers (rtx4070) → MPS daemon -->
-        <line x1="460" y1="430" x2="900" y2="315" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-amber)"/>
-        <text x="710" y="380" fill="#fbbf24" font-size="8">CUDA → MPS pipe</text>
-
-        <!-- device-plugin → /dev/nvidia0 (host) -->
-        <line x1="1070" y1="225" x2="660" y2="115" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead-amber)"/>
-        <text x="900" y="160" fill="#fbbf24" font-size="8">advertise 4 slots from 1 GPU</text>
-
-        <!-- prometheus → exporter scrape -->
-        <line x1="900" y1="595" x2="800" y2="430" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
-        <text x="828" y="500" fill="#a78bfa" font-size="8">scrape :9341</text>
-
-        <!-- prometheus → operator scrape -->
-        <line x1="930" y1="595" x2="780" y2="295" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
-        <text x="850" y="450" fill="#a78bfa" font-size="8">scrape :8000</text>
-
-        <!-- grafana → prometheus -->
-        <line x1="985" y1="700" x2="985" y2="650" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
-        <text x="990" y="680" fill="#a78bfa" font-size="8">query</text>
-
-        <!-- prometheus → alertmanager -->
-        <line x1="1060" y1="625" x2="1085" y2="625" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
-
-        <!-- provisioner → NFS host -->
-        <line x1="1000" y1="900" x2="1100" y2="115" stroke="#22d3ee" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrowhead-cyan)"/>
-        <text x="1170" y="500" fill="#22d3ee" font-size="8" transform="rotate(-15 1170 500)">NFS :2049</text>
-
-        <!-- provisioner → PVC slurm-shared-rwx (dynamic provision) -->
-        <line x1="900" y1="900" x2="700" y2="585" stroke="#22d3ee" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrowhead-cyan)"/>
-        <text x="780" y="730" fill="#22d3ee" font-size="8">dynamic provision (RWX)</text>
-
-        <!-- =========== COMPONENT BOXES (on top of arrows) =========== -->
-
-        <!-- ===== slurm namespace pods ===== -->
-        <!-- slurm-login -->
-        <rect x="60" y="240" width="140" height="50" rx="6" fill="#0f172a"/>
-        <rect x="60" y="240" width="140" height="50" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
-        <text x="130" y="259" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-login</text>
-        <text x="130" y="276" fill="#94a3b8" font-size="9" text-anchor="middle">Deployment · sshd+munged</text>
-
-        <!-- slurm-controller-0 -->
-        <rect x="320" y="225" width="200" height="80" rx="6" fill="#0f172a"/>
-        <rect x="320" y="225" width="200" height="80" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="2"/>
-        <text x="420" y="246" fill="white" font-size="12" font-weight="700" text-anchor="middle">slurm-controller-0</text>
-        <text x="420" y="263" fill="#94a3b8" font-size="9" text-anchor="middle">StatefulSet · 1 replica</text>
-        <text x="420" y="278" fill="#34d399" font-size="9" text-anchor="middle">slurmctld :6817</text>
-        <text x="420" y="293" fill="#34d399" font-size="9" text-anchor="middle">slurmrestd :6820</text>
-
-        <!-- operator -->
-        <rect x="680" y="240" width="160" height="60" rx="6" fill="#0f172a"/>
-        <rect x="680" y="240" width="160" height="60" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-        <text x="760" y="260" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-elastic-operator</text>
-        <text x="760" y="276" fill="#94a3b8" font-size="9" text-anchor="middle">Deployment · poll 15s</text>
-        <text x="760" y="291" fill="#a78bfa" font-size="9" text-anchor="middle">/metrics :8000</text>
-
-        <!-- worker-cpu -->
-        <rect x="60" y="395" width="200" height="80" rx="6" fill="#0f172a"/>
-        <rect x="60" y="395" width="200" height="80" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
-        <text x="160" y="415" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-worker-cpu</text>
-        <text x="160" y="431" fill="#94a3b8" font-size="9" text-anchor="middle">StatefulSet · 1–4 replicas</text>
-        <text x="160" y="446" fill="#94a3b8" font-size="9" text-anchor="middle">partition=cpu · features=cpu</text>
-        <text x="160" y="463" fill="#34d399" font-size="9" text-anchor="middle">slurmd :6818</text>
-
-        <!-- worker-rtx4070 -->
-        <rect x="280" y="395" width="200" height="80" rx="6" fill="#0f172a"/>
-        <rect x="280" y="395" width="200" height="80" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
-        <text x="380" y="415" fill="white" font-size="11" font-weight="600" text-anchor="middle">worker-gpu-rtx4070</text>
-        <text x="380" y="431" fill="#94a3b8" font-size="9" text-anchor="middle">StatefulSet · 0–2 replicas</text>
-        <text x="380" y="446" fill="#fbbf24" font-size="9" text-anchor="middle">runtimeClass=nvidia</text>
-        <text x="380" y="463" fill="#fbbf24" font-size="9" text-anchor="middle">gres=gpu:rtx4070:1, mps:100</text>
-
-        <!-- worker-rtx4080 -->
-        <rect x="500" y="395" width="200" height="80" rx="6" fill="#0f172a"/>
-        <rect x="500" y="395" width="200" height="80" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5" stroke-dasharray="3,3"/>
-        <text x="600" y="415" fill="white" font-size="11" font-weight="600" text-anchor="middle">worker-gpu-rtx4080</text>
-        <text x="600" y="431" fill="#94a3b8" font-size="9" text-anchor="middle">StatefulSet · 0–2 (reserved)</text>
-        <text x="600" y="446" fill="#94a3b8" font-size="9" text-anchor="middle">no hardware yet · replicas=0</text>
-        <text x="600" y="463" fill="#94a3b8" font-size="9" text-anchor="middle">gres=gpu:rtx4080:1</text>
-
-        <!-- exporter -->
-        <rect x="720" y="395" width="120" height="60" rx="6" fill="#0f172a"/>
-        <rect x="720" y="395" width="120" height="60" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
-        <text x="780" y="415" fill="white" font-size="10" font-weight="600" text-anchor="middle">slurm-exporter</text>
-        <text x="780" y="431" fill="#94a3b8" font-size="8" text-anchor="middle">Deployment</text>
-        <text x="780" y="447" fill="#fb923c" font-size="9" text-anchor="middle">/metrics :9341</text>
-
-        <!-- PVC slurm-ctld-state -->
-        <rect x="290" y="540" width="170" height="38" rx="6" fill="#0f172a"/>
-        <rect x="290" y="540" width="170" height="38" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-        <text x="375" y="557" fill="white" font-size="10" font-weight="600" text-anchor="middle">PVC slurm-ctld-state</text>
-        <text x="375" y="571" fill="#94a3b8" font-size="8" text-anchor="middle">1Gi RWO · local-path</text>
-
-        <!-- PVC slurm-shared-rwx -->
-        <rect x="500" y="540" width="200" height="50" rx="6" fill="#0f172a"/>
-        <rect x="500" y="540" width="200" height="50" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-        <text x="600" y="558" fill="white" font-size="10" font-weight="600" text-anchor="middle">PVC slurm-shared-rwx</text>
-        <text x="600" y="572" fill="#94a3b8" font-size="8" text-anchor="middle">20Gi RWX</text>
-        <text x="600" y="585" fill="#22d3ee" font-size="8" text-anchor="middle">SC: slurm-shared-nfs (Retain)</text>
-
-        <!-- slurmdbd -->
-        <rect x="220" y="640" width="160" height="60" rx="6" fill="#0f172a"/>
-        <rect x="220" y="640" width="160" height="60" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
-        <text x="300" y="660" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurmdbd</text>
-        <text x="300" y="676" fill="#94a3b8" font-size="9" text-anchor="middle">Deployment</text>
-        <text x="300" y="691" fill="#34d399" font-size="9" text-anchor="middle">accounting :6819</text>
-
-        <!-- mysql -->
-        <rect x="430" y="640" width="160" height="60" rx="6" fill="#0f172a"/>
-        <rect x="430" y="640" width="160" height="60" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-        <text x="510" y="660" fill="white" font-size="11" font-weight="600" text-anchor="middle">mysql</text>
-        <text x="510" y="676" fill="#94a3b8" font-size="9" text-anchor="middle">StatefulSet · 1 replica</text>
-        <text x="510" y="691" fill="#a78bfa" font-size="9" text-anchor="middle">:3306</text>
-
-        <!-- mysql-data PVC -->
-        <rect x="450" y="715" width="120" height="32" rx="6" fill="#0f172a"/>
-        <rect x="450" y="715" width="120" height="32" rx="6" fill="rgba(76, 29, 149, 0.3)" stroke="#a78bfa" stroke-width="1"/>
-        <text x="510" y="729" fill="white" font-size="9" font-weight="600" text-anchor="middle">PVC mysql-data</text>
-        <text x="510" y="741" fill="#94a3b8" font-size="8" text-anchor="middle">5Gi RWO · local-path</text>
-
-        <!-- Annotation: legacy (manifests/core/slurm-accounting.yaml) -->
-        <text x="610" y="660" fill="#fb923c" font-size="8">legacy:</text>
-        <text x="610" y="673" fill="#fb923c" font-size="8">manifests/core/</text>
-        <text x="610" y="685" fill="#fb923c" font-size="8">slurm-accounting.yaml</text>
-
-        <!-- ConfigMaps row -->
-        <rect x="60" y="780" width="180" height="36" rx="6" fill="#0f172a"/>
-        <rect x="60" y="780" width="180" height="36" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="150" y="794" fill="white" font-size="10" font-weight="600" text-anchor="middle">CM slurm-config-static</text>
-        <text x="150" y="807" fill="#94a3b8" font-size="8" text-anchor="middle">slurm.conf header</text>
-
-        <rect x="250" y="780" width="180" height="36" rx="6" fill="#0f172a"/>
-        <rect x="250" y="780" width="180" height="36" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="340" y="794" fill="white" font-size="10" font-weight="600" text-anchor="middle">CM slurm-config-nodes</text>
-        <text x="340" y="807" fill="#94a3b8" font-size="8" text-anchor="middle">nodes + gres.conf</text>
-
-        <rect x="440" y="780" width="180" height="36" rx="6" fill="#0f172a"/>
-        <rect x="440" y="780" width="180" height="36" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="530" y="794" fill="white" font-size="10" font-weight="600" text-anchor="middle">CM slurm-ddp-runtime</text>
-        <text x="530" y="807" fill="#94a3b8" font-size="8" text-anchor="middle">DDP env helpers</text>
-
-        <rect x="630" y="780" width="200" height="36" rx="6" fill="#0f172a"/>
-        <rect x="630" y="780" width="200" height="36" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1" stroke-dasharray="2,2"/>
-        <text x="730" y="794" fill="white" font-size="10" font-weight="600" text-anchor="middle">CM slurm-modulefile-{cuda,…}</text>
-        <text x="730" y="807" fill="#fb923c" font-size="7" text-anchor="middle">legacy: lmod-modulefiles.yaml</text>
-
-        <!-- Secrets row -->
-        <rect x="60" y="838" width="280" height="40" rx="6" fill="#0f172a"/>
-        <rect x="60" y="838" width="280" height="40" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
-        <text x="200" y="855" fill="white" font-size="10" font-weight="600" text-anchor="middle">Secrets (projected)</text>
-        <text x="200" y="869" fill="#fb7185" font-size="8" text-anchor="middle">slurm-munge-key · slurm-ssh-key · slurm-jwt-secret · slurm-mysql-secret</text>
-
-        <!-- NetworkPolicies -->
-        <rect x="360" y="838" width="240" height="40" rx="6" fill="#0f172a"/>
-        <rect x="360" y="838" width="240" height="40" rx="6" fill="rgba(136, 19, 55, 0.3)" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3"/>
-        <text x="480" y="855" fill="white" font-size="10" font-weight="600" text-anchor="middle">16 × NetworkPolicy</text>
-        <text x="480" y="869" fill="#fb7185" font-size="8" text-anchor="middle">default-deny ingress+egress · allow-* whitelist</text>
-
-        <!-- Services / RBAC summary -->
-        <rect x="620" y="838" width="220" height="40" rx="6" fill="#0f172a"/>
-        <rect x="620" y="838" width="220" height="40" rx="6" fill="rgba(8, 51, 68, 0.3)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="730" y="855" fill="white" font-size="10" font-weight="600" text-anchor="middle">10 × Service · SA + Role</text>
-        <text x="730" y="869" fill="#94a3b8" font-size="8" text-anchor="middle">controller/worker headless · restapi ClusterIP</text>
-
-        <!-- PDB row -->
-        <rect x="60" y="900" width="780" height="34" rx="6" fill="#0f172a"/>
-        <rect x="60" y="900" width="780" height="34" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3,3"/>
-        <text x="450" y="922" fill="#94a3b8" font-size="9" text-anchor="middle">PodDisruptionBudgets × 7 (controller/operator/dbd: minAvailable=1 · workers/login: maxUnavailable=1)</text>
-
-        <!-- Pools / scaling note -->
-        <rect x="60" y="950" width="780" height="60" rx="6" fill="rgba(15, 23, 42, 0.6)" stroke="#1e293b" stroke-width="1"/>
-        <text x="450" y="970" fill="#34d399" font-size="10" font-weight="600" text-anchor="middle">elastic scaling</text>
-        <text x="450" y="987" fill="#94a3b8" font-size="9" text-anchor="middle">operator polls slurmrestd → ScalingDecision → patch StatefulSet replicas</text>
-        <text x="450" y="1001" fill="#94a3b8" font-size="9" text-anchor="middle">cooldown persisted via annotation slurm.k8s/last-scale-up-at · checkpoint guard optional</text>
-
-        <!-- Image / chart info -->
-        <rect x="60" y="1024" width="780" height="56" rx="6" fill="rgba(15, 23, 42, 0.6)" stroke="#1e293b" stroke-width="1"/>
-        <text x="450" y="1043" fill="#22d3ee" font-size="10" font-weight="600" text-anchor="middle">helm chart · single source of truth</text>
-        <text x="450" y="1058" fill="#94a3b8" font-size="9" text-anchor="middle">values.yaml::pools → slurm.conf NodeName + PARTITIONS_JSON (operator) + StatefulSets</text>
-        <text x="450" y="1071" fill="#94a3b8" font-size="9" text-anchor="middle">images: slurm-controller / slurm-worker / slurm-elastic-operator / slurm-exporter</text>
-
-        <!-- ====== gpu-operator namespace ====== -->
-        <rect x="880" y="190" width="380" height="320" rx="10" fill="rgba(120, 53, 15, 0.12)" stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="4,3"/>
-        <text x="898" y="208" fill="#fbbf24" font-size="10" font-weight="600">gpu-operator namespace · PSS=privileged</text>
-
-        <!-- nvidia-device-plugin -->
-        <rect x="900" y="220" width="340" height="50" rx="6" fill="#0f172a"/>
-        <rect x="900" y="220" width="340" height="50" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
-        <text x="1070" y="240" fill="white" font-size="11" font-weight="600" text-anchor="middle">nvidia-device-plugin-daemonset</text>
-        <text x="1070" y="258" fill="#fbbf24" font-size="9" text-anchor="middle">advertises nvidia.com/gpu × replicas (sharing.mps)</text>
-
-        <!-- mps-control-daemon -->
-        <rect x="900" y="290" width="340" height="50" rx="6" fill="#0f172a"/>
-        <rect x="900" y="290" width="340" height="50" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="2"/>
-        <text x="1070" y="310" fill="white" font-size="11" font-weight="600" text-anchor="middle">nvidia-device-plugin-mps-control-daemon</text>
-        <text x="1070" y="328" fill="#fbbf24" font-size="9" text-anchor="middle">DaemonSet · runs `nvidia-cuda-mps-control -f`</text>
-
-        <!-- gpu-feature-discovery -->
-        <rect x="900" y="358" width="340" height="40" rx="6" fill="#0f172a"/>
-        <rect x="900" y="358" width="340" height="40" rx="6" fill="rgba(120, 53, 15, 0.25)" stroke="#fbbf24" stroke-width="1"/>
-        <text x="1070" y="375" fill="white" font-size="10" font-weight="600" text-anchor="middle">gpu-feature-discovery</text>
-        <text x="1070" y="389" fill="#94a3b8" font-size="8" text-anchor="middle">DaemonSet · GPU model/memory labels</text>
-
-        <!-- NFD -->
-        <rect x="900" y="408" width="340" height="40" rx="6" fill="#0f172a"/>
-        <rect x="900" y="408" width="340" height="40" rx="6" fill="rgba(120, 53, 15, 0.2)" stroke="#fbbf24" stroke-width="1"/>
-        <text x="1070" y="425" fill="white" font-size="10" font-weight="600" text-anchor="middle">node-feature-discovery (master + worker + gc)</text>
-        <text x="1070" y="439" fill="#94a3b8" font-size="8" text-anchor="middle">cpu/pci/kernel labels</text>
-
-        <!-- device-plugin-config CM -->
-        <rect x="900" y="460" width="340" height="40" rx="6" fill="#0f172a"/>
-        <rect x="900" y="460" width="340" height="40" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="1070" y="475" fill="white" font-size="10" font-weight="600" text-anchor="middle">CM slurm-platform-device-plugin-config</text>
-        <text x="1070" y="490" fill="#22d3ee" font-size="8" text-anchor="middle">keys: default · rtx4070-mps · rtx4080-exclusive</text>
-
-        <!-- ====== monitoring namespace ====== -->
-        <rect x="880" y="530" width="380" height="220" rx="10" fill="rgba(76, 29, 149, 0.18)" stroke="#a78bfa" stroke-width="1.2" stroke-dasharray="4,3"/>
-        <text x="898" y="548" fill="#a78bfa" font-size="10" font-weight="600">monitoring namespace</text>
-
-        <!-- prometheus -->
-        <rect x="900" y="570" width="160" height="50" rx="6" fill="#0f172a"/>
-        <rect x="900" y="570" width="160" height="50" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-        <text x="980" y="590" fill="white" font-size="11" font-weight="600" text-anchor="middle">prometheus</text>
-        <text x="980" y="608" fill="#a78bfa" font-size="9" text-anchor="middle">Deployment · :9090</text>
-
-        <!-- alertmanager -->
-        <rect x="1080" y="570" width="160" height="50" rx="6" fill="#0f172a"/>
-        <rect x="1080" y="570" width="160" height="50" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
-        <text x="1160" y="590" fill="white" font-size="11" font-weight="600" text-anchor="middle">alertmanager</text>
-        <text x="1160" y="608" fill="#a78bfa" font-size="9" text-anchor="middle">Deployment · :9093</text>
-
-        <!-- grafana -->
-        <rect x="900" y="640" width="160" height="50" rx="6" fill="#0f172a"/>
-        <rect x="900" y="640" width="160" height="50" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
-        <text x="980" y="660" fill="white" font-size="11" font-weight="600" text-anchor="middle">grafana</text>
-        <text x="980" y="678" fill="#22d3ee" font-size="9" text-anchor="middle">Deployment · :3000</text>
-
-        <!-- kube-state-metrics -->
-        <rect x="1080" y="640" width="160" height="50" rx="6" fill="#0f172a"/>
-        <rect x="1080" y="640" width="160" height="50" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
-        <text x="1160" y="660" fill="white" font-size="11" font-weight="600" text-anchor="middle">kube-state-metrics</text>
-        <text x="1160" y="678" fill="#fb923c" font-size="9" text-anchor="middle">:8080</text>
-
-        <!-- monitoring CMs -->
-        <rect x="900" y="710" width="340" height="32" rx="6" fill="#0f172a"/>
-        <rect x="900" y="710" width="340" height="32" rx="6" fill="rgba(8, 51, 68, 0.3)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="1070" y="730" fill="#94a3b8" font-size="9" text-anchor="middle">prometheus-config · alert-rules · grafana-dashboards · provisioning</text>
-
-        <!-- ====== nfs-provisioner namespace ====== -->
-        <rect x="880" y="770" width="380" height="160" rx="10" fill="rgba(8, 51, 68, 0.18)" stroke="#22d3ee" stroke-width="1.2" stroke-dasharray="4,3"/>
-        <text x="898" y="788" fill="#22d3ee" font-size="10" font-weight="600">nfs-provisioner namespace</text>
-
-        <!-- provisioner -->
-        <rect x="900" y="800" width="220" height="50" rx="6" fill="#0f172a"/>
-        <rect x="900" y="800" width="220" height="50" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
-        <text x="1010" y="820" fill="white" font-size="10" font-weight="600" text-anchor="middle">nfs-subdir-external-</text>
-        <text x="1010" y="833" fill="white" font-size="10" font-weight="600" text-anchor="middle">provisioner</text>
-        <text x="1010" y="846" fill="#22d3ee" font-size="8" text-anchor="middle">Deployment · ClusterRole</text>
-
-        <!-- StorageClass -->
-        <rect x="1140" y="800" width="100" height="50" rx="6" fill="#0f172a"/>
-        <rect x="1140" y="800" width="100" height="50" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
-        <text x="1190" y="817" fill="white" font-size="9" font-weight="600" text-anchor="middle">SC</text>
-        <text x="1190" y="831" fill="white" font-size="9" font-weight="600" text-anchor="middle">slurm-shared-nfs</text>
-        <text x="1190" y="845" fill="#22d3ee" font-size="7" text-anchor="middle">Retain · Immediate</text>
-
-        <!-- RBAC summary -->
-        <rect x="900" y="870" width="340" height="40" rx="6" fill="#0f172a"/>
-        <rect x="900" y="870" width="340" height="40" rx="6" fill="rgba(136, 19, 55, 0.3)" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3"/>
-        <text x="1070" y="887" fill="white" font-size="9" font-weight="600" text-anchor="middle">SA + ClusterRole/Binding (PV lifecycle)</text>
-        <text x="1070" y="901" fill="#fb7185" font-size="8" text-anchor="middle">+ Role/Binding (leader-lock lease)</text>
-
-        <!-- ====== Footer-ish: out-of-cluster annotations ====== -->
-        <rect x="40" y="1040" width="1200" height="80" rx="8" fill="rgba(15, 23, 42, 0.5)" stroke="#1e293b" stroke-width="1"/>
-        <text x="60" y="1060" fill="#fbbf24" font-size="10" font-weight="600">deploy chain</text>
-        <text x="60" y="1077" fill="#94a3b8" font-size="9">1. setup-linux-gpu.sh (driver+toolkit) · 2. setup-nfs-server.sh (host export) · 3. create-secrets.sh · 4. install-gpu-operator.sh (helm release: gpu-operator)</text>
-        <text x="60" y="1093" fill="#94a3b8" font-size="9">5. helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm  ·  6. kubectl apply -f manifests/core/slurm-accounting.yaml (mysql + slurmdbd)  ·  7. bootstrap-lmod.sh</text>
-        <text x="60" y="1109" fill="#94a3b8" font-size="9">verify: scripts/verify-helm.sh · verify-storage.sh · verify-monitoring.sh · verify-gpu.sh</text>
-
-        <!-- ===== Legend (bottom-right outside namespaces) ===== -->
-        <text x="1075" y="940" fill="white" font-size="10" font-weight="600">Legend</text>
-        <rect x="1075" y="950" width="14" height="9" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
-        <text x="1095" y="958" fill="#94a3b8" font-size="8">Slurm core (workload)</text>
-
-        <rect x="1075" y="965" width="14" height="9" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1"/>
-        <text x="1095" y="973" fill="#94a3b8" font-size="8">Operator / DB / Monitoring</text>
-
-        <rect x="1075" y="980" width="14" height="9" rx="2" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1"/>
-        <text x="1095" y="988" fill="#94a3b8" font-size="8">GPU Operator / NVIDIA</text>
-
-        <rect x="1075" y="995" width="14" height="9" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
-        <text x="1095" y="1003" fill="#94a3b8" font-size="8">Storage / ConfigMap</text>
-
-        <rect x="1075" y="1010" width="14" height="9" rx="2" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1"/>
-        <text x="1095" y="1018" fill="#94a3b8" font-size="8">Secret / RBAC / NetPol</text>
-
-        <line x1="1075" y1="1028" x2="1095" y2="1028" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="3,3"/>
-        <text x="1100" y="1031" fill="#94a3b8" font-size="8">control-plane / scrape</text>
+        <rect width="100%" height="100%" fill="url(#grid)" />
+
+        <!-- =============== Namespace boundaries (drawn first so they sit behind) =============== -->
+        <!-- namespace: slurm -->
+        <rect x="180" y="70" width="820" height="780" rx="12"
+              fill="rgba(251, 191, 36, 0.04)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="195" y="92" fill="#fbbf24" font-size="11" font-weight="600">namespace: slurm</text>
+
+        <!-- namespace: monitoring -->
+        <rect x="1020" y="70" width="240" height="780" rx="12"
+              fill="rgba(251, 191, 36, 0.04)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="1035" y="92" fill="#fbbf24" font-size="11" font-weight="600">namespace: monitoring</text>
+
+        <!-- k3s host (subtle outer wrapper) -->
+        <rect x="20" y="55" width="1240" height="810" rx="14"
+              fill="transparent" stroke="#475569" stroke-width="1" stroke-dasharray="2,3"/>
+        <text x="32" y="74" fill="#94a3b8" font-size="10" font-weight="600">k3s host · Linux + RTX 4070</text>
+
+        <!-- =============== ARROWS (drawn before component fills, behind) =============== -->
+
+        <!-- 1. User -> slurm-login (sbatch / SSH) -->
+        <line x1="160" y1="245" x2="208" y2="245" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <text x="184" y="237" fill="#94a3b8" font-size="8" text-anchor="middle">SSH/sbatch</text>
+
+        <!-- 2. slurm-login -> slurmctld -->
+        <line x1="340" y1="225" x2="388" y2="170" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <text x="358" y="200" fill="#34d399" font-size="8">submit job</text>
+
+        <!-- 3. slurmctld -> lua plugin (internal, vertical) -->
+        <line x1="470" y1="195" x2="470" y2="218" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+        <text x="490" y="211" fill="#22d3ee" font-size="8">job_desc</text>
+
+        <!-- 4. lua plugin -> runtime-predictor (POST /predict) -->
+        <line x1="552" y1="253" x2="778" y2="253" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+        <text x="665" y="245" fill="#22d3ee" font-size="8" text-anchor="middle">POST /predict (curl --max-time 200ms)</text>
+
+        <!-- 5. predictor -> lua (response pred_seconds) -->
+        <line x1="778" y1="280" x2="552" y2="280" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#arrowhead-cyan)"/>
+        <text x="665" y="294" fill="#22d3ee" font-size="8" text-anchor="middle">pred_seconds → f_runtime_short</text>
+
+        <!-- 6. lua -> back to slurmctld (priority writeback) -->
+        <line x1="445" y1="218" x2="445" y2="195" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+        <text x="395" y="211" fill="#22d3ee" font-size="8">priority</text>
+
+        <!-- 7. slurmctld -> workers (dispatch via slurmd) -->
+        <line x1="450" y1="195" x2="300" y2="580" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <line x1="470" y1="195" x2="510" y2="580" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <line x1="490" y1="195" x2="720" y2="580" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <text x="595" y="385" fill="#34d399" font-size="8" text-anchor="middle">dispatch :6818</text>
+
+        <!-- 8. slurmctld <-> slurmdbd / mysql (accounting) -->
+        <line x1="640" y1="170" x2="800" y2="420" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
+        <text x="745" y="295" fill="#a78bfa" font-size="8">JWT :6819</text>
+
+        <!-- 9. Operator -> slurmrestd (poll 15s) -->
+        <line x1="780" y1="475" x2="640" y2="200" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
+        <text x="690" y="345" fill="#a78bfa" font-size="8">poll 15s</text>
+
+        <!-- 10. Operator -> StatefulSets (patch replicas via k8s API) -->
+        <line x1="500" y1="540" x2="300" y2="580" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead-amber)"/>
+        <line x1="540" y1="540" x2="510" y2="580" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead-amber)"/>
+        <line x1="580" y1="540" x2="720" y2="580" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead-amber)"/>
+        <text x="445" y="563" fill="#fbbf24" font-size="8" text-anchor="middle">k8s patch replicas</text>
+
+        <!-- 11. Operator's M7 reconciler -> slurmctld (scontrol requeue) -->
+        <path d="M 560 420 Q 560 320 555 195" fill="none" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-rose)"/>
+        <text x="570" y="350" fill="#fb7185" font-size="8">scontrol requeue (shadow|live)</text>
+
+        <!-- 12. Workers -> NFS /shared (IO) -->
+        <line x1="300" y1="700" x2="180" y2="745" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
+        <line x1="510" y1="700" x2="195" y2="755" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
+        <line x1="720" y1="700" x2="210" y2="765" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
+        <text x="245" y="735" fill="#a78bfa" font-size="8">/shared RWX (NFSv4)</text>
+
+        <!-- 13. Workers -> slurmdbd (job completion accounting) -->
+        <line x1="720" y1="700" x2="820" y2="540" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-violet)"/>
+        <text x="780" y="625" fill="#a78bfa" font-size="8">epilog</text>
+
+        <!-- 14. Prometheus -> operator (scrape) -->
+        <line x1="1040" y1="460" x2="755" y2="460" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-amber)"/>
+        <text x="900" y="453" fill="#fbbf24" font-size="8" text-anchor="middle">scrape :8000</text>
+
+        <!-- 15. Prometheus -> predictor :8080 (scrape) -->
+        <line x1="1040" y1="240" x2="985" y2="240" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-amber)"/>
+        <text x="1012" y="232" fill="#fbbf24" font-size="8" text-anchor="middle">scrape</text>
+
+        <!-- 16. Prometheus -> slurm-exporter (scrape) -->
+        <line x1="1040" y1="620" x2="985" y2="620" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-amber)"/>
+        <text x="1010" y="612" fill="#fbbf24" font-size="8" text-anchor="middle">scrape</text>
+
+        <!-- 17. slurm-exporter -> slurmrestd -->
+        <line x1="915" y1="600" x2="725" y2="200" stroke="#a78bfa" stroke-width="1" stroke-dasharray="2,3"/>
+        <text x="780" y="540" fill="#a78bfa" font-size="8" transform="rotate(-65 780 540)">REST /jobs /nodes</text>
+
+        <!-- 18. Alertmanager -> Grafana (alert routing) -->
+        <line x1="1140" y1="500" x2="1140" y2="558" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-rose)"/>
+        <text x="1160" y="535" fill="#fb7185" font-size="8">alerts</text>
+
+        <!-- 19. Prometheus -> Alertmanager -->
+        <line x1="1140" y1="320" x2="1140" y2="418" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-rose)"/>
+        <text x="1160" y="372" fill="#fb7185" font-size="8">eval rules</text>
+
+        <!-- =============== COMPONENTS (drawn on top) =============== -->
+
+        <!-- User (external, slate) -->
+        <rect x="30" y="220" width="130" height="60" rx="6" fill="rgba(30,41,59,0.7)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="95" y="244" fill="white" font-size="11" font-weight="600" text-anchor="middle">User</text>
+        <text x="95" y="262" fill="#94a3b8" font-size="9" text-anchor="middle">researcher / CLI</text>
+
+        <!-- slurm-login (Deployment, emerald vanilla Slurm) -->
+        <rect x="208" y="100" width="0" height="0" fill="#0f172a"/>
+        <rect x="208" y="208" width="132" height="64" rx="6" fill="#0f172a"/>
+        <rect x="208" y="208" width="132" height="64" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="274" y="230" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-login</text>
+        <text x="274" y="245" fill="#94a3b8" font-size="8" text-anchor="middle">Deployment</text>
+        <text x="274" y="258" fill="#94a3b8" font-size="8" text-anchor="middle">srun / sbatch / SSH :22</text>
+
+        <!-- slurm-controller (StatefulSet container) -->
+        <rect x="378" y="108" width="285" height="200" rx="8" fill="rgba(15,23,42,0.85)" stroke="#34d399" stroke-width="1.5" stroke-dasharray="5,4"/>
+        <text x="392" y="125" fill="#34d399" font-size="9" font-weight="600">slurm-controller-0 · StatefulSet × 1</text>
+
+        <!-- slurmctld -->
+        <rect x="390" y="138" width="160" height="58" rx="5" fill="#0f172a"/>
+        <rect x="390" y="138" width="160" height="58" rx="5" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="470" y="158" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurmctld</text>
+        <text x="470" y="173" fill="#94a3b8" font-size="8" text-anchor="middle">priority/multifactor</text>
+        <text x="470" y="186" fill="#94a3b8" font-size="8" text-anchor="middle">backfill scheduler :6817</text>
+
+        <!-- slurmrestd -->
+        <rect x="560" y="138" width="95" height="58" rx="5" fill="#0f172a"/>
+        <rect x="560" y="138" width="95" height="58" rx="5" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="607" y="158" fill="white" font-size="10" font-weight="600" text-anchor="middle">slurmrestd</text>
+        <text x="607" y="173" fill="#94a3b8" font-size="8" text-anchor="middle">REST :6820</text>
+        <text x="607" y="186" fill="#94a3b8" font-size="8" text-anchor="middle">JWT-HS256</text>
+
+        <!-- lua job_submit (M2/M3) — HIGHLIGHTED -->
+        <rect x="390" y="216" width="160" height="80" rx="5" fill="#0f172a"/>
+        <rect x="390" y="216" width="160" height="80" rx="5" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="2"/>
+        <text x="470" y="234" fill="white" font-size="10" font-weight="700" text-anchor="middle">lua job_submit</text>
+        <text x="470" y="247" fill="#22d3ee" font-size="8" text-anchor="middle">★ M2 / M3</text>
+        <text x="470" y="262" fill="#94a3b8" font-size="7" text-anchor="middle">α·f_mps + β·f_vram</text>
+        <text x="470" y="273" fill="#94a3b8" font-size="7" text-anchor="middle">− δ·f_frag + ε·f_rt_short</text>
+        <text x="470" y="287" fill="#22d3ee" font-size="7" text-anchor="middle">→ priority</text>
+
+        <!-- accounting link (slurmdbd connector) -->
+        <rect x="560" y="216" width="95" height="80" rx="5" fill="#0f172a"/>
+        <rect x="560" y="216" width="95" height="80" rx="5" fill="rgba(6,78,59,0.25)" stroke="#34d399" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="607" y="240" fill="white" font-size="9" font-weight="600" text-anchor="middle">→ slurmdbd</text>
+        <text x="607" y="256" fill="#94a3b8" font-size="7" text-anchor="middle">accounting</text>
+        <text x="607" y="270" fill="#94a3b8" font-size="7" text-anchor="middle">storage_pass</text>
+        <text x="607" y="284" fill="#94a3b8" font-size="7" text-anchor="middle">port :6819</text>
+
+        <!-- runtime-predictor (M5) — HIGHLIGHTED -->
+        <rect x="780" y="190" width="200" height="135" rx="8" fill="#0f172a"/>
+        <rect x="780" y="190" width="200" height="135" rx="8" fill="rgba(8,51,68,0.5)" stroke="#22d3ee" stroke-width="2"/>
+        <text x="880" y="212" fill="white" font-size="12" font-weight="700" text-anchor="middle">runtime-predictor</text>
+        <text x="880" y="227" fill="#22d3ee" font-size="9" text-anchor="middle">★ M5 thesis contribution</text>
+        <text x="880" y="246" fill="#94a3b8" font-size="8" text-anchor="middle">FastAPI + LightGBM :8080</text>
+        <text x="880" y="260" fill="#94a3b8" font-size="8" text-anchor="middle">PVC /models/predictor.pkl</text>
+        <text x="880" y="274" fill="#94a3b8" font-size="8" text-anchor="middle">CronJob retrain (sacct → model)</text>
+        <text x="880" y="294" fill="#94a3b8" font-size="7" text-anchor="middle">cold-start fallback:</text>
+        <text x="880" y="305" fill="#94a3b8" font-size="7" text-anchor="middle">min(user_time_limit, 4h)</text>
+        <text x="880" y="319" fill="#22d3ee" font-size="7" text-anchor="middle">/predict /readyz /metrics</text>
+
+        <!-- elastic-operator (M7) — HIGHLIGHTED -->
+        <rect x="378" y="420" width="385" height="130" rx="8" fill="#0f172a"/>
+        <rect x="378" y="420" width="385" height="130" rx="8" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="2"/>
+        <text x="570" y="442" fill="white" font-size="12" font-weight="700" text-anchor="middle">slurm-elastic-operator</text>
+        <text x="570" y="457" fill="#22d3ee" font-size="9" text-anchor="middle">★ Python · kubernetes-client · 15s loop</text>
+        <!-- inner functions -->
+        <rect x="392" y="468" width="115" height="68" rx="4" fill="rgba(6,78,59,0.3)" stroke="#34d399" stroke-width="1"/>
+        <text x="449" y="484" fill="white" font-size="9" font-weight="600" text-anchor="middle">autoscaler</text>
+        <text x="449" y="497" fill="#94a3b8" font-size="7" text-anchor="middle">CheckpointAware-</text>
+        <text x="449" y="507" fill="#94a3b8" font-size="7" text-anchor="middle">QueuePolicy</text>
+        <text x="449" y="521" fill="#94a3b8" font-size="7" text-anchor="middle">drain → resize</text>
+
+        <rect x="513" y="468" width="118" height="68" rx="4" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="572" y="484" fill="white" font-size="9" font-weight="600" text-anchor="middle">M7 reconciler</text>
+        <text x="572" y="498" fill="#94a3b8" font-size="7" text-anchor="middle">detect blocked head</text>
+        <text x="572" y="509" fill="#94a3b8" font-size="7" text-anchor="middle">pick low-prio victim</text>
+        <text x="572" y="522" fill="#fb7185" font-size="7" text-anchor="middle">shadowMode=true</text>
+
+        <rect x="637" y="468" width="115" height="68" rx="4" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="694" y="484" fill="white" font-size="9" font-weight="600" text-anchor="middle">ghost detector</text>
+        <text x="694" y="497" fill="#94a3b8" font-size="7" text-anchor="middle">running_jobs &gt; 0 ∧</text>
+        <text x="694" y="508" fill="#94a3b8" font-size="7" text-anchor="middle">replicas = 0 ∧ pods = 0</text>
+        <text x="694" y="522" fill="#fb7185" font-size="7" text-anchor="middle">GhostJobsWedge alert</text>
+
+        <!-- mysql + slurmdbd box -->
+        <rect x="780" y="420" width="200" height="130" rx="8" fill="#0f172a"/>
+        <rect x="780" y="420" width="200" height="130" rx="8" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="880" y="442" fill="white" font-size="11" font-weight="600" text-anchor="middle">accounting</text>
+        <rect x="794" y="455" width="80" height="50" rx="4" fill="rgba(76,29,149,0.55)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="834" y="473" fill="white" font-size="9" font-weight="600" text-anchor="middle">slurmdbd</text>
+        <text x="834" y="487" fill="#94a3b8" font-size="7" text-anchor="middle">Deployment</text>
+        <text x="834" y="499" fill="#94a3b8" font-size="7" text-anchor="middle">:6819 JWT</text>
+
+        <rect x="886" y="455" width="80" height="50" rx="4" fill="rgba(76,29,149,0.55)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="926" y="473" fill="white" font-size="9" font-weight="600" text-anchor="middle">mysql</text>
+        <text x="926" y="487" fill="#94a3b8" font-size="7" text-anchor="middle">StatefulSet</text>
+        <text x="926" y="499" fill="#94a3b8" font-size="7" text-anchor="middle">PVC :3306</text>
+        <text x="880" y="525" fill="#94a3b8" font-size="8" text-anchor="middle">job history → predictor retrain</text>
+        <text x="880" y="540" fill="#a78bfa" font-size="7" text-anchor="middle">sacct -P --starttime …</text>
+
+        <!-- Worker pools (autoscaled) -->
+        <!-- slurm-worker-cpu -->
+        <rect x="210" y="578" width="170" height="120" rx="8" fill="#0f172a"/>
+        <rect x="210" y="578" width="170" height="120" rx="8" fill="rgba(120,53,15,0.35)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="295" y="600" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-worker-cpu</text>
+        <text x="295" y="615" fill="#fbbf24" font-size="8" text-anchor="middle">StatefulSet · 1..N replicas</text>
+        <text x="295" y="638" fill="#94a3b8" font-size="9" text-anchor="middle">slurmd :6818</text>
+        <text x="295" y="653" fill="#94a3b8" font-size="8" text-anchor="middle">4 cpu / 3.5Gi mem / pod</text>
+        <text x="295" y="670" fill="#94a3b8" font-size="8" text-anchor="middle">partition: cpu</text>
+        <text x="295" y="688" fill="#94a3b8" font-size="7" text-anchor="middle">Features: cpu</text>
+
+        <!-- slurm-worker-gpu-rtx4070 -->
+        <rect x="395" y="578" width="195" height="120" rx="8" fill="#0f172a"/>
+        <rect x="395" y="578" width="195" height="120" rx="8" fill="rgba(120,53,15,0.35)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="492" y="600" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-worker-gpu-rtx4070</text>
+        <text x="492" y="615" fill="#fbbf24" font-size="8" text-anchor="middle">StatefulSet · 0..2 replicas</text>
+        <text x="492" y="638" fill="#94a3b8" font-size="9" text-anchor="middle">slurmd :6818 + nvidia-container</text>
+        <text x="492" y="654" fill="#94a3b8" font-size="8" text-anchor="middle">gpu:rtx4070:1 · mps:100/pod</text>
+        <text x="492" y="670" fill="#94a3b8" font-size="8" text-anchor="middle">partition: gpu-rtx4070</text>
+        <text x="492" y="688" fill="#fbbf24" font-size="7" text-anchor="middle">device-plugin time-slicing × 2</text>
+
+        <!-- slurm-worker-gpu-rtx4080 -->
+        <rect x="605" y="578" width="175" height="120" rx="8" fill="#0f172a"/>
+        <rect x="605" y="578" width="175" height="120" rx="8" fill="rgba(120,53,15,0.35)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="692" y="600" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-worker-gpu-rtx4080</text>
+        <text x="692" y="615" fill="#fbbf24" font-size="8" text-anchor="middle">StatefulSet · 0..2 replicas</text>
+        <text x="692" y="638" fill="#94a3b8" font-size="9" text-anchor="middle">slurmd :6818</text>
+        <text x="692" y="654" fill="#94a3b8" font-size="8" text-anchor="middle">gpu:rtx4080:1 · 16GB VRAM</text>
+        <text x="692" y="670" fill="#94a3b8" font-size="8" text-anchor="middle">partition: gpu-rtx4080</text>
+        <text x="692" y="688" fill="#94a3b8" font-size="7" text-anchor="middle">whole-GPU exclusive</text>
+
+        <!-- slurm-exporter -->
+        <rect x="800" y="578" width="190" height="80" rx="6" fill="#0f172a"/>
+        <rect x="800" y="578" width="190" height="80" rx="6" fill="rgba(6,78,59,0.35)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="895" y="600" fill="white" font-size="11" font-weight="600" text-anchor="middle">slurm-exporter</text>
+        <text x="895" y="615" fill="#94a3b8" font-size="8" text-anchor="middle">Prometheus scrape :9092</text>
+        <text x="895" y="630" fill="#94a3b8" font-size="8" text-anchor="middle">queue · scheduler · TRES</text>
+        <text x="895" y="648" fill="#94a3b8" font-size="7" text-anchor="middle">slurmrestd-based</text>
+
+        <!-- NFS server (host-level, outside namespaces) -->
+        <rect x="30" y="700" width="160" height="90" rx="6" fill="#0f172a"/>
+        <rect x="30" y="700" width="160" height="90" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="110" y="722" fill="white" font-size="11" font-weight="600" text-anchor="middle">NFS server</text>
+        <text x="110" y="738" fill="#94a3b8" font-size="8" text-anchor="middle">host kernel · nfsd</text>
+        <text x="110" y="753" fill="#94a3b8" font-size="8" text-anchor="middle">/srv/nfs/k8s</text>
+        <text x="110" y="770" fill="#94a3b8" font-size="8" text-anchor="middle">subdir-provisioner</text>
+        <text x="110" y="785" fill="#a78bfa" font-size="7" text-anchor="middle">RWX /shared in workers</text>
+
+        <!-- Monitoring stack -->
+        <!-- Prometheus -->
+        <rect x="1040" y="200" width="200" height="100" rx="6" fill="#0f172a"/>
+        <rect x="1040" y="200" width="200" height="100" rx="6" fill="rgba(120,53,15,0.35)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="1140" y="222" fill="white" font-size="11" font-weight="600" text-anchor="middle">Prometheus</text>
+        <text x="1140" y="237" fill="#94a3b8" font-size="8" text-anchor="middle">scrape + rule eval :9090</text>
+        <text x="1140" y="255" fill="#94a3b8" font-size="7" text-anchor="middle">rules: ProvisioningLatencyHigh</text>
+        <text x="1140" y="267" fill="#94a3b8" font-size="7" text-anchor="middle">ScalingFlapping · QueueWaitTooLong</text>
+        <text x="1140" y="282" fill="#fb7185" font-size="7" text-anchor="middle">GhostJobsWedge (E7 hardening)</text>
+        <text x="1140" y="294" fill="#94a3b8" font-size="7" text-anchor="middle">OperatorPollSlow · WorkerPodsStuck</text>
+
+        <!-- Alertmanager -->
+        <rect x="1040" y="420" width="200" height="80" rx="6" fill="#0f172a"/>
+        <rect x="1040" y="420" width="200" height="80" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1140" y="442" fill="white" font-size="11" font-weight="600" text-anchor="middle">Alertmanager</text>
+        <text x="1140" y="457" fill="#94a3b8" font-size="8" text-anchor="middle">route + dedupe :9093</text>
+        <text x="1140" y="474" fill="#94a3b8" font-size="7" text-anchor="middle">severity: critical / warning</text>
+        <text x="1140" y="488" fill="#94a3b8" font-size="7" text-anchor="middle">routes → Grafana / webhook</text>
+
+        <!-- Grafana -->
+        <rect x="1040" y="560" width="200" height="80" rx="6" fill="#0f172a"/>
+        <rect x="1040" y="560" width="200" height="80" rx="6" fill="rgba(120,53,15,0.35)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="1140" y="582" fill="white" font-size="11" font-weight="600" text-anchor="middle">Grafana</text>
+        <text x="1140" y="597" fill="#94a3b8" font-size="8" text-anchor="middle">dashboards :3000</text>
+        <text x="1140" y="614" fill="#94a3b8" font-size="7" text-anchor="middle">queue · autoscale · fragmentation</text>
+        <text x="1140" y="628" fill="#94a3b8" font-size="7" text-anchor="middle">DataSource: Prometheus</text>
+
+        <!-- =============== LEGEND (bottom) =============== -->
+        <text x="40" y="885" fill="white" font-size="11" font-weight="600">Legend</text>
+
+        <rect x="40" y="895" width="18" height="11" rx="2" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="66" y="905" fill="#cbd5e1" font-size="9">★ Phase 6 thesis contribution (M2/M3/M5/M7)</text>
+
+        <rect x="320" y="895" width="18" height="11" rx="2" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="346" y="905" fill="#cbd5e1" font-size="9">vanilla Slurm component</text>
+
+        <rect x="540" y="895" width="18" height="11" rx="2" fill="rgba(120,53,15,0.35)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="566" y="905" fill="#cbd5e1" font-size="9">k8s-managed (autoscaled / cloud)</text>
+
+        <rect x="780" y="895" width="18" height="11" rx="2" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="806" y="905" fill="#cbd5e1" font-size="9">storage / database</text>
+
+        <rect x="980" y="895" width="18" height="11" rx="2" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1006" y="905" fill="#cbd5e1" font-size="9">alerting / monitoring</text>
+
+        <!-- arrow legend row -->
+        <line x1="40" y1="932" x2="80" y2="932" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <text x="88" y="935" fill="#cbd5e1" font-size="9">data / job dispatch (solid)</text>
+
+        <line x1="320" y1="932" x2="360" y2="932" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowhead-violet)"/>
+        <text x="368" y="935" fill="#cbd5e1" font-size="9">poll / accounting (dashed)</text>
+
+        <line x1="540" y1="932" x2="580" y2="932" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-rose)"/>
+        <text x="588" y="935" fill="#cbd5e1" font-size="9">requeue / alert (dashed)</text>
+
+        <line x1="780" y1="932" x2="820" y2="932" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrowhead-amber)"/>
+        <text x="828" y="935" fill="#cbd5e1" font-size="9">scrape / k8s API (dashed)</text>
+
+        <line x1="1020" y1="932" x2="1060" y2="932" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+        <text x="1068" y="935" fill="#cbd5e1" font-size="9">Phase 6 control flow</text>
       </svg>
     </div>
 
+    <!-- Info Cards -->
     <div class="cards">
       <div class="card">
         <div class="card-header">
-          <div class="card-dot emerald"></div>
-          <h3>Slurm core (slurm ns)</h3>
+          <div class="card-dot cyan"></div>
+          <h3>Phase 6 contributions (thesis core)</h3>
         </div>
         <ul>
-          <li>• controller-0: slurmctld :6817 + slurmrestd :6820</li>
-          <li>• 3 worker pools: cpu / rtx4070-mps / rtx4080</li>
-          <li>• login: sbatch entry (kubectl exec)</li>
-          <li>• elastic-operator: poll 15s → patch replicas</li>
-          <li>• exporter: slurmrestd → Prometheus :9341</li>
-          <li>• slurmdbd + mysql: accounting (legacy manifest)</li>
+          <li>• <b>M2/M3 lua job_submit</b>: score = α·f_mps_fit + β·f_vram_fit − δ·f_fragmentation + ε·f_runtime_short</li>
+          <li>• <b>M5 runtime-predictor</b>: LightGBM service, lua calls via curl --max-time 200ms; cold-start fallback returns min(user_time_limit, 4h)</li>
+          <li>• <b>M7 reconciler</b>: detects head-pending block + frees low-priority victim; default shadowMode=true after M8 sim showed net-negative on victim-selection-by-priority</li>
+          <li>• <b>Ghost-job detector</b>: emits GhostJobsWedge alert when slurmrestd reports running jobs but no pod is Ready (E7 hardening)</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>Vanilla Slurm (kept upstream)</h3>
+        </div>
+        <ul>
+          <li>• slurmctld with priority/multifactor + backfill scheduler on :6817</li>
+          <li>• slurmrestd on :6820 (JWT-HS256) — operator + slurm-exporter both consume</li>
+          <li>• slurmdbd ↔ mysql accounting; lua plugin sends pred_runtime → time_limit when applyTimeLimit=true</li>
+          <li>• slurmd on workers (:6818); step launch over plain TCP; epilog reports back through slurmdbd</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot amber"></div>
-          <h3>GPU sharing (RTX 4070)</h3>
+          <h3>Worker pools + autoscaling</h3>
         </div>
         <ul>
-          <li>• Driver 595-open + container-toolkit on host</li>
-          <li>• device-plugin advertises 4× nvidia.com/gpu</li>
-          <li>• mps-control-daemon = official MPS sharing</li>
-          <li>• Node label: nvidia.com/device-plugin.config=rtx4070-mps</li>
-          <li>• Slurm: gres=gpu:rtx4070:1, mps:100 (25% per slot)</li>
-          <li>• Validators: cuda / plugin / operator (Completed)</li>
+          <li>• <b>cpu</b>: 4 cpu / 3.5Gi mem per pod; partition `cpu`; min=1, autoscaled by operator</li>
+          <li>• <b>gpu-rtx4070</b>: 1×RTX 4070 sliced by NVIDIA device-plugin time-slicing into 2 logical GPUs; slurm.conf advertises 200 mps slots total</li>
+          <li>• <b>gpu-rtx4080</b>: whole-GPU exclusive (no MPS); partition routes from `--constraint gpu-rtx4080`</li>
+          <li>• Cooldown persisted on StatefulSet annotation; ghost-detector guards against scale-up deadlock</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
-          <div class="card-dot cyan"></div>
-          <h3>Storage + monitoring</h3>
+          <div class="card-dot rose"></div>
+          <h3>Monitoring + reliability</h3>
         </div>
         <ul>
-          <li>• NFS subdir provisioner → SC slurm-shared-nfs (Retain)</li>
-          <li>• /shared 20Gi RWX mounted on controller/workers/login</li>
-          <li>• ctld-state PVC: slurmctld StateSaveLocation</li>
-          <li>• Prometheus scrapes exporter, operator, KSM</li>
-          <li>• 3 Grafana dashboards: bridge / operator / SLA</li>
-          <li>• 16 NetworkPolicies: default-deny + allow-list</li>
+          <li>• Prometheus scrapes operator (:8000), predictor (:8080), slurm-exporter (:9092)</li>
+          <li>• Alert rules: GhostJobsWedge · ProvisioningLatencyHigh · ScalingFlapping · WorkerPodsStuck · QueueWaitTooLong · OperatorPollSlow</li>
+          <li>• Alertmanager → Grafana annotations; severity routing (critical / warning)</li>
+          <li>• Grafana dashboards mirror operator JSON logs for cold start traceability</li>
         </ul>
       </div>
     </div>
 
     <p class="footer">
-      slurm-platform helm chart · Phase 5-A cutover (2026-04-29) · k3s v1.34 · NVIDIA driver 595-open · GPU Operator with MPS sharing
+      Kubeflux · Phase 6 (M2/M3/M5/M7) · Slurm 21.08 + k3s + NVIDIA GPU Operator · diagram for thesis chapter §2.4
     </p>
   </div>
 </body>
