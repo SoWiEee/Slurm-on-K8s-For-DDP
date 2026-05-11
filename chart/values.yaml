@@ -400,6 +400,15 @@ operator:
   # decider runs end-to-end (logs + metrics) without actually requeueing
   # any job. Flip to false only after a release cycle of shadow data
   # confirms the decisions are sane.
+  #
+  # IMPORTANT — M8 evaluation (2026-05-11, 3 traces × 5 seeds, see
+  # docs/eval-writeup.md) found the current victim-selection policy
+  # produces a statistically significant mean-JCT regression on all three
+  # synthetic workloads (philly +33%, burst +61%, ali +6%, vs the
+  # predictor-only baseline). The cost is dominated by lost progress of
+  # already-running victims, not by checkpoint reload. Do NOT set
+  # shadowMode=false on production traffic until victim selection adds an
+  # elapsed-progress penalty or switches to suspend-resume preemption.
   fragmentation:
     enabled: false
     shadowMode: true

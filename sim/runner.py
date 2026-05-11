@@ -26,7 +26,10 @@ import time
 from typing import List, Tuple
 
 from .cluster import Cluster
-from .loader import Job, MPS_PER_GPU, generate_philly_like, load_auto, write_normalized
+from .loader import (
+    Job, MPS_PER_GPU, TRACE_FAMILIES,
+    generate_by_family, generate_philly_like, load_auto, write_normalized,
+)
 from .metrics import MetricCollector
 from .scheduler import make as make_scheduler
 
@@ -195,8 +198,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sim.runner")
     p.add_argument("--trace", help="path to JSON trace (normalized or Philly)")
     p.add_argument("--synth-jobs", type=int, default=0,
-                   help="generate this many synthetic Philly-like jobs instead")
+                   help="generate this many synthetic jobs (family selected by --trace-family)")
     p.add_argument("--synth-seed", type=int, default=42)
+    p.add_argument("--trace-family", choices=sorted(TRACE_FAMILIES), default="philly",
+                   help="synthetic trace generator: 'philly' (default), 'burst' (day-cycle bursts), 'ali' (Alibaba-PAI-like)")
     p.add_argument("--scheduler", choices=["fcfs", "multifactor", "score"],
                    default="fcfs")
     p.add_argument("--nodes", type=int, default=4)
@@ -222,7 +227,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
     if args.synth_jobs > 0:
-        jobs = generate_philly_like(n_jobs=args.synth_jobs, seed=args.synth_seed)
+        jobs = generate_by_family(args.trace_family,
+                                  n_jobs=args.synth_jobs, seed=args.synth_seed)
     elif args.trace:
         jobs = load_auto(args.trace)
     else:
@@ -261,6 +267,7 @@ def main(argv=None) -> int:
     summary["requeue_count"] = getattr(metrics, "requeue_count", 0)
     summary["requeue_cost_total"] = getattr(metrics, "requeue_cost_total", 0.0)
     summary["synth_seed"] = args.synth_seed if args.synth_jobs > 0 else None
+    summary["trace_family"] = args.trace_family if args.synth_jobs > 0 else "loaded"
     summary.update({k: v for k, v in sched_kwargs.items()})
 
     if args.output:

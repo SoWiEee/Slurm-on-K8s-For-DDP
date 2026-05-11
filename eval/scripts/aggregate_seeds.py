@@ -54,15 +54,18 @@ def _ci95(values: List[float]) -> float:
 def aggregate(summaries: List[dict]) -> List[dict]:
     groups: Dict[tuple, List[dict]] = defaultdict(list)
     for s in summaries:
-        key = (s.get("experiment"), _strip_seed(s.get("run", "")))
+        key = (s.get("trace_family", "philly"),
+               s.get("experiment"),
+               _strip_seed(s.get("run", "")))
         groups[key].append(s)
 
     rows = []
-    for (exp, run), group in sorted(groups.items()):
+    for (trace, exp, run), group in sorted(groups.items()):
         if not group:
             continue
         head = group[0]
         row = {
+            "trace_family": trace,
             "experiment": exp,
             "run": run,
             "n_seeds": len(group),

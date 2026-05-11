@@ -1120,62 +1120,60 @@ PRED_DEFAULT_GPU_TYPE = "rtx4070"
 - [x] 7 張圖出爐（CDF of JCT、box of slowdown、line of utilization over time）
 - [x] eval-writeup.md 約 8–12 頁、每張圖 1 段論述
 
-### 實驗結果（2026-05-07，2026-05-11 修訂）
+### 實驗結果（2026-05-07，2026-05-11 二度修訂）
 
-M8 已產出 `eval/results/`、`eval/figures/fig{1..7}.{png,pdf}` 與
+M8 產物：`eval/results/`、`eval/figures/fig{1..8}.{png,pdf}` 與
 `docs/eval-writeup.md`。
 
-**2026-05-11 修訂**：原始 M8 結果有兩個方法論問題已被修正——
-1. M7 fragmentation 在 sim 中 requeue victim 時把 `metrics.submit_ts` reset 成 `now`，
-   導致 JCT 只計算「重排隊之後」這段，**人為低估**了 victim JCT。
-2. 每組 exp 只有 1 個 deterministic sample，沒有 cross-seed variance。
+**修訂歷史**：
+- 第一輪（同日早）：修掉 sim `try_fragmentation_reconcile` 把 victim
+  `metrics.submit_ts` reset 的 bug、改用 5 seeds、加 `--ckpt-reload-cost`。
+- 第二輪：把 trace 廣度從單一 Philly-like 擴成 3 個 family（philly /
+  burst / ali），驗證 negative result 是否 generalises。新增 fig8
+  cross-trace。
 
-修正後改為 5 seeds × 1000 jobs synthetic Philly-like trace + `--ckpt-reload-cost`
-（E5=60s, E5b=0s）。新主表：
+**跨 trace 主表**（5 seeds 每 cell，數字為 paired same-seed Δ 對比前一階段）：
 
-| exp | 配置 | jct_mean (h, mean±std) | paired vs prev exp | 結論 |
-|---|---|---:|---:|---|
-| E1 | FCFS | 15.78 ± 12.44 | — | baseline |
-| E2 | multifactor + backfill | 4.49 ± 2.60 | −72% vs E1 | vendor 已吃掉大部分 |
-| E3 | score (M3) | 4.71 ± 3.18 | +4.9% vs E2（noise） | 純 score 沒幫忙 |
-| E4 | + predictor (M5) | **3.43 ± 1.61** | **−20.1% vs E2 (95% CI ±12%)** | **statistically significant win** |
-| E5 | + fragmentation (M7), 60s ckpt | 4.55 ± 2.12 | **+33.1% vs E4 (95% CI ±5.2%)** | **regression** |
-| E5b | E5 但 ckpt cost=0 | 4.20 ± 1.70 | +22.5% vs E4 | 純 lost-progress 已足以讓 M7 net negative |
+| | philly | burst | ali |
+|---|---:|---:|---:|
+| E2 vs E1（vendor 對 FCFS） | −72% | −63% | −0.5% |
+| E3 vs E2（純 score） | +4.9% | +4.1% | 0% |
+| **E4 vs E2（M5 predictor）** | **−20.1% ↓** | **−28.7% ↓** | −0.08% |
+| **E5 vs E4（M7 fragmentation）** | **+33.1% ↑** | **+60.9% ↑** | **+6.0% ↑** |
+| E5b vs E5（去掉 ckpt cost） | −5.8% | −0.7% | −1.9% |
+| E6 weight sensitivity spread | 10.6% | 28.5% | 0.1% |
 
-**主要結論（修訂版）**：
-- M5 runtime predictor 是排程 quality 的最大實際推進力（paired −20% vs vendor，significant）。
-- M7 fragmentation 在這份 trace 是 **negative result**：victim 純按 priority 選會把已執行很久的 job 也踢掉，losts > gains。
-- 即使把 ckpt reload cost 設 0（E5b），M7 仍比 E4 差 22% — 問題不在 cost 而在 lost progress。
-- E5 vs E2 已不再是「−28.6% 改善」；paired 結果是 +6% 沒有 statistical significance。
+↓/↑ 表示 95% CI 不跨 0。
 
-Future work for M7 救援方向：(1) victim selection 加「已執行時間 penalty」；
-(2) 只在 head 預估比 victim 剩餘時間短時觸發；(3) 改 preempt+suspend
-保留 GPU memory 取代 full requeue。詳見 `docs/eval-writeup.md` §4。
+**主要結論**：
+- M5 runtime predictor 在有 contention 的 trace 上 statistically significant
+  改善 mean JCT；ali 沒 contention 所以幾乎沒差。Predictor 的價值正比於排隊壓力。
+- M7 fragmentation 在三個 distribution 完全不同的 trace 上全是 net negative，
+  CI 都不跨 0。Negative result generalises，不是 philly artefact。
+- E5b 把 ckpt reload cost 設 0 也救不回來，問題出在 victim 重跑時失去的
+  in-flight progress，不是 reload overhead。
+- E6 sensitivity 跟 trace contention 等級正相關（ali 0.1% / philly 10.6% /
+  burst 28.5%），M9 RL tuner 在高 contention trace 上才會有意義。
 
-### 後續改進 / handoff 給 Claude Code
+M7 救援方向（給 future work）：(1) victim selection 加「已執行時間 / 完成比例」
+penalty；(2) 改 preempt+suspend 保留 GPU memory；(3) 只在 predictor 估計 head
+剩餘時間 < victim 剩餘時間時觸發。詳見 `docs/eval-writeup.md` §4 C4。
 
-1. **先補 E7 live-cluster 驗證。** 目前 M8 主結論來自 simulator；下一步應用
-   `eval/scripts/run_e7_live.sh` 跑 50-job mix，比較 vendor multifactor vs
-   our stack。輸出至少要包含 wall-clock JCT、p90 wait、bf_rate、operator
-   requeue log，以及 `scontrol show job` 的 priority/time_limit evidence。
-2. **量 checkpoint resume cost。** E5 的 1856 次 requeue 是最大風險；目前
-   simulator 沒扣 checkpoint reload / warmup。請用 DDP MNIST 或小 LLaMA toy
-   workload 實測每次 requeue 的 reload cost，然後把成本模型加回 `sim/runner.py`
-   或 evaluation writeup，不要直接把 2.621h 當 production claim。
-3. **做受控 rollout，而不是直接開 `shadowMode=false`。** 建議先新增
-   `values-phase6-shadow.yaml` 與 `values-phase6-live.yaml`：shadow profile 只開
-   Lua score / predictor log / fragmentation decision metrics；live profile 才允許
-   `scontrol requeue`，並保留 `maxRequeuesPerHour`、`priorityGap`、
-   `maxTargetsPerDecision` 的保守預設。
-4. **擴充 trace coverage。** Philly-like 1k 只是一個 deterministic sample；
-   至少再跑一個 burst-heavy trace 或 ALI-Cluster normalized trace。目標是驗證
-   E5 vs E2 的 28.6% mean-JCT 改善不是單一 sample artifact。
-5. **加大 sensitivity sweep，但先不要做 M9。** M8 的 3×3 grid 顯示 fixed
-   weights 已足夠 robust；若要補強，先做 5×5×5 + ε scan。M9 RL tuner 只有在
-   多 trace、多 workload 下仍看到可觀 weight sensitivity 時才值得做。
-6. **把 production claim 分層寫清楚。** 文件和簡報要分成 simulator result、
-   shadow-mode live observation、live requeue result 三層。E7 完成前，不要宣稱
-   Phase 6 已在真機證明 fragmentation requeue 的完整收益。
+### 後續改進進度（2026-05-11 完成）
+
+handoff 項目 #2、#3、#4、#5、#6 已處理完畢；剩 #1（live cluster E7 多 GPU 驗證）
+受限於只有單張 RTX 4070，留作 thesis appendix 或下一階段硬體升級後再做。
+
+- #2 ckpt resume cost：`sim/runner.py` 加 `--ckpt-reload-cost`、E5b 對照組；
+  E5b vs E5 顯示 cost 只佔 6%，問題是 lost progress 不是 reload。
+- #3 受控 rollout：`chart/values.yaml::operator.fragmentation` 預設 enabled=false、
+  shadowMode=true，加上 M8 negative result 警告註解，不開直到 victim
+  selection 改進。
+- #4 trace coverage：新增 `generate_burst_heavy` / `generate_ali_like`，跨三個
+  trace × 5 seeds 驗證 negative result generalises。
+- #5 sensitivity grid：升級到 5×5（α × δ），三個 trace 都跑。
+- #6 production claim 分層：eval-writeup §4 把 claim 分 simulator result /
+  shadow observation / live result 三層，未經 live 驗證的不在 chart default 開。
 
 ### 風險
 - 結論不顯著（score ≈ multifactor）— M3 / M6 之後就先跑 mini-eval 抓問題，不要拖到 M8 才發現

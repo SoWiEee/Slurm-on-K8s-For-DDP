@@ -54,24 +54,32 @@ def load_aggregated():
         return json.load(fh)
 
 
-def primary_run(summaries, exp):
-    """Pick a representative per-seed run for an experiment (for CSV plots).
-    Multi-seed data may have many — we use the lowest seed for determinism."""
-    rows = [s for s in summaries if s["experiment"] == exp]
+PRIMARY_TRACE = os.environ.get("PRIMARY_TRACE", "philly")
+
+
+def primary_run(summaries, exp, trace=PRIMARY_TRACE):
+    """Representative per-seed run on the headline trace (for CSV plots)."""
+    rows = [s for s in summaries
+            if s["experiment"] == exp and s.get("trace_family", "philly") == trace]
     if not rows:
         return None
     rows = sorted(rows, key=lambda r: r.get("synth_seed") or 0)
     return rows[0]
 
 
-def agg_for(agg, exp):
+def agg_for(agg, exp, trace=PRIMARY_TRACE):
     if not agg:
         return None
-    rows = [s for s in agg if s["experiment"] == exp]
+    rows = [s for s in agg
+            if s["experiment"] == exp and s.get("trace_family", "philly") == trace]
     return rows[0] if rows else None
 
 
-def csv_for(exp, run):
+def csv_for(exp, run, trace=PRIMARY_TRACE):
+    """Find the CSV — supports both nested (trace/exp/run.csv) and flat layouts."""
+    nested = os.path.join(RESULTS, trace, exp, f"{run}.csv")
+    if os.path.exists(nested):
+        return nested
     return os.path.join(RESULTS, exp, f"{run}.csv")
 
 
@@ -310,6 +318,62 @@ def fig7_jct_normalised(summaries, agg):
     save(fig, "fig7_jct_normalised")
 
 
+def fig8_cross_trace(summaries, agg):
+    """Paired Δ% (E4-E2 and E5-E4) per trace, with 95% CI error bars."""
+    import math, statistics
+    T = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571,
+         7: 2.447, 8: 2.365, 9: 2.306, 10: 2.262}
+
+    def paired(trace, a_exp, b_exp):
+        a = {r["synth_seed"]: r for r in summaries
+             if r["experiment"] == a_exp and r.get("trace_family") == trace}
+        b = {r["synth_seed"]: r for r in summaries
+             if r["experiment"] == b_exp and r.get("trace_family") == trace}
+        common = sorted(set(a) & set(b))
+        if not common:
+            return None, None
+        rel = [(a[s]["jct_mean"] / b[s]["jct_mean"] - 1.0) for s in common]
+        n = len(rel)
+        m = statistics.fmean(rel) * 100.0
+        ci = T.get(n, 1.96) * statistics.stdev(rel) * 100.0 / math.sqrt(n) if n > 1 else 0.0
+        return m, ci
+
+    traces = sorted({s.get("trace_family") for s in summaries
+                     if s.get("trace_family")})
+    means_pred, errs_pred, means_frag, errs_frag = [], [], [], []
+    for t in traces:
+        m1, c1 = paired(t, "e4", "e2")
+        m2, c2 = paired(t, "e5", "e4")
+        means_pred.append(m1 if m1 is not None else 0)
+        errs_pred.append(c1 if c1 is not None else 0)
+        means_frag.append(m2 if m2 is not None else 0)
+        errs_frag.append(c2 if c2 is not None else 0)
+
+    x = np.arange(len(traces))
+    w = 0.36
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(x - w/2, means_pred, w, yerr=errs_pred, capsize=4,
+           label="M5 predictor (E4 vs E2)", color="C2")
+    ax.bar(x + w/2, means_frag, w, yerr=errs_frag, capsize=4,
+           label="M7 fragmentation (E5 vs E4)", color="C3")
+    ax.axhline(0, color="k", linewidth=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(traces)
+    ax.set_ylabel("Paired Δ mean JCT vs prior stage (%)")
+    ax.set_title("Cross-trace generalisation — paired same-seed Δ (95% CI, n=5)")
+    ax.legend()
+    ax.grid(axis="y", linestyle=":", alpha=0.6)
+    for xi, m, c in zip(x - w/2, means_pred, errs_pred):
+        ax.text(xi, m + (1 if m >= 0 else -1) * (abs(c) + 2),
+                f"{m:+.1f}%", ha="center", fontsize=9,
+                va="bottom" if m >= 0 else "top")
+    for xi, m, c in zip(x + w/2, means_frag, errs_frag):
+        ax.text(xi, m + (1 if m >= 0 else -1) * (abs(c) + 2),
+                f"{m:+.1f}%", ha="center", fontsize=9,
+                va="bottom" if m >= 0 else "top")
+    save(fig, "fig8_cross_trace")
+
+
 def main() -> int:
     summaries = load_summary()
     agg = load_aggregated()
@@ -320,6 +384,7 @@ def main() -> int:
     fig5_e6_heatmap(summaries, agg)
     fig6_bf_rate(summaries, agg)
     fig7_jct_normalised(summaries, agg)
+    fig8_cross_trace(summaries, agg)
     return 0
 
 

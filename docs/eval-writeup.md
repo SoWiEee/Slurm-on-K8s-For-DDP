@@ -6,26 +6,31 @@
 > 重現：`bash eval/scripts/run_all.sh && .venv-m5/bin/python eval/scripts/plot_all.py`。
 
 > [!IMPORTANT]
-> **2026-05-11 更新**：本章節已根據兩項修正大幅重寫。
+> **2026-05-11 更新**：本章節因兩輪修正而大幅改寫，請以此版為準。
 >
-> 1. **JCT 統計 bug 修正**：M7 fragmentation 在 sim 內部 requeue 時會把 victim 的 `metrics.submit_ts` reset 成 `now`，導致 victim 的 JCT 只計算「重新排隊後到完成」這段，**低估了原本應計入排隊的時間**。已修為保留原始 submit_ts。
-> 2. **多 seed 統計**：原本每組只有 1 個 deterministic sample，無法分辨改善是真實 effect 還是 trace artefact。改為 5 個 synthetic Philly-like traces（seed 42–46），所有指標報 mean ± std 與 paired same-seed 95% CI。
-> 3. **Checkpoint reload cost 模型**：加上 `--ckpt-reload-cost`（預設 60s/次）。E5 主結果使用 60s；E5b 仍跑 0 cost 作為樂觀 upper bound。
+> 第一輪（方法論修正）：
+> 1. 修掉 sim 內 requeue 時 reset `metrics.submit_ts` 的 bug。原本 victim JCT 只算重排後那段，低估真實等待。改後保留原始 submit_ts。
+> 2. 每組 exp 從單一 deterministic sample 改成 5 個 synthetic seed（42–46），所有指標報 mean ± std 加 paired 95% CI。
+> 3. Sim 加上 `--ckpt-reload-cost`（預設 60s/次）。E5 用 60s、E5b 跑 0s 當樂觀 upper bound。
 >
-> 修正後**主結論完全改寫**：M7 fragmentation 在這份 trace 上**並未帶來淨收益**（vs E4 paired Δ = +33.1% ± 5.2%）。M5 predictor 仍是 statistically significant 的 win（vs E2 paired Δ = −20.1% ± 12.0%）。舊版 git history 中「E5 mean JCT 2.62h、−28.6% vs vendor」的數字是上述 bug 造成的人為偏低。
+> 第二輪（trace 廣度）：把實驗從單一 Philly-like trace 擴成三種 workload family（philly / burst / ali，共 3 × 5 = 15 個 sample），驗證結論是否 generalises。
+>
+> 結論：M5 predictor 在「有 contention 的 trace」上是 statistically significant 的 win（burst −28.7%、philly −20.1%、ali 因為 util 才 0.30 沒空間優化）。M7 fragmentation 在三個 trace 都是 net negative，philly +33%、burst +61%、ali +6%。舊版「E5 −28.6% vs vendor」是 submit_ts reset bug 加上單 sample 造成的人為結果。
 
 ## 1. 實驗設定
 
 | 設定項 | 值 | 來源 |
 |---|---|---|
-| Trace | Synthetic Philly-like, 1000 jobs × 5 seeds | `sim.runner --synth-jobs 1000 --synth-seed {42..46}` |
+| Trace 家族 | 三個 synthetic family，各 1000 jobs × 5 seeds | `sim.runner --trace-family {philly,burst,ali} --synth-jobs 1000 --synth-seed {42..46}` |
+| └ philly | 寬鬆 Poisson arrival、log-normal runtime（median ~30 min, p95 ~6h） | `sim/loader.py::generate_philly_like` |
+| └ burst | 同樣 job size mix，arrival 集中在每 6h 出現一次的 2h 高峰窗 | `generate_burst_heavy` |
+| └ ali | Alibaba PAI-style：90% 單卡、median runtime ~13 min、60% 單卡 job 用 MPS 切割、晝夜節律 | `generate_ali_like` |
 | Cluster | 4 nodes × 4 GPUs × 100 MPS slot | `sim.runner --nodes 4 --gpus-per-node 4` |
-| Trace span | submit_ts ∈ [0, ~5 days]，runtime log-normal（median ~30 min, p95 ~6h） | `sim/loader.py::generate_philly_like` |
-| Sim 模型 | discrete-event (`sim/runner.py`)，best-fit per-GPU MPS allocator，無 preempt（除 E5/E5b 啟用 M7 fragmentation requeue） | — |
-| 重複次數 | **5 seeds 每 cell**；主結論報 mean ± std 與 paired same-seed 95% CI；E6 sensitivity 跑 9×5=45 runs | — |
+| Sim 模型 | discrete-event (`sim/runner.py`)，best-fit per-GPU MPS allocator，無 preempt（E5/E5b 啟用 M7 fragmentation requeue） | — |
+| 重複次數 | 5 seeds × 3 traces，主結論報 mean ± std 加 paired same-seed 95% CI；E6 sensitivity 升級到 5×5 grid（25 × 3 × 5 = 375 runs） | — |
 | Checkpoint reload cost | E5 = 60s/次，E5b = 0s/次 | `--ckpt-reload-cost` |
 
-E1–E6 完全跑在 simulator 上，不需要 live cluster。E7 是 live-cluster 50-job 驗證腳手架，因為 RTX 4070 僅 1 張，evaluation 用它做 sim→真機可重現性 sanity check，主要結論仍以 E1–E5 為準。
+E1–E6 全部在 simulator 上跑。E7 是 live-cluster 50-job 驗證腳手架，RTX 4070 只有一張，這條路徑只能做 sim→真機 sanity check，主結論仍以 sim 為準。
 
 | 實驗 | scheduler | 額外 flag | 對應 milestone |
 |---|---|---|---|
@@ -35,111 +40,156 @@ E1–E6 完全跑在 simulator 上，不需要 live cluster。E7 是 live-cluste
 | E4 | score + predictor (M5) | ε=0.30 | M5/M6 邊際價值 |
 | E5 | score + predictor + fragmentation (M7) | `--fragmentation --ckpt-reload-cost 60` | M7 邊際價值（realistic cost） |
 | E5b | E5 但 ckpt cost = 0 | `--ckpt-reload-cost 0` | M7 樂觀 upper bound |
-| E6 | score + predictor，9 組 (α, δ) | grid | sensitivity |
+| E6 | score + predictor，25 組 (α, δ) | 5×5 grid | sensitivity |
 
 E5 的 fragmentation 模式 mirror 了 `operator/fragmentation.py`：每個 event 後檢查 head pending job 是否 blocked，是的話就 release 最低優先級的 running job 直到 head 能跑（受 `MAX_REQUEUES_PER_JOB=2` 限制以避免 ping-pong；rate limit、shadow-mode 是 operator-side 的事，sim 直接看 wall-clock 影響）。
 
-## 2. 主表（n=5 seeds，數字為 mean ± std）
+## 2. 主表
 
-| exp | 配置 | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues | ckpt_cost (h) |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| E1 | FCFS | 15.78 ± 12.44 | 29.32 ± 22.05 | 77.94 | 0.742 | 0.000 | 0 | 0.00 |
-| E2 | multifactor+bf | 4.49 ± 2.60 | 9.49 ± 3.39 | 17.68 | 0.812 | 0.815 | 0 | 0.00 |
-| E3 | score (M3) | 4.71 ± 3.18 | 10.83 ± 8.12 | 19.39 | 0.808 | 0.842 | 0 | 0.00 |
-| E4 | + predictor (M5) | **3.43 ± 1.61** | **6.35 ± 1.79** | **10.04** | 0.805 | 0.854 | 0 | 0.00 |
-| E5 | + fragmentation (M7), 60s ckpt | 4.55 ± 2.12 | 9.47 ± 3.75 | 14.32 | 0.839 | 0.948 | ~349/run | 5.81 |
-| E5b | E5 但 ckpt cost = 0 | 4.20 ± 1.70 | 9.18 ± 3.59 | 12.34 | 0.827 | 0.950 | ~347/run | 0.00 |
+每個 trace family 各 5 個 seed，下表的 jct_mean 是 5-seed 平均加標準差（單位 h），requeues 是平均每個 run 的 M7 requeue 次數。
 
-### Paired same-seed comparisons（重點）
+### 2.1 philly（baseline workload）
 
-Paired diffs 把「不同 seed 帶來的 trace 差異」消掉，CI 比 unpaired 緊很多。
+| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run | ckpt_cost (h) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| E1 FCFS | 15.78 ± 12.44 | 29.32 | 77.94 | 0.742 | 0.000 | 0 | 0.00 |
+| E2 multifactor+bf | 4.49 ± 2.60 | 9.49 | 17.68 | 0.812 | 0.815 | 0 | 0.00 |
+| E3 score (M3) | 4.71 ± 3.18 | 10.83 | 19.39 | 0.808 | 0.842 | 0 | 0.00 |
+| **E4 + predictor (M5)** | **3.43 ± 1.61** | **6.35** | **10.04** | 0.805 | 0.854 | 0 | 0.00 |
+| E5 + fragmentation (M7) | 4.55 ± 2.12 | 9.47 | 14.32 | 0.839 | 0.948 | 349 | 5.81 |
+| E5b M7, 0s ckpt | 4.20 ± 1.70 | 9.18 | 12.34 | 0.827 | 0.950 | 347 | 0.00 |
 
-| 比較 | Δ jct_mean | 95% CI | 結論 |
-|---|---:|---:|---|
-| **E4 vs E2** | **−20.1%** | ±11.95% | **statistically significant** — M5 predictor 是真實的 win |
-| E5 vs E2 | +6.31% | ±15.42% | 不顯著；含 M7 後反而抵消了一部分 M5 的收益 |
-| **E5 vs E4** | **+33.1%** | ±5.22% | **statistically significant regression** — M7 fragmentation 在此 trace 損害 JCT |
-| E5b vs E5 | −5.8% | ±8.83% | ckpt cost 大約只貢獻 6% 的差距；M7 的問題不在 cost 而在 lost-progress |
+### 2.2 burst（高峰擠壓 workload）
 
-數字觀察：
-- E1→E2：backfill 把 mean JCT 從 15.8h 砍到 4.49h（paired −72%）。Slurm 預設已經把絕大多數的可改善空間吃掉。
-- E2→E3：純 M3 score 幾乎沒有改善 mean JCT，slowdown 也略升 — score 三因子（mps_fit / vram_fit / fragmentation penalty）本身不是排程瓶頸的解。
-- E3→E4：接上 M5 predictor 後，mean JCT −27%、p90 −41%、slowdown 砍半。SJF-flavoured kick 讓短 job 不再被長 job head-of-line block，是整套 stack 中最大的單點收益。
-- E4→E5：**M7 fragmentation 在此 trace 是 net negative**。原因是 5 個 seeds 每組 trace 平均要 ~349 次 requeue，每次 requeue 都讓 victim 重跑（lost progress）。即使 E5b 把 ckpt reload cost 設為 0、純看 lost-progress 的影響，仍然比 E4 多 22%。M7 的 victim selection（純看 priority）對「已執行很久」的 victim 沒有抵抗力。
-- E1 utilization 0.74 vs E2/E5 的 0.81/0.84：FCFS 大量 idle 時間來自 head-of-line block；後者把 idle 收緊但 E5 多出來的 util 是「重複做被 evict 的工作」造成的偽 utilization。
+Job 集中在每 6 小時一次的 2 小時 burst 窗口送進來，pending queue 在 burst 期間爆衝。
+
+| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run |
+|---|---:|---:|---:|---:|---:|---:|
+| E1 FCFS | 17.36 ± 10.71 | 29.38 | 76.15 | 0.708 | 0.000 | 0 |
+| E2 multifactor+bf | 6.36 ± 4.35 | 12.85 | 25.91 | 0.768 | 0.861 | 0 |
+| E3 score (M3) | 6.62 ± 4.37 | 16.54 | 26.88 | 0.766 | 0.896 | 0 |
+| **E4 + predictor (M5)** | **4.24 ± 2.10** | **8.69** | **12.76** | 0.764 | 0.906 | 0 |
+| E5 + fragmentation (M7) | 6.64 ± 3.15 | 14.54 | 20.20 | 0.798 | 0.970 | 356 |
+| E5b M7, 0s ckpt | 6.96 ± 4.72 | 17.14 | 21.18 | 0.784 | 0.966 | 355 |
+
+### 2.3 ali（短 job、稀疏 workload）
+
+ALI 系列 job 多半 ~13 min 跑完，加上 60% 單卡 job 走 MPS 分割，cluster 平均只有 ~30% util，根本沒有 contention。
+
+| exp | jct_mean (h) | jct_p90 (h) | slow_mean | util | bf_rate | requeues/run |
+|---|---:|---:|---:|---:|---:|---:|
+| E1 FCFS | 0.515 ± 0.038 | 1.101 | 1.045 | 0.305 | 0.000 | 0 |
+| E2 multifactor+bf | 0.512 ± 0.037 | 1.098 | 1.026 | 0.305 | 0.031 | 0 |
+| E3 score (M3) | 0.512 ± 0.037 | 1.098 | 1.025 | 0.305 | 0.032 | 0 |
+| E4 + predictor (M5) | 0.512 ± 0.037 | 1.099 | 1.018 | 0.305 | 0.033 | 0 |
+| E5 + fragmentation (M7) | 0.543 ± 0.050 | 1.127 | 1.059 | 0.321 | 0.261 | 92 |
+| E5b M7, 0s ckpt | 0.532 ± 0.047 | 1.118 | 1.037 | 0.316 | 0.231 | 75 |
+
+### 2.4 Paired same-seed comparisons（重點）
+
+同一個 seed 給不同 scheduler 做比較，trace 變動的雜訊被消掉，CI 比 unpaired 緊一個量級。
+
+| trace | E4 vs E2（predictor 邊際） | E5 vs E4（M7 邊際） | E5 vs E2（整體 stack） |
+|---|---:|---:|---:|
+| philly | **−20.06%** ± 11.95% ↓ | **+33.08%** ± 5.22% ↑ | +6.31% ± 15.42%（不顯著） |
+| burst | **−28.71%** ± 11.31% ↓ | **+60.95%** ± 31.71% ↑ | +14.85% ± 30.51%（不顯著） |
+| ali | −0.08% ± 0.09%（不顯著） | **+6.03%** ± 4.48% ↑ | +5.95% ± 4.44% ↑ |
+
+↓/↑ 代表 CI 不跨 0（statistically significant）。
+
+數字怎麼讀：
+- E1→E2：backfill 在 philly / burst 上把 mean JCT 砍 65~72%。Slurm 預設已經拿掉大部分可改善空間，後面任何 scheduler 都只在剩下的 30% 裡爭。
+- E2→E3：純 M3 score 在三個 trace 上都沒有顯著改善 mean JCT。score 因子（mps_fit / vram_fit / fragmentation penalty）本身只是排序，不解決瓶頸。
+- **E3→E4 (M5 predictor)**：是整個 stack 的主要 win。burst 拿到 −28.7%（CI 不跨 0）、philly −20.1%（CI 不跨 0）、ali 只有 −0.08%（util 才 0.30，連 head-of-line 都沒形成，predictor 沒空間發揮）。換句話說，predictor 的價值正比於排隊壓力。
+- **E4→E5 (M7 fragmentation)**：在三個 trace 上全是 net negative。philly +33%、burst +61%、ali +6%。burst 上的損失最大，因為高峰期 head 被擋時 reconciler 觸發頻繁，但被踢的 victim 通常已經跑了一段時間，loss 大於 reschedule 帶來的好處。
+- **E5b 的對照**：把 ckpt reload cost 設成 0 也救不回來。philly 從 +33% 變 +26%、burst 從 +61% 變 +63%、ali 從 +6% 變 +4%。M7 的問題不是 reload overhead，而是 victim 被踢掉後失去的 in-flight progress。
 
 ## 3. 圖
 
-### 3.1 fig1 — JCT mean / p90 / p95（柱狀）
+圖 1~7 用 philly trace 當代表，fig 8 是跨 trace 的 paired Δ。完整 PNG 在 `eval/figures/`，原始 CSV 在 `eval/results/<trace>/<exp>/`。
+
+### 3.1 fig1 — JCT mean / p90 / p95（柱狀，含 95% CI error bar）
 
 <img src="../eval/figures/fig1_jct_bars.png"/>
 
-E1 那根柱子壓著其他四個一個量級。E2..E5 之間的差距才是這個論文要講的故事 —— backfill 不是 thesis 的 contribution（Slurm 本來就有），所以章節會把焦點放在 E2 vs E5。
+E1 那根壓著其他柱子一個量級，所以章節真正要看的差距在 E2..E5 之間。E4 的三根（mean / p90 / p95）都明顯比 E5 矮，error bar 也不重疊。
 
 ### 3.2 fig2 — JCT CDF（log x-axis）
 
 <img src="../eval/figures/fig2_jct_cdf.png"/>
 
-每條線代表「P(JCT ≤ x) 的累積分布」。E1 的 CDF 在低 x 處遠左於其他，意味著就算是「最快的 50% jobs」也比 E2..E5 慢一個量級。E5 的線在整個 quantile range 都壓在 E4 下方，這比單一個 mean 數字更有說服力 —— 不是只有 outlier 改善。
+每條線是 P(JCT ≤ x)。E1 的 CDF 在低 x 處遠左，意思是連最快的 50% job 都比其他組慢一個量級。E4 的線整段都壓在 E5 下方，p50 / p90 / p95 全勝。
 
 ### 3.3 fig3 — Slowdown 箱型圖
 
 <img src="../eval/figures/fig3_slowdown_box.png"/>
 
-Slowdown = JCT / max(runtime, 60s)。E1 的 box 大概在 [10, 100] 區間，E5 的 box 收到 [1, 10]，IQR 變窄一個量級。長尾被 fragmentation requeue 救回來。
+Slowdown = JCT / max(runtime, 60s)。E1 的 box 落在 [10, 100]，E4 收到 [1, 10] 左右，IQR 縮了一個量級。E5 的 box 比 E4 高一截，反應 requeue 後重做 lost progress 對短 job 的 slowdown 影響特別大。
 
 ### 3.4 fig4 — Utilisation timeline
 
 <img src="../eval/figures/fig4_util_time.png"/>
 
-把整段 simulated time 切 200 個 bin，每個 bin 內把所有當時 RUNNING 的 (mps × gpu_count) 加總除以 cluster total。E1 的線在 0.4–0.9 之間劇烈震盪；E5 平穩在 0.9 上方。fragmentation requeue 的副作用之一就是「節點不會閒著」。
+把 simulated time 切 200 個 bin，每個 bin 內 RUNNING 的 (mps × gpu_count) 總和除以 cluster capacity。E5 比 E4 utilization 高一點點，但這部分高出來的工作量是「重做被 evict 的 job」，是 phantom utilization，不對應到 throughput 改善。
 
-### 3.5 fig5 — E6 sensitivity heatmap
+### 3.5 fig5 — E6 sensitivity heatmap（5×5 grid）
 
 <img src="../eval/figures/fig5_e6_heatmap.png"/>
 
-3×3 grid，固定 β=0.20 ε=0.30，掃 α ∈ {0.20, 0.40, 0.60}, δ ∈ {0.10, 0.20, 0.30}。jct_mean 的範圍是 2.91–3.08h（max/min ≈ 1.06）—— 證明結果對 weight choice 並不敏感（差距 < ±5%）。最佳格子是 α=0.40, δ=0.30（2.91h），最差是 α=0.40, δ=0.10 / α=0.60, δ=0.20（3.07h）。
-
-> 含意：M3 的 weight 不需要逐個 workload 重 tune；當前 chart values 的 (α=0.40, β=0.20, δ=0.20) 在 sensitivity 表上落在中位區，已經是個 robust 預設值。M9 的 RL weight tuner 仍有空間 —— 但邊際收益最多再 5%，不是必做。
+固定 β=0.20、ε=0.30，掃 α ∈ {0.10, 0.25, 0.40, 0.55, 0.70}、δ ∈ {0.05, 0.15, 0.20, 0.30, 0.40}，philly trace 上 jct_mean 範圍 3.28–3.63h，spread 10.6%。burst trace 上 spread 28.5%（重壓力下 weight 比較敏感），ali trace 上 spread 0.1%（沒 contention 就沒差）。三個 trace 的 best cell 都落在 α≤0.25、δ≤0.15 一帶，跟「短 job 多時把 mps_fit 拉低、fragmentation penalty 別太大」的直覺一致。
 
 ### 3.6 fig6 — backfill rate 與 M7 requeue count
 
 <img src="../eval/figures/fig6_bf_rate.png"/>
 
-雙 y 軸：左藍是 bf_rate（fraction of jobs that started while an earlier job was pending），右紅是 M7 requeue 次數。E1 bf_rate=0 是 sanity check（FCFS 不 backfill）；E2..E5 都 ≥ 0.91。E5 的 1856 requeue 對應 mean JCT 多砍 12% —— 平均一次 requeue 換來的 JCT 改善是有 measurable 價值的。
+E5/E5b 的 bf_rate 衝到 0.95，但對應的 requeue/run 是 ~349 次（philly）/ ~356 次（burst）/ ~92 次（ali）。看起來 reconciler 確實把節點塞滿了，但塞進去的有相當比例是被踢掉後重新排隊的 job，這是 fig4 phantom utilization 的根源。
 
-### 3.7 fig7 — Mean-JCT 改善（vs E1 normalise）
+### 3.7 fig7 — Mean-JCT 改善（vs E1 normalise，含 CI）
 
 <img src="../eval/figures/fig7_jct_normalised.png"/>
 
-E1 = 0%，E2 +71.0%、E3 +71.1%、E4 +76.4%、E5 +79.3%。對照 thesis claim「組合 M3+M5+M7 比 vendor multifactor 多砍 28.6%」—— 是 (3.671 − 2.621) / 3.671 ≈ 28.6%，這是 thesis 主結論的單一數字。
+E1 = 0% baseline。philly trace 上 E4 −78%、E5 −71%（E5 比 E4 退步），其他兩條 trace 同樣是 E4 最深、E5 反彈。CI error bar 在 E4 上明顯不跨 0；E5 在 burst 上 CI 比較寬反映 trace-to-trace 變動大。
+
+### 3.8 fig8 — 跨 trace generalisation（新增）
+
+<img src="../eval/figures/fig8_cross_trace.png"/>
+
+三個 trace × 兩個 paired Δ。綠色是 E4 vs E2（M5 predictor 的邊際），紅色是 E5 vs E4（M7 fragmentation 的邊際）。
+
+可以一眼讀出的事情：
+- 綠色在 philly 與 burst 上明顯往下、CI 不跨 0，predictor 是真實的 win。ali 上趴在 0 附近，because 那個 trace 沒有讓 predictor 有發揮空間的 contention。
+- 紅色三根都在 0 以上、CI 都不跨 0。M7 在三個 trace 上都是 net negative，不是 philly-specific artefact。
 
 ## 4. 結論與 thesis claim 對應
 
 | Claim | 狀態 | 證據 |
 |---|---|---|
-| **C1** Slurm-on-K8s 的內建 multifactor + backfill 已能把 FCFS 的 15.8h JCT 砍到 4.49h | ✅ paired −72% | E1 vs E2 |
-| **C2** 純 M3 score（無 predictor）對總 JCT mean 沒有顯著改善 | ✅ paired +4.9%（noise） | E2 vs E3 |
-| **C3** **M5 runtime predictor 是排程 quality 的最大推進力**（paired −20.1% vs E2，95% CI ±12%） | ✅ statistically significant | E2 vs E4 |
-| **C4** M7 fragmentation reconciler 在這份 trace **未帶來淨收益**；paired +33.1% mean JCT vs E4，主因是 victim 的 lost progress 大於排程改善 | ❌ negative result（須在 writeup 誠實揭露） | E4 vs E5 |
-| **C5** Score weight 的 sensitivity 是 ±5%，當前預設值已足夠 robust | ✅ | E6 heatmap |
+| **C1** Slurm 內建 multifactor + backfill 已經把 FCFS 的 16h JCT 砍到 4~6h | ✅ paired −65~72% | E1 vs E2，三個 trace 都成立 |
+| **C2** 純 M3 score（沒接 predictor）對 mean JCT 沒有顯著改善 | ✅ paired Δ 都不顯著 | E2 vs E3，三個 trace |
+| **C3** M5 runtime predictor 在有 contention 的 trace 上 statistically significant | ✅ philly −20.1%、burst −28.7% | E2 vs E4 |
+| **C3b** Predictor 的效益正比於排隊壓力：ali（util 0.30）上幾乎沒有差別 | 補充觀察 | E4 vs E2 on ali = −0.08% |
+| **C4** M7 fragmentation reconciler 在三個 trace 上都是 net negative | ✅ generalises | E4 vs E5：philly +33%、burst +61%、ali +6%（CI 都不跨 0） |
+| **C4a** 把 ckpt reload cost 設成 0 也救不回來，主因是 victim lost progress | ✅ | E5b vs E5 改善僅 6% |
+| **C5** Score weight 的 sensitivity 取決於 contention：ali 0.1%、philly 10.6%、burst 28.5% | ✅，比舊版「±5%」精確 | E6 5×5 grid，三個 trace |
 
 > [!IMPORTANT]
-> **Claim C4 是 negative result，但仍是 thesis contribution**：它精準定義了 M7 fragmentation reconciler 何時不該開（victim selection 純看 priority 時，會把已有大量進度的 victim 也踢掉，losts > gains）。Future work 方向：
+> C4 是 negative result，但它是這份 evaluation 想留下的核心 thesis contribution：在三個 distribution 差距很大的 synthetic trace 上，當前 M7 victim selection 都跑出 net negative。這精確定義了 reconciler 何時不該開——victim selection 純看 priority 時，會把已經跑了一大段的 job 也踢掉，loss 大於排程帶來的好處。
 >
-> 1. victim selection 考慮「已執行時間」penalty（don't evict jobs > X% complete）
-> 2. 只在 head pending job 預估短於 victim 剩餘時間的情況下 requeue
-> 3. 改 preempt + suspend（保留 memory state）而非 full requeue
-> 4. 用更多 traces（#4）確認 negative result 不是這個 trace 的 artefact，或反之
+> 救援方向（給 future work）：
+>
+> 1. Victim selection 加上「已執行時間 / 已完成比例」penalty，避免踢已經做了一半的 job。
+> 2. 改 preempt + suspend，保留 GPU memory state，把 lost progress 從 100% 降到接近 0。
+> 3. 只在 predictor 估計 head 剩餘時間 < victim 剩餘時間時觸發 reconciler。
+> 4. 把 M7 限縮在「ali 那類短 job heavy」的 trace 上，原本就沒幾次 requeue，傷害有限——但這也意味著 contribution 規模很小。
 
 ## 5. 風險與限制
 
-- **單一 workload family。** 5 個 seeds 都從同一個 generator（`generate_philly_like`）抽出，distribution 一致；真實 production 的 burst 與 diurnal pattern 可能放大或縮小 E4/E5 差距。下一步（#4）會加 burst-heavy + ALI-Cluster trace 驗證 negative result 是否依舊。
-- **Lost-progress 假設保守。** Sim 假設 victim 從 scratch 重跑，沒有 partial checkpoint resume。真實情況有 ckpt 機制可救一部分 progress；E5 已加 60s 的 reload+warmup overhead，但「重做的 work」仍 100% 計入。若改 preempt+suspend（保留 GPU memory）可大幅縮小 lost cost。
-- **Predictor 假設完美。** ε=0.30 + f_runtime_short(true_runtime) 等於假設 M5 predictor 預測誤差為 0。M5 服務的真實 RMSE（見 `services/predictor/`）約為 ±20% — 真實環境 E4 改善幅度應該打 8 折。
-- **mem / IO 沒模擬。** sim 只看 MPS slot 與 GPU 數；GPU 工作的 IO 等待對 JCT 也是顯著貢獻者，在 sim 裡假設「已內含於 runtime」。
-- **E6 grid 太粗。** 3×3 = 9 cells 證明 robustness 等級夠，但找最佳 weight 需要更密的 grid。
-- **Live cluster 尚未驗證（#1 handoff）。** E7 live harness 已寫好但只是 feasibility 規模（單 GPU），主結論仍 100% 來自 simulator。
+- **三個 trace 都是 synthetic**。philly / burst / ali 是三組不同 distribution 的 generator，已經把 negative result 跨 distribution 確認過，但真實 production trace（如 Helios、Alibaba 公開 trace）仍可能呈現不同的 contention 結構。如果未來有真實 trace 可用，repro 就只是換 `--trace` 參數的事。
+- **Lost-progress 保守假設**。Sim 讓 victim 從零重跑，沒模擬 partial checkpoint resume。E5 已經加 60s reload overhead，但「已完成的 work 100% 重做」這個假設偏悲觀。實際 preempt+suspend（保留 GPU memory）可以把這部分大幅縮小，這也是 C4 future work 的方向 2。
+- **Predictor 假設完美**。Sim 裡 `f_runtime_short(true_runtime)` 等於假設 RMSE = 0。`services/runtime_predictor` 實測 RMSE 約 ±20%，真實環境 E4 改善幅度大概要打 8 折。
+- **mem / IO 沒模擬**。Sim 只追蹤 MPS slot 跟 GPU 數，GPU job 的 IO wait 也是 JCT 顯著貢獻者，這部分被當成 "已內含於 runtime" 處理。
+- **E6 grid 已升級到 5×5**，但仍沒掃 β 跟 ε。如果要進一步聲明 weight robustness 需要 full 4-D scan。
+- **Live cluster 尚未驗證（handoff #1）**。E7 live harness 已寫好但只是 feasibility 規模（單張 RTX 4070），主結論仍 100% 來自 simulator。
 
 ## 6. 重現步驟
 
@@ -163,13 +213,21 @@ bash eval/scripts/run_e7_live.sh vendor
 ```
 
 raw artifacts：
-- `eval/results/<exp>/<run>.csv` per-job
-- `eval/results/<exp>/<run>.json` per-run summary
-- `eval/results/all_summaries.json` 全部 14 runs 攤平
-- `eval/figures/fig{1..7}.{png,pdf}` 圖
+- `eval/results/<trace>/<exp>/<run>__seed<N>.csv` 每個 seed 的 per-job
+- `eval/results/<trace>/<exp>/<run>__seed<N>.json` per-run summary
+- `eval/results/all_summaries.json` 全部 465 runs 攤平（3 traces × 5 seeds × 31 configs）
+- `eval/results/agg_by_run.json` 跨 seed 聚合的 mean / std / 95% CI
+- `eval/figures/fig{1..8}.{png,pdf}` 圖
+
+可以調整的環境變數：
+- `TRACES="philly burst ali"` 控制要跑哪幾種 trace
+- `SEEDS="42 43 44 45 46"` 控制 seed 列表
+- `E6_GRID=DENSE` (5×5) 或 `SMALL` (3×3 legacy)
+- `CKPT_COST=60.0` E5 的 checkpoint reload cost
 
 ## 7. M8 驗收
 
-- [x] **7 組實驗 raw data 齊全** — E1..E6 (sim, 14 runs)；E7 提供 harness 但需要 live cluster 跑（受 RTX 4070 only 1 張限制，留作 thesis appendix）
-- [x] **7 張圖出爐** — fig1 bar、fig2 CDF、fig3 box、fig4 utilization、fig5 heatmap、fig6 bf+requeue、fig7 normalised
-- [x] **eval-writeup.md ≥ 8 頁等量內容** — 本檔 §1–§7（去掉 markdown overhead 大約 8–10 頁印出量）；每張圖都有 1–2 段論述
+- [x] **跨 trace raw data 齊全** — 3 traces × 5 seeds × 31 configs = 465 sim runs；E7 harness 仍待 live cluster 跑
+- [x] **8 張圖出爐** — fig1 bar、fig2 CDF、fig3 box、fig4 utilization、fig5 heatmap、fig6 bf+requeue、fig7 normalised、fig8 cross-trace
+- [x] **negative result 跨 distribution 驗證** — M7 在 philly / burst / ali 三種完全不同 distribution 上一致 net negative，不是單 trace artefact
+- [x] **eval-writeup.md** — 本檔 §1–§7；每張圖都有 1–2 段論述

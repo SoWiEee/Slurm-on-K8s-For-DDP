@@ -22,6 +22,7 @@ random tier {1, 2, 3, 4}. This is documented in §M4 of
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 from dataclasses import dataclass, asdict
@@ -200,6 +201,142 @@ def generate_philly_like(
             )
         )
     return jobs
+
+
+def generate_burst_heavy(
+    n_jobs: int = 1000,
+    *,
+    seed: int = 42,
+    horizon_seconds: float = 5 * 24 * 3600,
+    n_users: int = 40,
+    burst_period_seconds: float = 6 * 3600,
+    burst_active_seconds: float = 2 * 3600,
+    burst_concentration: float = 0.80,
+) -> List[Job]:
+    """Same job-size mix as `generate_philly_like` but with day-cycle bursts.
+
+    A `burst_concentration` fraction of arrivals lands inside the
+    `burst_active_seconds`-long active windows of each `burst_period_seconds`
+    cycle (~33% of horizon). The rest is sprinkled across the gaps. This
+    stresses the scheduler — peak queue length 3–4× the Poisson case —
+    and is the most adverse environment for fragmentation reconcilers
+    (head-of-line pile-ups + lots of small-MPS jobs queuing behind whole-
+    GPU ones).
+    """
+    rng = random.Random(seed)
+    users = [f"u{i:02d}" for i in range(n_users)]
+    gpu_choices = [1, 2, 4, 8]
+    gpu_weights = [0.75, 0.12, 0.10, 0.03]
+    gpu_types = ["rtx4070", "v100", "p100"]
+    gpu_type_weights = [0.55, 0.30, 0.15]
+
+    n_burst = int(round(n_jobs * burst_concentration))
+    n_gap = n_jobs - n_burst
+    n_cycles = max(1, int(horizon_seconds / burst_period_seconds))
+
+    # Build a deterministic list of submit_ts then attach job features.
+    submits: List[float] = []
+    for _ in range(n_burst):
+        cyc = rng.randrange(n_cycles)
+        offset = rng.uniform(0.0, burst_active_seconds)
+        submits.append(cyc * burst_period_seconds + offset)
+    for _ in range(n_gap):
+        submits.append(rng.uniform(0.0, horizon_seconds))
+    submits.sort()
+
+    jobs: List[Job] = []
+    for i, t in enumerate(submits):
+        gpu = rng.choices(gpu_choices, gpu_weights)[0]
+        runtime = max(60.0, rng.lognormvariate(7.5, 1.4))
+        mps = MPS_PER_GPU
+        if gpu == 1 and rng.random() < 0.30:
+            mps = rng.choice([1, 2, 3])
+        jobs.append(
+            Job(
+                job_id=f"burst-{i:05d}",
+                user=rng.choice(users),
+                gpu_count=gpu,
+                gpu_type=rng.choices(gpu_types, gpu_type_weights)[0],
+                submit_ts=round(t, 3),
+                runtime=round(runtime, 3),
+                mem_req=0.0,
+                mps_req=mps,
+            )
+        )
+    return jobs
+
+
+def generate_ali_like(
+    n_jobs: int = 1000,
+    *,
+    seed: int = 42,
+    horizon_seconds: float = 5 * 24 * 3600,
+    n_users: int = 60,
+) -> List[Job]:
+    """Approximate Alibaba PAI / ALI-Cluster MLaaS trace characteristics.
+
+    Reference: Weng et al., NSDI'22 "MLaaS in the Wild" — heavily
+    fractionalized, short tail, mostly single-GPU.
+
+    - 90% single-GPU, 7% 2-GPU, 3% 4-GPU.
+    - Runtimes shorter than Philly: median ~13 min, p95 ~3h (log-normal mu=6.8, sigma=1.2).
+    - 60% of single-GPU jobs are MPS-fractional, often <= 0.5 GPU (mps {1,2}).
+    - Diurnal arrival: rate doubles during the daytime 12h of each 24h cycle.
+    """
+    rng = random.Random(seed)
+    users = [f"u{i:02d}" for i in range(n_users)]
+    gpu_choices = [1, 2, 4]
+    gpu_weights = [0.90, 0.07, 0.03]
+    gpu_types = ["a10", "v100", "rtx4070"]
+    gpu_type_weights = [0.60, 0.25, 0.15]
+
+    # Diurnal arrival: thinning a uniform sample through a 1+sin envelope.
+    raw_ts = [rng.uniform(0.0, horizon_seconds) for _ in range(n_jobs * 3)]
+    def accept(t: float) -> bool:
+        phase = (t % (24 * 3600)) / (24 * 3600)  # 0..1 over a day
+        # daytime peak around 0.5 (noon), night trough around 0.0/1.0
+        envelope = 0.5 + 0.5 * math.sin(2 * math.pi * (phase - 0.25))
+        return rng.random() < envelope
+    submits = sorted([t for t in raw_ts if accept(t)])[:n_jobs]
+    # If sampling was too aggressive, top up uniformly.
+    while len(submits) < n_jobs:
+        submits.append(rng.uniform(0.0, horizon_seconds))
+    submits.sort()
+
+    jobs: List[Job] = []
+    for i, t in enumerate(submits):
+        gpu = rng.choices(gpu_choices, gpu_weights)[0]
+        runtime = max(60.0, rng.lognormvariate(6.8, 1.2))  # median ~900s, p95 ~3h
+        mps = MPS_PER_GPU
+        if gpu == 1 and rng.random() < 0.60:
+            mps = rng.choice([1, 2])
+        jobs.append(
+            Job(
+                job_id=f"ali-{i:05d}",
+                user=rng.choice(users),
+                gpu_count=gpu,
+                gpu_type=rng.choices(gpu_types, gpu_type_weights)[0],
+                submit_ts=round(t, 3),
+                runtime=round(runtime, 3),
+                mem_req=0.0,
+                mps_req=mps,
+            )
+        )
+    return jobs
+
+
+TRACE_FAMILIES = {
+    "philly": generate_philly_like,
+    "burst": generate_burst_heavy,
+    "ali": generate_ali_like,
+}
+
+
+def generate_by_family(family: str, **kwargs) -> List[Job]:
+    if family not in TRACE_FAMILIES:
+        raise ValueError(f"unknown trace family {family!r}; "
+                         f"choices: {sorted(TRACE_FAMILIES)}")
+    return TRACE_FAMILIES[family](**kwargs)
 
 
 def write_normalized(jobs: Iterable[Job], path: str) -> None:

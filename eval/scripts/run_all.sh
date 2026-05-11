@@ -22,35 +22,46 @@ NODES=${NODES:-4}
 GPN=${GPN:-4}
 SYNTH_JOBS=${SYNTH_JOBS:-1000}
 SEEDS=${SEEDS:-"42 43 44 45 46"}
+TRACES=${TRACES:-"philly burst ali"}
 # checkpoint reload cost (s) charged per requeue under fragmentation.
 # Default 60s ≈ a realistic small-LLM warmup (DDP MNIST ≈ 10s, larger
 # models can be several minutes — sweep externally if needed).
 CKPT_COST=${CKPT_COST:-60.0}
+# E6 sensitivity grid: SMALL = 3x3 (legacy), DENSE = 5x5 (fine grid)
+E6_GRID=${E6_GRID:-DENSE}
 OUT="$ROOT/eval/results"
 mkdir -p "$OUT"
 
+# Per-trace output prefix so seeds/configs don't collide across families.
+trace_outdir() { echo "$OUT/$1"; }
+
 run_sim_one_seed() {
-  # run_sim_one_seed <experiment> <run-name> <seed> <extra runner args...>
+  # run_sim_one_seed <trace> <experiment> <run-name> <seed> <extra runner args...>
+  local trace="$1"; shift
   local exp="$1"; shift
   local name="$1"; shift
   local seed="$1"; shift
-  mkdir -p "$OUT/$exp"
+  local dir="$(trace_outdir "$trace")/$exp"
+  mkdir -p "$dir"
   "$PY" -m sim.runner \
+      --trace-family "$trace" \
       --synth-jobs "$SYNTH_JOBS" --synth-seed "$seed" \
       --nodes "$NODES" --gpus-per-node "$GPN" \
-      --output "$OUT/$exp/${name}__seed${seed}.csv" \
-      --summary-json "$OUT/$exp/${name}__seed${seed}.json" \
+      --output "$dir/${name}__seed${seed}.csv" \
+      --summary-json "$dir/${name}__seed${seed}.json" \
       "$@" >/dev/null
 }
 
 run_sim() {
-  # run_sim <experiment> <run-name> <extra args...> — loops over SEEDS
+  # run_sim <experiment> <run-name> <extra args...> — loops over SEEDS × TRACES
   local exp="$1"; shift
   local name="$1"; shift
-  for s in $SEEDS; do
-    run_sim_one_seed "$exp" "$name" "$s" "$@"
+  for trace in $TRACES; do
+    for s in $SEEDS; do
+      run_sim_one_seed "$trace" "$exp" "$name" "$s" "$@"
+    done
   done
-  echo "  $exp/$name  OK ($(echo $SEEDS | wc -w) seeds)"
+  echo "  $exp/$name  OK ($(echo $TRACES | wc -w) traces × $(echo $SEEDS | wc -w) seeds)"
 }
 
 step() { printf "\n[eval] %s\n" "$*"; }
@@ -82,17 +93,24 @@ step "E5b fragmentation (ckpt_reload_cost=0 — optimistic upper bound)"
 run_sim e5b score-m7-free --scheduler score --alpha 0.40 --beta 0.20 --delta 0.20 --epsilon 0.30 \
         --fragmentation --ckpt-reload-cost 0.0
 
-# E6 — sensitivity grid (9 combos around E4 weights)
-step "E6 sensitivity grid"
+# E6 — sensitivity grid. DENSE = 5×5 over (α,δ); SMALL = 3×3 legacy.
+if [ "$E6_GRID" = "DENSE" ]; then
+  ALPHAS="0.10 0.25 0.40 0.55 0.70"
+  DELTAS="0.05 0.15 0.20 0.30 0.40"
+else
+  ALPHAS="0.20 0.40 0.60"
+  DELTAS="0.10 0.20 0.30"
+fi
+step "E6 sensitivity grid ($E6_GRID)"
 i=0
-for a in 0.20 0.40 0.60; do
-  for d in 0.10 0.20 0.30; do
+for a in $ALPHAS; do
+  for d in $DELTAS; do
     name=$(printf "a%s_d%s" "$a" "$d")
     run_sim e6 "$name" --scheduler score --alpha "$a" --beta 0.20 --delta "$d" --epsilon 0.30
     i=$((i+1))
   done
 done
-echo "  E6: $i combos × $(echo $SEEDS | wc -w) seeds"
+echo "  E6: $i combos × $(echo $TRACES | wc -w) traces × $(echo $SEEDS | wc -w) seeds"
 
 # Aggregate summaries for plotting
 step "merging summaries"
