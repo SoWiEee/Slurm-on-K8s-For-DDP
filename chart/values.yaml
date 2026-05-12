@@ -432,6 +432,33 @@ operator:
     # means "all partitions present in PARTITIONS_JSON".
     partitions: []
 
+# -- RL scheduler serve (M11 Phase D) ----------------------------------------
+# Optional FastAPI service that holds a trained MaskablePPO policy and
+# answers /decide from the lua submit filter (rl_hook.lua → curl /decide).
+# Shadow mode by default — logs decision but does not mutate priority.
+rlScheduler:
+  enabled: false
+  image:
+    repository: slurm-rl-scheduler
+    tag: m11
+    pullPolicy: IfNotPresent
+  service:
+    port: 8002
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: 2,    memory: 2Gi   }
+  shadowMode: true        # never mutates priority while true
+  snapshotTtlSeconds: 30  # /decide abstains if snapshot older than this
+  valueAbstain: -1.0      # abstain if policy value head < this
+  entropyAbstain: 1.5     # abstain if policy entropy > this
+  priorityBoost: 1000     # +X to priority of RL-picked job (shadow when shadowMode)
+  networkPolicy:
+    enabled: true
+  lua:
+    enabled: false        # job_submit.lua does NOT call /decide unless true
+    url: "http://rl-scheduler:8002/decide"
+    timeoutSeconds: 0.15  # curl --max-time
+
 # -- Runtime predictor (Phase 6 M5) ------------------------------------------
 # Optional FastAPI + LightGBM service that returns predicted runtime to the
 # M2 Lua plugin (M6 wires the call). Disabled by default; the lua plugin

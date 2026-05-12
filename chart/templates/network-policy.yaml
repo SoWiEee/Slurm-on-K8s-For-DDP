@@ -263,6 +263,16 @@ spec:
         - protocol: TCP
           port: 8080
     {{- end }}
+    {{- if and .Values.rlScheduler.enabled .Values.rlScheduler.lua.enabled }}
+    # M11 Phase D: lua job_submit plugin calls rl-scheduler on :8002 via curl.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rl-scheduler
+      ports:
+        - protocol: TCP
+          port: {{ .Values.rlScheduler.service.port }}
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

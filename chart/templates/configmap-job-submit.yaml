@@ -23,6 +23,8 @@ Reference: docs/scheduler-score-spec.md.
 {{- $js := .Values.slurm.jobSubmit }}
 {{- $w := $js.scoreWeights | default dict }}
 {{- $pr := $js.predictor | default dict }}
+{{- $rls := .Values.rlScheduler | default dict }}
+{{- $rll := $rls.lua | default dict }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -259,6 +261,17 @@ data:
     end
 
     -- ------------------------------------------------------------------
+    -- M11 Phase D — RL scheduler hook. SHADOW_MODE on the serve side
+    -- means /decide never returns a non-zero boost; we still call it so
+    -- that the live cluster emits decision events for offline analysis.
+    -- ------------------------------------------------------------------
+    RL_ENABLED   = {{ if $rll.enabled }}true{{ else }}false{{ end }}
+    RL_URL       = {{ default "http://rl-scheduler:8002/decide" $rll.url | quote }}
+    RL_TIMEOUT_S = {{ default 0.15 $rll.timeoutSeconds }}
+
+{{ .Files.Get "lua/rl_hook.lua" | indent 4 }}
+
+    -- ------------------------------------------------------------------
     -- Slurm hooks. log_summary / slurm_job_submit / slurm_job_modify.
     -- The `slurm` global is provided by slurmctld; tests stub it out.
     -- ------------------------------------------------------------------
@@ -323,6 +336,16 @@ data:
         if not job_desc.priority or job_desc.priority == 0 then
           job_desc.priority = delta
         end
+      end
+
+      -- M11 Phase D — RL scheduler shadow/live decision. rl_apply
+      -- safely no-ops on every failure path (disabled, network, parse
+      -- error, lua error inside pcall), so this never blocks sbatch.
+      if RL_ENABLED then
+        local mps_req   = parse_mps_req(job_desc and job_desc.tres_per_node)
+        local gpu_count = tonumber((job_desc and job_desc.min_nodes) or 1) or 1
+        local runtime_s = (tonumber((job_desc and job_desc.time_limit) or 0) or 0) * 60
+        rl_apply(job_desc, mps_req, gpu_count, runtime_s)
       end
 
       return slurm.SUCCESS

@@ -1,0 +1,117 @@
+{{/*
+M11 Phase D — RL scheduler serve endpoint (FastAPI /decide + /snapshot).
+
+  Deployment   → uvicorn FastAPI on :8002, policy baked into image at /models
+  Service      → ClusterIP, port 8002
+  NetPol       → controller (lua) → rl-scheduler ingress
+
+Disabled by default. Enable via rlScheduler.enabled=true; pair with
+slurm.luaPlugin.rlEnabled to wire the lua side.
+*/}}
+{{- if .Values.rlScheduler.enabled }}
+{{- $rl := .Values.rlScheduler -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-scheduler
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: rl-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rl-scheduler
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.selectorLabels" . | nindent 8 }}
+        app: rl-scheduler
+    spec:
+      containers:
+        - name: serve
+          image: "{{ $rl.image.repository }}:{{ $rl.image.tag }}"
+          imagePullPolicy: {{ $rl.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8002
+              protocol: TCP
+          env:
+            - name: SHADOW_MODE
+              value: {{ $rl.shadowMode | quote }}
+            - name: SNAPSHOT_TTL_S
+              value: {{ $rl.snapshotTtlSeconds | quote }}
+            - name: VALUE_ABSTAIN
+              value: {{ $rl.valueAbstain | quote }}
+            - name: ENTROPY_ABSTAIN
+              value: {{ $rl.entropyAbstain | quote }}
+            - name: PRIORITY_BOOST
+              value: {{ $rl.priorityBoost | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- toYaml $rl.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-scheduler
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: rl-scheduler
+spec:
+  type: ClusterIP
+  selector:
+    app: rl-scheduler
+  ports:
+    - name: http
+      port: {{ $rl.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- if and .Values.networkPolicy.enabled $rl.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rl-scheduler-ingress
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: rl-scheduler
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        # controller (lua submit filter), workers, login, snapshot agent
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8002
+  egress:
+    # DNS only — serve.py uses an in-process model, no outbound calls
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- end }}

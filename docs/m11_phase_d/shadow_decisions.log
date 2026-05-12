@@ -1,0 +1,105 @@
+slurmctld: lua: [score-m3] submit name=rl-snap-11 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-snap-12 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-snap-13 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-snap-14 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-snap-15 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b1s1 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b1s2 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b1s3 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b1s4 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b1s5 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b2s1 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b2s2 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b2s3 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b2s4 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b2s5 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b3s1 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b3s2 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b3s3 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b3s4 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-live-b3s5 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] abstain (value=-4.221 entropy=2.303)
+slurmctld: lua: [score-m3] submit name=rl-relaxed-1 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-2 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-3 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-4 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-5 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-6 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-7 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-8 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-9 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-10 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-11 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-12 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-13 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-14 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
+slurmctld: lua: [score-m3] submit name=rl-relaxed-15 partition=cpu tres_per_node= features=
+slurmctld: lua: [score-m3] score=0.5000 delta=500 mps_fit=1.00 vram_fit=0.50 topo=0.50 frag=0.00 pred=0.50 apply=true
+slurmctld: lua: [rl] no-boost selected_id=phl-00001 value=-4.221
