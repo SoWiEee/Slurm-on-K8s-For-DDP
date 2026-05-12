@@ -42,6 +42,9 @@ spec:
         # we don't support out-of-band edits).
         checksum/config-static: {{ include (print $.Template.BasePath "/configmap-static.yaml") . | sha256sum }}
         checksum/config-nodes: {{ include (print $.Template.BasePath "/configmap-nodes.yaml") . | sha256sum }}
+        {{- if .Values.slurm.jobSubmit.enabled }}
+        checksum/config-job-submit: {{ include (print $.Template.BasePath "/configmap-job-submit.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       containers:
         - name: slurm-controller
@@ -124,6 +127,11 @@ spec:
               mountPath: /etc/slurm/gres.conf
               subPath: gres.conf
             {{- end }}
+            {{- if .Values.slurm.jobSubmit.enabled }}
+            - name: slurm-config-job-submit
+              mountPath: /etc/slurm/job_submit.lua
+              subPath: job_submit.lua
+            {{- end }}
             - name: slurm-secrets
               mountPath: /slurm-secrets
               readOnly: true
@@ -140,6 +148,11 @@ spec:
         - name: slurm-config-nodes
           configMap:
             name: slurm-config-nodes
+        {{- if .Values.slurm.jobSubmit.enabled }}
+        - name: slurm-config-job-submit
+          configMap:
+            name: slurm-config-job-submit
+        {{- end }}
         - name: slurm-secrets
           projected:
             sources:

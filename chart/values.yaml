@@ -191,6 +191,106 @@ slurm:
     lifespanSeconds: 86400                         # used by Stage B+ controller scripts
   fairshare:
     enabled: false                                 # P1+ feature
+  # M1 (Phase 6): Slurm built-in scheduling knobs. The defaults below match
+  # Slurm's built-in behaviour for selectTypeParameters (CR_Core, no Pack)
+  # and turn on backfill + multifactor priority — both already on in stock
+  # Slurm 21.08, just made explicit here so values.yaml is the single source
+  # of truth. Preempt is OFF by default (M7 turns it on after the
+  # checkpoint-aware requeue lands). See docs/scheduler.md §5.1.
+  scheduling:
+    # sched/backfill is strictly better than sched/builtin for our mixed
+    # workload (long DDP + short cpu jobs). Override to sched/builtin only
+    # for A/B comparisons.
+    schedulerType: sched/backfill
+    # bf_window=720 → look 12h ahead; bf_resolution=30 → 30s slot grain;
+    # bf_continue → don't restart backfill on every new submission;
+    # bf_max_job_test=200 → cap per-cycle job evaluations.
+    schedulerParameters: "bf_window=720,bf_resolution=30,bf_continue,bf_max_job_test=200"
+    priorityType: priority/multifactor
+    priorityWeights:
+      age: 1000           # 1 hour wait ≈ 1000 priority points
+      fairshare: 0        # off until slurmdbd-driven fairshare lands
+      jobSize: 500        # mild preference for larger jobs (helps DDP)
+      partition: 1000     # partition.PriorityTier still dominates
+      qos: 2000           # QOS dominates jobSize/age
+    preempt:
+      enabled: false      # M7 flips this on after checkpoint+requeue plumb
+      type: preempt/qos
+      mode: REQUEUE
+  # M2 (Phase 6): Lua submit plugin scaffold. Disabled by default — when
+  # enabled, slurm.conf gets `JobSubmitPlugins=lua` and the controller
+  # mounts /etc/slurm/job_submit.lua from the slurm-config-job-submit
+  # ConfigMap. The shipped scaffold only logs job_desc fields; M3 fills
+  # in the score factors. See docs/scheduler-score-spec.md.
+  jobSubmit:
+    enabled: false
+    # debugLog: write per-call summary to slurmctld.log at level info.
+    # Useful for M2/M3 plumbing tests; turn off in steady state to avoid
+    # log spam.
+    debugLog: true
+    # demoBoostPriority: when > 0, the scaffold sets job_desc.priority to
+    # this value for any job whose name starts with "score-demo-". Lets
+    # M2 verify the plugin can write back to job_desc without needing the
+    # full scoring stack. Set to 0 to disable.
+    demoBoostPriority: 9999
+    # scoreGain: M3+ multiplier converting the [0,1] score into a Slurm
+    # priority delta. Roughly equal to PriorityWeightAge / hour so a
+    # perfect score buys ~1 hour of age.
+    scoreGain: 1000
+    # M3: scoreApply controls whether the computed score is applied to
+    # job_desc.priority. Set to false for shadow-mode evaluation (the
+    # plugin still logs `[score-m3] score=...` so we can compare against
+    # baseline without changing scheduling behaviour). Default true now
+    # that the factors are real (M2 was always shadow).
+    scoreApply: true
+    # M3: factor coefficients (α/β/γ/δ/ε in docs/scheduler-score-spec.md).
+    # γ (topology) and ε (predicted runtime) stay at 0 until M5+M7 wire
+    # them in — keeping their slots here means M3 evaluation isn't biased
+    # by uninitialised factors.
+    scoreWeights:
+      mpsFit: 0.40           # α
+      vramFit: 0.20          # β
+      topology: 0.00         # γ — M7
+      fragmentation: 0.20    # δ
+      predRuntime: 0.00      # ε — M5+M6
+    # M3: VRAM tiers used by f_vram_fit. Sorted ascending. The smallest
+    # tier ≥ job's vram constraint is treated as the ideal placement; the
+    # plugin penalises over-provisioning (sending a 12g job to a 24g
+    # node). Derive these from .Values.pools when M7 lands; for M3 we
+    # keep the values explicit so the lua doesn't need to walk pools.
+    vramTiers: [12, 24]
+    # M3: assumed MPS slots per GPU node. Slurm's gres.conf sets mps
+    # Count=100 for our pools; embed it here so f_mps_fit / f_fragmentation
+    # don't hard-code 100.
+    mpsPerNode: 100
+    # M6: Predictor wiring. The lua plugin shells out to curl with --max-time
+    # so a hung service can't stall slurmctld; the call is wrapped in pcall,
+    # and a missing/empty response degrades to "no override". When enabled
+    # without a reachable predictor the only effect is a single
+    # `[predictor] skipped (...)` line per submission, so leaving this on by
+    # mistake is safe — but the controller image MUST carry curl
+    # (docker/controller/Dockerfile installs it on top of the slurm bundle).
+    predictor:
+      enabled: false
+      # In-cluster Service URL — matches the chart's runtime-predictor
+      # Service when runtimePredictor.enabled=true. Override per env if
+      # the predictor lives in a different namespace.
+      url: "http://runtime-predictor:8080/predict"
+      # Hard timeout passed to `curl --max-time`. Keep small (≤200 ms).
+      # slurmctld is single-threaded over the lua plugin call, so any
+      # blocking here delays *every* sbatch.
+      timeoutMs: 200
+      # Cap on the override applied to job_desc.time_limit (minutes).
+      # The lua clamps `pred_minutes` at fallbackHours·60 so a runaway
+      # prediction can't ask for a 100-hour walltime.
+      fallbackHours: 4
+      # When true, the lua mutates job_desc.time_limit. Set false for
+      # shadow-mode evaluation — the plugin still logs the prediction
+      # but leaves walltime untouched.
+      applyTimeLimit: true
+      # GPU-type label sent when the job's --constraint doesn't carry
+      # one. Aligns with the predictor's one-hot alphabet.
+      defaultGpuType: rtx4070
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:
@@ -295,6 +395,113 @@ operator:
     enabled: true
     maxAgeSeconds: 600
     graceSeconds: 300
+  # Phase 6 M7: fragmentation detector + requeue decider. Disabled by
+  # default; even when enabled, ``shadowMode`` defaults true so the
+  # decider runs end-to-end (logs + metrics) without actually requeueing
+  # any job. Flip to false only after a release cycle of shadow data
+  # confirms the decisions are sane.
+  #
+  # IMPORTANT — M8 evaluation (2026-05-11, 3 traces × 5 seeds, see
+  # docs/eval-writeup.md) found the current victim-selection policy
+  # produces a statistically significant mean-JCT regression on all three
+  # synthetic workloads (philly +33%, burst +61%, ali +6%, vs the
+  # predictor-only baseline). The cost is dominated by lost progress of
+  # already-running victims, not by checkpoint reload. Do NOT set
+  # shadowMode=false on production traffic until victim selection adds an
+  # elapsed-progress penalty or switches to suspend-resume preemption.
+  fragmentation:
+    enabled: false
+    shadowMode: true
+    # Cadence for the periodic reconcile thread. Doubles as the decider's
+    # min-interval rate limit, so two ticks back-to-back can't both fire
+    # a requeue.
+    minIntervalSeconds: 60
+    # Sliding-window cap on requeue decisions per hour.
+    maxRequeuesPerHour: 5
+    # Maximum number of low-priority victims requeued in a single decision.
+    maxTargetsPerDecision: 4
+    # Required priority gap (target.priority - victim.priority) before a
+    # running job is eligible for preemption. 0 = any positive gap; bump
+    # to e.g. 500 to require a more decisive lead.
+    priorityGap: 0
+    # MPS slots per node — must match Slurm's gres.conf ``Count=…`` for
+    # the ``mps`` GRES. Override per pool when a deployment uses a
+    # different slot count.
+    mpsPerNode: 100
+    # Restrict reconciliation to specific Slurm partitions. Empty list
+    # means "all partitions present in PARTITIONS_JSON".
+    partitions: []
+
+# -- RL scheduler serve (M11 Phase D) ----------------------------------------
+# Optional FastAPI service that holds a trained MaskablePPO policy and
+# answers /decide from the lua submit filter (rl_hook.lua → curl /decide).
+# Shadow mode by default — logs decision but does not mutate priority.
+rlScheduler:
+  enabled: false
+  image:
+    repository: slurm-rl-scheduler
+    tag: m11
+    pullPolicy: IfNotPresent
+  service:
+    port: 8002
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: 2,    memory: 2Gi   }
+  shadowMode: true        # never mutates priority while true
+  snapshotTtlSeconds: 30  # /decide abstains if snapshot older than this
+  valueAbstain: -1.0      # abstain if policy value head < this
+  entropyAbstain: 1.5     # abstain if policy entropy > this
+  priorityBoost: 1000     # +X to priority of RL-picked job (shadow when shadowMode)
+  networkPolicy:
+    enabled: true
+  lua:
+    enabled: false        # job_submit.lua does NOT call /decide unless true
+    url: "http://rl-scheduler:8002/decide"
+    timeoutSeconds: 0.15  # curl --max-time
+
+# -- Runtime predictor (Phase 6 M5) ------------------------------------------
+# Optional FastAPI + LightGBM service that returns predicted runtime to the
+# M2 Lua plugin (M6 wires the call). Disabled by default; the lua plugin
+# falls back gracefully when the predictor is unreachable (`pcall` + 200ms
+# timeout, see scheduler.md M6 risks).
+runtimePredictor:
+  enabled: false
+  image:
+    repository: slurm-runtime-predictor
+    tag: m5
+    pullPolicy: IfNotPresent
+  service:
+    port: 8080
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 1,    memory: 1Gi   }
+  # Cold-start fallback floor (seconds). Returned by /predict when the
+  # model artifact is missing or n_train < minTrainSamples.
+  bootstrapFloorSeconds: 14400
+  minTrainSamples: 100
+  modelPvc:
+    name: runtime-predictor-models
+    size: 1Gi
+    accessMode: ReadWriteOnce
+    # Leave empty to use the default StorageClass (k3s ships local-path).
+    storageClassName: ""
+  # Weekly retrain CronJob (Sunday 03:00). The job pulls a normalized
+  # trace from the shared NFS mount and writes a new model artifact,
+  # rotating the previous one to <output>.bak.
+  retrain:
+    enabled: true
+    schedule: "0 3 * * 0"
+    suspend: false
+    tracePath: /shared/jobs/trace.json
+    modelPath: /models/predictor.pkl
+    nEstimators: 200
+    holdoutFrac: 0.2
+    backoffLimit: 1
+    activeDeadlineSeconds: 1800
+    sharedPvc: ""    # empty ⇒ reuse storage.sharedPvc.name when storage.enabled
+  # Allow controller pod → predictor:8080 (and predictor → DNS).
+  networkPolicy:
+    enabled: true
 
 # -- NetworkPolicy (Stage C) -------------------------------------------------
 networkPolicy:

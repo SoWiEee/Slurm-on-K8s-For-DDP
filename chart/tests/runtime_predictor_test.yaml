@@ -1,0 +1,158 @@
+suite: runtime predictor (Phase 6 M5)
+templates:
+  - runtime-predictor/deployment.yaml
+  - runtime-predictor/cronjob.yaml
+  - runtime-predictor/network-policy.yaml
+tests:
+  - it: predictor resources omitted when runtimePredictor.enabled=false (default)
+    template: runtime-predictor/deployment.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: cronjob omitted when runtimePredictor.enabled=false (default)
+    template: runtime-predictor/cronjob.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: network policy omitted when disabled (default)
+    template: runtime-predictor/network-policy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: enabling runtimePredictor renders PVC+Deployment+Service trio
+    template: runtime-predictor/deployment.yaml
+    set:
+      runtimePredictor.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 3
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: slurm-runtime-predictor:m5
+        documentSelector:
+          path: kind
+          value: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 8080
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MODEL_PATH
+            value: /models/predictor.pkl
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: bootstrap floor + minTrainSamples flow into env
+    template: runtime-predictor/deployment.yaml
+    set:
+      runtimePredictor.enabled: true
+      runtimePredictor.bootstrapFloorSeconds: 7200
+      runtimePredictor.minTrainSamples: 50
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BOOTSTRAP_FLOOR_SECONDS
+            value: "7200"
+        documentSelector:
+          path: kind
+          value: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MIN_TRAIN_SAMPLES
+            value: "50"
+        documentSelector:
+          path: kind
+          value: Deployment
+
+  - it: PVC respects size + accessMode + storageClassName overrides
+    template: runtime-predictor/deployment.yaml
+    set:
+      runtimePredictor.enabled: true
+      runtimePredictor.modelPvc.size: 5Gi
+      runtimePredictor.modelPvc.accessMode: ReadWriteOnce
+      runtimePredictor.modelPvc.storageClassName: nfs
+    asserts:
+      - equal:
+          path: spec.resources.requests.storage
+          value: 5Gi
+        documentSelector:
+          path: kind
+          value: PersistentVolumeClaim
+      - equal:
+          path: spec.storageClassName
+          value: nfs
+        documentSelector:
+          path: kind
+          value: PersistentVolumeClaim
+
+  - it: Service exposes the configured port
+    template: runtime-predictor/deployment.yaml
+    set:
+      runtimePredictor.enabled: true
+      runtimePredictor.service.port: 9090
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 9090
+        documentSelector:
+          path: kind
+          value: Service
+
+  - it: cronjob renders with rotate flag and schedule when both enabled
+    template: runtime-predictor/cronjob.yaml
+    set:
+      runtimePredictor.enabled: true
+      runtimePredictor.retrain.enabled: true
+      runtimePredictor.retrain.schedule: "30 4 * * 0"
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: CronJob
+      - equal:
+          path: spec.schedule
+          value: "30 4 * * 0"
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args
+          content: "--rotate"
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args
+          content: "--trace"
+
+  - it: cronjob suspends without removing the resource when retrain.suspend=true
+    template: runtime-predictor/cronjob.yaml
+    set:
+      runtimePredictor.enabled: true
+      runtimePredictor.retrain.suspend: true
+    asserts:
+      - equal:
+          path: spec.suspend
+          value: true
+
+  - it: network policy renders ingress from controller and DNS egress
+    template: runtime-predictor/network-policy.yaml
+    set:
+      runtimePredictor.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.podSelector.matchLabels.app
+          value: runtime-predictor
+      - contains:
+          path: spec.ingress[0].from
+          content:
+            podSelector:
+              matchLabels:
+                app: slurm-controller

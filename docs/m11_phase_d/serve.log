@@ -1,0 +1,41 @@
+INFO:     Started server process [1]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8002 (Press CTRL+C to quit)
+[serve] loaded MaskablePPO from /models
+INFO:     10.42.0.1:52846 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     10.42.0.1:52858 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     10.42.0.1:17334 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53916 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:56443 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53470 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:37365 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53484 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:31395 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53490 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:7242 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53500 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:38188 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53502 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:40004 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53508 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:59389 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53522 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:51187 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53524 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:21897 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53530 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:10967 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53542 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:39624 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53548 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:15344 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53558 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:20243 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53564 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:38305 - "POST /snapshot HTTP/1.1" 200 OK
+INFO:     10.42.0.1:50766 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     10.42.0.171:53566 - "POST /decide HTTP/1.1" 200 OK
+INFO:     10.42.0.1:50772 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     10.42.0.1:51686 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     10.42.0.1:51702 - "GET /healthz HTTP/1.1" 200 OK

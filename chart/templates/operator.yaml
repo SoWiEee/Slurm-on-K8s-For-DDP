@@ -125,6 +125,25 @@ spec:
               value: "v0.0.37"
             - name: SLURM_JWT_KEY_PATH
               value: "/slurm-jwt/jwt_hs256.key"
+            # Phase 6 M7: fragmentation detector + requeue decider.
+            {{- with .Values.operator.fragmentation }}
+            - name: FRAGMENTATION_ENABLED
+              value: {{ .enabled | quote }}
+            - name: FRAGMENTATION_SHADOW_MODE
+              value: {{ .shadowMode | quote }}
+            - name: FRAGMENTATION_MIN_INTERVAL_SECONDS
+              value: {{ .minIntervalSeconds | quote }}
+            - name: FRAGMENTATION_MAX_REQUEUES_PER_HOUR
+              value: {{ .maxRequeuesPerHour | quote }}
+            - name: FRAGMENTATION_MAX_TARGETS_PER_DECISION
+              value: {{ .maxTargetsPerDecision | quote }}
+            - name: FRAGMENTATION_PRIORITY_GAP
+              value: {{ .priorityGap | quote }}
+            - name: FRAGMENTATION_MPS_PER_NODE
+              value: {{ .mpsPerNode | quote }}
+            - name: FRAGMENTATION_PARTITIONS
+              value: {{ join "," .partitions | quote }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8000

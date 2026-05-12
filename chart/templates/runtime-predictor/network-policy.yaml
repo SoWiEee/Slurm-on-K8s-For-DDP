@@ -1,0 +1,62 @@
+{{/*
+NetworkPolicy: lock predictor:8080 to in-namespace clients only.
+
+Ingress allowed from:
+  - slurm-controller pod (lua plugin will POST /predict — M6 wiring)
+  - monitoring namespace (Prometheus scrape /metrics) when monitoring is on
+
+Egress allowed:
+  - DNS (kube-dns)
+  - kube-apiserver (no — predictor needs no API access)
+  - all in-namespace pods on TCP 2049 (NFS) when shared volume is mounted
+*/}}
+{{- if and .Values.runtimePredictor.enabled .Values.runtimePredictor.networkPolicy.enabled .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runtime-predictor
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: runtime-predictor
+spec:
+  podSelector:
+    matchLabels:
+      app: runtime-predictor
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NFS (shared trace volume) — port 2049 anywhere in-namespace
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 2049
+{{- end }}

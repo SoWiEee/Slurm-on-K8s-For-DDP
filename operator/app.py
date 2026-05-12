@@ -33,7 +33,16 @@ from typing import Any
 from kubernetes import watch as k8s_watch
 from prometheus_client import start_http_server
 
+import os
+
 from collector import ClusterStateCollector, PartitionConfigLoader
+from fragmentation import (
+    FragmentationDetector,
+    FragmentationReconciler,
+    RequeueDecider,
+    jobs_from_slurm_rest,
+    nodes_from_slurm_rest,
+)
 from k8s import K8sClient
 from metrics import (
     _CHECKPOINT_GUARD_BLOCKS_TOTAL,
@@ -42,11 +51,17 @@ from metrics import (
     _DRAIN_TIMEOUT_TOTAL,
     _DRAIN_TOTAL,
     _EVENT_LAG_SECONDS,
+    _FRAGMENTATION_BLOCKED_JOBS,
+    _FRAGMENTATION_SCORE,
+    _GHOST_DETECTED_TOTAL,
+    _GHOST_JOBS_PRESENT,
     _PODS_READY,
     _POLL_DURATION,
     _PROVISIONING_LATENCY,
     _QUEUE_DEDUP_DROPS,
     _RECONCILES_TOTAL,
+    _REQUEUE_TOTAL,
+    _REQUEUE_VICTIMS,
     _SCALE_DOWN_TOTAL,
     _SCALE_SKIPPED_TOTAL,
     _SCALE_UP_TOTAL,
@@ -167,6 +182,50 @@ class OperatorApp:
             except ValueError:
                 self.last_scale_up_at[_p.worker_statefulset] = 0.0
 
+        # Phase 6 M7: fragmentation reconciler (default disabled, default
+        # shadow=true even when enabled — flip FRAGMENTATION_SHADOW_MODE=false
+        # only after observing decisions in shadow mode for a release cycle).
+        self._fragmentation_interval = float(
+            os.getenv("FRAGMENTATION_MIN_INTERVAL_SECONDS", "60")
+        )
+        self._fragmentation_partitions = tuple(
+            p.strip() for p in os.getenv("FRAGMENTATION_PARTITIONS", "").split(",")
+            if p.strip()
+        )
+        self._fragmentation_reconciler = self._build_fragmentation_reconciler()
+
+    def _build_fragmentation_reconciler(self) -> FragmentationReconciler | None:
+        if os.getenv("FRAGMENTATION_ENABLED", "false").lower() != "true":
+            return None
+        if self.rest is None:
+            # The reconciler depends on Slurm REST for jobs/nodes — exec
+            # path doesn't expose the per-job priority + gres_used we need.
+            # Disable rather than silently fall back to a degraded view.
+            return None
+        mps_per_node = int(os.getenv("FRAGMENTATION_MPS_PER_NODE", "100"))
+        priority_gap = int(os.getenv("FRAGMENTATION_PRIORITY_GAP", "0"))
+        max_per_hour = int(os.getenv("FRAGMENTATION_MAX_REQUEUES_PER_HOUR", "5"))
+        max_targets = int(os.getenv("FRAGMENTATION_MAX_TARGETS_PER_DECISION", "4"))
+        shadow = os.getenv("FRAGMENTATION_SHADOW_MODE", "true").lower() == "true"
+        detector = FragmentationDetector(
+            mps_per_node=mps_per_node, priority_gap=priority_gap,
+        )
+        decider = RequeueDecider(
+            min_interval_seconds=self._fragmentation_interval,
+            max_requeues_per_hour=max_per_hour,
+            max_targets_per_decision=max_targets,
+        )
+        return FragmentationReconciler(
+            detector=detector,
+            decider=decider,
+            actuator=self._fragmentation_actuator,
+            shadow_mode=shadow,
+        )
+
+    def _fragmentation_actuator(self, job_id: str) -> None:
+        """Issue ``scontrol requeue`` against a single Slurm job id."""
+        self.client.exec_in_controller(f"scontrol requeue {job_id}")
+
     def run(self) -> None:
         rest_available = self.rest is not None and self.rest.ping()
         self.logger.emit(
@@ -210,6 +269,23 @@ class OperatorApp:
         ):
             t = threading.Thread(target=thread_target, name=name, daemon=True)
             t.start()
+        # M7: separate fragmentation reconcile thread. Stays out of the
+        # main reconcile queue so a slow scontrol requeue can't delay
+        # scale-up / scale-down decisions, and so its rate-limit window
+        # is independent of pool reconciles.
+        if self._fragmentation_reconciler is not None:
+            t = threading.Thread(
+                target=self._fragmentation_loop,
+                name="fragmentation-reconciler",
+                daemon=True,
+            )
+            t.start()
+            self.logger.emit(
+                "fragmentation_started",
+                interval_seconds=self._fragmentation_interval,
+                shadow_mode=self._fragmentation_reconciler.shadow_mode,
+                partitions=list(self._fragmentation_partitions) or "all",
+            )
         # Prime the queue so the first reconcile happens immediately, before
         # any watcher fires. Without this the readiness probe waits up to
         # `slurm_poll_interval` seconds for the first slurm diff.
@@ -340,6 +416,94 @@ class OperatorApp:
                 )
             time.sleep(interval)
 
+    def _fragmentation_loop(self) -> None:
+        """Periodic fragmentation reconcile (M7).
+
+        Runs at ``FRAGMENTATION_MIN_INTERVAL_SECONDS`` cadence. The
+        decider's own rate limiter is what prevents bursty requeues —
+        this loop is just the scheduler. Errors are logged but never
+        crash the thread (the operator's circuit breaker only covers the
+        scaling reconcile path).
+        """
+        assert self._fragmentation_reconciler is not None
+        while True:
+            time.sleep(max(1.0, self._fragmentation_interval))
+            try:
+                self._fragmentation_tick()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.emit(
+                    "fragmentation_error", level="WARN",
+                    error=type(exc).__name__, message=str(exc),
+                )
+
+    def _fragmentation_tick(self) -> None:
+        """Single detect → decide → (optional) actuate cycle."""
+        if self.rest is None or self._fragmentation_reconciler is None:
+            return
+        partitions = self._fragmentation_partitions or tuple(
+            p.partition for p in self.partition_cfgs
+        )
+        # Pull a single union of jobs across the partitions we care about.
+        rest_jobs: list[dict] = []
+        for part in partitions:
+            try:
+                rest_jobs.extend(self.rest.list_jobs(part))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.emit(
+                    "fragmentation_error", level="WARN",
+                    error=f"list_jobs({part}):{type(exc).__name__}", message=str(exc),
+                )
+                return
+        try:
+            rest_nodes = self.rest.list_nodes()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.emit(
+                "fragmentation_error", level="WARN",
+                error=f"list_nodes:{type(exc).__name__}", message=str(exc),
+            )
+            return
+
+        mps_per_node = self._fragmentation_reconciler.detector.mps_per_node
+        jobs = jobs_from_slurm_rest(rest_jobs, mps_per_node=mps_per_node)
+        nodes = nodes_from_slurm_rest(rest_nodes, mps_per_node=mps_per_node)
+        result = self._fragmentation_reconciler.reconcile(jobs, nodes, now=time.time())
+
+        _FRAGMENTATION_SCORE.set(result.snapshot.score)
+        _FRAGMENTATION_BLOCKED_JOBS.set(len(result.snapshot.pending_blocked))
+
+        # Log + count by reason bucket. The decider's `reason` is one of
+        # "no-fragmentation" | "rate-limited:..." | "no-candidates-..." |
+        # "<unblock detail>"; bucket them so Prometheus cardinality stays
+        # bounded.
+        reason_label = (
+            "rate-limited" if result.reason.startswith("rate-limited")
+            else "no-fragmentation" if result.reason == "no-fragmentation"
+            else "no-victims" if result.reason.startswith("no-")
+            else "unblock"
+        )
+        _REQUEUE_TOTAL.labels(reason=reason_label).inc()
+
+        log_fields: dict[str, Any] = {
+            "score": round(result.snapshot.score, 4),
+            "blocked": [j.job_id for j in result.snapshot.pending_blocked[:5]],
+            "reason": result.reason,
+            "shadow": result.shadow,
+        }
+        if result.decision is not None:
+            log_fields["target_jobs"] = list(result.decision.target_job_ids)
+            log_fields["unblocks"] = list(result.decision.blocked_job_ids)
+            log_fields["requeued_jobs"] = list(result.requeued)
+            if result.actuator_errors:
+                log_fields["actuator_errors"] = list(result.actuator_errors)
+            for _ in result.requeued:
+                _REQUEUE_VICTIMS.inc()
+            self.logger.emit("requeue_decision", **log_fields)
+        else:
+            # Quiet by default — only log non-trivial reasons. A
+            # "no-fragmentation" tick every 60s would flood slurm log.
+            if reason_label != "no-fragmentation":
+                self.logger.emit("requeue_skipped", **log_fields)
+
     def _periodic_timer(self) -> None:
         """Safety-net reconcile every `reconcile_period_seconds`.
 
@@ -371,6 +535,39 @@ class OperatorApp:
                 if ready >= prov_target:
                     _PROVISIONING_LATENCY.labels(pool=key).observe(time.time() - prov_start)
                     del self._provisioning[key]
+
+            # E7 hardening — ghost-job detector. If slurmrestd reports
+            # running jobs but the StatefulSet has scaled to zero AND no
+            # pod is Ready, those "running" jobs are orphaned: their
+            # worker pod died without slurmd reporting the epilog, so
+            # the controller's job table is wedged. Left untreated this
+            # blocks every future scale-up (no pending → scheduler hands
+            # off → no pod → loop). We surface it via metric + log so
+            # alerting can page; we deliberately don't auto-recover
+            # because the safe recovery (scontrol DOWN/RESUME on each
+            # node, or `kubectl delete pod slurm-controller-0`) has a
+            # non-trivial blast radius if mis-fired during a real burst.
+            ghost = (state.current_replicas == 0 and ready == 0
+                     and state.running_jobs > 0)
+            _GHOST_JOBS_PRESENT.labels(pool=key).set(1 if ghost else 0)
+            if ghost:
+                _GHOST_DETECTED_TOTAL.labels(pool=key).inc()
+                self.logger.emit(
+                    "ghost_jobs_detected",
+                    policy=self.cfg.policy_name,
+                    partition=partition_cfg.partition,
+                    statefulset=key,
+                    running_jobs=state.running_jobs,
+                    current_replicas=state.current_replicas,
+                    ready_replicas=ready,
+                    severity="warning",
+                    remediation=(
+                        "scontrol update NodeName=<pool>-[0-N] State=DOWN; "
+                        "sleep 2; State=RESUME — or kubectl delete pod "
+                        "slurm-controller-0 to force slurmctld state rebuild. "
+                        "See docs/note.md #16."
+                    ),
+                )
 
             checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
 

@@ -192,6 +192,58 @@ GresTypes={{ $gresTypes }}
 AccountingStorageTRES={{ join "," $s.accounting.storageTres }}
 {{- end }}
 {{- end }}
+{{- /*
+M1 (Phase 6): Slurm scheduling knobs — backfill scheduler, multifactor
+priority weights, optional preempt block. See values.yaml `slurm.scheduling`
+and docs/scheduler.md §5.1. The block emits only when slurm.scheduling is
+defined so older value files stay byte-equivalent.
+*/}}
+{{- $sched := $s.scheduling | default dict }}
+{{- if $sched }}
+
+# Scheduling (Phase 6 M1)
+{{- if $sched.schedulerType }}
+SchedulerType={{ $sched.schedulerType }}
+{{- end }}
+{{- if $sched.schedulerParameters }}
+SchedulerParameters={{ $sched.schedulerParameters }}
+{{- end }}
+{{- if $sched.priorityType }}
+PriorityType={{ $sched.priorityType }}
+{{- end }}
+{{- with $sched.priorityWeights }}
+{{- if hasKey . "age" }}
+PriorityWeightAge={{ .age }}
+{{- end }}
+{{- if hasKey . "fairshare" }}
+PriorityWeightFairshare={{ .fairshare }}
+{{- end }}
+{{- if hasKey . "jobSize" }}
+PriorityWeightJobSize={{ .jobSize }}
+{{- end }}
+{{- if hasKey . "partition" }}
+PriorityWeightPartition={{ .partition }}
+{{- end }}
+{{- if hasKey . "qos" }}
+PriorityWeightQOS={{ .qos }}
+{{- end }}
+{{- end }}
+{{- if and $sched.preempt $sched.preempt.enabled }}
+PreemptType={{ $sched.preempt.type }}
+PreemptMode={{ $sched.preempt.mode }}
+{{- end }}
+{{- end }}
+{{- /*
+M2 (Phase 6): Lua submit plugin. When jobSubmit.enabled, slurmctld loads
+/etc/slurm/job_submit.lua from the slurm-config-job-submit ConfigMap
+mounted on the controller pod.
+*/}}
+{{- $js := $s.jobSubmit | default dict }}
+{{- if $js.enabled }}
+
+# Job submit plugin (Phase 6 M2)
+JobSubmitPlugins=lua
+{{- end }}
 
 Include /etc/slurm/slurm.nodes.conf
 {{- end -}}

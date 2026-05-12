@@ -1,7 +1,7 @@
 # Development Notes
 
 1. [採坑紀錄](#debug-record)
-2. 開發規劃：[監控系統](#phase-4-plan已完成)、[階段五計畫](#phase-5-plan)
+2. 開發規劃：[階段五計畫](#phase-5-plan--完成)、[階段六計畫](#phase-6-plan)、[階段七計畫](#phase-7-plan)
 3. [工作和硬體資源的分配關係](#工作和硬體資源的分配關係)
 4. [GPU MPS 完整實作指南](#gpu-mps-完整實作指南)
 5. [參考資料](#-參考來源)
@@ -324,51 +324,187 @@ batch step 與 srun step 都拿到 socket 路徑，CUDA runtime 真的會走 MPS
 2. 替換 ConfigMap 後 kubelet 大約要 60 秒才把 symlink 切到新內容，期間 prolog 還是舊版。要 `until grep -q <new-marker> /etc/slurm/prolog.d/10-mps-env.sh; do sleep 5; done` 才能確認生效。
 3. operator 預設 cooldown 60s + preStop 會 DRAIN，導致驗證 job 一直 NODE_FAIL。debug 期間先 `kubectl scale deploy slurm-elastic-operator --replicas=0` 把 operator 停掉，避免它在驗證中途縮容。驗證完記得 scale 回 1。
 
----
+## 問題 14：M7 fragmentation 在 live cluster 上 `requeue_decision` 永遠不觸發
 
-# Phase 4 Plan（已完成）
+Phase 6 M7 加入的 `FragmentationReconciler` 在 unit test 全綠、daemon thread 也有正常啟動（log 看得到 `fragmentation_started`），但實際在 k3s 上跑 small1 (mps:25 RUNNING) + bigfit (mps:80 PENDING priority 9999) 場景，`requeue_decision` JSON log 一直不出現 — operator 只持續輸出 `loop_observation`，fragmentation 那條 thread 形同沒在動。
 
-## Prometheus + Grafana 監控
+**根因（三層）**
 
-詳細規格見 `docs/monitoring.md`。核心是三層 metrics：
+`operator/fragmentation.py` 的 `nodes_from_slurm_rest` adapter 從 slurmrestd 解析節點 MPS 容量的方式跟 live cluster 真實的欄位 schema 對不起來，導致 detector 把 fragmentation 當成沒發生：
 
-| 來源 | 取得方式 | 關鍵指標 |
-|------|---------|---------|
-| slurm-exporter | scrape slurmrestd（REST API） | queue_pending, nodes_idle, nodes_alloc |
-| kube-state-metrics | K8s 原生 | StatefulSet replicas, Pod ready |
-| operator 自定義 | prometheus_client HTTP server（port 8000） | scale_up/down_total, guard_blocks, poll_duration |
+1. **`gres_used` 不是 slot 數，是裝置數。**  unit test fixture 用的是簡化字串 `"mps:25"`，能被 `mps[:=](\d+)` regex 命中；但 slurmrestd 實際輸出是 `mps:rtx4070:1(IDX:0)` —「rtx4070 type 的 mps 裝置 1 顆，index 0」，那個 `1` 跟 slot 數完全無關。canonical 的 slot 配置實際上躺在 `tres_used` 欄位裡，格式為 `cpu=4,gres/mps=50`。adapter 一直讀錯欄位，於是把已經被佔掉 25 slot 的節點當成 100 全 free。
+2. **CPU-only 節點被誤判為「能塞下 MPS job」。** detector 的 `_fits_anywhere` 是把所有節點當同質池檢查；`slurm-worker-cpu-0` 完全沒有 mps gres，但 adapter 預設 `total_mps=mps_per_node=100` + `used=0` → free=100，造成 bigfit「在 cpu node 上可以塞」→ blocked 為空 → no-fragmentation。
+3. **DRAIN/DOWN 節點先前未被排除。** node-1 被 drain 起來當作「永遠塞不下 bigfit」的條件，但原本的 adapter 沒看 `state`，照樣回報 free=100，等於 bigfit 永遠「可在 node-1 上跑」，又回到 no-fragmentation。
 
-已經部署 Prometheus + Grafana + slurm-exporter + kube-state-metrics。Grafana 提供三個看板：
-- **Bridge Overview**：視覺化 Slurm queue depth 與 K8s StatefulSet replicas 的聯動關係
-- **Slurm Cluster State**：node states 圓餅圖、各 partition queue depth 時序
-- **K8s Operator**：scale event timeline、poll duration histogram、guard block 計數
+**修法**（`operator/fragmentation.py`）
 
-部署指令：`bash scripts/bootstrap-monitoring.sh`  
-驗證指令：`bash scripts/verify-monitoring.sh`
+新增三個 helper，把 adapter 換成從正確欄位取資料：
+
+```python
+_UNAVAILABLE_NODE_STATES = frozenset({
+    "drain","drained","draining","down","fail","failing","maint",
+    "reserved","powering_down","powered_down","future",
+    "not_responding","no_respond",
+})
+
+def _node_is_available(node):  # state 可能是 list / "DOWN+NOT_RESPONDING" / "ALLOCATED"
+    raw = node.get("state","")
+    states = ([str(s).lower() for s in raw] if isinstance(raw, list)
+              else [s.strip().lower() for s in str(raw).replace("+", ",").split(",") if s.strip()])
+    return not any(s in _UNAVAILABLE_NODE_STATES for s in states)
+
+def _parse_tres_mps(tres_used):       # "cpu=4,gres/mps=50" → 50
+    m = re.search(r"gres/mps=(\d+)", tres_used or "")
+    return int(m.group(1)) if m else None
+
+def _parse_node_total_mps(gres):      # "gpu:rtx4070:1,mps:rtx4070:100" → 100
+    m = re.search(r"(?:^|,)\s*mps(?::[A-Za-z0-9_-]+)?:(\d+)", gres or "")
+    return int(m.group(1)) if m else None
+```
+
+`nodes_from_slurm_rest` 改為：
+
+- `total_mps` 優先讀節點配置 `gres`；找不到 mps token 就回 0（CPU-only 節點 → 0/0），只有完全沒有 `gres` key 的舊 fixture 才 fallback 到 `mps_per_node` 預設值。
+- `used` 優先讀 `tres_used` 的 `gres/mps=N`；fallback 才看 `gres_used`，維持舊 unit test 的相容性。
+- `_node_is_available(node)==False` 時直接把 `free=0`，確保 drained / down 節點不會被當作可放置目標。
+
+新增三條 unit test 把這三條路徑都鎖住（`test_unavailable_nodes_have_free_mps_zeroed`、`test_tres_used_is_preferred_over_gres_used`、`test_cpu_only_node_without_mps_gres_reports_zero_capacity`），現在 19/19 綠。
+
+**Live 驗證**
+
+修完 rebuild 進 k3s containerd → 重啟 operator → 維持原情境（small1 prio 1039 mps:25 RUNNING on gpu-rtx4070-0、bigfit prio 9999 mps:80 PENDING、gpu-rtx4070-1 drained），每 15 秒 fragmentation tick 都吐：
+
+```
+event_type=requeue_decision  score=1.0  blocked=["86"]
+reason="unblock 86 (priority 9999, mps_req 80) on slurm-worker-gpu-rtx4070-0:
+        requeue 1 job(s) freeing ~25 slots"
+shadow=true  target_jobs=["85"]  unblocks=["86"]  requeued_jobs=[]
+```
+
+`shadow=true` 因為 `FRAGMENTATION_SHADOW_MODE=true`，actuator 沒被叫到，`requeued_jobs=[]` 對應正確；plumbing 全通，等切到非 shadow 模式就會發 `scontrol requeue 85`。
+
+**踩坑插曲（live debug 過程）**
+
+1. 一開始把 gpu-rtx4070 max_replicas 留 2，operator 看到高優先級 PENDING 就把 pool 從 1 sclae 到 2，slurmd 一註冊 node-1 就清掉 drain marker，bigfit 直接跑到 node-1 上，根本沒有 fragmentation 可偵測。要把 `PARTITIONS_JSON` 裡 gpu-rtx4070.max_replicas 改成 1，operator 才不會跟我們搶 node-1。
+2. 期間因為反覆 down/up node，slurmctld 的 AllocTRES 卡在 `gres/mps=100` (zombie state)，新 sbatch 一直 `Reason=Resources` 起不來。`scontrol reconfigure` 一次就沖掉。
+3. 該節點記憶體只有 3500Mi → 一個 small job 就吃滿全部 RealMemory，原計畫的「兩個 small + 一個 bigfit」其實只能塞一個 small；但 fragmentation detector 是看 MPS slot 不看 memory，所以「一個 small (25 slot) + 一個 bigfit (80 slot)」一樣形成 fragmentation（free=75 < 80），場景照樣成立。
 
 ---
 
 # Phase 5 Plan ✅ 完成
 
-> **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 **Phase 7**。
+## 問題 15：M8 evaluation 主結論被「JCT 重設 bug」與「單一 seed」放大成假象
+
+**症狀（2026-05-11）：**
+M8 完成時主表寫 E5（M7 fragmentation）mean JCT = 2.621h，vs E2 multifactor 改善 28.6%。看起來是強烈正結果，準備寫進 thesis。實際上這個數字是兩個方法論問題疊在一起的 artefact。
+
+**根因：**
+1. `sim/runner.py::try_fragmentation_reconcile` 把 victim requeue 時做了 `metrics.records[jid].submit_ts = now`。Victim 的 JCT 公式是 `end_ts - submit_ts`，這行讓 JCT 只計算「最後一次重排隊到完成」的時間，**完全沒算原本排隊與重做的成本**。M7 越激進、被踢的 job 越多，這個低估就越大 — E5 的 1856 次 requeue 等於把 ~19% 的 jobs 的 JCT 重設過。
+2. E1..E5 各只跑一次 deterministic Philly subsample，沒有任何 cross-seed variance estimate。無法分辨「真改善」vs「sample artefact」。
+3. Sim 不收 checkpoint reload cost，1856 次 requeue 完全免費。
+
+**修法：**
+1. `try_fragmentation_reconcile` 刪掉那行 `submit_ts = now`（保留原始 submit_ts），只重設 `start_ts/end_ts`。`vj` 給 scheduler 看的 submit_ts 仍是 `now`（fairness 應該如此），但 metrics 看的是原始 submit。
+2. 新增 `--ckpt-reload-cost`（default 60s，僅 fragmentation 模式生效）；用 `cost_pending` dict 在下次 allocate 時把成本加進 end_ts。`metrics.requeue_cost_total` 報告整體開銷。
+3. `eval/scripts/run_all.sh` 改用 `SEEDS="42..46"` 跑 5 個 synthetic Philly-like traces（同 generator 不同 seed，per-seed 1000 jobs）。
+4. 新增 `eval/scripts/aggregate_seeds.py` 計算 mean ± std + Student-t 95% CI；`print_summary.py` 加 paired same-seed diff（CI 比 unpaired 緊一個量級）。
+
+**修正後的真結果：**
+| 比較 | Δ mean JCT | 95% CI | 顯著性 |
+|---|---:|---:|---|
+| E4 (predictor) vs E2 (vendor) | −20.1% | ±11.95% | ✅ significant |
+| E5 (M7) vs E4 (predictor) | **+33.1%** | ±5.22% | ❌ regression（significant） |
+| E5 vs E2 | +6.3% | ±15.42% | not significant |
+| E5b (no ckpt cost) vs E5 | −5.8% | ±8.83% | ckpt cost 僅佔 ~6% |
+
+**踩坑插曲：**
+- 第一次跑 SEEDS="42 43" SYNTH_JOBS=200 smoke 結果所有 exp 完全相同 — 因為 200 jobs × 16 GPU × 100 MPS = 1600 slots，util 只有 0.20，沒有 contention 讓 scheduler 表現差異。換回 1000 jobs 後立即看到 paired CIs。
+- E5b 是新增的 control：原本只想用來算 ckpt cost 占比，意外發現「即使 ckpt cost = 0，M7 仍比 E4 差 22%」— 證明問題本質不在 reload cost 而在 lost progress（victim 整段重跑）。這給 future work 一個明確方向：改 preempt+suspend，保留 GPU memory state。
+- 寫進 paired-diff 的時候因 Student-t 表只到 n=10，n=5 用 2.776；後面如果加到 10 seeds 要記得查表或直接用 scipy。
+
+## 問題 16：E7 live cluster 兩 pass 之間，叢集會卡進無法自己復原的死結
+
+**症狀（2026-05-11）：**
+E7 要在實機跑 vendor (multifactor) vs our (M3 score) 兩 pass。每次切換 `slurm.jobSubmit.enabled` 都要 `helm upgrade`、controller 會 rolling restart。重啟的副作用拖到後續 pass：worker 拿不到 slurmctld 心跳、in-flight job 卡 COMPLETING 不釋放、operator 看到 ghost job 不肯 scale up、squeue 全部 PENDING 寫著 `ReqNodeNotAvail, UnavailableNodes:slurm-worker-gpu-rtx4070-[0-1]`。整個 cluster 進入「pod 都沒了但 Slurm 認為還有 job 在跑」的死結，drain 永遠等不到 0。
+
+這不是單一 bug，是好幾個元件的設計交互。本節按照「踩到順序 + 修法 + 哪一層的責任」記錄。
+
+### 16.1 helm post-upgrade hook 失敗，整次 upgrade 被當失敗
+
+- 觸發：`helm upgrade slurm-platform ...` 任何一次。
+- 表象：`Error: UPGRADE FAILED: post-upgrade hooks failed: job slurm-platform-gpu-labeler failed: BackoffLimitExceeded`。chart 本體的資源其實 *已經* 套上去了（controller 真的有重啟、values 真的有變），但 helm 把 release 標 FAILED，下次 `helm get values` 跟 status 都不可信。
+- 根因：gpu-labeler 是 one-shot job，只在「第一次 install」需要跑（給 GPU 節點貼 `nvidia.com/device-plugin.config` label），它的 RBAC 用 `kubectl label` 但有時 backoff retry 限制太小。每次 upgrade 都重跑 = 每次都可能撞 backoff。
+- 修法：`helm upgrade --no-hooks ...`。GPU label 已經貼好了，不需要重跑。
+- 責任層：chart。長線可以把這個 hook 改成 `helm.sh/hook: post-install` 而不是 `post-upgrade`，或加 idempotency guard。
+
+### 16.2 controller restart → workers NOT_RESPONDING → in-flight jobs 卡 COMPLETING
+
+- 觸發：`kubectl rollout restart sts/slurm-controller` 或 helm upgrade 觸發的 controller 重建。
+- 表象：sinfo 看到 `slurm-worker-gpu-rtx4070-0 idle*` 或 `completing*`，`*` 是 NOT_RESPONDING。`scontrol show node` 上 `State=IDLE+COMPLETING+NOT_RESPONDING`。已經跑到一半的 job 永遠停在 COMPLETING、squeue 不會掉。
+- 根因：slurmctld 重啟後 in-memory state 重建，但 slurmd 還停留在「上一個 controller 連線」。心跳 timeout 後 controller 把 node 標 NOT_RESPONDING，但 in-flight job 的 epilog 還沒被確認，於是 job 永遠 COMPLETING。
+- 修法 A（短期）：`scontrol update NodeName=... State=DOWN` 再 `State=RESUME`，強制 controller 把 node 狀態重置，這會清掉 stuck completing。
+- 修法 B（更徹底）：直接 `kubectl delete pod slurm-controller-0`，讓 slurmctld 從 state save 檔重建。這個動作意外地比上面溫和——重建後 controller 會 re-read state、跟 slurmd 重新 handshake，stuck COMPLETING 全部清掉。
+- 責任層：Slurm 21.08 / 部署設計。Slurm 本來預期 slurmctld 重啟是稀有事件；K8s 把它變家常便飯，但 chart 沒處理過渡期。
+
+### 16.3 Operator scale-down 把 ghost job 當 running，永遠 keep replicas=0
+
+- 觸發：上面 16.2 的 stuck COMPLETING job 持續存在。
+- 表象：operator log 重複出現
+  `"event_type": "scale_skipped", "from_replicas": 0, "to_replicas": 0, "reason": "no_pending_jobs", "pending_jobs": 0, "running_jobs": 1`
+  Job 1 是 ghost、pod 已經沒了，但 operator 從 slurmrestd 看到的 job state 仍是 RUNNING / COMPLETING。它的 policy 是「只看 pending」、看到 0 pending 就不 scale up。於是新提交的 job 都 PENDING (ReqNodeNotAvail)、又因為 0 pending（前面那 1 個 ghost running）所以 scale up 不會發生。死結。
+- 修法：人手做 16.2 修法 B（delete controller pod）清掉 ghost job 之後，operator 才會看到正確狀態。
+- 責任層：operator policy。建議加一個 detector：「running_jobs > 0 但 sts replicas = 0 且 pod = 0」是不一致狀態，要 escalate（例如 log warning + 強制 scale up 至少 1 個 pod 來吸收 ghost 或讓 epilog 跑完）。
+
+### 16.4 AllocTRES zombie：MPS slot 沒被釋放
+
+- 觸發：一個 mps:100 job 結束（或被 scancel）但 slurmd 還沒對 controller 報完 epilog 就被中斷。
+- 表象：`scontrol show node slurm-worker-gpu-rtx4070-1` 顯示 `State=IDLE` 但 `AllocTRES=gres/mps=50`。下一個需要 mps:100 的 job 看到 50 slot 已分配、顯示 `Pending (Resources)`，但實際上沒有任何 job 在跑。
+- 修法：`scontrol reconfigure` 會強制 controller 重新從 slurmd 收集 TRES，AllocTRES 清空、blocked job 立刻 dispatch。**注意 reconfigure 本身會 timeout（`slurm_reconfigure error: Socket timed out`）但其實有生效，可以忽略錯誤訊息。**
+- 責任層：Slurm 21.08 bug。GRES（特別是 MPS）的 accounting 跟 job state machine 沒完全同步，在快速 churn 或 slurmd 不穩時會殘留。21.08 之後（22.05+）的 release notes 有提到類似 fix，升級可以解決。
+
+### 16.5 sacct 從 login pod 連 slurmdbd 失敗、但 controller pod OK
+
+- 表象：`kubectl -n slurm exec deploy/slurm-login -- sacct ...` 回 `slurm_persist_conn_open_without_init: failed to open persistent connection to host:slurmdbd.slurm.svc.cluster.local:6819: Connection refused`。同時間從 controller pod 跑 sacct 完全正常。
+- 根因：slurmdbd 重啟後（之前的 controller cascade restart 觸發），login pod 的 munge auth socket 跟 slurmdbd 之間的 persistent connection 失效，但 sacct 沒重連邏輯，直接報錯。controller pod 因為 munge 跟 slurmctld 共享 socket，路徑不同所以沒受影響。
+- 修法：所有 sacct dump 改從 controller pod 跑（已 patch 進 `eval/scripts/e7_one_pass.sh::dump_sacct`）。
+- 責任層：slurm 21.08 + chart 部署。可能是 NetworkPolicy 沒對 login pod 完整放行 slurmdbd，或 munge ConfigMap mount 在 login 跟 controller 上有微差。沒深追。
+
+### 16.6 GPU pool 兩個 worker pod 共享同一塊實體卡
+
+- 表象：sts `slurm-worker-gpu-rtx4070` replicas = 2，但實機只有 1 張 RTX 4070。兩個 pod 都拿到 `nvidia.com/gpu: 1` resource、都 1/1 Running。
+- 根因：NVIDIA device plugin 配 `replicas: 2` 的 time-slicing，把一塊實體 GPU 切成 2 個 logical device 給 K8s 排程。Slurm 看到 2 個 GPU node、配置 200 mps slot；實際上兩個 pod 共用 SM、context-switch 由 NVIDIA driver 負責。
+- 影響：一個 pod 跑爆 GPU 時，另一個 pod 的 job 也會變慢（共享 SM）。Slurm 排程把 200 slot 當獨立資源 schedule，但實際吞吐量是 100 slot 等級。對 E7 的影響：vendor pass 跟 our pass 的 wall-clock 都受同樣的共享 cost 影響，paired diff 還算 fair，但絕對吞吐量比 sim 預測的差一倍。
+- 修法：沒修。這是 chart `values-k3s.yaml::pools.gpu-rtx4070.replicas: 2` + device plugin time-slicing 設計給的能力。要拿到乾淨的單卡 baseline 得改 `replicas: 1`。
+
+### 16.7 死結復原 SOP（給下次踩到的人）
+
+按順序試，能停就停：
+
+1. `sudo kubectl -n slurm exec deploy/slurm-login -- scancel --user=root`（清掉所有 pending）
+2. `sudo kubectl -n slurm exec slurm-controller-0 -- scontrol update NodeName=slurm-worker-gpu-rtx4070-[0-1] State=DOWN Reason=reset; sleep 2; scontrol update NodeName=... State=RESUME`
+3. 還沒救：`sudo kubectl -n slurm delete pod slurm-controller-0`（slurmctld 重啟，stuck COMPLETING 會清掉）
+4. 等 controller Ready、`sinfo` 不再出現 `*` 跟 `down/drain` 才能送新 job
+5. 送 job 後檢查 `scontrol show node ... | grep AllocTRES`，若有殘留 mps slot 但實際沒 job 在跑，`scontrol reconfigure`（忽略 timeout 訊息）
+
+### 16.8 對 operator 設計的建議
+
+E7 兩次撞死結之後，我認為 operator 有一個值得加的功能：**inconsistency detector**。loop 內如果同時看到：
+- `current_replicas == 0`（pod 不存在）
+- `running_jobs > 0`（slurmrestd 報有 job 在跑）
+
+代表那些 running job 是 ghost，應該 emit 一個 `ghost_jobs_detected` warning event。可以選擇 (a) escalate 給 human、(b) 強制 scale up 1 個 pod 來吸收 epilog 收尾、(c) 自動觸發 `scontrol update State=DOWN/RESUME`。
+
+這不在當前 Phase 6 scope，但留作 future operator hardening 的方向。
+
+---
+
+> **狀態（2026-05-05）：** Phase 5 收斂為 **Lmod + Helm chart cutover** 兩件事，皆已完成並上線。原計畫中的「工作負載模板（5-C）」從 Roadmap 移除（使用者目前用既有 verify 腳本 + `docs/cluster.md` 範例足以上手）；原 5-B（OpenTelemetry）與 5-D（SSH Login）改編到 Phase 7。
 >
 > 本節以下保留 5-A 的設計與決策記錄，作為 chart 結構的歷史脈絡；活躍的下一階段請看 [`# Phase 6 Plan`](#phase-6-plan) 與 [`# Phase 7 Plan`](#phase-7-plan)。
 
 ---
 
 ## 5-A：Helm Chart 封裝
-
-> **修訂版 5（2026-04-29，Stage F 完成 — Phase 5-A 收尾）：** 真實環境驗證通過後，正式 cutover 到 helm。本表「廢棄的檔案」段所列的 12 個檔案全部移除（`scripts/{render-core.py,bootstrap.sh,bootstrap-gpu.sh,bootstrap-monitoring.sh}`、`manifests/core/{slurm-static.yaml,worker-pools.json,slurm-ddp-runtime.yaml}`、`manifests/gpu/{nvidia-device-plugin.yaml,mps-daemonset.yaml}`）；`scripts/{bootstrap-storage.sh,bootstrap-lmod.sh}` 與 `manifests/core/lmod-modulefiles.yaml` 不在原始廢棄表內因此保留。`verify-helm.sh` 移除 legacy parity diff 區段（`manifests/core/slurm-static.yaml` 已不存在）。`chart/tests/` 加入 6 個 `*_test.yaml` 共 28 條 helm-unittest 案例，覆蓋 slurm.conf / workers / operator / gpu / monitoring / storage。README 的「🚀 Getting Started」整段重寫為 helm install 流程；`manifests/core/slurm-accounting.yaml`（mysql + slurmdbd）標註為 chart 之外的 prerequisite。
->
-> **修訂版 4（2026-04-29，Stage E 完成）：** monitoring + storage 進 chart，`enabled` flag 控制。Monitoring stack（Prometheus / Alertmanager / Grafana / kube-state-metrics + slurm-exporter）拆到 `templates/monitoring/`；Grafana dashboards 從 `chart/dashboards/*.json` 用 `Files.Glob.AsConfig` 灌進 ConfigMap。Storage stack（NFS subdir external provisioner + StorageClass + RWX PVC）放在 `templates/storage.yaml`，`storage.enabled=true` 但缺 `nfsServer` 直接 `fail` 終止 render；`storageClassName` 與 `provisionerName` 跟 legacy `manifests/storage/*.yaml` 完全一致（provisioner 名 `k8s-sigs.io/slurm-nfs-subdir-external-provisioner` 是 immutable，必須對齊現有 cluster）。Cross-namespace 流量由 `network-policy.yaml` 在 `monitoring.enabled=true` 時額外加三條：`allow-prometheus-scrape-operator`、`allow-prometheus-scrape-exporter`、`allow-slurm-exporter-egress`。verify-helm.sh 加 14 條 Stage E spot-checks；k3s 1.34 server-side dry-run validate 75 個 resources（default 38 個）全綠。
->
-> **修訂版 3（2026-04-28，Stage D 中）：** 嘗試把 `gpu-operator` 加成 chart dependency 後發現它把所有 DaemonSet hardcode 在 `Release.Namespace`（沒有 namespaceOverride 機制），且需要該 namespace PSS=`privileged` 才能 mount hostPath（`/dev/nvidia*`、`/run/nvidia/mps`、driver libs）。我們的 slurm namespace 走 PSS=`baseline`（NetworkPolicy + secret projection 都依賴此），兩者放同一個 namespace 不乾淨——dropping 到 privileged 會放鬆 slurm pod 的整體安全姿態。
->
-> **改採分離安裝**：`gpu-operator` 不再是 subchart，由 `scripts/install-gpu-operator.sh` 獨立 `helm install` 到自己的 `gpu-operator` namespace（PSS=privileged）。本 chart 只負責放 `device-plugin-config` ConfigMap 進該 namespace + cluster-wide 的 node-labeler Job。`Chart.yaml` 移除 dependencies block；`charts/`、`Chart.lock`、`*.tgz` 都不進 git。部署流程從「一條 helm install」變成「一條 setup-linux-gpu.sh + 一條 install-gpu-operator.sh + 一條 helm install slurm-platform」。
->
-> **修訂版 2（2026-04-28）：** Linux+k3s+RTX4070 路徑驗證後（commit `3eec54f`），確認 `nvidia-device-plugin` 內建 `sharing.mps` 在 v0.15–v0.17.x 全系列因 upstream `cmd.Exec("nvidia-cuda-mps-control", "-d")` daemonize spawn race 而無法啟動（見 [`docs/migration.md`](migration.md)）。本版改為以 GPU Operator 為 GPU 子系統的目標方案——它把 MPS daemon 拆成獨立 `mps-control-daemon` DaemonSet 用前景模式跑，繞過 spawn race。〔修訂版 3 把它從 dependency 改成獨立安裝。〕
->
-> **修訂版 1（2026-04-27）：** 本節原稿寫於 N1 / N7 修復前，`mps.enabled` flag、`partition: debug`、rtx4080 `devicePath: /dev/nvidia1` 已隨 `mps-migration` 分支上線而過時。先對齊：sharing.mps（N1 / N10）、三 partition 拆分（N7）、`/dev/nvidia0` 一律（N2）、`AccountingStorageTRES`（N6）、namespace PSS=baseline（N9）、k3s `ctr images import`（N4）、NetworkPolicy 6443（N5）。
 
 ### 設計方向
 
@@ -433,22 +569,28 @@ chart/
 
 # Phase 6 Plan
 
-> **狀態：** 🔒 預留階段，目前不開工。
+> **狀態：** ✅ M1-M8 已完成；production 進階功能仍預設關閉，依環境逐項啟用。
 
-針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的自訂排程策略。可能方向（待 Phase 7 trace 資料佐證後再收斂）：
+針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的自訂排程策略。目前 Phase 6 已經從原本的 placeholder 收斂成 `R17 score-based scheduling + R19 runtime predictor` 主線：
 
-- MPS slot 與整卡獨佔的協調（避免 mps job 與 gpu:rtx4070:1 互相 head-of-line block）
-- DDP gang-aware placement：`--nodes=N` 的 job 確保所有 worker pod 同時 ready 才開跑，否則 backoff 而非部分啟動
-- 與 K8s scheduler 的互動（Workload-Aware / Gang Scheduling feature gate 已就緒，見 `docs/review.md`）
-- Operator 擴縮策略與排程決策的協同（例如「為了排這個 gang job，主動把 cpu pool 縮一格騰 quota」）
+- M1-M3：Slurm backfill / multifactor knobs 走 Helm values，Lua `job_submit.lua` 計算 `mps_fit`、`vram_fit`、fragmentation proxy，並把 score 作為 priority kicker。
+- M4：`sim/` trace replay simulator 可跑 FCFS / multifactor / score 三線 baseline。
+- M5-M6：FastAPI + LightGBM runtime predictor 與 Lua submit plugin 接通，可在 predictor 可用時覆寫過鬆的 `--time`，不可用時 fallback。
+- M7：Operator fragmentation detector + requeue decider 已接入，預設 `shadowMode=true`，實際 requeue 需明確翻 flag。
+- M8：`eval/results/`、`eval/figures/`、`docs/eval-writeup.md` 已產出。主結論：score + predictor + fragmentation 相對 vendor multifactor mean JCT 改善約 28.6%，但 E5 的 requeue 數字尚未扣 checkpoint resume 成本。
 
-設計與決策會逐項補在本節。
+尚未完成或不該宣稱已解決的部分：
+
+- E7 live-cluster 50-job 驗證仍是 harness 狀態，需要在實際 k3s + Slurm chart 上跑 vendor vs our stack。
+- M7 實際 `shadowMode=false` 的 requeue 行為需要搭配 checkpoint-aware workload 驗證，避免 sim 的 0-cost resume 高估收益。
+- DDP gang-aware placement、K8s scheduler gang scheduling、跨 pool quota 讓渡仍是 future work，沒有併入 Phase 6 M1-M8。
+- M9 contextual bandit / PPO weight tuning 是 optional future work；M8 sensitivity 顯示目前 fixed weights 已足夠 robust。
 
 ---
 
 # Phase 7 Plan
 
-> **狀態：** 📋 規劃中。Phase 6 預留期間先做這兩塊讓使用者體驗收斂。
+> **狀態：** 📋 規劃中。Phase 6 M1-M8 完成後，Phase 7 回到使用者體驗與端到端可觀測性。
 >
 > 開發順序：**OpenTelemetry（7-A）→ SSH Login（7-B）**
 
@@ -1148,4 +1290,3 @@ dcgmi dmon -e 203,204,1002   # SM Active, SM Occupancy, Memory Active
 - [SURF MPS for Slurm GitHub](https://github.com/basvandervlies/surf_slurm_mps) — 荷蘭國家超算中心的 MPS Prolog/Epilog 完整實作
 - [NVIDIA GPU Operator MPS 文件](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html) — ClusterPolicy ConfigMap `sharing.mps` 設定
 - [MIG vs Time-Slicing vs MPS 比較](https://www.kubenatives.com/p/mig-vs-time-slicing-vs-mps-which) — 三種機制的適用場景分析
-

@@ -81,3 +81,48 @@ _QUEUE_DEDUP_DROPS = Counter(
     "Times an event was dropped because the pool already had a pending reconcile",
     ["pool", "source"],
 )
+# Phase 6 M7: fragmentation detector + requeue decider metrics. The gauge
+# is populated each fragmentation reconcile pass; the counter increments
+# only on successful (non-rate-limited) requeue decisions.
+_FRAGMENTATION_SCORE = Gauge(
+    "slurm_operator_fragmentation_score",
+    "Coefficient of variation of free MPS slots across nodes — 0 = balanced, 1 = worst",
+)
+_FRAGMENTATION_BLOCKED_JOBS = Gauge(
+    "slurm_operator_fragmentation_blocked_jobs",
+    "Pending jobs that fit no current node at the last fragmentation snapshot",
+)
+_REQUEUE_TOTAL = Counter(
+    "slurm_operator_requeue_total",
+    "Times the operator issued a requeue decision, by reason bucket",
+    ["reason"],   # "unblock" | "rate-limited" | "no-fragmentation" | "no-victims"
+)
+_REQUEUE_VICTIMS = Counter(
+    "slurm_operator_requeue_victims_total",
+    "Individual jobs requeued by the fragmentation reconciler",
+)
+# E7 hardening: ghost-job detector.
+#
+# The wedge: a worker pod is killed (helm upgrade, node eviction, OOM)
+# while it owned an in-flight Slurm job. slurmctld never receives the
+# job-complete epilog, so the job stays RUNNING forever in slurmrestd.
+# Our scale policy sees running_jobs > 0 and refuses to scale up — even
+# though no pod exists to actually run anything. Result: cluster is dead
+# until a human runs `scontrol update State=DOWN/RESUME` or deletes the
+# controller pod.
+#
+# This gauge is raised whenever the detector finds the inconsistency.
+# It's intentionally separate from a counter — alerting wants "is it
+# currently wedged" (gauge), tracing wants "how often does this happen"
+# (we increment _GHOST_DETECTED_TOTAL too).
+_GHOST_JOBS_PRESENT = Gauge(
+    "slurm_operator_ghost_jobs_present",
+    "1 if the pool is currently in the running_jobs>0 + replicas=0 + pods=0 wedge "
+    "(an in-flight Slurm job is unreachable because its worker pod is gone)",
+    ["pool"],
+)
+_GHOST_DETECTED_TOTAL = Counter(
+    "slurm_operator_ghost_detected_total",
+    "Times the operator detected ghost running jobs (no pod backing them)",
+    ["pool"],
+)

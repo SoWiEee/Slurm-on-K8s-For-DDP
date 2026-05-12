@@ -1,3 +1,10 @@
 __pycache__/
 .claude/
 CLAUDE.md
+sim/data/out/
+sim/data/philly_subsample.json
+.venv-m5/
+.venv*/
+services/runtime-predictor/models/
+eval/results/
+runs/

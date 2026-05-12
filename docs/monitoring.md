@@ -20,6 +20,7 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 │                                                                 │
 │  slurm-exporter  ──→  /metrics（Slurm queue / node states）    │
 │  slurm-elastic-operator  ──→  /metrics（scale events, guard）  │
+│  nvidia-dcgm-exporter（gpu-operator ns）──→ /metrics（GPU SM/VRAM）│
 └────────────────────────────┬────────────────────────────────────┘
                              │ scrape
 ┌────────────────────────────▼────────────────────────────────────┐
@@ -31,7 +32,8 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 │  Grafana                                                        │
 │    ├─ Bridge Overview Dashboard（主 demo 看板）                  │
 │    ├─ Slurm Cluster State Dashboard                            │
-│    └─ K8s Operator Dashboard                                   │
+│    ├─ K8s Operator Dashboard                                   │
+│    └─ GPU Utilisation (DCGM) Dashboard                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -41,11 +43,9 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 
 ### 1. prometheus-slurm-exporter
 
-**來源：** 自製（`docker/slurm-exporter/exporter.py`）
-
-**部署方式：** 獨立 Deployment，部署於 `slurm` namespace，透過 Slurm REST API（slurmrestd）取得 job 與 node 狀態，使用 HS256 JWT 進行認證（key 來自 `slurm-jwt-secret`）。
-
-**核心 metrics：**
+- 來源：自製（`docker/slurm-exporter/exporter.py`）
+- 部署方式：獨立 Deployment，部署於 `slurm` namespace，透過 Slurm REST API（slurmrestd）取得 job 與 node 狀態，使用 HS256 JWT 進行認證（key 來自 `slurm-jwt-secret`）。
+- 核心 metrics：
 
 | Metric | 類型 | 說明 |
 |--------|------|------|
@@ -66,11 +66,9 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 
 ### 2. kube-state-metrics
 
-**來源：** Kubernetes 官方 [`kubernetes/kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
-
-**部署方式：** 自維護 manifest（`manifests/monitoring/kube-state-metrics/kube-state-metrics.yaml`），含 ServiceAccount + ClusterRole + ClusterRoleBinding + Deployment + Service，部署於 `monitoring` namespace。
-
-**使用的 metrics：**
+- 來源：Kubernetes 官方 [`kubernetes/kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
+- 部署方式：自行維護 manifest（`manifests/monitoring/kube-state-metrics/kube-state-metrics.yaml`），含 ServiceAccount + ClusterRole + ClusterRoleBinding + Deployment + Service，部署於 `monitoring` namespace。
+- 使用的 metrics：
 
 | Metric | 說明 |
 |--------|------|
@@ -93,6 +91,47 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 | `slurm_operator_current_replicas` | Gauge | 各 pool 目前 replica 數，label: `pool` |
 
 **Port：** `8000`（`/metrics` endpoint）
+
+### 4. NVIDIA DCGM exporter
+
+- 來源：NVIDIA GPU Operator 內建的 `nvidia-dcgm-exporter`
+
+- 部署方式：`scripts/install-gpu-operator.sh` 安裝 GPU Operator 時開啟：
+
+```bash
+--set dcgmExporter.enabled=true
+--set dcgmExporter.serviceMonitor.enabled=false
+```
+
+ServiceMonitor 維持關閉，因為本專案使用 chart 內建 Prometheus；Prometheus 透過
+`chart/templates/monitoring/prometheus.yaml` 的 static scrape job 抓：
+`nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400`。
+
+Chart 開關：
+
+```yaml
+monitoring:
+  dcgmExporter:
+    enabled: true
+    namespace: gpu-operator
+    serviceName: nvidia-dcgm-exporter
+    port: 9400
+```
+
+核心 metrics：
+
+| Metric | 類型 | 說明 |
+|--------|------|------|
+| `DCGM_FI_DEV_GPU_UTIL` | Gauge | 真實 GPU SM 使用率，不是 Slurm allocated GPU count |
+| `DCGM_FI_DEV_FB_USED` | Gauge | VRAM 已用量 |
+| `DCGM_FI_DEV_FB_FREE` | Gauge | VRAM 可用量 |
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | Gauge | Memory controller active ratio，可抓 bandwidth-bound workload |
+| `DCGM_FI_DEV_GPU_TEMP` | Gauge | GPU 溫度 |
+| `DCGM_FI_DEV_POWER_USAGE` | Gauge | GPU 板卡功耗 |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Gauge | Tensor Core busy ratio；硬體/driver 支援時可用 |
+
+DCGM 指標補上了 Slurm-only monitoring 的盲點：Slurm 知道「GPU 被分配」，
+但不知道該 GPU 是否真的在算、VRAM 是否接近 OOM、或是否只是 idle allocation。
 
 ---
 
@@ -124,13 +163,16 @@ phase4/
 └── scripts/
     ├── bootstrap-monitoring.sh            # 一鍵部署監控堆疊
     └── verify-monitoring.sh               # 驗證 metrics 可正常抓取
+chart/
+└── dashboards/
+    └── gpu.json                           # GPU Utilisation (DCGM) dashboard
 ```
 
 ---
 
 ## Dashboard 設計
 
-### Bridge Overview（主 demo 看板）
+### Bridge Overview
 
 這是最重要的一塊看板，視覺化呈現「Slurm 語意驅動 K8s 行為」。
 
@@ -163,40 +205,22 @@ phase4/
 - Checkpoint Guard 攔截事件計數
 - 各 pool 的 replica count 時序（cpu / gpu-a10 / gpu-h100）
 
----
+### GPU Utilisation (DCGM) Dashboard
 
-## Demo 腳本
+`chart/dashboards/gpu.json` 提供真實 GPU 使用狀態，dashboard uid 為
+`slurm-k8s-gpu`，title 為 `GPU Utilisation (DCGM)`。
 
-Phase 4 的標準 demo 流程，可在 Grafana Bridge Overview 看板上即時觀察：
+**Panels：**
 
-```
-1. 初始狀態
-   → queue_pending = 0, replicas = 1（baseline worker）
+- GPU SM Utilisation (%)：`DCGM_FI_DEV_GPU_UTIL`
+- VRAM Used / Free (MiB)：`DCGM_FI_DEV_FB_USED`、`DCGM_FI_DEV_FB_FREE`
+- Memory Copy Util (%)：`DCGM_FI_DEV_MEM_COPY_UTIL`
+- GPU Temperature (°C)：`DCGM_FI_DEV_GPU_TEMP`
+- GPU Power Draw (W)：`DCGM_FI_DEV_POWER_USAGE`
+- GPU Util (Now)：目前各 GPU 的 SM% stat panel
+- VRAM Used (Now)：目前各 GPU 的 VRAM 使用量 stat panel
 
-2. 提交需要 2 個節點的 job
-   sbatch -N 2 /shared/demo-job.sbatch
-   → queue_pending = 1
-
-3. Operator 偵測到 pending（下一個 poll cycle，~15s 內）
-   → scale_up_total + 1
-   → StatefulSet replicas: 1 → 2
-
-4. 新 Pod ready，job 開始執行
-   → queue_running = 1, queue_pending = 0
-   → replicas_ready = 2
-
-5. Job 完成
-   → queue_running = 0
-   → 等待 scale_down_cooldown（60s）
-
-6. Operator 縮容
-   → scale_down_total + 1
-   → replicas: 2 → 1
-
-7. 重複步驟 2，但這次讓 checkpoint 過舊
-   → checkpoint_guard_blocks + 1
-   → scale skipped（可在 Operator 看板觀察）
-```
+> 這個 dashboard 取代早期用 Slurm allocation count 推估 GPU utilization 的做法。Slurm allocation count 只能表示「排程器分配了 GPU」，DCGM 才能回答「硬體實際忙不忙」。
 
 ---
 
@@ -217,6 +241,10 @@ scrape_configs:
     static_configs:
       - targets: ['kube-state-metrics.monitoring.svc.cluster.local:8080']
 
+  - job_name: dcgm-exporter
+    static_configs:
+      - targets: ['nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400']
+
   - job_name: kubernetes-pods
     kubernetes_sd_configs:
       - role: pod
@@ -228,22 +256,7 @@ scrape_configs:
 
 ---
 
-## 部署步驟（已完成）
-
-### bootstrap-monitoring.sh 執行內容
-
-```
-1. 確認 Phase 1–3 已部署（slurm namespace + slurm-controller + slurm-shared-rwx）
-2. 建立 monitoring namespace
-3. 部署 kube-state-metrics（manifest）
-4. 建置 slurm-exporter image → kind load → 部署 Deployment + Service（REST API 模式）
-5. 重建 operator image（加入 prometheus-client）→ kind load → rollout restart
-6. 套用 prometheus ConfigMap + Deployment + Service
-7. 套用 grafana Deployment + Service + dashboard ConfigMap
-8. 套用跨 namespace NetworkPolicy（monitoring → slurm scrape）
-9. 等待所有 Pod ready
-10. 印出 port-forward 指令
-```
+## 部署步驟 ✅️
 
 ```bash
 bash scripts/bootstrap-monitoring.sh   # 一鍵部署
@@ -262,9 +275,25 @@ kubectl -n monitoring port-forward svc/prometheus 9090:9090
 # http://localhost:9090
 ```
 
+### DCGM 驗證
+
+```bash
+# 確認 GPU Operator 有部署 DCGM exporter
+kubectl -n gpu-operator get svc nvidia-dcgm-exporter
+kubectl -n gpu-operator get pods -l app=nvidia-dcgm-exporter
+
+# 直接看 raw metrics
+kubectl -n gpu-operator port-forward svc/nvidia-dcgm-exporter 9400:9400
+curl -s http://localhost:9400/metrics | grep -E 'DCGM_FI_DEV_GPU_UTIL|DCGM_FI_DEV_FB_USED|DCGM_FI_DEV_POWER_USAGE' | head
+
+# Prometheus 查詢
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+# 在 Prometheus UI 查 DCGM_FI_DEV_GPU_UTIL / DCGM_FI_DEV_FB_USED
+```
+
 ---
 
-## 與現有 Operator 的整合（已完成）
+## 與現有 Operator 的整合 ✅️
 
 `operator/main.py` 已加入 `prometheus_client` 整合：
 
@@ -278,7 +307,6 @@ checkpoint_guard_blocks = Counter('slurm_operator_checkpoint_guard_blocks_total'
 poll_duration = Histogram('slurm_operator_poll_duration_seconds', '...')
 current_replicas = Gauge('slurm_operator_current_replicas', '...', ['pool'])
 
-# 在 run() 中啟動 HTTP server
 start_http_server(8000)
 ```
 
@@ -293,7 +321,7 @@ ports:
 
 並已加入對應 Service（`slurm-elastic-operator` port 8000），讓 Prometheus 可以 scrape。
 
-**驗證方式：**
+驗證方式：
 ```bash
 kubectl -n slurm port-forward svc/slurm-elastic-operator 8000:8000
 curl http://localhost:8000/metrics | grep slurm_operator

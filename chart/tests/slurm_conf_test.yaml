@@ -167,6 +167,68 @@ tests:
           path: data["cgroup.conf"]
           pattern: "ConstrainDevices=yes"
 
+  - it: M1 default emits backfill + multifactor scheduler knobs
+    template: configmap-static.yaml
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SchedulerType=sched/backfill"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SchedulerParameters=bf_window=720,bf_resolution=30,bf_continue,bf_max_job_test=200"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "PriorityType=priority/multifactor"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "PriorityWeightAge=1000"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "PriorityWeightJobSize=500"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "PriorityWeightQOS=2000"
+
+  - it: M1 preempt block omitted when disabled (default)
+    template: configmap-static.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["slurm.conf"]
+          pattern: "PreemptType="
+      - notMatchRegex:
+          path: data["slurm.conf"]
+          pattern: "PreemptMode="
+
+  - it: M1 preempt block emitted when slurm.scheduling.preempt.enabled
+    template: configmap-static.yaml
+    set:
+      slurm.scheduling.preempt.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "PreemptType=preempt/qos"
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "PreemptMode=REQUEUE"
+
+  - it: M1 CR_Pack_Nodes opt-in via slurm.selectTypeParameters override
+    template: configmap-static.yaml
+    set:
+      slurm.selectTypeParameters: "CR_Core,CR_Pack_Nodes"
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SelectTypeParameters=CR_Core,CR_Pack_Nodes"
+
+  - it: M1 schedulerParameters override flows through
+    template: configmap-static.yaml
+    set:
+      slurm.scheduling.schedulerParameters: "bf_window=1440,bf_resolution=60"
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "SchedulerParameters=bf_window=1440,bf_resolution=60"
+
   - it: TaskPlugin / ProctrackType default for PSS=baseline pods (R9 known limit)
     template: configmap-static.yaml
     asserts:

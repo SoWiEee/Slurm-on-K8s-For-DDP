@@ -1,0 +1,207 @@
+suite: job_submit lua plugin (Phase 6 M2 + M3)
+templates:
+  - configmap-job-submit.yaml
+  - configmap-static.yaml
+  - configmap-nodes.yaml
+  - controller.yaml
+tests:
+  - it: ConfigMap is omitted when jobSubmit.enabled=false (default)
+    template: configmap-job-submit.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: slurm.conf does not emit JobSubmitPlugins when disabled (default)
+    template: configmap-static.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["slurm.conf"]
+          pattern: "JobSubmitPlugins=lua"
+
+  - it: ConfigMap is rendered when jobSubmit.enabled=true
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: slurm-config-job-submit
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "function slurm_job_submit"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "function slurm_job_modify"
+
+  - it: slurm.conf adds JobSubmitPlugins=lua when enabled
+    template: configmap-static.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["slurm.conf"]
+          pattern: "JobSubmitPlugins=lua"
+
+  - it: lua scaffold inlines demoBoostPriority + scoreGain values
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.demoBoostPriority: 4242
+      slurm.jobSubmit.scoreGain: 750
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "DEMO_BOOST_PRIORITY = 4242"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "SCORE_GAIN          = 750"
+
+  - it: lua scaffold respects debugLog=false
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.debugLog: false
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "DEBUG_LOG           = false"
+
+  - it: M3 default scoreApply=true and weights inline (mpsFit=0.40, vramFit=0.20)
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "SCORE_APPLY         = true"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "local A = 0\\.4"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "local B = 0\\.2"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "local D = 0\\.2"
+
+  - it: M3 vramTiers list inlines into VRAM_TIERS
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.vramTiers: [8, 16, 40]
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "VRAM_TIERS = \\{\\s*8, 16, 40"
+
+  - it: M3 scoreApply=false (shadow mode) preserves apply=false in scaffold
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.scoreApply: false
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "SCORE_APPLY         = false"
+
+  - it: M3 mpsPerNode override flows through
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.mpsPerNode: 200
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "MPS_PER_NODE        = 200"
+
+  - it: controller mounts /etc/slurm/job_submit.lua only when enabled
+    template: controller.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: slurm-config-job-submit
+            mountPath: /etc/slurm/job_submit.lua
+            subPath: job_submit.lua
+        documentSelector:
+          path: kind
+          value: StatefulSet
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: slurm-config-job-submit
+            configMap:
+              name: slurm-config-job-submit
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: controller does NOT mount job_submit.lua when disabled (default)
+    template: controller.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: slurm-config-job-submit
+            mountPath: /etc/slurm/job_submit.lua
+            subPath: job_submit.lua
+        documentSelector:
+          path: kind
+          value: StatefulSet
+
+  - it: M6 predictor disabled by default — PRED_ENABLED=false in lua
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_ENABLED          = false"
+
+  - it: M6 predictor enabled — URL + timeout + fallback inlined
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.predictor.enabled: true
+      slurm.jobSubmit.predictor.url: "http://predictor.svc.local:9000/predict"
+      slurm.jobSubmit.predictor.timeoutMs: 150
+      slurm.jobSubmit.predictor.fallbackHours: 6
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_ENABLED          = true"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: 'PRED_URL              = "http://predictor.svc.local:9000/predict"'
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_TIMEOUT_S        = 150 / 1000.0"
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_FALLBACK_HOURS   = 6"
+
+  - it: M6 predictor applyTimeLimit=false leaves walltime untouched
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.predictor.enabled: true
+      slurm.jobSubmit.predictor.applyTimeLimit: false
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: "PRED_APPLY_TIME_LIMIT = false"
+
+  - it: M6 predictor defaultGpuType propagates to lua
+    template: configmap-job-submit.yaml
+    set:
+      slurm.jobSubmit.enabled: true
+      slurm.jobSubmit.predictor.enabled: true
+      slurm.jobSubmit.predictor.defaultGpuType: "h100"
+    asserts:
+      - matchRegex:
+          path: data["job_submit.lua"]
+          pattern: 'PRED_DEFAULT_GPU_TYPE = "h100"'
