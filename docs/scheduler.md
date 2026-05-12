@@ -1267,6 +1267,47 @@ services/weight_tuner/
 
 Slurm 側：`job_submit.lua` 開頭 HTTP GET `/select_weights`（已有 predictor 整合範本），job epilog 走新 hook 回呼 `/update_reward`。
 
+### Hybrid 設計：LinUCB + heuristic safety net
+
+純 bandit 在 live cluster 部署有兩個 failure mode：(1) cold-start 期前 ~50 jobs 的 exploration 拿到極端 action；(2) workload distribution 漂移時 stale θ̂ 持續推爛權重。M11 內建一個 heuristic guardrail，避免上述狀況拖累 live JCT。
+
+**Guardrail 規則**（在 `LinUCBBandit.select()` 外面包一層）：
+
+```python
+def select_with_guardrail(self, x, cluster_state):
+    a_ucb = self.linucb_select(x)
+    a_default = DEFAULT_WEIGHTS
+
+    # Rule 1: shadow JCT estimate（用 M8 sim 抽樣 ~5 jobs）
+    est_jct_ucb = shadow_eval(a_ucb, cluster_state, n=5)
+    est_jct_def = shadow_eval(a_default, cluster_state, n=5)
+    if est_jct_ucb > 1.30 * est_jct_def:
+        return a_default, "fallback:est_jct_regression"
+
+    # Rule 2: queue empty 時 bandit 沒意義
+    if cluster_state.queue_len < 3:
+        return a_default, "fallback:queue_too_small"
+
+    # Rule 3: predictor confidence 太低時降權重 ε
+    if cluster_state.predictor_spread > 2.0:  # p90/p50 ratio
+        a_ucb = a_ucb._replace(epsilon=a_ucb.epsilon * 0.5)
+
+    # Rule 4: 連續 N 次 cold-start exploration 後強制 cooldown
+    if self.exploration_streak > 20:
+        self.exploration_streak = 0
+        return a_default, "fallback:cooldown"
+
+    return a_ucb, "linucb"
+```
+
+**Telemetry**：每次決策 emit `bandit_decision` JSON line（action、是否 fallback、reason），跟 operator JsonLogger 同 channel。M8 evaluation script 自動 aggregate fallback rate。
+
+**驗證指標**：fallback rate 在收斂期應 < 5%；高 fallback rate = LinUCB 學壞訊號，需要重看 reward shaping。
+
+引用：
+- Bouneffouf, D., Rish, I., & Aggarwal, C., "Survey on Applications of Multi-Armed and Contextual Bandits", **IEEE CIM 2020** — 工業界部署 contextual bandit 的 safety / fallback pattern 整理。
+- Krishnaswamy et al. **NSDI 2023**（前述）— systems setting 用 shadow eval 守住 learning component 的具體案例。
+
 ### Deployment 規劃
 
 | 階段 | 內容 | 時程 |
