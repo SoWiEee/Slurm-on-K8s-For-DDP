@@ -27,6 +27,8 @@ from typing import List, Optional
 
 import numpy as np
 import uvicorn
+import time
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from stable_baselines3 import PPO
@@ -224,15 +226,127 @@ class ModelHolder:
 _holder: Optional[ModelHolder] = None
 
 
+# ---------- snapshot cache (Phase C-3: sidecar pushes; lua reads) ----------
+class Snapshot(BaseModel):
+    """Cluster state pushed by the operator-side collector sidecar.
+
+    /decide uses this cached snapshot + the lua-side current job to
+    construct the obs vector.  Snapshots older than ``SNAPSHOT_TTL_S``
+    cause /decide to abstain (shadow log only, priority boost = 0).
+    """
+    ts: float = Field(default_factory=time.time)
+    now: float
+    pending_jobs: List[JobView] = Field(default_factory=list)
+    nodes: List[NodeView] = Field(default_factory=list)
+    n_nodes: int = 1
+    gpus_per_node: int = 1
+    mps_per_gpu: int = MPS_PER_GPU
+
+
+SNAPSHOT_TTL_S = float(os.environ.get("SNAPSHOT_TTL_S", "30"))
+SHADOW_MODE = os.environ.get("SHADOW_MODE", "true").lower() in ("1", "true", "yes")
+VALUE_ABSTAIN = float(os.environ.get("VALUE_ABSTAIN", "-1.0"))
+ENTROPY_ABSTAIN = float(os.environ.get("ENTROPY_ABSTAIN", "1.5"))
+PRIORITY_BOOST = int(os.environ.get("PRIORITY_BOOST", "1000"))
+
+_snapshot: Optional[Snapshot] = None
+
+
+class DecideRequest(BaseModel):
+    """Lua sends only the current submitting job; serve fuses with snapshot."""
+    job_id: str
+    mps_req: int
+    gpu_count: int
+    gpu_type: str = "rtx4070"
+    runtime: float
+    submit_ts: float
+
+
+class DecideResponse(BaseModel):
+    priority_boost: int          # value to add to job_desc.priority (0 = abstain)
+    rl_selected: bool            # did RL pick THIS job?
+    abstain: bool                # safety-net triggered or snapshot stale
+    abstain_reason: Optional[str]
+    rl_selected_job_id: Optional[str]
+    value: float
+    entropy: float
+    shadow: bool                 # SHADOW_MODE flag (informational)
+
+
 # ---------- FastAPI app ----------
 app = FastAPI(title="kubeflux-rl-scheduler", version="0.1")
 
 
 @app.get("/healthz")
 def healthz():
+    snap_age = (time.time() - _snapshot.ts) if _snapshot else None
     return {"ready": _holder is not None,
             "masked": _holder.masked if _holder else None,
-            "policy_dir": str(_holder.policy_dir) if _holder else None}
+            "policy_dir": str(_holder.policy_dir) if _holder else None,
+            "snapshot_age_s": snap_age,
+            "shadow_mode": SHADOW_MODE}
+
+
+@app.post("/snapshot")
+def push_snapshot(snap: Snapshot):
+    global _snapshot
+    _snapshot = snap
+    return {"ok": True, "ts": snap.ts, "pending": len(snap.pending_jobs),
+            "nodes": len(snap.nodes)}
+
+
+@app.post("/decide", response_model=DecideResponse)
+def decide(req: DecideRequest):
+    if _holder is None:
+        raise HTTPException(status_code=503, detail="model not loaded")
+    snap = _snapshot
+    age = (time.time() - snap.ts) if snap else None
+    if snap is None or age is None or age > SNAPSHOT_TTL_S:
+        return DecideResponse(
+            priority_boost=0, rl_selected=False, abstain=True,
+            abstain_reason=f"snapshot_stale (age={age})",
+            rl_selected_job_id=None, value=0.0, entropy=0.0,
+            shadow=SHADOW_MODE,
+        )
+    # Fuse: ensure the current submitting job is in pending list
+    fused = list(snap.pending_jobs)
+    if not any(j.job_id == req.job_id for j in fused):
+        fused.append(JobView(
+            job_id=req.job_id, mps_req=req.mps_req,
+            gpu_count=req.gpu_count, gpu_type=req.gpu_type,
+            runtime=req.runtime, submit_ts=req.submit_ts, can_fit=True,
+        ))
+    act_req = ActRequest(
+        now=max(snap.now, req.submit_ts),
+        pending_jobs=fused, nodes=snap.nodes,
+        n_nodes=snap.n_nodes, gpus_per_node=snap.gpus_per_node,
+        mps_per_gpu=snap.mps_per_gpu,
+    )
+    obs, mask, top_ids = build_obs(act_req)
+    action, value, entropy = _holder.predict(obs, mask)
+    sel_id = top_ids[action] if 0 <= action < TOP_K else None
+
+    # Safety-net
+    abstain = False
+    reason = None
+    if value < VALUE_ABSTAIN:
+        abstain = True
+        reason = f"low_value ({value:.3f} < {VALUE_ABSTAIN})"
+    elif entropy > ENTROPY_ABSTAIN:
+        abstain = True
+        reason = f"high_entropy ({entropy:.3f} > {ENTROPY_ABSTAIN})"
+
+    rl_picked_me = (sel_id == req.job_id)
+    if SHADOW_MODE or abstain:
+        boost = 0
+    else:
+        boost = PRIORITY_BOOST if rl_picked_me else 0
+    return DecideResponse(
+        priority_boost=boost, rl_selected=rl_picked_me,
+        abstain=abstain, abstain_reason=reason,
+        rl_selected_job_id=sel_id, value=value, entropy=entropy,
+        shadow=SHADOW_MODE,
+    )
 
 
 @app.post("/act", response_model=ActResponse)
