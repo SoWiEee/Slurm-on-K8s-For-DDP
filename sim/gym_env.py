@@ -286,6 +286,10 @@ class KubefluxSchedEnv:
         glob = _global_feat(st.pending, st.cluster, st.now)
         return np.concatenate([*feats, *node_feats, glob]).astype(np.float32)
 
+    def action_masks(self) -> np.ndarray:
+        """sb3-contrib MaskablePPO API: alias of action_mask()."""
+        return self.action_mask()
+
     def action_mask(self) -> np.ndarray:
         """Bool mask over action space — true = action is legal."""
         st = self._state

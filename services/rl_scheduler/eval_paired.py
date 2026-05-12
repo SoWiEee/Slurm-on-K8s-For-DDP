@@ -28,6 +28,11 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+try:
+    from sb3_contrib import MaskablePPO
+except ImportError:
+    MaskablePPO = None  # type: ignore
+
 from sim.gym_env import KubefluxSchedGymEnv
 from sim.loader import generate_by_family
 from sim.runner import run
@@ -46,17 +51,17 @@ def run_baseline(scheduler_name: str, *, trace_family: str, n_jobs: int,
 
 
 def run_ppo(model, vecnorm_path: str, *, trace_family: str, n_jobs: int,
-            seed: int, n_nodes: int, gpus_per_node: int) -> float:
+            seed: int, n_nodes: int, gpus_per_node: int,
+            masked: bool = False) -> float:
     def _factory():
         return generate_by_family(trace_family, n_jobs=n_jobs, seed=seed)
-    env = KubefluxSchedGymEnv(
+    raw_env = KubefluxSchedGymEnv(
         jobs_factory=_factory,
         n_nodes=n_nodes,
         gpus_per_node=gpus_per_node,
         max_steps=n_jobs * 100,
     )
-    # Use VecNormalize at eval (norm_reward=False, training=False)
-    venv = DummyVecEnv([lambda: env])
+    venv = DummyVecEnv([lambda: raw_env])
     venv = VecNormalize.load(vecnorm_path, venv)
     venv.training = False
     venv.norm_reward = False
@@ -67,7 +72,11 @@ def run_ppo(model, vecnorm_path: str, *, trace_family: str, n_jobs: int,
     steps = 0
     max_steps = n_jobs * 100
     while not terminated and steps < max_steps:
-        action, _ = model.predict(obs, deterministic=True)
+        if masked:
+            mask = raw_env.action_masks()[np.newaxis, :]
+            action, _ = model.predict(obs, action_masks=mask, deterministic=True)
+        else:
+            action, _ = model.predict(obs, deterministic=True)
         obs, _r, dones, infos = venv.step(action)
         terminated = bool(dones[0])
         info_buf = infos[0]
@@ -111,9 +120,19 @@ def main(argv=None) -> int:
         print(f"ERROR: policy/vecnormalize missing under {pd}", file=sys.stderr)
         return 2
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = PPO.load(str(policy_path), device=device)
-    print(f"loaded policy from {policy_path}, device={device}")
+    masked = (pd / "MASKED").exists()
+    if masked:
+        if MaskablePPO is None:
+            print("ERROR: MASKED marker present but sb3-contrib not installed",
+                  file=sys.stderr)
+            return 3
+        device = "cpu"
+        model = MaskablePPO.load(str(policy_path), device=device)
+        print(f"loaded MaskablePPO from {policy_path}, device={device}")
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = PPO.load(str(policy_path), device=device)
+        print(f"loaded PPO from {policy_path}, device={device}")
 
     SCHEDULERS = ["fcfs", "multifactor", "score", "ppo"]
     rows: List[Dict] = []
@@ -125,7 +144,8 @@ def main(argv=None) -> int:
                     j = run_ppo(model, str(vecnorm_path),
                                 trace_family=fam, n_jobs=args.n_jobs,
                                 seed=seed, n_nodes=args.n_nodes,
-                                gpus_per_node=args.gpus_per_node)
+                                gpus_per_node=args.gpus_per_node,
+                                masked=masked)
                 else:
                     j = run_baseline(sname, trace_family=fam,
                                      n_jobs=args.n_jobs, seed=seed,
