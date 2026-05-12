@@ -716,7 +716,7 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | M8 | Evaluation：JCT / utilization / makespan / fairness | §9.5 | 7 天 | ✅ |
 | M9 | Contextual bandit / PPO weight tuning | §7.5 | 10 天 | ✅ LinUCB only |
 | M10 | Score function 後續優化（horizon auto-tune、刪 γ、修 mps_fit、age boost、M7 suspend+resume、predictor quantile）| §M10 | 3–4 週 | ⬜ 規劃中 |
-| M11 ★ | Live contextual bandit：LinUCB 取代 M9 UCB1，引入 cluster state context | §M11 | 2 週 | ⬜ 規劃中 |
+| M11 ★ | Live contextual bandit：D-LinUCB 取代 M9 UCB1，引入 cluster state context + non-stationary discount + heuristic safety net | §M11 | 2 週 | ⬜ 規劃中 |
 
 ## M1：Slurm 內建調度旋鈕
 
@@ -1218,11 +1218,11 @@ M8/M9 跑完後重新審視 `docs/scheduler-score-spec.md`，列出 11 個可優
 - M7 從「flat negative result」升級成「我們找到讓 M7 work 的條件」→ §4.4 / §9 future work 第一條改寫成「已實作」。
 - Predictor 從 point estimate 升級成 distribution-aware → §5.5 condition 1 改成 robustness statement（即使 workload 跨度不大，confidence-weighted scheduling 仍能保守降權 not actively harm）。
 
-## M11 ★：Live contextual bandit（LinUCB，規劃中，M10 後接續）
+## M11 ★：Live contextual bandit（D-LinUCB，規劃中，M10 後接續）
 
-M9 的 UCB1 是 context-free bandit——把所有 cluster state 平均掉，只學「全域最好的權重組」。M9 sim 結果顯示這個假設在 stationary workload 上 OK，但在 live cluster 上 queue depth / fragmentation index / predictor confidence 會隨時間飄，最佳權重應該隨之改變。M11 把 UCB1 升級成 **LinUCB**（Li et al. WWW 2010），讓 bandit 依當前 cluster state 挑權重。
+M9 的 UCB1 是 context-free bandit——把所有 cluster state 平均掉，只學「全域最好的權重組」。M9 sim 結果顯示這個假設在 stationary workload 上 OK，但 **live cluster 上 queue depth / fragmentation index / predictor confidence 會隨時間漂移**，最佳權重應該隨之改變。M11 採用 **D-LinUCB**（Russac et al. NeurIPS 2019）——discounted LinUCB，把舊樣本指數衰減，直接針對非平穩環境設計。
 
-選 LinUCB 而不是 Neural-LinUCB / CQL / DRL 的理由寫在後面「替代方法分析」。簡言之：在 1–2 台機器 cluster 一天 ~200 jobs 的 throughput 下，**只有 LinUCB 的樣本需求（~300–500 jobs）落在碩論時程內收得到 paired CI 的量級**。
+選 D-LinUCB 而不是 vanilla LinUCB / Neural-LinUCB / CQL / DRL 的理由寫在後面「替代方法分析」。簡言之：vanilla LinUCB 假設 θ 不變、漂移時持續挑爛 action；D-LinUCB 改一行 update rule 即可拿到 non-stationary robustness，且樣本需求（~300–500 jobs）落在碩論時程內收得到 paired CI 的量級。
 
 ### 設計
 
@@ -1240,20 +1240,22 @@ M9 的 UCB1 是 context-free bandit——把所有 cluster state 平均掉，只
 
 **Reward**：job 結束時計算 `r = -normalized_JCT_delta_vs_default`，其中 default 由 shadow simulator 同 trace 算出來（用 M8 sim infrastructure，0 額外 cluster 成本）。
 
-**更新規則**（每個 job 結束觸發）：
+**更新規則 — D-LinUCB**（每個 job 結束觸發）：
 ```
-A_a ← A_a + x xᵀ
-b_a ← b_a + r · x
+A_a ← γ · A_a + x xᵀ + (1-γ) · λI       # discount factor γ ∈ (0,1]
+b_a ← γ · b_a + r · x
 θ̂_a ← A_a⁻¹ b_a
 ```
-A_a 初始 = λI（λ=1），closed-form 無 gradient descent。
+- γ=1.0 退化成 vanilla LinUCB；γ<1 把舊樣本指數衰減，effective window ≈ 1/(1-γ)
+- 預設 γ=0.99，effective window ~100 samples（≈ live cluster 一天 throughput），落在 workload 日週期的尺度內
+- λ=1.0（ridge regularization），A_a 初始 = λI
+- closed-form 無 gradient descent
 
-**Action selection**：
+**Action selection**（D-LinUCB confidence bound）：
 ```
-UCB(a, x) = θ̂_aᵀ x + α √(xᵀ A_a⁻¹ x)
-a* = argmax_a UCB(a, x)
+UCB(a, x) = θ̂_aᵀ x + α(t) · √(xᵀ A_a⁻¹ V_a A_a⁻¹ x)
 ```
-α 從 1.0 開始，每 100 jobs 衰減 0.95。
+其中 V_a = Σ γ^(2(t-s)) x_s x_sᵀ 是「discount 變異數」accumulator，比 vanilla LinUCB 的 bound 緊。α(t) 從 1.0 開始，每 100 jobs 衰減 0.95。詳細推導見 Russac et al. NeurIPS 2019 Theorem 1。
 
 ### 實作位置
 
@@ -1320,24 +1322,39 @@ def select_with_guardrail(self, x, cluster_state):
 
 兩台機器設定：trace 同步 replay（用 M8 `eval/scripts/run_e7_live.sh` 同 seed），機 A 跑 LinUCB、機 B 跑 default，收同樣 50 jobs 後算 paired CI。
 
-### 替代方法分析（為什麼是 LinUCB 不是其他）
+### 替代方法分析（為什麼是 D-LinUCB 不是其他）
 
 | 方法 | 樣本需求 | 1–2 機可行 | 主風險 | 採用 |
 |---|---|:---:|---|:---:|
-| **LinUCB** | ~300–500 jobs | ✅ 2–3 天 | 線性 model 假設失敗時退化成 UCB1，可控 | ✅ |
-| Neural-LinUCB（Riquelme ICLR 2018） | ~2k–5k jobs | ⚠️ 4–6 週 | NN cold-start 期間比 UCB1 還差 | ❌ |
+| **D-LinUCB（Russac NeurIPS 2019）** | ~300–500 jobs | ✅ 2–3 天 | 線性假設失敗時退化成 UCB1，可控；γ 設太小會 forget 過快 | ✅ |
+| vanilla LinUCB（Li WWW 2010） | ~300–500 jobs | ✅ | workload 漂移時持續 fit stale θ̂ | ❌（D-LinUCB superset） |
+| NeuralUCB（Zhou ICML 2020） | ~1k–2k jobs | ⚠️ 2–3 週 | NN cold-start 期間比 D-LinUCB 還差 | ❌（thesis ablation 可選） |
+| EE-Net（Ban & He KDD 2022） | ~2k–5k jobs | ⚠️ 4–6 週 | 雙網路設計，hyperparam tuning 重 | ❌ |
 | CQL offline RL（Kumar NeurIPS 2020） | ~10⁴ transitions | ⚠️ 訓得起來但 deploy 不確定贏 | M8 已證 sim-to-live distribution shift 嚴重 | ❌（留 future work）|
+| IQL（Kostrikov ICLR 2022） | ~10⁴ transitions | ⚠️ 同上但實作簡單 | 同上 | ❌（留 future work）|
 | Online DRL（PPO/SAC）live 訓練 | ~10⁵–10⁶ episodes | ❌ | exploration 期 JCT 爆炸 | ❌ |
 | Sim-trained DRL（Gymnasium wrapper） | sim 充足、live 不確定 | ⚠️ sim 跑得起來 | sim-to-real gap（M7 案例已示警） | ❌（留 future work）|
 
-關鍵 insight：**throughput 是真實 reward signal 的硬上限**，加機器只能線性 scale、無法跨數量級。LinUCB 是唯一樣本需求落在 cluster 一週能產生的量級內的方法。
+關鍵 insight：**throughput 是真實 reward signal 的硬上限**，加機器只能線性 scale、無法跨數量級。D-LinUCB 是唯一樣本需求落在 cluster 一週能產生的量級內、且原生處理 non-stationarity 的方法。
 
 ### 引用文獻
 
-- Li, L., Chu, W., Langford, J., & Schapire, R., "A Contextual-Bandit Approach to Personalized News Article Recommendation", **WWW 2010** — LinUCB 原始論文。
-- Auer, P., Cesa-Bianchi, N., & Fischer, P., "Finite-time Analysis of the Multiarmed Bandit Problem", **Machine Learning 47, 2002** — UCB1 base，M9 sublinear regret 結果的理論依據，LinUCB 在 contextual setting 的延伸。
-- Riquelme, C., Tucker, G., & Snoek, J., "Deep Bayesian Bandits Showdown", **ICLR 2018** — Neural-LinUCB / Bayesian linear regression 對照組，量化 NN-bandit 在 small-data regime 的劣勢。
-- Krishnaswamy, V. et al., "Application-Aware Network Management with Contextual Bandits", **NSDI 2023** — LinUCB 在 systems setting 部署範本，可借 reward shaping / context engineering 細節。
+**主方法（D-LinUCB）**
+- Russac, Y., Vernade, C., & Cappé, O., "Weighted Linear Bandits for Non-Stationary Environments", **NeurIPS 2019** — D-LinUCB 原始論文，sliding-window 跟 discount factor 兩種非平穩處理的統一框架。
+- Cheung, W. C., Simchi-Levi, D., & Zhu, R., "Hedging the Drift: Learning to Optimize under Non-Stationarity", **NeurIPS 2019** — sliding-window LinUCB 並列工作，可同時引以證明非平穩 bandit 在 2019 已成獨立研究分支。
+
+**基礎引用（thesis 必引）**
+- Li, L., Chu, W., Langford, J., & Schapire, R., "A Contextual-Bandit Approach to Personalized News Article Recommendation", **WWW 2010** — LinUCB 原始論文，D-LinUCB 的退化形式。
+- Auer, P., Cesa-Bianchi, N., & Fischer, P., "Finite-time Analysis of the Multiarmed Bandit Problem", **Machine Learning 47, 2002** — UCB1 base，M9 sublinear regret 結果的理論依據。
+
+**對照組 / ablation 文獻**
+- Zhou, D., Li, L., & Gu, Q., "Neural Contextual Bandits with UCB-based Exploration", **ICML 2020** — NeuralUCB，若 thesis 加 ablation 用此引用。
+- Ban, Y., & He, J., "EE-Net: Exploitation-Exploration Neural Networks in Contextual Bandits", **KDD 2022** — 雙網路 contextual bandit，列為未採用方法的 baseline。
+- Krishnaswamy, V. et al., "Application-Aware Network Management with Contextual Bandits", **NSDI 2023** — LinUCB 在 systems setting 部署範本，借 reward shaping / context engineering 細節。
+
+**系統 baseline（non-ML 對照）**
+- Zheng, P. et al., "Shockwave: Fair and Efficient Cluster Scheduling for Dynamic Adaptation", **NSDI 2023** — market-based scheduling，明確處理 dynamic workload，是 D-LinUCB 的非 ML 對照。
+- Jayaram Subramanya, S. et al., "Sia: Heterogeneity-aware, Goodput-Optimized ML-cluster Scheduling", **SOSP 2023** — 異構 GPU 自動配對，跟 M5 + M10-4 mps_fit 重疊。
 
 ### 期望結論
 
