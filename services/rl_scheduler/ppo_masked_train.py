@@ -127,6 +127,10 @@ def main(argv=None) -> int:
     p.add_argument("--no-subproc", action="store_true")
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--norm-reward", action="store_true",
+                   help="enable VecNormalize reward normalisation "
+                        "(default: off — for jct_aligned reward we want "
+                        "raw signal so big completions aren't clipped)")
     args = p.parse_args(argv)
 
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -149,8 +153,10 @@ def main(argv=None) -> int:
     ]
     vec_cls = DummyVecEnv if args.no_subproc else SubprocVecEnv
     vec_env = vec_cls(env_fns)
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True,
-                           clip_obs=10.0, clip_reward=10.0)
+    vec_env = VecNormalize(vec_env, norm_obs=True,
+                           norm_reward=args.norm_reward,
+                           clip_obs=10.0,
+                           clip_reward=10.0 if args.norm_reward else 1e9)
 
     model = MaskablePPO(
         "MlpPolicy",

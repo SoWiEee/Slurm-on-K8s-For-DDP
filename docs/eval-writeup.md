@@ -672,3 +672,62 @@ RUN=$(ls -dt runs/m11_mppo_* | head -1)
 - `runs/m11_mppo_20260512-161346/policy.zip` + `vecnormalize.pkl`
 - `runs/m11_mppo_20260512-161346/eval_log.csv`（訓練曲線）
 - `runs/m11_mppo_20260512-161346/paired_eval_contention.csv`（C.4 原始）
+
+## D. M11 Phase B/C — Stage 2: JCT-aligned reward redesign（2026-05-12）
+
+### D.1 動機
+
+§C 的負結果中，H1 假設 wait-proxy reward 與 JCT 不對齊。Stage 2 重新設計 reward
+為 JCT-aligned（每個 job 完成時給 `-jct / scale`，episode 結束對 pending 也扣
+分），並關掉 `VecNormalize.norm_reward` 以免大數值被 `clip_reward=10` 截斷。
+
+具體改動：
+- `sim/gym_env.py`：新增 `reward_mode={"jct_aligned","wait_proxy"}`，default 設為 jct_aligned
+- `services/rl_scheduler/ppo_masked_train.py`：新增 `--norm-reward` flag（default off）；
+  off 時 `clip_reward=1e9`，避免 episode-end 大型負獎勵被截掉
+
+### D.2 訓練曲線
+
+`runs/m11_mppo_20260512-185937/eval_log.csv`（單一 eval seed=999）
+
+| step  | ppo_jct  | score_jct | ratio  |
+|-------|----------|-----------|--------|
+| 25k   | 20828    | 16431     | 1.268  |
+| 125k  | 12182    | 16431     | 0.741  |
+| 250k  | 50269    | 16431     | 3.059  |
+| 375k  | 9351     | 16431     | 0.569  |
+| 500k  | **7561** | 16431     | **0.460** |
+
+callback eval 跡象很漂亮：final step PPO 平均 JCT 是 score 的 46%。
+
+### D.3 但 paired-CI 拆穿單一 seed 的假象
+
+3 family × 5 seeds × 4 schedulers，`runs/m11_mppo_20260512-185937/`：
+
+**philly**（訓練 family）：
+| baseline    | Δ vs ppo | 95% CI               | sig |
+|-------------|----------|----------------------|-----|
+| fcfs        | -27924   | [-42435, -13414]     | *** |
+| multifactor | -7448    | [-28941, +14044]     |     |
+| score       | -7849    | [-28962, +13264]     |     |
+
+PPO 顯著輸給 fcfs，與 multifactor/score 統計上 tie。
+
+**burst / ali**（OOD families）：
+
+ali 上 5 個 seeds 內出現 1 個 NaN（episode 撞 max_steps）+ 2 個災難（138k、198k
+JCT），整個 paired-CI 算出 NaN。burst 上 PPO 普遍輸但 high variance。
+
+### D.4 結論：reward 對齊 ≠ generalization
+
+- 單一 callback eval seed=999 完全誤導 — 看起來贏 54%，paired-CI 顯示其實 in-distribution
+  就在輸（philly），OOD 直接崩潰（ali）。
+- 改 reward 沒解決根本問題：state 觀測沒有長期 horizon 資訊（job runtime 分佈、
+  到達率），policy 容易過擬合到訓練 trace 的偶然結構。
+- 教訓：**RL eval 必須 paired multi-seed，single-seed callback 完全不可信**。
+
+### D.5 立場
+
+把 stage 2 結果寫進論文當作對 §C H1 的 ablation：reward 不是主要瓶頸，state 設計
+與 trace generalization 才是。下一步應該換 state（加 trace summary features）或
+跨 family 訓練（domain randomization），而不是繼續調 reward。

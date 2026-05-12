@@ -120,6 +120,8 @@ class KubefluxSchedEnv:
         mps_per_gpu: int = MPS_PER_GPU,
         top_k: int = TOP_K,
         max_steps: int = 50_000,
+        reward_mode: str = "jct_aligned",  # "jct_aligned" or "wait_proxy"
+        reward_scale: float = 1000.0,
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed in this venv")
@@ -129,6 +131,10 @@ class KubefluxSchedEnv:
         self.mps_per_gpu = mps_per_gpu
         self.top_k = top_k
         self.max_steps = max_steps
+        if reward_mode not in ("jct_aligned", "wait_proxy"):
+            raise ValueError(f"reward_mode={reward_mode!r}")
+        self.reward_mode = reward_mode
+        self.reward_scale = float(reward_scale)
         self._step_count = 0
         self._state: Optional[_RunState] = None
 
@@ -207,14 +213,34 @@ class KubefluxSchedEnv:
 
         self._advance_to_decision()
 
-        # Dense reward: increase in summed pending wait time
-        wait_accum = sum(max(0.0, st.now - j.submit_ts) for j in st.pending)
-        dwait = wait_accum - st.wait_accum_prev
-        st.wait_accum_prev = wait_accum
-        reward = -dwait / 1000.0 + reward_action + st.completion_reward
-
         terminated = (st.completed >= st.n_jobs) and not st.events
         truncated = self._step_count >= self.max_steps
+
+        # ---- Reward ------------------------------------------------------
+        # jct_aligned: per-completion bonus = -JCT/scale; at episode end,
+        #   charge each still-pending job as if its JCT continues to now
+        #   (and each unsubmitted future job as if it's lost). Sum-of-reward
+        #   == -sum(JCT-equivalent)/scale, monotone with the eval metric.
+        # wait_proxy: legacy -Δwait/1000 + -log(slowdown) (kept for A/B).
+        if self.reward_mode == "jct_aligned":
+            # _on_job_end already pushed -jct/scale into st.completion_reward
+            # via the helper below; here just settle truncation/term cost.
+            end_charge = 0.0
+            if terminated or truncated:
+                for j in st.pending:
+                    end_charge -= (st.now - j.submit_ts) / self.reward_scale
+                # Unsubmitted future jobs (events still in heap with kind=submit)
+                if truncated:
+                    for (t_ev, _s, kind, payload) in st.events:
+                        if kind == "submit":
+                            j = st.by_id[payload]
+                            end_charge -= max(0.0, st.now - j.submit_ts) / self.reward_scale
+            reward = reward_action + st.completion_reward + end_charge
+        else:  # wait_proxy (legacy)
+            wait_accum = sum(max(0.0, st.now - j.submit_ts) for j in st.pending)
+            dwait = wait_accum - st.wait_accum_prev
+            st.wait_accum_prev = wait_accum
+            reward = -dwait / 1000.0 + reward_action + st.completion_reward
         obs = self._build_obs()
         info = {
             "now": st.now,
@@ -261,11 +287,13 @@ class KubefluxSchedEnv:
         j = st.by_id[jid]
         jct = st.now - j.submit_ts
         st.jct_sum += jct
-        # Slowdown bonus: r = -log(JCT / runtime). Perfect (JCT == runtime) → 0;
-        # 2× slowdown → -0.69; 10× → -2.30. Clip to keep gradients stable.
-        runtime = max(1.0, j.runtime)
-        slowdown = max(1.0, jct / runtime)
-        st.completion_reward += -math.log(slowdown)
+        if self.reward_mode == "jct_aligned":
+            # JCT-aligned dense reward: sum over episode = -sum(JCT)/scale.
+            st.completion_reward += -jct / self.reward_scale
+        else:  # wait_proxy legacy
+            runtime = max(1.0, j.runtime)
+            slowdown = max(1.0, jct / runtime)
+            st.completion_reward += -math.log(slowdown)
 
     def _build_obs(self) -> np.ndarray:
         st = self._state
