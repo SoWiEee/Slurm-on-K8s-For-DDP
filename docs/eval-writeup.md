@@ -807,6 +807,54 @@ reward 是大負數，policy 的 value head 學到的都是大負數；`entropy=
 job → 永遠 boost=0 → score scheduler 全程主導。這是 high-entropy uniform policy
 的典型 failure mode。
 
+### E.3a 為什麼 live shadow 沒有 JCT 數字比較
+
+Live shadow mode 設計就是 **不改 priority**（boost=0），所以 score 與 RL 看到的
+cluster state、job 順序、completion 順序完全一樣 → JCT 差 = 0（trivially）。本次
+workload 也刻意輕：
+
+- 提交 30+ 個 `sbatch --wrap='sleep 2|3|5'` jobs，所有特徵相同
+- live cluster 當下只有 1 個 CPU worker active（GPU pools 0 nodes），沒
+  contention 可以 expose schedule order 差異
+- shadow log 上 `score=0.5000 delta=500` 對每筆都一樣，因為 sleep job 沒 mps/vram
+
+因此 live shadow 唯一給出的數字是 **decision 行為**（abstain / no-boost /
+selected_id），不是 JCT outcome。
+
+真正的 score vs RL JCT 數字在 §C.4 / §D.3 的 sim paired-CI（受控、可重現、5-seed），
+為了方便對照把兩張表並排放在這裡：
+
+**Stage 1（wait-proxy reward, 500k steps）— §C.4，5-seed mean JCT (s)**
+
+| Family | FCFS  | Multifactor | Score      | **PPO** | Δ(score−ppo) | sig |
+|--------|------:|------------:|-----------:|--------:|-------------:|:---:|
+| philly | 22195 |       42671 |  **42271** |   89462 |       −47191 | *** |
+| burst  | 50746 |   **36142** |      37548 |   80114 |       −42566 | *** |
+| ali    |  6600 |    **2944** |       2958 |   24115 |       −21157 | *** |
+
+**Stage 2（JCT-aligned reward, 500k steps）— §D.3，5-seed mean JCT (s)**
+
+| Family | FCFS  | Multifactor | Score      | **PPO**     | Δ(score−ppo) | 95% CI            |
+|--------|------:|------------:|-----------:|------------:|-------------:|:------------------|
+| philly | 22195 |       42671 |  **42271** |       50120 |        −7849 | [−28962, +13264]  |
+| burst  | 50746 |   **36142** |      37548 |       73841 |       −36293 | [−111333, +38747] |
+| ali    |  6600 |    **2944** |       2958 | NaN (爆炸)  |          NaN | —                 |
+
+（PPO column 是 5 seeds 的 mean；philly 的 5 個 raw seed JCT 是 26528 / 46386 /
+52867 / 93546 / 31273；burst 是 174990 / 70987 / 42027 / 34544 / 46655；ali 5 seeds
+有 1 個 NaN + 2 個 >138000 → 整列 NaN）
+
+讀法：
+
+- **數值越小越好**（JCT mean，單位 seconds）
+- Stage 1：score 全面贏 PPO，3 個 family 上的差距都統計顯著（***）
+- Stage 2：JCT-aligned reward 讓 single-seed callback eval 看起來好（philly seed=999
+  ratio=0.46），但 5-seed paired-CI 拆穿 — philly 上 PPO 仍輸 score Δ=−7849
+  （CI 跨 0，沒到顯著），burst 上 PPO 平均輸 36k 但 CI 寬到跨 0，ali 直接 NaN
+- **Bottom line**：score scheduler 在 sim 上對所有 family 都 ≥ PPO，差距在 philly
+  最小（~8k 秒）、ali 最大（PPO 崩潰）。Live shadow 階段的 100% abstain / no-boost
+  跟這個 sim 結論完全 consistent — policy 本來就還不能 deploy
+
 ### E.4 Phase D 驗收
 
 `docs/m11_phase_d/` 下有完整 artifact：
