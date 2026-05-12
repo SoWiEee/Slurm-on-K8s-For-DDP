@@ -199,7 +199,19 @@ bash eval/scripts/run_e7_live.sh vendor
 M11 把 M3 score function 換成 sim-trained MaskablePPO policy，並用 lua hook
 在 live cluster 跑 shadow mode 收 decision log。**Honest negative result**：sim
 上 score 全面贏 PPO（philly Δ=−7849、burst Δ=−36293、ali NaN），詳見
-`docs/eval-writeup.md §C–§E`。以下命令會把整個 pipeline 從零跑一次。
+`docs/eval-writeup.md §C–§E`。
+
+**一鍵執行**（venv 自動建、stages 自由選）：
+
+```bash
+bash scripts/run-m11-experiment.sh                  # B + C + D 全跑
+STAGES=B bash scripts/run-m11-experiment.sh         # 只訓練 + paired-CI
+STAGES=C bash scripts/run-m11-experiment.sh         # serve / lua / rlpd smoke
+STAGES=D SKIP_BUILD=1 bash scripts/run-m11-experiment.sh  # live shadow，重用既有 image
+# 其他旋鈕：TOTAL_STEPS / N_JOBS / N_NODES / GPUS_PER_NODE / TRACE_FAMILY / SEEDS
+```
+
+以下是腳本拆解的逐 phase 命令（懂手動跑時參考）：
 
 ```bash
 # 一次性：建 M11 專用 venv
