@@ -715,8 +715,8 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ✅ |
 | M8 | Evaluation：JCT / utilization / makespan / fairness | §9.5 | 7 天 | ✅ |
 | M9 | Contextual bandit / PPO weight tuning | §7.5 | 10 天 | ✅ LinUCB only |
-| M10 | Score function 後續優化（horizon auto-tune、刪 γ、修 mps_fit、age boost、M7 suspend+resume、predictor quantile）| §M10 | 3–4 週 | ⬜ 規劃中 |
-| M11 ★ | Live contextual bandit：D-LinUCB 取代 M9 UCB1，引入 cluster state context + non-stationary discount + heuristic safety net | §M11 | 2 週 | ⬜ 規劃中 |
+| **M11 ★** | **Deep RL scheduler：sim-trained PPO + Sim2Real fine-tune（hierarchical：DRL inner loop + D-LinUCB outer-loop weight tuning）— 指導教授要求，優先做** | §M11 | 5–6 週 | 🟡 進行中（next）|
+| M10 | Score function 後續優化（horizon auto-tune、刪 γ、修 mps_fit、age boost、M7 suspend+resume、predictor quantile）| §M10 | 3–4 週 | ⬜ 延後（M11 之後） |
 
 ## M1：Slurm 內建調度旋鈕
 
@@ -1218,157 +1218,217 @@ M8/M9 跑完後重新審視 `docs/scheduler-score-spec.md`，列出 11 個可優
 - M7 從「flat negative result」升級成「我們找到讓 M7 work 的條件」→ §4.4 / §9 future work 第一條改寫成「已實作」。
 - Predictor 從 point estimate 升級成 distribution-aware → §5.5 condition 1 改成 robustness statement（即使 workload 跨度不大，confidence-weighted scheduling 仍能保守降權 not actively harm）。
 
-## M11 ★：Live contextual bandit（D-LinUCB，規劃中，M10 後接續）
+## M11 ★：Deep RL scheduler（規劃中，**M10 之前優先做**）
 
-M9 的 UCB1 是 context-free bandit——把所有 cluster state 平均掉，只學「全域最好的權重組」。M9 sim 結果顯示這個假設在 stationary workload 上 OK，但 **live cluster 上 queue depth / fragmentation index / predictor confidence 會隨時間漂移**，最佳權重應該隨之改變。M11 採用 **D-LinUCB**（Russac et al. NeurIPS 2019）——discounted LinUCB，把舊樣本指數衰減，直接針對非平穩環境設計。
+> **優先序變更（2026-05-12）**：指導教授要求 RL/DRL 路線優先，M11 提前於 M10。M10（公式清理 + M7 suspend+resume + predictor quantile）改成 M11 完成後再回頭做，因為 M11 一旦讓 DRL policy 取代手寫公式，M10 的部分清理項（M10-1 horizon、M10-2 刪 γ、M10-4 修 mps_fit、M10-6 age boost）可能直接被 policy 學會、不需手動改公式。
 
-選 D-LinUCB 而不是 vanilla LinUCB / Neural-LinUCB / CQL / DRL 的理由寫在後面「替代方法分析」。簡言之：vanilla LinUCB 假設 θ 不變、漂移時持續挑爛 action；D-LinUCB 改一行 update rule 即可拿到 non-stationary robustness，且樣本需求（~300–500 jobs）落在碩論時程內收得到 paired CI 的量級。
+指導教授要求採用 RL/DRL 路線。M9 的 UCB1 / 原規劃的 D-LinUCB 都是 bandit——只決定「權重組合」、不決定「下一個跑哪個 job」。M11 升級成 **deep RL scheduler**：DRL policy 直接學排程決策本身（policy 輸出 = top-K queue 中下一個 schedule 的 job），把 M3 score function 從「固定形式 + 學權重」變成「learned policy 取代手寫公式」。
 
-### 設計
+考慮到小叢集樣本量（一天 ~200 jobs）遠低於 online DRL 需求（10⁵–10⁶ episode），M11 採取 **sim-trained PPO + Sim2Real fine-tune** 三段式設計，並保留 D-LinUCB 作為 outer-loop weight tuner / fallback baseline（hierarchical 結構）。
 
-**Context vector** `x ∈ ℝᵈ`，d=8：
-1. queue 長度（log scale）
-2. queue 中平均 `mps_req` / `mps_per_node`
-3. queue 中 job mix entropy（gpu_type 分佈熵）
-4. cluster fragmentation index（free MPS stddev / mean）
-5. predictor service p50 / p90 ratio（confidence proxy）
-6. 過去 1h 平均 backfill rate
-7. 過去 1h 平均 requeue cost
-8. bias term = 1.0
+### 為什麼選這個路徑
 
-**Action space**：4 個離散權重組（沿用 M9 的 grid）+ default，共 5 個 arms。
+直接在 live cluster 跑 online DRL 在小叢集不可行——樣本量級差 3 個數量級。三段式設計避開這個瓶頸：
 
-**Reward**：job 結束時計算 `r = -normalized_JCT_delta_vs_default`，其中 default 由 shadow simulator 同 trace 算出來（用 M8 sim infrastructure，0 額外 cluster 成本）。
+1. **Phase 1（sim 訓練）**：Gymnasium wrapper 包 `sim/runner.py`，PPO 跑 10⁵–10⁶ episode 拿到 sim-optimal policy。Sim throughput 不受 wall-clock 限制。
+2. **Phase 2（Sim2Real fine-tune）**：sim policy deploy 到 live cluster，用 RLPD（Ball ICML 2023）混合 sim trajectory（offline）+ live trajectory（online）持續 fine-tune。RLPD 在 ~10³ live samples 級別已能 close sim-to-real gap。
+3. **Phase 3（hierarchical 整合）**：外層 D-LinUCB 在小時尺度調 (α, β, δ, ε) 4 個 reward shaping 超參，內層 DRL 在 per-decision 尺度排程。**這是 M11 的學術新意所在**。
 
-**更新規則 — D-LinUCB**（每個 job 結束觸發）：
+「Decima inspired but adapted to small cluster」是論文章節最自然的 framing。
+
+### MDP 設計
+
+**State**（observation space）：permutation-invariant encoding of pending queue + cluster
+- Top-K=16 pending jobs，每個 job 11 維 feature：`[mps_req/N, gpu_count, gpu_type_onehot(4), runtime_pred_log, wait_time_log, age_log, deadline_remaining, retry_count]`
+- 每個 worker node：`[free_mps/N, free_vram/N, running_job_count]`
+- 全域：`[queue_len_log, predictor_spread, fragmentation_index, time_of_day_sin/cos]`
+- Padding mask 處理 queue < K 情況
+
+**Action**：discrete head over top-K + no-op
+- `a ∈ {schedule_job_1, ..., schedule_job_K, no_op}`
+- no-op 在所有 K job 都 blocked 時 emit，等下個 timestep
+- M11 v1 不直接做 preemption decision；preemption 留給未來的 M12（migration / 優先 preemption）
+- M11 v2（可選）擴成 multi-head 加 preempt action
+
+**Reward**：dense + sparse 混合
+- 每個 timestep：`r_t = -ΔΣ(wait_time_pending) / 1000`（pending wait 累積懲罰）
+- Job 完成時：`r_done = -log(JCT / pred_runtime)`（slowdown 懲罰，跟 M8 metric 對齊）
+- Discount γ_rl = 0.99
+
+**Episode 邊界**：sim 一條 trace（philly/burst/ali 各 ~500 jobs）= 一個 episode；live 用 4 小時 sliding window 切 episode boundary
+
+### Policy / Value 架構
+
 ```
-A_a ← γ · A_a + x xᵀ + (1-γ) · λI       # discount factor γ ∈ (0,1]
-b_a ← γ · b_a + r · x
-θ̂_a ← A_a⁻¹ b_a
+JobEncoder(MLP 11 → 64)  ── for each of K pending jobs
+        ↓
+Mean-Pool 或 Set-Attention  ── permutation-invariant
+        ↓                    (v1 mean-pool，v2 self-attention)
+NodeEncoder(MLP 3 → 32)  ── for each node
+        ↓
+Concat + GlobalFeat (5 dims)
+        ↓
+Trunk(MLP 256 → 128)
+        ↓                    ↓
+Policy head             Value head
+(K+1 logits, masked)    (V(s) scalar)
 ```
-- γ=1.0 退化成 vanilla LinUCB；γ<1 把舊樣本指數衰減，effective window ≈ 1/(1-γ)
-- 預設 γ=0.99，effective window ~100 samples（≈ live cluster 一天 throughput），落在 workload 日週期的尺度內
-- λ=1.0（ridge regularization），A_a 初始 = λI
-- closed-form 無 gradient descent
 
-**Action selection**（D-LinUCB confidence bound）：
-```
-UCB(a, x) = θ̂_aᵀ x + α(t) · √(xᵀ A_a⁻¹ V_a A_a⁻¹ x)
-```
-其中 V_a = Σ γ^(2(t-s)) x_s x_sᵀ 是「discount 變異數」accumulator，比 vanilla LinUCB 的 bound 緊。α(t) 從 1.0 開始，每 100 jobs 衰減 0.95。詳細推導見 Russac et al. NeurIPS 2019 Theorem 1。
+~80k 參數，比 Decima GNN encoder 小一個量級。Mean-pool 對 K=16 queue 已足夠（小叢集 queue 通常 < 50），Set Transformer 留 v2 ablation。
+
+引用：
+- Zaheer, M. et al. "Deep Sets", **NeurIPS 2017** — permutation-invariant encoder 理論基礎。
+- Lee, J. et al. "Set Transformer", **ICML 2019** — v2 attention encoder reference。
+- Vinyals, O. et al. "Pointer Networks", **NeurIPS 2015** — variable-length 候選集合 action 範本。
+
+### 訓練演算法
+
+**Phase 1 — Sim PPO**（Schulman 2017）
+- 4 parallel sim env、batch=2048、minibatch=256、4 epoch per update
+- LR=3e-4 cosine decay、entropy coef=0.01
+- Target：10⁵ episode ≈ 4–6 GPU 小時（第二台機器跑剛好）
+
+**Phase 2 — Sim2Real Fine-tune（RLPD，Ball ICML 2023）**
+- 50% offline minibatch（sim trajectory replay）+ 50% online minibatch（live trajectory）
+- SAC-style critic + 同 policy 架構
+- LayerNorm + 高 UTD ratio（update-to-data=20）是 RLPD 關鍵
+- 預期 ~500 live samples 即可看到 fine-tune 收斂
+
+**Phase 3 — Hierarchical 整合**
+- 外層 D-LinUCB 跑 reward shaping coefficient（β1, β2, β3 分別 weight pending wait penalty、slowdown penalty、resource utilization bonus）
+- 內層 DRL 用當前 coefficient 算 reward、PPO update
+- 外層每 ~100 jobs update 一次（小時尺度），內層 per-decision
+- 引用：Pateria, S. et al. "Hierarchical Reinforcement Learning: A Comprehensive Survey", **ACM Computing Surveys 2021**；Nachum, O. et al. "Data-Efficient HRL" (HIRO), **NeurIPS 2018**
 
 ### 實作位置
 
 ```
-services/weight_tuner/
-  bandit.py        # 新增 LinUCBBandit class，跟 UCB1Bandit 平行
-  context.py       # 新檔，build_context(cluster_state) → np.ndarray
-  state_store.py   # 新檔，持久化 {A_a, b_a} 到 ConfigMap（survive pod restart）
-  app.py           # FastAPI endpoint /select_weights, /update_reward
+sim/gym_env.py                 # 新檔：gym.Env wrapper for runner.py
+                                #   reset(), step(action), spaces, info
+services/rl_scheduler/
+  policy.py                    # DRL policy + value network (PyTorch)
+  ppo_train.py                 # sim training script
+  rlpd_finetune.py             # Sim2Real fine-tune
+  serve.py                     # FastAPI /select_action endpoint
+  state_store.py               # checkpoint policy weights to PVC
+services/weight_tuner/         # 沿用 M9 + 加 D-LinUCB（外層 reward shaping）
+chart/templates/rl-scheduler.yaml          # 新 Deployment (GPU=1 inference)
+chart/templates/configmap-job-submit.yaml  # lua 改 call /select_action
 ```
 
-Slurm 側：`job_submit.lua` 開頭 HTTP GET `/select_weights`（已有 predictor 整合範本），job epilog 走新 hook 回呼 `/update_reward`。
+Slurm 側：原本的 score function 變 fallback path。`job_submit.lua` 在 backfill 階段呼叫 RL serve endpoint 拿 action；endpoint timeout 或 confidence 低時 fallback 回 M3 score scheduler。
 
-### Hybrid 設計：LinUCB + heuristic safety net
-
-純 bandit 在 live cluster 部署有兩個 failure mode：(1) cold-start 期前 ~50 jobs 的 exploration 拿到極端 action；(2) workload distribution 漂移時 stale θ̂ 持續推爛權重。M11 內建一個 heuristic guardrail，避免上述狀況拖累 live JCT。
-
-**Guardrail 規則**（在 `LinUCBBandit.select()` 外面包一層）：
-
-```python
-def select_with_guardrail(self, x, cluster_state):
-    a_ucb = self.linucb_select(x)
-    a_default = DEFAULT_WEIGHTS
-
-    # Rule 1: shadow JCT estimate（用 M8 sim 抽樣 ~5 jobs）
-    est_jct_ucb = shadow_eval(a_ucb, cluster_state, n=5)
-    est_jct_def = shadow_eval(a_default, cluster_state, n=5)
-    if est_jct_ucb > 1.30 * est_jct_def:
-        return a_default, "fallback:est_jct_regression"
-
-    # Rule 2: queue empty 時 bandit 沒意義
-    if cluster_state.queue_len < 3:
-        return a_default, "fallback:queue_too_small"
-
-    # Rule 3: predictor confidence 太低時降權重 ε
-    if cluster_state.predictor_spread > 2.0:  # p90/p50 ratio
-        a_ucb = a_ucb._replace(epsilon=a_ucb.epsilon * 0.5)
-
-    # Rule 4: 連續 N 次 cold-start exploration 後強制 cooldown
-    if self.exploration_streak > 20:
-        self.exploration_streak = 0
-        return a_default, "fallback:cooldown"
-
-    return a_ucb, "linucb"
-```
-
-**Telemetry**：每次決策 emit `bandit_decision` JSON line（action、是否 fallback、reason），跟 operator JsonLogger 同 channel。M8 evaluation script 自動 aggregate fallback rate。
-
-**驗證指標**：fallback rate 在收斂期應 < 5%；高 fallback rate = LinUCB 學壞訊號，需要重看 reward shaping。
-
-引用：
-- Bouneffouf, D., Rish, I., & Aggarwal, C., "Survey on Applications of Multi-Armed and Contextual Bandits", **IEEE CIM 2020** — 工業界部署 contextual bandit 的 safety / fallback pattern 整理。
-- Krishnaswamy et al. **NSDI 2023**（前述）— systems setting 用 shadow eval 守住 learning component 的具體案例。
-
-### Deployment 規劃
+### 部署規劃
 
 | 階段 | 內容 | 時程 |
 |---|---|---|
-| Phase A | LinUCBBandit + context vector + state_store 實作 + unit tests | 3 天 |
-| Phase B | sim 整合：用 `sim/runner.py` 驗證 LinUCB regret < UCB1 | 2 天 |
-| Phase C | 機 A（k3s）部署 + shadow-mode 1 天（不真實改權重，只 log decision） | 1 天 |
-| Phase D | 兩 partition A/B：`score-linucb` vs `score-default`，同 trace replay 5 天 | 5 天 |
-| Phase E | 第二台機器加入後跑 paired same-seed CI（兩台機各跑一個 arm） | 3 天 |
+| Phase A | Gymnasium wrapper（`sim/gym_env.py`），unit tests 驗證 spec 一致 | 1 週 |
+| Phase B | PPO training pipeline + sim 上 vs fcfs / multifactor / score paired CI | 1.5 週 |
+| Phase C | RLPD fine-tune pipeline + serve endpoint + lua 整合 | 1 週 |
+| Phase D | Shadow-mode 機 A 部署（log RL decision 但不真實採用，比對 score scheduler） | 4 天 |
+| Phase E | Live A/B：兩台機器 score-rl vs score-default partition，paired CI | 1 週 |
+| Phase F | Hierarchical 加 D-LinUCB outer loop + ablation | 5 天 |
 
-兩台機器設定：trace 同步 replay（用 M8 `eval/scripts/run_e7_live.sh` 同 seed），機 A 跑 LinUCB、機 B 跑 default，收同樣 50 jobs 後算 paired CI。
+總工期 5–6 週。比 D-LinUCB-only 路線（2 週）長，但學術 contribution 高一個量級。
 
-### 替代方法分析（為什麼是 D-LinUCB 不是其他）
+### Safety net
+
+DRL inference 包同樣 guardrail wrapper：
+
+```python
+def select_with_guardrail(obs, cluster_state):
+    a_rl, v_rl = rl_policy(obs)
+
+    # Rule 1: value head 估計過低 → fallback score
+    if v_rl < V_THRESHOLD:
+        return score_scheduler_action(cluster_state), "fallback:low_value"
+
+    # Rule 2: policy entropy 過高（不確定） → fallback
+    if policy_entropy(obs) > ENTROPY_THRESHOLD:
+        return score_scheduler_action(cluster_state), "fallback:high_entropy"
+
+    # Rule 3: queue < 3 不需 RL
+    if cluster_state.queue_len < 3:
+        return score_scheduler_action(cluster_state), "fallback:queue_too_small"
+
+    # Rule 4: serve endpoint timeout (lua side: HTTP timeout 200ms → fallback)
+
+    return a_rl, "rl"
+```
+
+Fallback rate 目標 < 10%（RL 比 bandit 更難一次學好，閾值放寬）。
+
+引用：
+- Bouneffouf, D., Rish, I., & Aggarwal, C., "Survey on Applications of Multi-Armed and Contextual Bandits", **IEEE CIM 2020** — learning component 的 safety / fallback pattern 整理。
+- Krishnaswamy, V. et al. **NSDI 2023** — systems setting 用 shadow eval 守住 learning component 的具體案例。
+
+### 替代方法分析（為什麼是 PPO + RLPD）
 
 | 方法 | 樣本需求 | 1–2 機可行 | 主風險 | 採用 |
 |---|---|:---:|---|:---:|
-| **D-LinUCB（Russac NeurIPS 2019）** | ~300–500 jobs | ✅ 2–3 天 | 線性假設失敗時退化成 UCB1，可控；γ 設太小會 forget 過快 | ✅ |
-| vanilla LinUCB（Li WWW 2010） | ~300–500 jobs | ✅ | workload 漂移時持續 fit stale θ̂ | ❌（D-LinUCB superset） |
-| NeuralUCB（Zhou ICML 2020） | ~1k–2k jobs | ⚠️ 2–3 週 | NN cold-start 期間比 D-LinUCB 還差 | ❌（thesis ablation 可選） |
-| EE-Net（Ban & He KDD 2022） | ~2k–5k jobs | ⚠️ 4–6 週 | 雙網路設計，hyperparam tuning 重 | ❌ |
-| CQL offline RL（Kumar NeurIPS 2020） | ~10⁴ transitions | ⚠️ 訓得起來但 deploy 不確定贏 | M8 已證 sim-to-live distribution shift 嚴重 | ❌（留 future work）|
-| IQL（Kostrikov ICLR 2022） | ~10⁴ transitions | ⚠️ 同上但實作簡單 | 同上 | ❌（留 future work）|
-| Online DRL（PPO/SAC）live 訓練 | ~10⁵–10⁶ episodes | ❌ | exploration 期 JCT 爆炸 | ❌ |
-| Sim-trained DRL（Gymnasium wrapper） | sim 充足、live 不確定 | ⚠️ sim 跑得起來 | sim-to-real gap（M7 案例已示警） | ❌（留 future work）|
+| **Sim-PPO + RLPD fine-tune** | sim 10⁵ + live ~500 | ✅ 5–6 週 | sim-to-real gap、reward shaping 工 | ✅ 主軸 |
+| **D-LinUCB（Russac NeurIPS 2019）** | ~300–500 jobs | ✅ 2 週 | 只調權重、不直接學 policy | ✅ Phase F outer-loop / baseline 對照 |
+| Decima 原版 GNN（Mao SIGCOMM 2019） | 10⁵ episode | ✅ sim 內 | DAG-aware 設計過剩（我們無 DAG） | ❌（簡化版 inspired） |
+| DreamerV3 model-based | ~10³–10⁴ live | ⚠️ 需學 world model | world model 學歪 policy 跟著歪 | ❌（Phase B 後備） |
+| IQL / ReBRAC offline-only | ~10⁴ transitions | ⚠️ 訓得起來 | dataset 蓋天花板 | ❌（baseline 對照） |
+| Pure online PPO/SAC live | ~10⁵–10⁶ episodes | ❌ | exploration 期 JCT 爆炸 | ❌ |
+| Decision Transformer | ~10⁴ transitions | ⚠️ sequence-modeling 路線 | systems setting 尚無強案例 | ❌（future work） |
+| Online D-LinUCB only | ~300–500 jobs | ✅ | 只調權重，policy 仍是手寫公式 | ❌（被主軸 superset） |
 
-關鍵 insight：**throughput 是真實 reward signal 的硬上限**，加機器只能線性 scale、無法跨數量級。D-LinUCB 是唯一樣本需求落在 cluster 一週能產生的量級內、且原生處理 non-stationarity 的方法。
+關鍵 insight：**sim 提供「廉價但有 bias 的 reward signal」、live 提供「貴但 unbiased 的 reward signal」**，RLPD 用 ratio mixing 整合兩者，是 2023 之後 sim-to-real 的主流範式，跟 Kubeflux「sim 已存在、live 樣本稀少」的 setting 天然契合。
 
 ### 引用文獻
 
-**主方法（D-LinUCB）**
-- Russac, Y., Vernade, C., & Cappé, O., "Weighted Linear Bandits for Non-Stationary Environments", **NeurIPS 2019** — D-LinUCB 原始論文，sliding-window 跟 discount factor 兩種非平穩處理的統一框架。
-- Cheung, W. C., Simchi-Levi, D., & Zhu, R., "Hedging the Drift: Learning to Optimize under Non-Stationarity", **NeurIPS 2019** — sliding-window LinUCB 並列工作，可同時引以證明非平穩 bandit 在 2019 已成獨立研究分支。
+**主方法（Sim-trained DRL + Sim2Real）**
+- Schulman, J. et al. "Proximal Policy Optimization Algorithms", **arXiv 2017** — PPO 原始論文。
+- Ball, P. J., Smith, L., Kostrikov, I., & Levine, S. "Efficient Online Reinforcement Learning with Offline Data" (RLPD), **ICML 2023** — Sim2Real fine-tune 主方法。
+- Song, Y. et al. "Hybrid RL: Using Both Offline and Online Data Can Make RL Efficient", **ICLR 2023** — 並列工作，理論分析 hybrid RL sample complexity。
+- Niu, H. et al. "When to Trust Your Simulator: Dynamics-Aware Hybrid Offline-and-Online RL", **NeurIPS 2022** — sim-trust 自適應，RLPD 對照組。
 
-**基礎引用（thesis 必引）**
-- Li, L., Chu, W., Langford, J., & Schapire, R., "A Contextual-Bandit Approach to Personalized News Article Recommendation", **WWW 2010** — LinUCB 原始論文，D-LinUCB 的退化形式。
-- Auer, P., Cesa-Bianchi, N., & Fischer, P., "Finite-time Analysis of the Multiarmed Bandit Problem", **Machine Learning 47, 2002** — UCB1 base，M9 sublinear regret 結果的理論依據。
+**Cluster scheduling DRL 先導工作**
+- Mao, H. et al. "Resource Management with Deep Reinforcement Learning" (DeepRM), **HotNets 2016** — cluster scheduling RL 奠基。
+- Mao, H. et al. "Learning Scheduling Algorithms for Data Processing Clusters" (Decima), **SIGCOMM 2019** — GNN + PPO，M11 架構直接前作。
+- Park, A. et al. "Park: An Open Platform for Learning-Augmented Computer Systems", **NeurIPS 2019** — systems-RL benchmark，含 cluster scheduling environment。
 
-**對照組 / ablation 文獻**
-- Zhou, D., Li, L., & Gu, Q., "Neural Contextual Bandits with UCB-based Exploration", **ICML 2020** — NeuralUCB，若 thesis 加 ablation 用此引用。
-- Ban, Y., & He, J., "EE-Net: Exploitation-Exploration Neural Networks in Contextual Bandits", **KDD 2022** — 雙網路 contextual bandit，列為未採用方法的 baseline。
-- Krishnaswamy, V. et al., "Application-Aware Network Management with Contextual Bandits", **NSDI 2023** — LinUCB 在 systems setting 部署範本，借 reward shaping / context engineering 細節。
+**架構元件**
+- Zaheer, M. et al. "Deep Sets", **NeurIPS 2017**。
+- Lee, J. et al. "Set Transformer", **ICML 2019**。
+- Vinyals, O. et al. "Pointer Networks", **NeurIPS 2015**。
+
+**Hierarchical RL**
+- Pateria, S. et al. "Hierarchical Reinforcement Learning: A Comprehensive Survey", **ACM Computing Surveys 2021**。
+- Nachum, O. et al. "Data-Efficient Hierarchical Reinforcement Learning" (HIRO), **NeurIPS 2018**。
+
+**Outer-loop bandit（D-LinUCB，Phase F）**
+- Russac, Y. et al. "Weighted Linear Bandits for Non-Stationary Environments", **NeurIPS 2019**。
+- Li, L. et al. **WWW 2010**、Auer, P. et al. **Machine Learning 47, 2002** — bandit base citations。
+
+**Offline RL 對照組 / future work**
+- Kostrikov, I. et al. "Offline Reinforcement Learning with Implicit Q-Learning" (IQL), **ICLR 2022**。
+- Tarasov, D. et al. "ReBRAC: Revisiting the Minimalist Approach to Offline RL", **NeurIPS 2023**。
+- Chen, L. et al. "Decision Transformer: Reinforcement Learning via Sequence Modeling", **NeurIPS 2021**。
+- Hafner, D. et al. "Mastering Diverse Domains through World Models" (DreamerV3), **arXiv 2023 / Nature 2025**。
 
 **系統 baseline（non-ML 對照）**
-- Zheng, P. et al., "Shockwave: Fair and Efficient Cluster Scheduling for Dynamic Adaptation", **NSDI 2023** — market-based scheduling，明確處理 dynamic workload，是 D-LinUCB 的非 ML 對照。
-- Jayaram Subramanya, S. et al., "Sia: Heterogeneity-aware, Goodput-Optimized ML-cluster Scheduling", **SOSP 2023** — 異構 GPU 自動配對，跟 M5 + M10-4 mps_fit 重疊。
+- Zheng, P. et al. "Shockwave: Fair and Efficient Cluster Scheduling for Dynamic Adaptation", **NSDI 2023**。
+- Jayaram Subramanya, S. et al. "Sia: Heterogeneity-aware, Goodput-Optimized ML-cluster Scheduling", **SOSP 2023**。
+- Mohan, J. et al. "Looking Beyond GPUs for DNN Scheduling" (Synergy), **OSDI 2022**。
 
 ### 期望結論
 
 跑完 M11 後 thesis 章節變動：
 
-- §7.5 從「M9 UCB1 在 sim 上 sublinear regret」延伸成「M11 LinUCB 在 live cluster 取得 paired CI 顯著優於 UCB1 / default」。
-- §6 Discussion 多一段「為何 contextual bandit 在小規模 cluster 比 DRL / offline RL 適合」的論述，引 Decima SIGCOMM 2019 對比 cluster size 的樣本需求差距。
-- Future work 章節從 vague「可以做 RL」升級成 specific「sim-to-real gap mitigation（domain randomization）+ multi-objective bandit（JCT + fairness joint）」。
+- §3 公式章節從「手寫 5 因子」延伸成「公式作為 fallback / interpretability layer，主決策由 DRL policy 取代」。
+- §4 新增 "Deep RL scheduler architecture"：MDP 設計、permutation-invariant encoder、PPO + RLPD pipeline。
+- §5 主結果章節三條對照：DRL policy vs score-default vs D-LinUCB-only，paired CI，預期 DRL 在 burst trace（high contention）贏幅最大。
+- §6 Discussion 多三段：(a) sim-to-real gap 量化、(b) hierarchical decomposition 為何在小叢集 work、(c) Decima 對照（我們無 DAG、用 Set encoder 取代 GNN）。
+- Future work 升級成 Decision Transformer / DreamerV3 / multi-cluster federated RL。
 
 ## 排程依賴圖
 
 ```
 M1 ──┐
-     ├──► M2 ──► M3 ──┬──► M4 ──┬──► M8 ──► M9 (★) ──► M10 (★) ──► M11 (★)
+     ├──► M2 ──► M3 ──┬──► M4 ──┬──► M8 ──► M9 (★) ──► M11 (★) ──► M10
      │                 │         │
      │                 └──► M5 ──┼──► M6 ──┘
      │                           │
@@ -1380,8 +1440,8 @@ M1 ──┐
 - M6 / M7 都吃 M3 + 自己的依賴（M5 / 無）
 - M8 在 M3 + M5 + M6 + M7 完成後跑
 - M9（UCB1）跑在 M8 後、純 sim 不依賴 live
-- M10 是 M8/M9 跑完後盤點出的優化迴圈，分 3 個 sprint
-- M11 是 M10 之後接 live cluster 上的 contextual bandit，可在 2 台機器上跑 paired A/B
+- **M11（Deep RL scheduler）優先做**，指導教授要求 RL 路線。Sim PPO + RLPD Sim2Real + 內含 D-LinUCB outer loop
+- M10（公式清理 + M7 suspend+resume + predictor quantile）延到 M11 完成後再回頭，部分項可能被 DRL policy 直接學會、變成 optional
 
 ## 與 Phase 7（R16 OTel）的關係
 
