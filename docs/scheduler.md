@@ -697,9 +697,6 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 
 # 開發進度追蹤
 
-> **Owner**: 你（單人專題）
-> **起手日**: 2026-05-06（R21 event-driven operator 完成後立刻可起）
-> **預計總工期**: 7–10 週（必做 M1–M8 ≈ 7–8 週、含 ★ M9 ≈ 10 週）
 > **依賴**: R5（DCGM）✅、R7（resources/limits）✅、R21（event-driven loop）✅
 > **review.md 對應**: R17（score-based scheduling）+ R19（runtime predictor）
 
@@ -717,22 +714,13 @@ score(job, placement) = ... + ε · f_predicted_runtime(job)
 | M6 | Predictor → Lua → backfill 端到端 | §9.3 | 3 天 | ✅ |
 | M7 | Fragmentation detector + 自動 requeue（Gandiva-lite） | §5.2 | 5 天 | ✅ |
 | M8 | Evaluation：JCT / utilization / makespan / fairness | §9.5 | 7 天 | ✅ |
-| M9 ★ | （可選）Contextual bandit / PPO weight tuning | §7.5 | 10 天 | ✅ LinUCB only |
-| M10 ★ | Score function 後續優化（horizon auto-tune、刪 γ、修 mps_fit、age boost、M7 suspend+resume、predictor quantile）| §M10 | 3–4 週 | ⬜ 規劃中 |
+| M9 | Contextual bandit / PPO weight tuning | §7.5 | 10 天 | ✅ LinUCB only |
+| M10 | Score function 後續優化（horizon auto-tune、刪 γ、修 mps_fit、age boost、M7 suspend+resume、predictor quantile）| §M10 | 3–4 週 | ⬜ 規劃中 |
+| M11 ★ | Live contextual bandit：LinUCB 取代 M9 UCB1，引入 cluster state context | §M11 | 2 週 | ⬜ 規劃中 |
 
-★ = 加分項，做不完不影響畢業/上線。
+## M1：Slurm 內建調度旋鈕
 
-## M1：Slurm 內建調度旋鈕（2 天）
-
-### 目標
 把 §5.1 的 ini 設定走 chart values，確認對既有 workload 沒有 regress。**不寫程式就能拿到的免費收益**，也是後面所有 milestone 的 baseline。
-
-### 產出檔案
-- `chart/values.yaml` — 新 `slurm.scheduling.{selectTypeParameters, schedulerParameters, priorityWeights, preempt}` 段
-- `chart/templates/_helpers.tpl` — `slurm-platform.slurmConf` helper render 進 slurm.conf
-- `chart/templates/configmap-static.yaml` — 透過 helper 自動帶入
-- `chart/tests/slurm_conf_test.yaml` — 至少 3 條：default 不變、`CR_Pack_Nodes` 開時 SelectTypeParameters 對、preempt 預設關
-- `docs/scheduler.md` — 在 §5.1 加 ✅ + 實機觀察的 backfill 命中率
 
 ### 預設值（建議）
 ```yaml
@@ -752,24 +740,7 @@ slurm:
       mode: REQUEUE
 ```
 
-### 驗收條件
-- [ ] `helm-unittest` 全綠（含 3 條新測試）
-- [ ] `verify.sh` 全綠 — 既有 workload 無 regress
-- [ ] sbatch 5 個 cpu job，sinfo 觀察 backfill 命中率 ≥ 0（沒 worse than baseline）
-- [ ] `scontrol show config | grep -E "SchedulerParameters|SelectTypeParameters|PriorityWeight"` 對得上 values
-
-### 風險
-- `CR_Pack_Nodes` 在某些 partition 配置下會讓 fragmentation 暫時更糟（先 pack 滿一台才開下一台）— evaluation 時要量測 baseline vs M1 的 utilization 比例
-
-### 實機驗收（2026-05-06，custom-sched）
-
-- 5 條 helm-unittest 全綠（67/67 total）；`SchedulerType=sched/backfill` / `SchedulerParameters=bf_window=720,...` / `PriorityType=priority/multifactor` / `PriorityWeight{Age,JobSize,Partition,QOS}` 全部從 `scontrol show config` 回讀對齊 values
-- `verify.sh` baseline 全綠（單機 srun + sbatch / scale-up→4 / scale-down→1 / PMI2 / OpenMPI / GPU pool）
-- 5 條 cpu sleep job：4 條同時跑在 cpu-0 / cpu-1，第 5 條 PENDING(Resources)，operator scale-up 觸發後排空 → backfill + 既有 elastic loop 沒互打架
-- `CR_Pack_Nodes` 暫不打開（roadmap 預設仍 `CR_Core`），等 M3 fragmentation_penalty 上線後再做 baseline vs pack 的 A/B
-- preempt 維持 `enabled: false`，slurm.conf 不出 `PreemptType` / `PreemptMode`；M7 才會翻
-
-## M2：Score function 規格 + Lua submit plugin scaffold（3 天）
+## M2：Score function 規格 + Lua submit plugin scaffold
 
 ### 目標
 - 把 §7.1 的 score 公式寫成可執行規格（**規格不是 code**）
@@ -796,21 +767,7 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 （變更係數要動 sensitivity analysis，記在 spec 文件裡）
 ```
 
-### 驗收條件
-- [x] spec 文件含每個 factor 的 input、output、邊界 case 表
-- [x] `helm-unittest` 60+ 條全綠
-- [x] 進 controller pod `tail -f /var/log/slurm/slurmctld.log`，sbatch 一個 job 看到 lua plugin invoke 成功
-- [x] lua 改一個值（e.g. 硬寫 `job_desc.priority = 9999`），sbatch 後 squeue 看到該 priority
-
-### 實機驗收（2026-05-06，custom-sched）
-
-- 75/75 helm-unittest 全綠（M2 加 8 條，含 ConfigMap gating / mount 條件 / lua scaffold inline 值）
-- `verify.sh` 在 `jobSubmit.enabled=true` 下 baseline 全綠（單機 srun + sbatch / scale-up→4 / scale-down→1 / PMI2 / GPU pool）
-- `scripts/verify-lua-submit.sh` 全綠 — sbatch `score-demo-*` job，`scontrol show job` 回讀 `Priority=9999`（plugin 寫回成功）
-- slurmctld.log 三條 lua 線都有：`submit name=...`、`demo-boost name=... priority=9999`、`shadow_score=0.3000`（5 個 stub factor 各回 0.5 → 0.4·0.5 + 0.2·0.5 + 0.15·0.5 - 0.2·0.5 + 0.05·0.5 = 0.30）
-- 規格文件 `docs/scheduler-score-spec.md`：5 個 factor 的 input/output/邊界 case 表 + I/O schema + busted 測試骨架 + sensitivity log
-
-## M3：Score v1 — mps_fit + vram_fit + fragmentation（5 天）
+## M3：Score v1 — mps_fit + vram_fit + fragmentation
 
 ### 目標
 把 M2 規格中前 4 個 factor（除 `f_pred_runtime`）真的算出來。**先單機 + 假資料過 unit test，再上真機驗證。**
@@ -823,12 +780,6 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 - `tests/lua/score_test.lua`（新，`busted`）— 10–15 case 測每個 factor 邊界
 - `scripts/render-score-trace.py`（新）— sbatch + score 過程序列化成 JSONL，方便 M8 evaluation
 - `chart/dashboards/scheduler.json`（新 panel）— `slurm_lua_score{factor=...}` histogram、`slurm_score_decision_total`
-
-### 驗收條件
-- [ ] `busted` lua unit test 全綠
-- [ ] sbatch 5 個 mix（不同 mps、不同 vram constraint），squeue 順序與 score 排序一致
-- [ ] Grafana panel score histogram，p50 在 [0.3, 0.7]
-- [ ] `verify.sh` 沒 regress
 
 ### 風險
 - Lua 沒 native MPS 計算 API — 從 sinfo / scontrol show node 字串解析。寫個小工具函式 + cache 1 秒避免 hot path 卡 slurmctld
@@ -846,7 +797,7 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
 
 > M3 邊界： 還是純 job_desc + chart values 的計算，沒接 live cluster state。當 mps=50 + 真實 cluster 已半空 vs 全空，目前公式給同一個 frag penalty。M7 (Gandiva-lite) 會由 operator 寫一份 `/shared/scheduler-state.json`，再由 lua io.open 讀進來算真 stddev。
 
-## M4：Trace replay simulator（5 天）
+## M4：Trace replay simulator
 
 ### 目標
 真機規模太小（2 GPU、3 pool），有統計意義的比較必須走 trace replay。挑 **Philly trace**（~400 GPU、3000 jobs，2 個月）。
@@ -860,11 +811,6 @@ score(J, P) = α·f_mps_fit(J,P)        ∈ [0,1]   MPS slot 容量配適
   - `sim/metrics.py` — JCT / makespan / utilization / slowdown
 - `sim/tests/` — pytest，至少 3 個 sanity test
 - `docs/sim-readme.md` — 怎麼下 trace、怎麼跑
-
-### 驗收條件
-- [x] 1000-job subsample of Philly，FCFS 跑完輸出 metric CSV
-- [x] 同一 trace 跑 FCFS vs multifactor vs score(M3 版)，三者 metric 都有合理數字
-- [x] `sim/runner.py --scheduler score --trace philly_subsample.json` < 60 秒跑完
 
 ### 風險
 - Philly trace 沒 MPS 資訊（純整 GPU）— augment 假設「每張 GPU 4 個 MPS slot」，evaluation 章節要說明
@@ -1272,11 +1218,99 @@ M8/M9 跑完後重新審視 `docs/scheduler-score-spec.md`，列出 11 個可優
 - M7 從「flat negative result」升級成「我們找到讓 M7 work 的條件」→ §4.4 / §9 future work 第一條改寫成「已實作」。
 - Predictor 從 point estimate 升級成 distribution-aware → §5.5 condition 1 改成 robustness statement（即使 workload 跨度不大，confidence-weighted scheduling 仍能保守降權 not actively harm）。
 
+## M11 ★：Live contextual bandit（LinUCB，規劃中，M10 後接續）
+
+M9 的 UCB1 是 context-free bandit——把所有 cluster state 平均掉，只學「全域最好的權重組」。M9 sim 結果顯示這個假設在 stationary workload 上 OK，但在 live cluster 上 queue depth / fragmentation index / predictor confidence 會隨時間飄，最佳權重應該隨之改變。M11 把 UCB1 升級成 **LinUCB**（Li et al. WWW 2010），讓 bandit 依當前 cluster state 挑權重。
+
+選 LinUCB 而不是 Neural-LinUCB / CQL / DRL 的理由寫在後面「替代方法分析」。簡言之：在 1–2 台機器 cluster 一天 ~200 jobs 的 throughput 下，**只有 LinUCB 的樣本需求（~300–500 jobs）落在碩論時程內收得到 paired CI 的量級**。
+
+### 設計
+
+**Context vector** `x ∈ ℝᵈ`，d=8：
+1. queue 長度（log scale）
+2. queue 中平均 `mps_req` / `mps_per_node`
+3. queue 中 job mix entropy（gpu_type 分佈熵）
+4. cluster fragmentation index（free MPS stddev / mean）
+5. predictor service p50 / p90 ratio（confidence proxy）
+6. 過去 1h 平均 backfill rate
+7. 過去 1h 平均 requeue cost
+8. bias term = 1.0
+
+**Action space**：4 個離散權重組（沿用 M9 的 grid）+ default，共 5 個 arms。
+
+**Reward**：job 結束時計算 `r = -normalized_JCT_delta_vs_default`，其中 default 由 shadow simulator 同 trace 算出來（用 M8 sim infrastructure，0 額外 cluster 成本）。
+
+**更新規則**（每個 job 結束觸發）：
+```
+A_a ← A_a + x xᵀ
+b_a ← b_a + r · x
+θ̂_a ← A_a⁻¹ b_a
+```
+A_a 初始 = λI（λ=1），closed-form 無 gradient descent。
+
+**Action selection**：
+```
+UCB(a, x) = θ̂_aᵀ x + α √(xᵀ A_a⁻¹ x)
+a* = argmax_a UCB(a, x)
+```
+α 從 1.0 開始，每 100 jobs 衰減 0.95。
+
+### 實作位置
+
+```
+services/weight_tuner/
+  bandit.py        # 新增 LinUCBBandit class，跟 UCB1Bandit 平行
+  context.py       # 新檔，build_context(cluster_state) → np.ndarray
+  state_store.py   # 新檔，持久化 {A_a, b_a} 到 ConfigMap（survive pod restart）
+  app.py           # FastAPI endpoint /select_weights, /update_reward
+```
+
+Slurm 側：`job_submit.lua` 開頭 HTTP GET `/select_weights`（已有 predictor 整合範本），job epilog 走新 hook 回呼 `/update_reward`。
+
+### Deployment 規劃
+
+| 階段 | 內容 | 時程 |
+|---|---|---|
+| Phase A | LinUCBBandit + context vector + state_store 實作 + unit tests | 3 天 |
+| Phase B | sim 整合：用 `sim/runner.py` 驗證 LinUCB regret < UCB1 | 2 天 |
+| Phase C | 機 A（k3s）部署 + shadow-mode 1 天（不真實改權重，只 log decision） | 1 天 |
+| Phase D | 兩 partition A/B：`score-linucb` vs `score-default`，同 trace replay 5 天 | 5 天 |
+| Phase E | 第二台機器加入後跑 paired same-seed CI（兩台機各跑一個 arm） | 3 天 |
+
+兩台機器設定：trace 同步 replay（用 M8 `eval/scripts/run_e7_live.sh` 同 seed），機 A 跑 LinUCB、機 B 跑 default，收同樣 50 jobs 後算 paired CI。
+
+### 替代方法分析（為什麼是 LinUCB 不是其他）
+
+| 方法 | 樣本需求 | 1–2 機可行 | 主風險 | 採用 |
+|---|---|:---:|---|:---:|
+| **LinUCB** | ~300–500 jobs | ✅ 2–3 天 | 線性 model 假設失敗時退化成 UCB1，可控 | ✅ |
+| Neural-LinUCB（Riquelme ICLR 2018） | ~2k–5k jobs | ⚠️ 4–6 週 | NN cold-start 期間比 UCB1 還差 | ❌ |
+| CQL offline RL（Kumar NeurIPS 2020） | ~10⁴ transitions | ⚠️ 訓得起來但 deploy 不確定贏 | M8 已證 sim-to-live distribution shift 嚴重 | ❌（留 future work）|
+| Online DRL（PPO/SAC）live 訓練 | ~10⁵–10⁶ episodes | ❌ | exploration 期 JCT 爆炸 | ❌ |
+| Sim-trained DRL（Gymnasium wrapper） | sim 充足、live 不確定 | ⚠️ sim 跑得起來 | sim-to-real gap（M7 案例已示警） | ❌（留 future work）|
+
+關鍵 insight：**throughput 是真實 reward signal 的硬上限**，加機器只能線性 scale、無法跨數量級。LinUCB 是唯一樣本需求落在 cluster 一週能產生的量級內的方法。
+
+### 引用文獻
+
+- Li, L., Chu, W., Langford, J., & Schapire, R., "A Contextual-Bandit Approach to Personalized News Article Recommendation", **WWW 2010** — LinUCB 原始論文。
+- Auer, P., Cesa-Bianchi, N., & Fischer, P., "Finite-time Analysis of the Multiarmed Bandit Problem", **Machine Learning 47, 2002** — UCB1 base，M9 sublinear regret 結果的理論依據，LinUCB 在 contextual setting 的延伸。
+- Riquelme, C., Tucker, G., & Snoek, J., "Deep Bayesian Bandits Showdown", **ICLR 2018** — Neural-LinUCB / Bayesian linear regression 對照組，量化 NN-bandit 在 small-data regime 的劣勢。
+- Krishnaswamy, V. et al., "Application-Aware Network Management with Contextual Bandits", **NSDI 2023** — LinUCB 在 systems setting 部署範本，可借 reward shaping / context engineering 細節。
+
+### 期望結論
+
+跑完 M11 後 thesis 章節變動：
+
+- §7.5 從「M9 UCB1 在 sim 上 sublinear regret」延伸成「M11 LinUCB 在 live cluster 取得 paired CI 顯著優於 UCB1 / default」。
+- §6 Discussion 多一段「為何 contextual bandit 在小規模 cluster 比 DRL / offline RL 適合」的論述，引 Decima SIGCOMM 2019 對比 cluster size 的樣本需求差距。
+- Future work 章節從 vague「可以做 RL」升級成 specific「sim-to-real gap mitigation（domain randomization）+ multi-objective bandit（JCT + fairness joint）」。
+
 ## 排程依賴圖
 
 ```
 M1 ──┐
-     ├──► M2 ──► M3 ──┬──► M4 ──┬──► M8 ──► M9 (★) ──► M10 (★)
+     ├──► M2 ──► M3 ──┬──► M4 ──┬──► M8 ──► M9 (★) ──► M10 (★) ──► M11 (★)
      │                 │         │
      │                 └──► M5 ──┼──► M6 ──┘
      │                           │
@@ -1287,8 +1321,9 @@ M1 ──┐
 - M2/M3/M4/M5 可並行（不同檔案）
 - M6 / M7 都吃 M3 + 自己的依賴（M5 / 無）
 - M8 在 M3 + M5 + M6 + M7 完成後跑
-- M9（LinUCB）跑在 M8 後、純 sim 不依賴 live
+- M9（UCB1）跑在 M8 後、純 sim 不依賴 live
 - M10 是 M8/M9 跑完後盤點出的優化迴圈，分 3 個 sprint
+- M11 是 M10 之後接 live cluster 上的 contextual bandit，可在 2 台機器上跑 paired A/B
 
 ## 與 Phase 7（R16 OTel）的關係
 
@@ -1302,22 +1337,4 @@ Phase 7 OTel 端到端 trace 會把每個 job 的：
 
 每個 step span 內會帶上 score 各 factor 的值、predictor MAE、fragmentation snapshot。**Phase 6 寫 trace span 的成本接近 0**（lua emit log line + operator emit metric 已經有了），等 Phase 7 起手時把這些 log/metric 包成 OTel span 即可。
 
-## 維護準則
 
-1. **每完成一個 milestone 就更新本節進度總覽**（⬜ → ✅，註記 commit hash）
-2. **每個 milestone 最後 5% 是寫測試 + 文件**，不要跳過 — Phase 6 evaluation 章節要靠這些當「reproducibility appendix」
-3. **不要先做 M9**。M9 RL novelty 只在 M1–M8 跑出 baseline 數字後才有意義
-4. **scheduler.md §1–9 是研究筆記**（不會再大改），**這節 Phase 6 Roadmap 是執行清單**（每天會勾）— 兩個分工不要混
-
-## 起手第一步
-
-```bash
-git checkout -b custom-sched
-# 1. chart/values.yaml 把 §5.1 的 ini 全部 expose 成 yaml
-# 2. helper / configmap 接好
-# 3. helm-unittest 加 3 條
-# 4. helm upgrade + verify.sh，確認沒 regress
-# 5. commit "Phase 6 M1: expose Slurm scheduling knobs in chart values"
-```
-
-完成 M1 後回來把這節進度總覽勾掉，附上 commit hash。
