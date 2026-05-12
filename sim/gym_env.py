@@ -99,6 +99,7 @@ class _RunState:
     n_jobs: int
     wait_accum_prev: float
     jct_sum: float
+    completion_reward: float   # accumulated this-step completion bonus
 
 
 class KubefluxSchedEnv:
@@ -164,6 +165,7 @@ class KubefluxSchedEnv:
             n_jobs=len(jobs),
             wait_accum_prev=0.0,
             jct_sum=0.0,
+            completion_reward=0.0,
         )
         self._step_count = 0
         self._advance_to_decision()
@@ -194,15 +196,14 @@ class KubefluxSchedEnv:
                 reward_action = -0.01
         # If no allocation happened this step, force time forward by one event
         # to avoid infinite no-op loops while the queue stays stuck.
+        st.completion_reward = 0.0
         if not scheduled and st.events:
             t, _s, kind, payload = heapq.heappop(st.events)
             st.now = t
             if kind == "submit":
                 st.pending.append(st.by_id[payload])
             elif kind == "end":
-                st.cluster.release(payload)
-                st.completed += 1
-                st.jct_sum += st.now - st.by_id[payload].submit_ts
+                self._on_job_end(payload)
 
         self._advance_to_decision()
 
@@ -210,7 +211,7 @@ class KubefluxSchedEnv:
         wait_accum = sum(max(0.0, st.now - j.submit_ts) for j in st.pending)
         dwait = wait_accum - st.wait_accum_prev
         st.wait_accum_prev = wait_accum
-        reward = -dwait / 1000.0 + reward_action
+        reward = -dwait / 1000.0 + reward_action + st.completion_reward
 
         terminated = (st.completed >= st.n_jobs) and not st.events
         truncated = self._step_count >= self.max_steps
@@ -221,9 +222,8 @@ class KubefluxSchedEnv:
             "completed": st.completed,
             "n_jobs": st.n_jobs,
         }
-        if terminated:
-            info["jct_sum"] = st.jct_sum
-            info["avg_jct"] = st.jct_sum / max(1, st.n_jobs)
+        info["jct_sum"] = st.jct_sum
+        info["avg_jct"] = st.jct_sum / max(1, st.completed) if st.completed else float("nan")
         return obs, float(reward), bool(terminated), bool(truncated), info
 
     # --------------------------------------------------------------
@@ -248,13 +248,24 @@ class KubefluxSchedEnv:
             if kind == "submit":
                 st.pending.append(st.by_id[payload])
             elif kind == "end":
-                st.cluster.release(payload)
-                st.completed += 1
-                j = st.by_id[payload]
-                # JCT = end - submit (sim measures from original submit)
-                jct = st.now - j.submit_ts
-                st.jct_sum += jct
+                self._on_job_end(payload)
         # Drained: terminal state with possibly orphan pending (shouldn't happen)
+
+    def _on_job_end(self, jid: str) -> None:
+        """Centralised end-event handling: release cluster, accumulate JCT
+        and completion-bonus reward."""
+        st = self._state
+        assert st is not None
+        st.cluster.release(jid)
+        st.completed += 1
+        j = st.by_id[jid]
+        jct = st.now - j.submit_ts
+        st.jct_sum += jct
+        # Slowdown bonus: r = -log(JCT / runtime). Perfect (JCT == runtime) → 0;
+        # 2× slowdown → -0.69; 10× → -2.30. Clip to keep gradients stable.
+        runtime = max(1.0, j.runtime)
+        slowdown = max(1.0, jct / runtime)
+        st.completion_reward += -math.log(slowdown)
 
     def _build_obs(self) -> np.ndarray:
         st = self._state
