@@ -194,6 +194,80 @@ bash eval/scripts/run_e7_live.sh vendor
 比 Slurm vendor multifactor 多砍 28.6%）。`eval/results/` 已 gitignore，
 重跑 `run_all.sh` 會重產。
 
+## 10. 執行 M11 Deep RL scheduler 實驗（PPO sim 訓練 + live shadow）
+
+M11 把 M3 score function 換成 sim-trained MaskablePPO policy，並用 lua hook
+在 live cluster 跑 shadow mode 收 decision log。**Honest negative result**：sim
+上 score 全面贏 PPO（philly Δ=−7849、burst Δ=−36293、ali NaN），詳見
+`docs/eval-writeup.md §C–§E`。以下命令會把整個 pipeline 從零跑一次。
+
+```bash
+# 一次性：建 M11 專用 venv
+uv venv .venv-m11
+uv pip install --python .venv-m11/bin/python \
+    "stable-baselines3==2.8.0" "sb3-contrib==2.8.0" \
+    "torch>=2.4" gymnasium numpy fastapi uvicorn pydantic
+
+# --- Phase B：sim PPO 訓練（500k steps，~5–10 min on CPU）---------------
+.venv-m11/bin/python -m services.rl_scheduler.ppo_masked_train \
+    --total-steps 500000 --eval-freq 25000 --n-envs 4 \
+    --n-jobs 300 --n-nodes 2 --gpus-per-node 2 \
+    --trace-family philly
+# → 輸出到 runs/m11_mppo_<timestamp>/{policy.zip, vecnormalize.pkl, eval_log.csv}
+
+# --- Phase B-3：paired-CI 評估 vs heuristic baselines（3 family × 5 seed）-
+RUN=$(ls -td runs/m11_mppo_* | head -1)
+.venv-m11/bin/python -m services.rl_scheduler.eval_paired \
+    --policy-dir "$RUN" --seeds 42 43 44 45 46 \
+    --trace-families philly burst ali \
+    --n-jobs 300 --n-nodes 2 --gpus-per-node 2
+# → stdout 印 §C.4/§D.3 那種 Δ + 95% CI 表
+
+# --- Phase C-1：serve endpoint smoke（本機 FastAPI）---------------------
+.venv-m11/bin/python -m services.rl_scheduler.serve \
+    --policy-dir "$RUN" --port 8002 &
+.venv-m11/bin/python -m services.rl_scheduler.snapshot_agent \
+    --serve-url http://127.0.0.1:8002 --source sim --once
+curl -fsS http://127.0.0.1:8002/healthz
+
+# --- Phase C-3：lua hook 單元測試（不需 Slurm）-------------------------
+lua5.3 tests/lua/rl_hook_test.lua    # 5 個 case 都該 ok
+
+# --- Phase C-4：RLPD fine-tune scaffold smoke ---------------------------
+.venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
+    --base-policy "$RUN" --offline-steps 2000 \
+    --n-updates 5 --utd-ratio 2 --n-jobs 100
+
+# --- Phase D：live shadow on k3s ----------------------------------------
+# 1) build + 載入 image 進 k3s containerd
+docker build -f services/rl_scheduler/Dockerfile -t slurm-rl-scheduler:m11 .
+docker save slurm-rl-scheduler:m11 | sudo k3s ctr images import -
+
+# 2) 開 rl-scheduler + lua hook（shadowMode=true 預設，不會改 priority）
+helm upgrade slurm-platform chart/ -n slurm -f chart/values-k3s.yaml \
+    --reset-then-reuse-values --no-hooks \
+    --set rlScheduler.enabled=true --set rlScheduler.lua.enabled=true
+sudo kubectl -n slurm rollout restart sts/slurm-controller
+sudo kubectl -n slurm wait --for=condition=Ready pod -l app=slurm-controller --timeout=120s
+
+# 3) push 一次 snapshot，再 sbatch 一批 job 觀察 lua → /decide → log
+RL_SVC=$(sudo kubectl -n slurm get svc rl-scheduler -o jsonpath='{.spec.clusterIP}')
+.venv-m11/bin/python -m services.rl_scheduler.snapshot_agent \
+    --serve-url http://$RL_SVC:8002 --source sim --once --n-jobs 50
+LOGIN=$(sudo kubectl -n slurm get pod -l app=slurm-login -o name | head -1)
+for i in $(seq 1 10); do
+  sudo kubectl -n slurm exec "$LOGIN" -- \
+      sbatch --wrap='sleep 3' --job-name=rl-test-$i -p cpu
+done
+
+# 4) 撈 shadow log
+sudo kubectl -n slurm logs slurm-controller-0 --tail=400 | grep -E '\[rl\]|\[score-m3\]'
+sudo kubectl -n slurm logs deploy/rl-scheduler --tail=50      # uvicorn /decide hits
+```
+
+Artifact：訓練曲線 `runs/m11_mppo_*/eval_log.csv`；live shadow log 範例存在
+`docs/m11_phase_d/`。
+
 ## 🗑️ 清理環境
 
 ```bash
