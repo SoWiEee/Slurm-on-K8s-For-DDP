@@ -511,3 +511,164 @@ Raw artifacts：
 - [x] M9 LinUCB / UCB1 sample efficiency vs M8 grid 比較
 - [x] Operator hardening：ghost-job detector + GhostJobsWedge alert
 - [x] eval-writeup.md 9 個章節 + 2 個 appendix（本檔）
+
+---
+
+## C. M11 Phase B/C — Deep RL scheduler 初試結果（2026-05-12 stage 1）
+
+> 本節記錄 M11 第一輪 sim-only PPO 訓練的 honest negative result。對應
+> commits 6fedf97（Phase A）、81f2a75（Phase B）、89cec79（Phase C-1/C-2）、
+> 22afedb（Phase C-3）以及本節對應的 contention sweep。
+
+### C.1 動機與第一輪設定
+
+M11 的目標是把 score formula 升級為 deep RL policy：state = top-K queue +
+node feats + global feats，action = 「挑哪個 top-K job」+ no-op，reward =
+`-Δsum(pending wait time)/1000 + reward_action + -log(slowdown@end)`。
+Phase A/B 完成 Gymnasium wrapper、SB3 PPO + VecNormalize、200k-step
+MaskablePPO（sb3-contrib）訓練 pipeline。
+
+第一輪 paired-CI（N4×4gpu n_jobs=100，philly/burst/ali，5 seeds）：
+
+| Family | FCFS | Multifactor | Score | PPO | 結論 |
+|---|---|---|---|---|---|
+| philly | 3438 | 3438 | 3438 | 3438 | 全部相等 |
+| burst  | 3504 | 3504 | 3504 | 3517 | 差 ≤ 0.4% |
+| ali    | 1462 | 1462 | 1462 | 1462 | 全部相等 |
+
+也就是這個 cluster 太大、trace 太短 → 不擁塞 → 所有 scheduler 都退化成
+FCFS（包含學會 FCFS-等價行為的 PPO）。在這條件下無法區辨好壞。
+
+### C.2 Contention sweep — 找一個會分裂的配置
+
+```
+cfg                                 |  fcfs | multifactor | score  | spread%
+--------------------------------------------------------------------------
+N4x4gpu n_jobs=100 philly/42        |  3909 |       3909  |  3909  |    0.0%
+N2x2gpu n_jobs=200 philly/42        |  2144 |      15432  | 15330  |  619.9%
+N2x2gpu n_jobs=500 philly/42        |  2498 |     105886  |113195  | 4431.8%
+N4x2gpu n_jobs=500 philly/42        |177007 |      19402  | 19620  |  812.3%
+N2x2gpu n_jobs=300 burst/42         | 77187 |      31467  | 33019  |  145.3%
+N2x2gpu n_jobs=300 ali/42           | 10317 |       3617  |  3647  |  185.2%
+```
+
+挑 **N2×2gpu n_jobs=300**（總 GPU=4，job 數量 75× cluster 容量）作為主
+contention config — 三個 family 在這個設定下都有 100% 以上 spread，
+且沒有單一 baseline 通吃（philly 是 FCFS 贏，burst/ali 是 multifactor 贏）。
+正是 RL 該勝出的場景。
+
+### C.3 PPO 第二輪訓練（500k steps, contention config）
+
+- N2×2gpu, n_jobs=300, philly synthetic
+- 500k steps、n_envs=4、entropy coef 0.01、lr 3e-4、net_arch [256,128]
+- 訓練 time = 538s on CPU（930 steps/s）
+
+訓練曲線（eval seed=999 vs `score` baseline）：
+```
+step      ppo_jct    score_jct   ratio
+25000     41763      16431       2.54
+50000     41763      16431       2.54
+125000    54235      16431       3.30
+250000    45701      16431       2.78
+500000    41387      16431       2.52
+```
+
+policy entropy 在 ~50k step 就收斂到 ≈ 0，後續完全 deterministic；critic
+explained_variance 收斂到 0.96（value function 預測精準）。policy 卡在
+一個 critic 自己很有信心的爛 mode。
+
+### C.4 Paired-CI 完整表（3 family × 5 seeds × 4 schedulers）
+
+| Family | FCFS | Multifactor | Score | **PPO** | 最佳 baseline |
+|---|---:|---:|---:|---:|:---:|
+| philly | **22195** | 42671 | 42271 | 89462 | FCFS |
+| burst  | 50746 | **36142** | 37548 | 80114 | Multifactor |
+| ali    | 6600  | **2944**  | 2958  | 24115 | Multifactor |
+
+paired-CI（baseline − ppo，正 = PPO 贏）：
+
+```
+[philly]
+  fcfs        − ppo  Δ=-67266  [-109114,  -25418] ***
+  multifactor − ppo  Δ=-46790  [ -79305,  -14275] ***
+  score       − ppo  Δ=-47191  [ -78444,  -15937] ***
+
+[burst]
+  fcfs        − ppo  Δ=-29367  [ -67592,   +8857]
+  multifactor − ppo  Δ=-43971  [ -64028,  -23915] ***
+  score       − ppo  Δ=-42566  [ -62033,  -23098] ***
+
+[ali]
+  fcfs        − ppo  Δ=-17515  [ -36632,   +1602]
+  multifactor − ppo  Δ=-21171  [ -42095,    -246] ***
+  score       − ppo  Δ=-21157  [ -42035,    -278] ***
+```
+
+**PPO 在 3 個 family 的 9 個 baseline 比較中、7 個 statistically
+significantly 顯著更糟（***，95% CI 不跨 0）**。對最強 baseline 而言
+（philly→FCFS, burst→multifactor, ali→multifactor），PPO 是 **2.1–8.2×
+worse JCT**。
+
+### C.5 為什麼學壞了 — 三個候選假設
+
+H1（reward proxy 偏離 JCT）：dense `-Δwait/1000` 在 300-job heavy queue
+下會主導 reward signal（總 wait 累積為主），讓 policy 學「把 queue 清乾
+淨」而不是「壓低個別 job 的 JCT」。這兩個 metric 在輕負載一致，但
+contention 下會分歧（清掉小 job 減 queue len 快、但大 job 被堵 → JCT 爆）。
+
+H2（state representation 不足以做 long-horizon 推理）：top-K 只看 16 個
+queue head，沒有 「整個 trace 剩多少 jobs / 剩多少 future submits」訊號。
+critic 看得到的 features 不夠完整 → value 預測精準（H 內部一致）但對整
+個 episode JCT 來說系統性偏差。
+
+H3（trace 變異性 + zero-shot OOD）：訓練只看 philly，但 burst/ali 是
+out-of-distribution。但 H3 解釋不了 philly 上自己也輸這件事，所以 H1/H2
+應該是主因。
+
+### C.6 並行觀察 — score baseline 也有問題
+
+contention sweep 顯示 score scheduler 在 N2×2gpu n_jobs=300 philly 上
+（42271）反而比 FCFS（22195）差 90%。M3+M5 的加權公式在 heavy load 時
+反向激勵（推測：`f_mps_fit` 鼓勵塞滿 → 加重 fragmentation；
+`-f_fragmentation` 不夠權重抵銷）。這個 score-vs-FCFS 的負面結果是
+M11 工作期間附帶發現的、獨立於 RL 本身。
+
+### C.7 立場與下一步
+
+不要先做：chart wiring、Phase D shadow 部署、RLPD fine-tune。在 sim 端
+PPO 連最強 baseline 都贏不了之前，這些都是把 negative result 帶上正餐
+桌的工程，不會產生新 contribution。
+
+優先順序：
+1. **reward 重設計** — 改為 `-Δ(sum_of_JCT_of_finished_jobs)`，直接對齊
+   evaluation metric。重訓 500k steps、觀察 ratio_ppo_over_score 是否能
+   持續 < 1.0
+2. **state 加全局訊號** — 加 `remaining_unsubmitted_jobs` proxy（從
+   trace 長度估）、`running_jobs_count`、`pending_size_bytes`（總 MPS
+   需求 vs 總 free）等 long-horizon features
+3. （後備）**mixed-family training** — n_envs 內混三個 family，看 zero-shot
+   OOD 是否還能維持
+
+每個 step 結束都重跑這份 contention paired-CI 表來追蹤進度。
+
+### C.8 重現
+
+```bash
+# Training（500k steps under contention）
+.venv-m11/bin/python -m services.rl_scheduler.ppo_masked_train \
+    --total-steps 500000 --n-envs 4 --n-jobs 300 \
+    --n-nodes 2 --gpus-per-node 2 --trace-family philly
+
+# Paired-CI（3 family × 5 seeds × 4 schedulers）
+RUN=$(ls -dt runs/m11_mppo_* | head -1)
+.venv-m11/bin/python -m services.rl_scheduler.eval_paired \
+    --policy-dir "$RUN" --seeds 42 43 44 45 46 \
+    --trace-families philly burst ali \
+    --n-jobs 300 --n-nodes 2 --gpus-per-node 2 \
+    --out-csv "$RUN/paired_eval_contention.csv"
+```
+
+對應 artifacts：
+- `runs/m11_mppo_20260512-161346/policy.zip` + `vecnormalize.pkl`
+- `runs/m11_mppo_20260512-161346/eval_log.csv`（訓練曲線）
+- `runs/m11_mppo_20260512-161346/paired_eval_contention.csv`（C.4 原始）
