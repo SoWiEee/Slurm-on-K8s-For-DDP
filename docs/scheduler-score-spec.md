@@ -1,6 +1,6 @@
 # 排程 score function 規格（最終版）
 
-> **狀態（2026-05-12）**：M3 + M5 + M6 + M9 評估完成；M7 的 topology 因子仍未實作（γ=0）。本規格反映目前實際跑在 `chart/templates/configmap-job-submit.yaml` 與 `sim/scheduler/score.py` 裡的版本，不是最初的 M2 scaffold。
+> **狀態（2026-05-13）**：M3 + M5 + M6 + M9（含 live 部署）完成；M7 topology 因子仍未實作（γ=0）。本規格反映目前實際跑在 `chart/templates/configmap-job-submit.yaml` 與 `sim/scheduler/score.py` 裡的版本。
 >
 > **Milestone 進展**：
 > - M2（2026-05-06）：lua scaffold，每個因子都回 0.5，係數先用手調的。
@@ -8,7 +8,8 @@
 > - M5/M6（2026-05-07）：runtime-predictor service 跟 lua 接通；`f_runtime_short` 啟用；ε 從 0.05 調到 0.30。
 > - M7（2026-05-10）：fragmentation reconciler 走 operator 那條路（不是新增 score 因子）；預設 shadow mode。
 > - M8（2026-05-11）：跨 trace sensitivity sweep 加 paired CI；γ 維持 0（topology 沒做）。
-> - M9（2026-05-12）：UCB1 offline weight tuner（見 §8），學出來的 arm 跟 grid-best 差 3% 以內。
+> - M9 sim（2026-05-12）：UCB1 offline weight tuner，學出來的 arm 跟 grid-best 差 3% 以內。
+> - M9 live（2026-05-13）：`weight-tuner` service 上線（k3s）；`f_pred_runtime` 接通 predictor；UCB1 arm 動態覆蓋 (α,δ,ε)；score 從 0.200→0.497（見 §8）。
 
 ## 1. 用途
 
@@ -232,43 +233,90 @@ describe "score（複合）" {
 - **Score > 1**：clamp 到 1。
 - **`SCORE_GAIN = 0`**（chart 設定）：plugin 照跑照 log，但不動 priority。M8 shadow-mode 評估用。
 
-## 8. M9 — Bandit weight tuning（離線）
+## 8. M9 — Bandit weight tuning
 
-M2 spec 假設係數會永遠手調。M8 sensitivity sweep 打破這個假設：高 contention 下 weight 選擇能把 mean JCT 移動 28%。M9 補上對應的工具。
+M2 spec 假設係數會永遠手調。M8 sensitivity sweep 打破這個假設：高 contention 下 weight 選擇能把 mean JCT 移動 28%。M9 補上動態工具，分為兩個交付：**sim offline（2026-05-12）**與 **live service（2026-05-13）**。
 
-### 8.1 為什麼是離線（而不是 online RL）
+### 8.1 為什麼 UCB1 而不是 LinUCB / PPO
 
-兩個從 M8 推出來的廉價結論否決掉重量級版本：
+兩個從 M8 推出來的結論：
 
-1. Per-context oracle 跟 static best 在這個 workload 池上只差 2.5%。Contextual policy（LinUCB、PPO）的上限就是 oracle，所以最多多拿 2.5%。不值得為這點 headroom 弄 Stable-Baselines3 + 自製 gym + chart deployment。
-2. UCB1 跑 120 sim runs 就拿到跟 M8 grid-best 差 3% 以內的答案，M8 grid 用 375 runs。所以 bandit 的真正價值是 sample efficiency，不是 contextual adaptation。每季拿最新 sacct 跑一次、把選出來的 weight commit 進 chart 就好。
+1. Per-context oracle 跟 static best 在這個 workload 池只差 2.5%。Contextual policy 上限就是 oracle，最多再拿 2.5%，不值得為此加 ridge regression 或 gym env。
+2. UCB1 跑 120 sim rounds 就拿到與 M8 grid-best 差 3% 以內的答案（grid 用 375 rounds）。**Bandit 的真正價值是 sample efficiency，不是 contextual adaptation**。
+
+LinUCB eval JCT 2.745h > UCB1 2.587h，印證上述。LinUCB 留在 `bandit.py` 供 M10-F D-LinUCB 升級路徑使用，不是現行 production tuner。
 
 ### 8.2 演算法
 
-`services/weight_tuner/bandit.py::UCB1Policy`。標準 UCB1：
+`services/weight_tuner/bandit.py::UCB1Policy`。標準 UCB1（Auer et al. 2002）：
 
 ```
-arm a：pull a ⇒ reward r；μ_a += (r − μ_a)/n_a；t += 1
-select：argmax_a  μ_a + c · sqrt(2·ln(t) / n_a)
-                          ^^^^^^^^^^^^^^^^^
-                          UCB exploration bonus, c=0.4
+select:  argmax_a  μ_a + c · sqrt(2·ln(t) / n_a)   (untried arms → +∞)
+update:  μ_a += (r − μ_a) / n_a ;  t += 1
 ```
 
-- **Arm 空間**：`(α, δ, ε)` 在 3×3×3 grid（27 arms）。β 固定在 0.20。見 `services/weight_tuner/sim_env.py::default_arm_grid()`。
-- **Reward**：`-jct_mean / 3600`，每 round 在一個取樣的 (trace_family, seed) 上跑 `sim.runner.run()` 拿到。
-- **Pull caching**：`SimPull` 把 `(arm, context) → reward` 結果 memoise 起來，重複 pull 不重跑。M9 報的 120 rounds 是 120 次不重複的 `(arm, context)` 加上額外 cache 命中。
+- **Arm 空間**：`(α, δ, ε)` 3×3×3 grid = 27 arms；β=0.20 固定。見 `sim_env.py::default_arm_grid()`。
+- **Reward（sim）**：`−jct_mean / 3600`，每 round 呼叫 `sim.runner.run()` 拿到。
+- **Reward（live）**：`−mean_JCT_hours`，每 `COLLECTOR_INTERVAL_S` 秒從 slurmrestd 拉 completed jobs 計算。
+- c=1.0（live serve.py），c=0.4（原 sim driver）。
 
-### 8.3 LinUCB 版本（給完整性）
+### 8.3 f_pred_runtime 接線（2026-05-13）
 
-`services/weight_tuner/bandit.py::LinUCBPolicy`。Disjoint per-arm ridge regression，context = `(n_jobs/2000, mean_mps/4, mean_gpu/8)`。Selection：`argmax_a θ_a · x + α · sqrt(x · A_a⁻¹ · x)`，α=0.6、ridge=1.0。
+原本 `f_pred_runtime` 是 stub，回傳固定 0.5（ε 係數無效）。M9 live 實作後改為：
 
-實測 LinUCB 比 UCB1 差（eval JCT 2.745 vs 2.587）。Context 在這個問題上幾乎沒有可學的 signal，因為 per-context oracle 跟 static best 只差 2.5%。LinUCB 的 ridge regression 把預算花在 fit 那個小 signal、被 noise 拖著走。留下記錄是為了可重現，不建議拿來當 production tuner。
+```lua
+function f_pred_runtime(job_desc)
+  if not PRED_ENABLED then return 0.5 end
+  local ok, success, pred_s = pcall(call_predictor, job_desc)
+  if not ok or not success or not pred_s or pred_s <= 0 then return 0.5 end
+  return clamp01(1.0 - pred_s / PRED_FALLBACK_SECONDS)
+end
+```
 
-### 8.4 什麼 ship、什麼不 ship
+- 短 job（pred_s → 0）→ f_p → 1.0（高分，SJF-inspired）
+- 長 job（pred_s → PRED_FALLBACK_SECONDS）→ f_p → 0.0
+- predictor 不可用 → 0.5（中性，不影響 arm 間比較）
 
-- **Ship 在 repo（這份 thesis）**：`services/weight_tuner/`（bandit policies + sim adapter + 6 個 unit test）。離線 driver 是 `eval/scripts/run_m9_linucb.py`。
-- **沒進 chart**：沒有 `weightTuner.enabled` 設定、沒 Service、沒 PVC。M9 是離線分析工具，不是 runtime 元件。每次跑完把選出來的 weight commit 進 `chart/values.yaml`。
-- **Production rollout 流程**（建議）：每季左右，拉 cluster sacct、重新生一份 `--synth-jobs` 訓練 trace（distribution 對齊實際 workload）、重跑 `run_m9_linucb.py`、拿 eval JCT 最低的 arm 更新 `slurm.jobSubmit.scoreWeights`、`helm upgrade`。把 JCT delta 跟 sacct 快照日期記到 §6。
+Live 驗證（`sleep 3` job，pred_s ≈ 180s，PRED_FALLBACK = 14400s）：
+```
+f_p = 1 − 180/14400 = 0.987 ≈ 0.99
+score = 0.10·1.00 + 0.20·0.50 + 0.30·0.99 = 0.497  (vs stub 時 0.200)
+```
+
+### 8.4 Live service（weight-tuner）
+
+`services/weight_tuner/serve.py`，FastAPI :8003，與 M10-D rl-scheduler 平行部署：
+
+| endpoint | 說明 |
+|---|---|
+| `GET /weights` | 當前 UCB1 best arm `{arm:[α,δ,ε], alpha, delta, epsilon, beta, n_pulls, total_t}` |
+| `POST /feedback` | `{arm, reward}` → UCB1.update；state 寫 `/state/ucb1_state.json` |
+| `GET /stats` | 27 arms 的 n / mean reward |
+| `GET /healthz` | liveness probe |
+
+Lua 在 plugin load 時呼叫一次 `GET /weights`，pcall 保護，失敗 fallback chart 預設。
+Background asyncio task 每 300s 拉 slurmrestd completed jobs，自動 POST /feedback。
+
+**Helm**：`weightTuner.enabled=true/false`（預設 false），`weightTuner.lua.enabled` 控制 Lua 端。
+NetworkPolicy：controller egress → weight-tuner:8003；weight-tuner egress → slurmrestd:6820 + DNS。
+
+### 8.5 Sim + Live 結果對照
+
+| 場景 | arm (α,δ,ε) | score | 備註 |
+|---|---|---|---|
+| M8 chart 預設 | (0.40, 0.20, 0.00) | 0.500 | f_pred_runtime=stub |
+| M9 sim best | (0.10, 0.05, 0.60) | — | sim-only，ε=0.6 predictor-heavy |
+| M9 live round 1 | (0.10, 0.05, 0.00) | 0.200 | UCB1 初始探索，f_p=stub |
+| **M9 live round 2** | **(0.10, 0.05, 0.30)** | **0.497** | f_p=0.99（predictor 接通） |
+
+### 8.6 Production rollout 流程
+
+**離線快速更新**（每季）：拉 sacct → 重跑 `eval/scripts/run_m9_linucb.py` → 取 best arm → 更新 `chart/values.yaml scoreWeights` → `helm upgrade`。
+
+**Live 自適應**（已部署）：`weight-tuner` service 持續運行，slurmrestd auto-feedback。
+arm 收斂指標：top-3 arm pulls ≥ 60% total（需 GPU training workloads，~300 jobs 量級）。
+
+**D-LinUCB 升級**（M10-F）：serve.py 切 `policy=linucb`，其餘架構不變。
 
 ## 9. Production 部署的三個必要條件
 

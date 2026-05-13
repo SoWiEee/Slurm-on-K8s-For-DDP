@@ -273,6 +273,16 @@ spec:
         - protocol: TCP
           port: {{ .Values.rlScheduler.service.port }}
     {{- end }}
+    {{- if and .Values.weightTuner.enabled .Values.weightTuner.lua.enabled }}
+    # M9/M10-F: lua job_submit plugin pulls weights from weight-tuner on :8003.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: weight-tuner
+      ports:
+        - protocol: TCP
+          port: {{ .Values.weightTuner.service.port }}
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

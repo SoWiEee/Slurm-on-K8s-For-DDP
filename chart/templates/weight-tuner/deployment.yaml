@@ -1,0 +1,143 @@
+{{/*
+M9/M10-F — UCB1 weight-tuner service.
+
+  Deployment   → FastAPI on :8003, UCB1 bandit for (α, δ, ε) score weights
+  Service      → ClusterIP, port 8003
+  NetPol       → ingress from any pod in ns; egress DNS + slurmrestd:6820
+
+Disabled by default. Enable via:
+  helm upgrade ... --set weightTuner.enabled=true \
+                   --set weightTuner.slurmrestdUrl=http://slurm-restapi.slurm.svc:6820
+Also wire the Lua side:
+  --set slurm.jobSubmit.weightTuner.enabled=true
+*/}}
+{{- if .Values.weightTuner.enabled }}
+{{- $wt := .Values.weightTuner -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weight-tuner
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: weight-tuner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weight-tuner
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.selectorLabels" . | nindent 8 }}
+        app: weight-tuner
+    spec:
+      containers:
+        - name: serve
+          image: "{{ $wt.image.repository }}:{{ $wt.image.tag }}"
+          imagePullPolicy: {{ $wt.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8003
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8003"
+            - name: STATE_DIR
+              value: /state
+            - name: SLURMRESTD_URL
+              value: {{ $wt.slurmrestdUrl | quote }}
+            - name: SLURM_API_VERSION
+              value: {{ $wt.slurmApiVersion | quote }}
+            - name: SLURM_USER
+              value: {{ $wt.slurmUser | quote }}
+            - name: COLLECTOR_INTERVAL_S
+              value: {{ $wt.collectorIntervalSeconds | quote }}
+            - name: MIN_JOBS_FOR_UPDATE
+              value: {{ $wt.minJobsForUpdate | quote }}
+            - name: UCB1_C
+              value: {{ $wt.ucb1C | quote }}
+            - name: BETA_FIXED
+              value: {{ $wt.betaFixed | quote }}
+            - name: LOG_LEVEL
+              value: {{ $wt.logLevel | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: state
+              mountPath: /state
+          resources:
+            {{- toYaml $wt.resources | nindent 12 }}
+      volumes:
+        - name: state
+          emptyDir: {}   # UCB1 state survives in-container; upgrade to PVC for long runs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weight-tuner
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: weight-tuner
+spec:
+  type: ClusterIP
+  selector:
+    app: weight-tuner
+  ports:
+    - name: http
+      port: {{ $wt.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weight-tuner-netpol
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: weight-tuner
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}   # any pod in ns (controller lua + snapshot agent)
+      ports:
+        - protocol: TCP
+          port: 8003
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # slurmrestd on controller (live JCT collection)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: slurm-controller
+      ports:
+        - protocol: TCP
+          port: 6820
+{{- end }}
+{{- end }}

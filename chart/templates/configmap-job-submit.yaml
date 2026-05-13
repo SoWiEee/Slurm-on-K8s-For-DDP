@@ -25,6 +25,8 @@ Reference: docs/scheduler-score-spec.md.
 {{- $pr := $js.predictor | default dict }}
 {{- $rls := .Values.rlScheduler | default dict }}
 {{- $rll := $rls.lua | default dict }}
+{{- $wt := .Values.weightTuner | default dict }}
+{{- $wtl := $wt.lua | default dict }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,11 +49,49 @@ data:
     local MPS_PER_NODE        = {{ default 100 $js.mpsPerNode }}
 
     -- Coefficients (kept in sync with values.yaml jobSubmit.scoreWeights).
+    -- These locals are upvalues: the M9/M10-F weight-tuner pull below may
+    -- overwrite A, D, E at plugin-load time if weightTuner.lua.enabled=true.
     local A = {{ default 0.40 $w.mpsFit }}        -- α
     local B = {{ default 0.20 $w.vramFit }}       -- β
     local G = {{ default 0.00 $w.topology }}      -- γ
     local D = {{ default 0.20 $w.fragmentation }} -- δ
     local E = {{ default 0.00 $w.predRuntime }}   -- ε
+
+    -- ------------------------------------------------------------------
+    -- M9/M10-F — Weight-tuner: pull (α, δ, ε) from UCB1 bandit at plugin
+    -- load time (once per slurmctld start). Failures are silently ignored
+    -- so chart-default weights remain in effect. B (vramFit) is not tuned.
+    -- ------------------------------------------------------------------
+    local WT_ENABLED  = {{ if $wtl.enabled }}true{{ else }}false{{ end }}
+    local WT_URL      = {{ default "http://weight-tuner:8003/weights" $wtl.url | quote }}
+    local WT_TIMEOUT  = {{ default 0.5 $wtl.timeoutSeconds }}
+
+    if WT_ENABLED then
+      pcall(function()
+        local cmd = string.format(
+          "curl -fsS --max-time %.2f %s 2>/dev/null", WT_TIMEOUT, WT_URL)
+        local h = io.popen(cmd, "r")
+        if not h then return end
+        local body = h:read("*a") or ""
+        h:close()
+        -- Parse "arm":[α,δ,ε] from JSON (minimal, no deps).
+        local arr = string.match(body, '"arm"%s*:%s*%[([^%]]+)%]')
+        if not arr then return end
+        local vals = {}
+        for v in string.gmatch(arr, "%-?%d+%.?%d*") do
+          vals[#vals + 1] = tonumber(v)
+        end
+        if #vals >= 3 then
+          A = vals[1]
+          D = vals[2]
+          E = vals[3]
+          if slurm and slurm.log_info then
+            slurm.log_info(string.format(
+              "[weight-tuner] loaded arm α=%.3f δ=%.3f ε=%.3f", A, D, E))
+          end
+        end
+      end)
+    end
 
     -- VRAM tiers (sorted ascending) — used by f_vram_fit.
     local VRAM_TIERS = {
@@ -151,8 +191,17 @@ data:
     -- no effect on the composite.
     function f_topology(job_desc, part_list) return 0.5 end
 
-    -- f_pred_runtime: deferred to M5+M6. Same idea — coefficient 0.
-    function f_pred_runtime(job_desc) return 0.5 end
+    -- f_pred_runtime: shorter predicted runtime → higher score (SJF-inspired).
+    -- Calls call_predictor(); falls back to 0.5 (neutral) on any failure.
+    -- Normalised: 1 − pred_s/PRED_FALLBACK_SECONDS, clamped to [0,1].
+    -- Only active when PRED_ENABLED=true; otherwise returns 0.5 so ε·0.5
+    -- contributes a flat offset (no discrimination).
+    function f_pred_runtime(job_desc)
+      if not PRED_ENABLED then return 0.5 end
+      local ok, success, pred_s = pcall(call_predictor, job_desc)
+      if not ok or not success or not pred_s or pred_s <= 0 then return 0.5 end
+      return clamp01(1.0 - pred_s / PRED_FALLBACK_SECONDS)
+    end
 
     function compute_score(job_desc, part_list)
       local f_m = f_mps_fit(job_desc, part_list)

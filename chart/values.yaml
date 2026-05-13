@@ -459,6 +459,36 @@ rlScheduler:
     url: "http://rl-scheduler:8002/decide"
     timeoutSeconds: 0.15  # curl --max-time
 
+# -- Weight tuner (M9/M10-F) --------------------------------------------------
+# UCB1 outer-loop bandit that dynamically tunes (α, δ, ε) score weights.
+# Background collector polls slurmrestd every collectorIntervalSeconds and
+# feeds mean JCT reward back to the bandit.  Lua pulls /weights at module
+# load (once per slurmctld start); wire via slurm.jobSubmit.weightTuner.enabled.
+weightTuner:
+  enabled: false
+  image:
+    repository: slurm-weight-tuner
+    tag: m9
+    pullPolicy: IfNotPresent
+  service:
+    port: 8003
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+  slurmrestdUrl: "http://slurm-restapi.slurm.svc:6820"
+  slurmApiVersion: "v0.0.41"
+  slurmUser: "root"
+  collectorIntervalSeconds: "300"
+  minJobsForUpdate: "5"
+  ucb1C: "1.0"
+  betaFixed: "0.20"
+  logLevel: "INFO"
+  # Lua side (job_submit.lua pulls /weights on plugin load)
+  lua:
+    enabled: false
+    url: "http://weight-tuner:8003/weights"
+    timeoutSeconds: 0.5     # curl --max-time; on failure falls back to chart defaults
+
 # -- Runtime predictor (Phase 6 M5) ------------------------------------------
 # Optional FastAPI + LightGBM service that returns predicted runtime to the
 # M2 Lua plugin (M6 wires the call). Disabled by default; the lua plugin

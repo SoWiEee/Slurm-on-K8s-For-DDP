@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# M11 Deep RL scheduler — one-shot pipeline:
+# M11 Deep RL scheduler + M9/M10-F UCB1 weight-tuner — one-shot pipeline:
 #   Phase B  PPO training + paired-CI evaluation
 #   Phase C  serve smoke + lua unit tests + RLPD scaffold smoke
-#   Phase D  live shadow on k3s (image build + helm + sbatch + log capture)
+#              + weight-tuner local smoke (endpoints + arm cycling)
+#   Phase D  live shadow on k3s:
+#              rl-scheduler (M11) + weight-tuner (M9) image build + helm deploy
+#              sbatch shadow jobs + log capture
 #
 # Stages are gated by env vars so a partial re-run is cheap. Default: run all.
 #   STAGES=B          # only training + paired-CI
-#   STAGES=B,C        # add serve / lua / rlpd smoke
+#   STAGES=B,C        # add serve / lua / rlpd + weight-tuner smoke
 #   STAGES=B,C,D      # add live shadow on k3s
 #   STAGES=D          # skip training, reuse newest runs/m11_mppo_*
+#   STAGES=C,D        # skip training, run smoke + live
 #
 # Knobs (env, all optional):
-#   TOTAL_STEPS   500000   PPO training steps
-#   N_JOBS        300      synth jobs per episode
-#   N_NODES       2        sim cluster shape
-#   GPUS_PER_NODE 2
-#   TRACE_FAMILY  philly
-#   SEEDS         "42 43 44 45 46"   paired-CI seeds
-#   NAMESPACE     slurm
-#   IMAGE         slurm-rl-scheduler:m11
-#   SKIP_BUILD    ""       set non-empty to skip docker build in stage D
+#   TOTAL_STEPS       500000   PPO training steps
+#   N_JOBS            300      synth jobs per episode
+#   N_NODES           2        sim cluster shape
+#   GPUS_PER_NODE     2
+#   TRACE_FAMILY      philly
+#   SEEDS             "42 43 44 45 46"   paired-CI seeds
+#   NAMESPACE         slurm
+#   IMAGE             slurm-rl-scheduler:m11
+#   WT_IMAGE          slurm-weight-tuner:m9
+#   SKIP_BUILD        ""       set non-empty to skip docker build in stage D
 #
 # Exit codes: 0 ok, 1 stage failure, 2 prerequisite missing.
 
@@ -34,6 +39,7 @@ TRACE_FAMILY=${TRACE_FAMILY:-philly}
 SEEDS=${SEEDS:-"42 43 44 45 46"}
 NAMESPACE=${NAMESPACE:-slurm}
 IMAGE=${IMAGE:-slurm-rl-scheduler:m11}
+WT_IMAGE=${WT_IMAGE:-slurm-weight-tuner:m9}
 SKIP_BUILD=${SKIP_BUILD:-}
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -123,6 +129,42 @@ stage_C() {
       --base-policy "$run" --offline-steps 2000 \
       --n-updates 5 --utd-ratio 2 --n-jobs 100 \
       --out-dir /tmp/m11_rlpd_smoke
+
+  log "Phase C-5: weight-tuner smoke (UCB1 serve + arm cycling)"
+  local wt_state_dir
+  wt_state_dir=$(mktemp -d /tmp/wt-smoke-XXXXXX)
+  STATE_DIR="$wt_state_dir" "$PY" -m services.weight_tuner.serve --port 8003 \
+      >/tmp/wt_serve_smoke.log 2>&1 &
+  local wt_pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $wt_pid 2>/dev/null || true" EXIT
+  sleep 3
+  curl -fsS http://127.0.0.1:8003/healthz \
+      || die "weight-tuner healthz failed; see /tmp/wt_serve_smoke.log"
+  echo
+  # verify /weights returns arm with 3 floats
+  local arm_json
+  arm_json=$(curl -fsS http://127.0.0.1:8003/weights)
+  echo "$arm_json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert len(d['arm']) == 3, 'arm length != 3'
+assert d['policy'] == 'ucb1', 'wrong policy'
+print(f\"  arm={d['arm']}  n_pulls={d['n_pulls']}  total_t={d['total_t']}\")
+" || die "weight-tuner /weights response invalid"
+  # feed a few rewards and verify arm shifts after exploration
+  for rew in -2.5 -1.8 -3.1 -2.0 -2.2; do
+    curl -fsS -X POST http://127.0.0.1:8003/feedback \
+      -H 'Content-Type: application/json' \
+      -d "{\"arm\":[0.1,0.05,0.0],\"reward\":$rew}" >/dev/null
+  done
+  local stats_n
+  stats_n=$(curl -fsS http://127.0.0.1:8003/stats \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(e['n'] for e in d))")
+  [[ "$stats_n" -eq 5 ]] || die "weight-tuner stats total pulls != 5 (got $stats_n)"
+  echo "  weight-tuner stats OK: 5 pulls recorded"
+  kill "$wt_pid" 2>/dev/null || true
+  trap - EXIT
 }
 
 # ---------- Stage D: live shadow on k3s ------------------------------------
@@ -134,26 +176,38 @@ stage_D() {
       || die "stage D needs slurm-platform already deployed in ns/$NAMESPACE"
 
   if [[ -z $SKIP_BUILD ]]; then
-    log "Phase D-1: docker build $IMAGE"
+    log "Phase D-1: docker build $IMAGE (rl-scheduler)"
     docker build -f services/rl_scheduler/Dockerfile -t "$IMAGE" .
-    log "Phase D-1: ctr import into k3s containerd"
+    log "Phase D-1: ctr import $IMAGE into k3s containerd"
     docker save "$IMAGE" | sudo k3s ctr images import -
+
+    log "Phase D-1: docker build $WT_IMAGE (weight-tuner)"
+    docker build -f services/weight_tuner/Dockerfile -t "$WT_IMAGE" .
+    log "Phase D-1: ctr import $WT_IMAGE into k3s containerd"
+    docker save "$WT_IMAGE" | sudo k3s ctr images import -
   else
-    warn "SKIP_BUILD set — reusing existing image $IMAGE"
+    warn "SKIP_BUILD set — reusing existing images $IMAGE $WT_IMAGE"
   fi
 
-  log "Phase D-2: helm upgrade with rlScheduler.enabled=true"
+  log "Phase D-2: helm upgrade with rlScheduler + weightTuner enabled"
   helm upgrade slurm-platform chart/ -n "$NAMESPACE" \
       -f chart/values-k3s.yaml --reset-then-reuse-values --no-hooks \
       --set rlScheduler.enabled=true \
-      --set rlScheduler.lua.enabled=true
+      --set rlScheduler.lua.enabled=true \
+      --set weightTuner.enabled=true \
+      --set weightTuner.image.repository="${WT_IMAGE%%:*}" \
+      --set weightTuner.image.tag="${WT_IMAGE##*:}" \
+      --set "weightTuner.slurmrestdUrl=http://slurm-restapi.${NAMESPACE}.svc:6820" \
+      --set weightTuner.lua.enabled=true
 
-  log "Phase D-2: restart controller, wait for rl-scheduler"
+  log "Phase D-2: restart controller, wait for rl-scheduler + weight-tuner"
   sudo kubectl -n "$NAMESPACE" rollout restart sts/slurm-controller
   sudo kubectl -n "$NAMESPACE" wait --for=condition=Ready \
       pod -l app=slurm-controller --timeout=180s
   sudo kubectl -n "$NAMESPACE" wait --for=condition=Available \
       deploy/rl-scheduler --timeout=120s
+  sudo kubectl -n "$NAMESPACE" wait --for=condition=Available \
+      deploy/weight-tuner --timeout=120s
 
   local rl_svc
   rl_svc=$(sudo kubectl -n "$NAMESPACE" get svc rl-scheduler \
@@ -181,12 +235,35 @@ stage_D() {
       | tee docs/m11_phase_d/shadow_decisions.log >/dev/null
   sudo kubectl -n "$NAMESPACE" logs deploy/rl-scheduler --tail=200 \
       > docs/m11_phase_d/serve.log
+  sudo kubectl -n "$NAMESPACE" logs deploy/weight-tuner --tail=200 \
+      > docs/m11_phase_d/weight_tuner.log
+
+  # Check weight-tuner loaded an arm (look for [weight-tuner] in controller log)
+  local n_wt_load
+  n_wt_load=$(grep -c '\[weight-tuner\]' docs/m11_phase_d/shadow_decisions.log || true)
+
   local n_decide n_abstain n_noboost
   n_decide=$(grep -c '\[rl\]' docs/m11_phase_d/shadow_decisions.log || true)
   n_abstain=$(grep -c 'abstain' docs/m11_phase_d/shadow_decisions.log || true)
   n_noboost=$(grep -c 'no-boost' docs/m11_phase_d/shadow_decisions.log || true)
-  printf '\n  decisions=%d  abstain=%d  no-boost=%d\n' \
-      "$n_decide" "$n_abstain" "$n_noboost"
+  printf '\n  decisions=%d  abstain=%d  no-boost=%d  wt-arm-loads=%d\n' \
+      "$n_decide" "$n_abstain" "$n_noboost" "$n_wt_load"
+
+  # Verify weight-tuner /weights reachable from outside cluster (via port-forward)
+  local wt_svc
+  wt_svc=$(sudo kubectl -n "$NAMESPACE" get svc weight-tuner \
+      -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+  if [[ -n $wt_svc ]]; then
+    log "Phase D-4: weight-tuner /weights via cluster IP $wt_svc"
+    ensure_venv
+    "$PY" -c "
+import urllib.request, json
+resp = urllib.request.urlopen('http://${wt_svc}:8003/weights', timeout=5)
+d = json.loads(resp.read())
+print(f\"  weight-tuner arm={d['arm']}  total_t={d['total_t']}\")
+" 2>/dev/null || warn "weight-tuner reachability check skipped (not in cluster)"
+  fi
+
   log "artifacts saved to docs/m11_phase_d/"
 }
 
