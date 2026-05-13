@@ -131,10 +131,12 @@ class KubefluxSchedEnv:
         self.mps_per_gpu = mps_per_gpu
         self.top_k = top_k
         self.max_steps = max_steps
-        if reward_mode not in ("jct_aligned", "wait_proxy"):
+        if reward_mode not in ("jct_aligned", "wait_proxy", "shaped"):
             raise ValueError(f"reward_mode={reward_mode!r}")
         self.reward_mode = reward_mode
         self.reward_scale = float(reward_scale)
+        # (β_jct, β_slowdown) for reward_mode="shaped"; defaults = jct_aligned
+        self.reward_betas: tuple = (1.0, 0.0)
         self._step_count = 0
         self._state: Optional[_RunState] = None
 
@@ -290,6 +292,12 @@ class KubefluxSchedEnv:
         if self.reward_mode == "jct_aligned":
             # JCT-aligned dense reward: sum over episode = -sum(JCT)/scale.
             st.completion_reward += -jct / self.reward_scale
+        elif self.reward_mode == "shaped":
+            b_jct, b_slow = self.reward_betas
+            runtime = max(1.0, j.runtime)
+            slowdown = max(1.0, jct / runtime)
+            st.completion_reward += (b_jct * (-jct / self.reward_scale)
+                                     + b_slow * (-math.log(slowdown)))
         else:  # wait_proxy legacy
             runtime = max(1.0, j.runtime)
             slowdown = max(1.0, jct / runtime)

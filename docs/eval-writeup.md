@@ -981,3 +981,45 @@ Round 2 的 score 幾乎回到 chart 預設水準，但 weight 組合已由 UCB1
 - [x] `POST /feedback` 更新 bandit state，`/stats` 反映 n/mean
 - [x] `weightTuner.enabled=false` 預設不影響任何現有路徑
 - [ ] arm 收斂（top-3 pulls ≥ 60%）— 待 GPU workloads（~300 jobs）
+
+---
+
+## G. M10 Phase E — Hierarchical DSAC scheduler 初跑結果（2026-05-14）
+
+### G.1 設定
+
+Phase E 把外層 bandit / contextual bandit 的「調權重」角色往上移一層：外層選
+reward shaping arm，內層 DSAC 直接做 masked scheduling action。這次 run 的外層
+arm 是：
+
+| outer round | arm | selection |
+|---:|---|---|
+| 5/5 | `Arm(β_jct=1.0, β_slow=0.5)` | UCB selected |
+
+內層 DSAC 持續 fine-tune 1000 steps，最後 500 steps 的 log：
+
+| inner step | loss_q | alpha |
+|---:|---:|---:|
+| 500/1000 | 296.8741 | 40.0037 |
+| 1000/1000 | 4082.9038 | 72.6386 |
+
+### G.2 結果
+
+```
+JCT=1.576h  reward=-1.5759  elapsed=44s
+*** new best — dsac.pt updated ***
+Hierarchical DSAC best JCT : 1.576h (Arm(β_jct=1.0, β_slow=0.5))
+```
+
+這代表 hierarchical DSAC 在本次 5-round run 中找到新的 best checkpoint，並已把
+`dsac.pt` 更新到 `Arm(β_jct=1.0, β_slow=0.5)` 對應的 policy。reward 使用
+`−mean_JCT_hours`，所以 `reward=-1.5759` 與 `JCT=1.576h` 對齊。
+
+### G.3 解讀
+
+- 這是 M10 Phase E 的第一個正向訓練訊號：DSAC + outer reward shaping 能在單次 run
+  內更新出 best checkpoint，且 wall-clock 成本低（44s）。
+- 目前仍屬 **single-run / single-context result**，不能直接取代 §C/§D 的
+  3-family × 5-seed paired-CI 結論。
+- 下一步要用 `eval/scripts/eval_hierarchical.py` 跑完整 paired evaluation：
+  hierarchical DSAC vs score vs PPO，至少覆蓋 philly / burst / ali × 5 seeds。

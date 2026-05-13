@@ -1008,10 +1008,24 @@ Policy head             Value head
 - 預期 ~500 live samples 即可看到 fine-tune 收斂
 
 **Phase 3 — Hierarchical 整合**
-- 外層 D-LinUCB 跑 reward shaping coefficient（β1, β2, β3 分別 weight pending wait penalty、slowdown penalty、resource utilization bonus）
-- 內層 DRL 用當前 coefficient 算 reward、PPO update
-- 外層每 ~100 jobs update 一次（小時尺度），內層 per-decision
+- 外層 bandit / D-LinUCB 跑 reward shaping coefficient（例如 `β_jct`, `β_slow`）
+- 內層 DSAC 用當前 coefficient 算 reward，並做 masked scheduling action update
+- 外層每個 round 根據 eval mean JCT 更新 arm reward（`−mean_JCT_hours`），內層 per-decision fine-tune
 - 引用：Pateria, S. et al. "Hierarchical Reinforcement Learning: A Comprehensive Survey", **ACM Computing Surveys 2021**；Nachum, O. et al. "Data-Efficient HRL" (HIRO), **NeurIPS 2018**
+
+**Phase E 初跑結果（2026-05-14）**
+
+Hierarchical DSAC 已跑完 5 個 outer rounds；最後一輪 UCB 選到
+`Arm(β_jct=1.0, β_slow=0.5)`，內層訓練 1000 steps 後得到：
+
+```
+JCT=1.576h  reward=-1.5759  elapsed=44s
+*** new best — dsac.pt updated ***
+Hierarchical DSAC best JCT : 1.576h (Arm(β_jct=1.0, β_slow=0.5))
+```
+
+`dsac.pt` 已更新為本次 best checkpoint。這是 single-run 訓練結果；正式結論仍需跑
+philly / burst / ali × 5 seeds 的 paired evaluation，再跟 score / PPO 對照。
 
 ### 實作位置
 
@@ -1226,5 +1240,3 @@ Phase 7 OTel 端到端 trace 會把每個 job 的：
 6. checkpoint → completion / requeue (M7 觸發)
 
 每個 step span 內會帶上 score 各 factor 的值、predictor MAE、fragmentation snapshot。**Phase 6 寫 trace span 的成本接近 0**（lua emit log line + operator emit metric 已經有了），等 Phase 7 起手時把這些 log/metric 包成 OTel span 即可。
-
-
