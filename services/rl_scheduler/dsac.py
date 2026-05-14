@@ -144,11 +144,14 @@ class DSACAgent:
         dones = _t("dones", torch.float32)
         masks = _t("masks", torch.bool)
         next_masks = _t("next_masks", torch.bool)
+        # gammas holds γ^n for n-step returns (γ^1 for 1-step)
+        gammas = _t("gammas") if "gammas" in batch else \
+            torch.full_like(rews, self.gamma)
 
         # ---- Critic update -------------------------------------------
         with torch.no_grad():
             v_next = self._soft_value(next_obs, next_masks, use_target=True)
-            target_q = rews + self.gamma * (1.0 - dones) * v_next
+            target_q = rews + gammas * (1.0 - dones) * v_next
 
         q1_a = self.q1(obs).gather(1, acts.unsqueeze(1)).squeeze(1)
         q2_a = self.q2(obs).gather(1, acts.unsqueeze(1)).squeeze(1)

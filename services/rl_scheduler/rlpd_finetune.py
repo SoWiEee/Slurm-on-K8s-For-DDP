@@ -47,7 +47,14 @@ class Transition:
 @dataclass
 class ReplayBuffer:
     """FIFO numpy-backed replay. Stored as parallel arrays for cheap batch
-    sampling. Pre-allocates to capacity to avoid repeated np.append."""
+    sampling. Pre-allocates to capacity to avoid repeated np.append.
+
+    The `gammas` field stores the effective discount for each transition.
+    For 1-step TD this is always γ.  For n-step returns (n>1) the caller
+    pre-computes the discounted sum r + γr' + ... + γ^{n-1}r'' and stores
+    γ^n here so the critic target becomes:
+        y = n_step_return + gammas * (1 - done) * V(s_{t+n})
+    """
     capacity: int
     obs_dim: int
     n_actions: int
@@ -58,6 +65,7 @@ class ReplayBuffer:
     dones: np.ndarray = field(init=False)
     masks: np.ndarray = field(init=False)
     next_masks: np.ndarray = field(init=False)
+    gammas: np.ndarray = field(init=False)   # γ^n per transition
     _size: int = 0
     _idx: int = 0
 
@@ -69,17 +77,19 @@ class ReplayBuffer:
         self.dones = np.zeros((self.capacity,), dtype=np.bool_)
         self.masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
         self.next_masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
+        self.gammas = np.full((self.capacity,), 0.99, dtype=np.float32)
 
     def __len__(self) -> int:
         return self._size
 
-    def add(self, t: Transition) -> None:
+    def add(self, t: Transition, gamma: float = 0.99) -> None:
         i = self._idx
         self.obs[i] = t.obs
         self.acts[i] = t.act
         self.rews[i] = t.rew
         self.next_obs[i] = t.next_obs
         self.dones[i] = t.done
+        self.gammas[i] = gamma
         if t.mask is not None:
             self.masks[i] = t.mask
         if t.next_mask is not None:
@@ -94,6 +104,7 @@ class ReplayBuffer:
             "rews": self.rews[idx], "next_obs": self.next_obs[idx],
             "dones": self.dones[idx], "masks": self.masks[idx],
             "next_masks": self.next_masks[idx],
+            "gammas": self.gammas[idx],
         }
 
 
