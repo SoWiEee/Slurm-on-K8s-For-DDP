@@ -335,8 +335,11 @@ def main(argv=None) -> int:
     p.add_argument("--online-ratio", type=float, default=0.5)
     p.add_argument("--trace-family", default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
-    p.add_argument("--n-nodes", type=int, default=2)
-    p.add_argument("--gpus-per-node", type=int, default=2)
+    # Cluster shape — must match the live deployment.
+    # Current: 1 host × 1 GPU → obs_dim=192, n_actions=17.
+    # When second GPU is online: change both to 2 and retrain from scratch.
+    p.add_argument("--n-nodes", type=int, default=1)
+    p.add_argument("--gpus-per-node", type=int, default=1)
     p.add_argument("--out-dir",
                    default=f"runs/m11_rlpd_{time.strftime('%Y%m%d-%H%M%S')}")
     args = p.parse_args(argv)

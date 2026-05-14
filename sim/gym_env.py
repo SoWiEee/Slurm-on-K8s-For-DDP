@@ -33,23 +33,57 @@ from .cluster import Cluster
 from .loader import Job, MPS_PER_GPU
 
 # ── Layout constants ───────────────────────────────────────────────────────
-TOP_K       = 16
-N_NODES     = 2   # fixed for 2-host cluster
-N_GPUS      = 2   # GPUs per node
-GPU_TYPES   = ("rtx4070", "rtx4080", "a10", "h100")
+TOP_K     = 16
+GPU_TYPES = ("rtx4070", "rtx4080", "a10", "h100")
 
 JOB_FEAT_DIM    = 11
 GPU_FEAT_DIM    = 6
 TOPO_FEAT_DIM   = 4
 GLOBAL_FEAT_DIM = 6
 
-# Total obs = 16*11 + (2*2)*6 + 4 + 6 = 176 + 24 + 4 + 6 = 210
-OBS_DIM = TOP_K * JOB_FEAT_DIM + N_NODES * N_GPUS * GPU_FEAT_DIM + TOPO_FEAT_DIM + GLOBAL_FEAT_DIM
+# ── Cluster size — current deployment vs. target ───────────────────────────
+# LIVE (current): 1 host × 1 GPU (RTX 4070, MPS enabled)
+#   obs_dim  = 16*11 + 1*1*6 + 4 + 6 = 192
+#   n_actions = 16*1*1 + 1 = 17
+#
+# SIM training default (2×2): mirrors target 2-host cluster
+#   obs_dim  = 16*11 + 2*2*6 + 4 + 6 = 210
+#   n_actions = 16*2*2 + 1 = 65
+#
+# HOW TO ADD A SECOND GPU:
+#   1. Set N_NODES=2, N_GPUS=2 below (or pass n_nodes=2, gpus_per_node=2 to env)
+#   2. Retrain DSAC from scratch (obs_dim 192→210, n_actions 17→65 — checkpoint
+#      is NOT compatible; different network input/output shape)
+#   3. Update rlpd_finetune.py / hierarchical.py CLI defaults to match
+#   4. In Slurm: verify two worker nodes are registered and GRES is correct
+N_NODES = 1   # current: single host  ← change to 2 when second GPU is online
+N_GPUS  = 1   # current: single GPU   ← change to 2 when second GPU is online
 
-# Action space: 16 jobs × 2 nodes × 2 GPUs + no-op
-N_PLACEMENTS = N_NODES * N_GPUS          # 4
-N_ACTIONS    = TOP_K * N_PLACEMENTS + 1  # 65
-NO_OP        = N_ACTIONS - 1             # 64
+# Derived defaults (reflect N_NODES / N_GPUS above)
+N_PLACEMENTS = N_NODES * N_GPUS
+N_ACTIONS    = TOP_K * N_PLACEMENTS + 1
+NO_OP        = N_ACTIONS - 1
+OBS_DIM      = (TOP_K * JOB_FEAT_DIM
+                + N_NODES * N_GPUS * GPU_FEAT_DIM
+                + TOPO_FEAT_DIM
+                + GLOBAL_FEAT_DIM)
+
+
+def env_dims(n_nodes: int, gpus_per_node: int, top_k: int = TOP_K) -> tuple[int, int]:
+    """Return (obs_dim, n_actions) for a given cluster shape.
+
+    Use this to construct a matching DSACAgent before creating the env::
+
+        obs_dim, n_actions = env_dims(n_nodes=1, gpus_per_node=1)
+        agent = DSACAgent(obs_dim=obs_dim, n_actions=n_actions)
+        env = KubefluxSchedEnv(..., n_nodes=1, gpus_per_node=1)
+    """
+    obs = (top_k * JOB_FEAT_DIM
+           + n_nodes * gpus_per_node * GPU_FEAT_DIM
+           + TOPO_FEAT_DIM
+           + GLOBAL_FEAT_DIM)
+    n_act = top_k * n_nodes * gpus_per_node + 1
+    return obs, n_act
 
 # Bandwidth placeholders (sim has no real network model; feats are 1.0 = full)
 _INTRA_BW_TOTAL = 1.0

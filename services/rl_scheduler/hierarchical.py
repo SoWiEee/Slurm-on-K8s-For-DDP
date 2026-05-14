@@ -211,8 +211,8 @@ class HierarchicalTrainer:
         *,
         trace_family: str = "philly",
         n_jobs: int = 200,
-        n_nodes: int = 2,
-        gpus_per_node: int = 2,
+        n_nodes: int = 1,
+        gpus_per_node: int = 1,
         n_outer: int = 5,
         n_inner: int = 2000,
         utd_ratio: int = 4,
@@ -302,7 +302,9 @@ class HierarchicalTrainer:
             print(f"[hier] warm-starting DSAC from {dsac_path}")
             agent = DSACAgent.load(dsac_path, device=self.device)
         else:
-            agent = DSACAgent(obs_dim=193, n_actions=17, device=self.device)
+            from sim.gym_env import env_dims
+            _obs_dim, _n_act = env_dims(self.n_nodes, self.gpus_per_node)
+            agent = DSACAgent(obs_dim=_obs_dim, n_actions=_n_act, device=self.device)
 
         # Shared offline buffer (sim, diverse random policy)
         print(f"[hier] collecting offline buffer ({self.offline_buffer_size} steps)...")
