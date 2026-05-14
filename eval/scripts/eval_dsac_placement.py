@@ -146,6 +146,8 @@ def main(argv=None) -> int:
     p.add_argument("--greedy",         action="store_true", default=True)
     p.add_argument("--device",         default="cpu",
                    help="torch device for DSAC: 'cpu' or 'cuda'")
+    p.add_argument("--no-attention",   action="store_true",
+                   help="use flat MLP Q-network instead of attention (default: attention)")
     args = p.parse_args(argv)
 
     out_dir = Path(args.out_dir)
@@ -163,7 +165,9 @@ def main(argv=None) -> int:
         agent = DSACAgent.load(args.ckpt)
     else:
         trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
-        print(f"[eval] training DSAC for {args.total_steps:,} steps "
+        use_attention = not args.no_attention
+        arch_name = "MLP" if args.no_attention else "Attention"
+        print(f"[eval] training DSAC({arch_name}) for {args.total_steps:,} steps "
               f"(traces={trains}) ...")
         agent = sim_train(
             n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
@@ -172,6 +176,7 @@ def main(argv=None) -> int:
             out_dir=out_dir / "train",
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
+            use_attention=use_attention,
         )
         print()
 

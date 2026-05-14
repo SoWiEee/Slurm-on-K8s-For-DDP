@@ -90,6 +90,7 @@ def sim_train(
     reward_mode: str = "jct_aligned",
     device: str = "cpu",
     log_every: int = 5_000,
+    use_attention: bool = True,
 ) -> DSACAgent:
     """Run online DSAC training in sim. Returns the trained agent."""
     obs_dim, n_actions = env_dims(n_nodes, gpus_per_node)
@@ -110,7 +111,8 @@ def sim_train(
         max_steps=n_jobs * 200,
         reward_mode=reward_mode,
     )
-    agent = DSACAgent(obs_dim=obs_dim, n_actions=n_actions, device=device)
+    agent = DSACAgent(obs_dim=obs_dim, n_actions=n_actions, device=device,
+                      use_attention=use_attention)
     buf   = ReplayBuffer(capacity=buf_capacity, obs_dim=obs_dim, n_actions=n_actions)
 
     # Score-guided warmup: use score scheduler for high-quality seed data
