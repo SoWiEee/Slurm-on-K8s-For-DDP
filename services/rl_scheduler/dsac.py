@@ -87,7 +87,13 @@ class DSACAgent:
             math.log(init_alpha), dtype=torch.float32,
             requires_grad=True, device=self.device,
         )
-        # Target entropy: -0.98 * log(1/n_actions)
+        # Target entropy based on valid (unmasked) actions, not total n_actions.
+        # Action masking shrinks the effective action space — using log(n_actions)
+        # as target causes log_α to explode because the masked policy can never
+        # reach that entropy level. We store the ratio and compute dynamically
+        # from each batch's mask in update().
+        self.target_entropy_ratio = target_entropy_ratio
+        # Fallback static target (used when mask info is unavailable)
         self.target_entropy = target_entropy_ratio * math.log(n_actions)
 
         self.opt_q = torch.optim.Adam(
@@ -168,17 +174,30 @@ class DSACAgent:
             q_avg = (self.q1(obs) + self.q2(obs)) * 0.5
             probs, log_probs = self._masked_policy(q_avg, masks)
         entropy = -(probs * log_probs).sum(dim=-1).mean()
-        loss_alpha = self.log_alpha * (entropy - self.target_entropy).detach()
+
+        # Mask-aware target entropy: base on average number of VALID actions
+        # in this batch, not total n_actions.  Prevents log_α explosion when
+        # most actions are masked (common in small clusters).
+        n_valid = masks.float().sum(dim=-1).clamp(min=1.0).mean()
+        target_entropy = self.target_entropy_ratio * torch.log(n_valid)
+
+        loss_alpha = self.log_alpha * (entropy - target_entropy).detach()
 
         self.opt_alpha.zero_grad()
         loss_alpha.backward()
         self.opt_alpha.step()
+
+        # Hard clamp: prevent catastrophic α divergence regardless of target
+        with torch.no_grad():
+            self.log_alpha.clamp_(-5.0, 2.0)   # α ∈ [0.007, 7.4]
 
         return {
             "loss_q": loss_q.item(),
             "loss_alpha": loss_alpha.item(),
             "alpha": self.alpha.item(),
             "entropy": entropy.item(),
+            "target_entropy": target_entropy.item(),
+            "n_valid_actions": n_valid.item(),
         }
 
     # ------------------------------------------------------------------
