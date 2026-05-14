@@ -273,15 +273,15 @@ TD-MPC2 的主要問題：(1) 所有 benchmark（DMControl / Meta-World / ManiSk
 
 ### 實作規劃
 
-| 階段 | 內容 |
-|------|------|
-| **Step 1** | 擴展 `sim/gym_env.py`：action space 從 Discrete(17) 改為 Discrete(65)，加 placement 維度；補 GPU slot feats + topology feats |
-| **Step 2** | `sim/cluster.py` 支援 placement-aware allocation（指定 node + gpu 分配） |
-| **Step 3** | `services/rl_scheduler/dsac.py` 升級 n_actions=65；action masking 對應新 65-dim mask |
-| **Step 4** | Sim 驗證：DSAC 能學到 placement-aware policy（比 score+Slurm placement 好） |
-| **Step 5** | Live daemon：監聽 Slurm queue，呼叫 DSAC /select_action，執行 `srun --nodelist=… --gres=mps:N`；live buffer 收集 transitions |
-| **Step 6** | RLPD online fine-tune loop；live buffer 累積足夠後逐步提高 live buffer 比例 |
-| **Step 7**（可選）| 嘗試 DreamerV3 作為對照：用相同 env，比較 sample efficiency 和穩定性 |
+| 階段 | 內容 | 狀態 |
+|------|------|------|
+| **Step 1** | 擴展 `sim/gym_env.py`：placement-aware MDP, Discrete(17)，GPU slot + topology feats，env_dims() helper | ✅ |
+| **Step 2** | `sim/cluster.py`：`try_allocate_on(job, node, gpu)`, `can_allocate_on()`, `_plan_on()` | ✅ |
+| **Step 3** | 5 integration tests：dims match，buffer fill，update loss finite，mask compliance，200-step stability | ✅ |
+| **Step 4** | `sim_train.py`：online DSAC training loop（UTD=4，job filter for cluster size）；`eval_dsac_placement.py`：paired t-test + 95% CI vs score baseline | ✅ |
+| **Step 5** | `serve.py`：DSAC FastAPI（/healthz /snapshot /decide /act，backward-compat Lua hook，placement node_j+gpu_k in response）；`live_daemon.py`：squeue poller → obs build → srun → transition log，SHADOW_MODE=true default | ✅ |
+| **Step 6** | `rlpd_finetune.py`：DSAC-native（KubefluxSchedEnv，gpu_count filter，clean up PPO legacy）；混合 offline sim + online live JSONL；UTD=4–20 | ✅ |
+| **Step 7**（可選）| DreamerV3 作為研究對照：用相同 env，比較 sample efficiency 和穩定性 | — |
 
 ### 與現有架構的關係
 
