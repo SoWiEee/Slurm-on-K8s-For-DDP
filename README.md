@@ -509,7 +509,7 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 - **M4-M6：trace replay + runtime predictor**：`sim/` 可離線重播 Philly-like trace；FastAPI + LightGBM predictor 可由 Lua submit plugin 呼叫並覆寫過鬆的 `--time`。
 - **M7：fragmentation requeue**：Operator 加入 fragmentation detector / decider，預設 `shadowMode=true`，可觀察解卡決策後再開實際 `scontrol requeue`。
 - **M8：evaluation**：`eval/results/`、`eval/figures/` 與 `docs/eval-writeup.md` 已產出；目前主要結論是 E5（score + predictor + fragmentation）相對 vendor multifactor mean JCT 改善約 28.6%。
-- **M9-M10：adaptive / DRL scheduler**：M9 UCB1 weight tuner 已有 offline + live service；M10 hierarchical DSAC 初跑 best JCT = 1.576h（`Arm(β_jct=1.0, β_slow=0.5)`，single-run，`dsac.pt` updated）。
+- **M9-M10：adaptive / DRL scheduler**：M9 UCB1 weight tuner 已有 offline + live service；M10 hierarchical DSAC paired eval 顯示 philly 平均改善 35% 但 CI 跨 0，burst 平均退步 46%，ali 顯著退步 85.5%，因此 production 仍維持 score + weight tuner、RL 僅 shadow / fallback。
 - **仍待補強**：E7 live-cluster 50-job 驗證、checkpoint resume cost 實測、更多 trace / sensitivity sweep，以及 M10 hierarchical DSAC paired multi-seed evaluation。
 
 ## Phase 7：分散式追蹤 + SSH Login 📋 規劃中

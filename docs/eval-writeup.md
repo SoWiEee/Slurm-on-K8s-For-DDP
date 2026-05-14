@@ -1019,7 +1019,49 @@ Hierarchical DSAC best JCT : 1.576h (Arm(β_jct=1.0, β_slow=0.5))
 
 - 這是 M10 Phase E 的第一個正向訓練訊號：DSAC + outer reward shaping 能在單次 run
   內更新出 best checkpoint，且 wall-clock 成本低（44s）。
-- 目前仍屬 **single-run / single-context result**，不能直接取代 §C/§D 的
-  3-family × 5-seed paired-CI 結論。
-- 下一步要用 `eval/scripts/eval_hierarchical.py` 跑完整 paired evaluation：
-  hierarchical DSAC vs score vs PPO，至少覆蓋 philly / burst / ali × 5 seeds。
+- 這筆仍屬 **single-run / single-context result**，不能直接取代 §C/§D 的
+  3-family × 5-seed paired-CI 結論；正式 paired evaluation 見 §G.4。
+
+### G.4 正式 paired evaluation（philly / burst / ali × 5 seeds）
+
+Run：
+
+```bash
+.venv-m11/bin/python -u eval/scripts/eval_hierarchical.py \
+  --n-outer 5 --n-inner 1000 --utd-ratio 4 \
+  --seeds 42 43 44 45 46 \
+  --trace-families philly burst ali \
+  --n-jobs 300 --n-nodes 2 --gpus-per-node 2 \
+  --out-csv eval/results/hierarchical_full_20260514_formal.csv \
+  --out-base runs/hier_eval_20260514_formal
+```
+
+Artifacts：
+- `eval/results/hierarchical_full_20260514_formal.csv`
+- `logs/m10_hier_eval_20260514_formal.log`
+- `runs/hier_eval_20260514_formal/<family>_seed<seed>/`
+
+Mean JCT（hours，越低越好）：
+
+| Family | Score | Multifactor | Hierarchical DSAC |
+|---|---:|---:|---:|
+| philly | 11.742 | 11.853 | **7.638** |
+| burst | **10.430** | 10.039 | 15.226 |
+| ali | **0.822** | 0.818 | 1.525 |
+
+Paired CI（`score − hier`，正 = DSAC 比 score 好）：
+
+| Family | Δ(score−hier) | 95% CI | 結論 |
+|---|---:|---:|---|
+| philly | +4.104h (+35.0%) | [−4.651, +12.859]h | 平均贏，但 CI 跨 0，不顯著 |
+| burst | −4.796h (−46.0%) | [−13.002, +3.410]h | 平均輸，CI 跨 0 |
+| ali | −0.703h (−85.5%) | [−1.095, −0.311]h | **顯著輸給 score** |
+
+正式結論：hierarchical DSAC 在 philly heavy-contention case 有正向訊號，但
+跨 family 不穩；burst 退步、ali 顯著退步。因此 M10 不能宣稱 DSAC scheduler 已勝過
+score scheduler。這支持 §E 的保守立場：live path 可以保留 shadow / fallback，但
+production priority 仍應由 score + weight tuner 主導。
+
+注意：這是受控 simulator paired evaluation，不是 live cluster A/B。live cluster
+目前仍只有 shadow-mode decision 行為可看；要量 live JCT effect 需要實際提交對照 workload
+並讓 RL 非 shadow 改 priority。

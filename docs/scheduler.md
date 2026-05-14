@@ -1027,6 +1027,21 @@ Hierarchical DSAC best JCT : 1.576h (Arm(β_jct=1.0, β_slow=0.5))
 `dsac.pt` 已更新為本次 best checkpoint。這是 single-run 訓練結果；正式結論仍需跑
 philly / burst / ali × 5 seeds 的 paired evaluation，再跟 score / PPO 對照。
 
+**Phase E 正式 paired evaluation（2026-05-14）**
+
+`eval/scripts/eval_hierarchical.py` 已跑完 philly / burst / ali × 5 seeds（N2×2gpu,
+n_jobs=300, n_outer=5, n_inner=1000）。Paired CI（`score − hier`，正 = DSAC 贏）：
+
+| Family | mean score JCT | mean hier JCT | Δ(score−hier) | 95% CI | 結論 |
+|---|---:|---:|---:|---:|---|
+| philly | 11.742h | **7.638h** | +4.104h (+35.0%) | [−4.651, +12.859]h | 平均贏但不顯著 |
+| burst | **10.430h** | 15.226h | −4.796h (−46.0%) | [−13.002, +3.410]h | 平均輸 |
+| ali | **0.822h** | 1.525h | −0.703h (−85.5%) | [−1.095, −0.311]h | 顯著輸 |
+
+結論：hierarchical DSAC 還不能取代 score scheduler。philly 有可追的正向訊號，但
+burst / ali generalization 不穩，ali 已顯著 regression；live production path 維持
+score + weight tuner，RL 保持 shadow / fallback。
+
 ### 實作位置
 
 ```
