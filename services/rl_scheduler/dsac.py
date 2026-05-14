@@ -65,8 +65,8 @@ class DSACAgent:
         lr_alpha: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        init_alpha: float = 0.2,
-        target_entropy_ratio: float = 0.5,
+        init_alpha: float = 0.05,
+        target_entropy_ratio: float = 0.1,
         layer_norm: bool = True,
         device: str = "cpu",
     ) -> None:
@@ -187,9 +187,14 @@ class DSACAgent:
         loss_alpha.backward()
         self.opt_alpha.step()
 
-        # Hard clamp: prevent catastrophic α divergence regardless of target
+        # Hard clamp + reset Adam momentum if boundary hit.
+        # Without momentum reset, Adam's accumulated upward push keeps log_α
+        # pinned at the ceiling even after the signal flips (warmup spike).
         with torch.no_grad():
-            self.log_alpha.clamp_(-5.0, 2.0)   # α ∈ [0.007, 7.4]
+            prev = self.log_alpha.item()
+            self.log_alpha.clamp_(-5.0, 0.5)   # α ∈ [0.007, 1.65]
+            if abs(self.log_alpha.item() - prev) > 1e-6:
+                self.opt_alpha.state[self.log_alpha] = {}
 
         return {
             "loss_q": loss_q.item(),
