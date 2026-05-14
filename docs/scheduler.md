@@ -187,12 +187,9 @@ Safety：value head 估值低或 policy entropy 高時，fallback 到 score sche
 | 演算法 | 樣本效率 | Live 可行 | 主風險 | 推薦 |
 |--------|---------|-----------|--------|------|
 | **DSAC + RLPD** | 高（UTD=4–20） | ✅ | reward shaping 工 | ✅ 主軸 |
-| **PPO (Maskable)** | 低（需大 batch） | ⚠️ 需多 env | live 樣本不夠 | ❌ sim-only 適用 |
 | **TD3** | 高 | ❌ | 連續 action only | ❌ 不適合 |
-| **IQL（offline）** | 中（dataset 天花板） | ⚠️ warm-start | 無法超越 dataset | offline pre-train 用 |
 | **DreamerV3（model-based）** | 極高（~10³ live） | ✅ | world model 學歪 policy 跟著歪 | ⭐ 強力備選 |
 | **TD-MPC2** | 高，規劃能力強 | ✅ | 實作複雜，離散 action 需調整 | ⭐ 強力備選 |
-| **Recurrent PPO（RPPO）** | 低 | ❌ | partial obs 改善有限 | ❌ |
 
 > **DreamerV3**（Hafner 2023）值得認真考慮：學一個 latent world model，agent 在模型中做 imagination rollout，live 樣本需求僅 ~10³ 量級，與本場景（小叢集、每天 ~200 jobs）高度契合。風險是 world model 若建模錯 scheduling dynamics，policy 會在錯誤的 imagined world 中過擬合。
 >
