@@ -66,7 +66,7 @@ class DSACAgent:
         gamma: float = 0.99,
         tau: float = 0.005,
         init_alpha: float = 0.2,
-        target_entropy_ratio: float = 0.98,
+        target_entropy_ratio: float = 0.5,
         layer_norm: bool = True,
         device: str = "cpu",
     ) -> None:

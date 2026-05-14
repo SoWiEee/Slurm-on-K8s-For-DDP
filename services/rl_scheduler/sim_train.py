@@ -30,7 +30,7 @@ def sim_train(
     *,
     n_nodes: int = 1,
     gpus_per_node: int = 1,
-    trace_family: str = "philly",
+    trace_family: str | list = "philly",   # single str or list for mixed training
     n_jobs: int = 100,
     total_steps: int = 50_000,
     warmup_steps: int = 2_000,
@@ -49,13 +49,13 @@ def sim_train(
     rng = np.random.default_rng(seed)
 
     total_gpus = n_nodes * gpus_per_node
+    # Support single trace str or list of traces for mixed training
+    families = [trace_family] if isinstance(trace_family, str) else list(trace_family)
 
     def _factory():
-        jobs = generate_by_family(
-            trace_family, n_jobs=n_jobs,
-            seed=int(rng.integers(0, 2**31 - 1))
-        )
-        # Drop jobs that can never be scheduled in this cluster size
+        family = families[int(rng.integers(0, len(families)))]
+        jobs = generate_by_family(family, n_jobs=n_jobs,
+                                   seed=int(rng.integers(0, 2**31 - 1)))
         return [j for j in jobs if j.gpu_count <= total_gpus]
 
     env = KubefluxSchedEnv(
@@ -139,8 +139,9 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--n-nodes",       type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)
-    p.add_argument("--trace",         default="philly",
-                   choices=["philly", "burst", "ali"])
+    p.add_argument("--trace",         default=["philly", "burst", "ali"],
+                   nargs="+", choices=["philly", "burst", "ali"],
+                   help="trace family/families; multiple = mixed training")
     p.add_argument("--n-jobs",        type=int, default=100)
     p.add_argument("--total-steps",   type=int, default=50_000)
     p.add_argument("--warmup-steps",  type=int, default=2_000)
@@ -149,20 +150,29 @@ def main(argv=None) -> int:
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--reward-mode",   default="jct_aligned",
                    choices=["jct_aligned", "shaped"])
+    p.add_argument("--device",        default="cpu",
+                   help="torch device: 'cpu' or 'cuda' (GPU). "
+                        "For CUDA use --batch-size >=1024 to amortise transfer overhead.")
     p.add_argument("--out-dir",
                    default=f"runs/dsac_sim_{time.strftime('%Y%m%d-%H%M%S')}")
     args = p.parse_args(argv)
 
+    import torch
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[sim_train] CUDA requested but not available, falling back to CPU")
+        device = "cpu"
+    traces = args.trace if len(args.trace) > 1 else args.trace[0]
     print(f"[sim_train] n={args.n_nodes}×{args.gpus_per_node}  "
-          f"trace={args.trace}  steps={args.total_steps:,}  "
-          f"UTD={args.utd_ratio}")
+          f"trace={traces}  steps={args.total_steps:,}  "
+          f"UTD={args.utd_ratio}  device={device}")
     sim_train(
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
-        trace_family=args.trace, n_jobs=args.n_jobs,
+        trace_family=traces, n_jobs=args.n_jobs,
         total_steps=args.total_steps, warmup_steps=args.warmup_steps,
         utd_ratio=args.utd_ratio, batch_size=args.batch_size,
         seed=args.seed, reward_mode=args.reward_mode,
-        out_dir=Path(args.out_dir),
+        out_dir=Path(args.out_dir), device=device,
     )
     return 0
 

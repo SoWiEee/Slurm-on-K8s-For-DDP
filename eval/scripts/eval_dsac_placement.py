@@ -134,8 +134,9 @@ def main(argv=None) -> int:
                    default=[42, 43, 44, 45, 46])
     p.add_argument("--trace-families", nargs="+",
                    default=["philly", "burst", "ali"])
-    p.add_argument("--train-trace",    default="philly",
-                   help="trace family used for training")
+    p.add_argument("--train-trace",    default=["philly", "burst", "ali"],
+                   nargs="+", choices=["philly", "burst", "ali"],
+                   help="trace(s) for training; multiple = mixed (default: all three)")
     p.add_argument("--out-dir",
                    default=f"runs/eval_dsac_{time.strftime('%Y%m%d-%H%M%S')}")
     p.add_argument("--ckpt",           default=None,
@@ -143,6 +144,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-train",       action="store_true",
                    help="skip training (requires --ckpt)")
     p.add_argument("--greedy",         action="store_true", default=True)
+    p.add_argument("--device",         default="cpu",
+                   help="torch device for DSAC: 'cpu' or 'cuda'")
     args = p.parse_args(argv)
 
     out_dir = Path(args.out_dir)
@@ -159,14 +162,16 @@ def main(argv=None) -> int:
         print(f"[eval] loading checkpoint: {args.ckpt}")
         agent = DSACAgent.load(args.ckpt)
     else:
+        trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
         print(f"[eval] training DSAC for {args.total_steps:,} steps "
-              f"(trace={args.train_trace}) ...")
+              f"(traces={trains}) ...")
         agent = sim_train(
             n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
-            trace_family=args.train_trace, n_jobs=args.n_jobs,
+            trace_family=trains, n_jobs=args.n_jobs,
             total_steps=args.total_steps,
             out_dir=out_dir / "train",
             log_every=max(1000, args.total_steps // 10),
+            device=args.device,
         )
         print()
 
