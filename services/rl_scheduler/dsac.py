@@ -255,7 +255,7 @@ class DSACAgent:
         agent.q2_target.load_state_dict(data["q2_target"])
         agent.opt_q.load_state_dict(data["opt_q"])
         with torch.no_grad():
-            agent.log_alpha.copy_(torch.tensor(math.log(max(1e-8, data["log_alpha"]))))
+            agent.log_alpha.fill_(float(data["log_alpha"]))
         if agent.opt_alpha and data.get("opt_alpha"):
             agent.opt_alpha.load_state_dict(data["opt_alpha"])
         agent._update_count = data["update_count"]

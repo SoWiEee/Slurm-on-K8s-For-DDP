@@ -1065,3 +1065,104 @@ production priority 仍應由 score + weight tuner 主導。
 注意：這是受控 simulator paired evaluation，不是 live cluster A/B。live cluster
 目前仍只有 shadow-mode decision 行為可看；要量 live JCT effect 需要實際提交對照 workload
 並讓 RL 非 shadow 改 priority。
+
+---
+
+## H. DSAC Branch — Placement-aware 1×1 Scheduler（2026-05-14）
+
+### H.1 架構改動（vs §G 的 hierarchical DSAC）
+
+| 項目 | §G（舊） | §H（DSAC branch） |
+|---|---|---|
+| 演算法 | MaskablePPO（sb3-contrib） | Discrete SAC（自實作，twin Q + LayerNorm）|
+| Cluster | 2×2 GPU（4 nodes, 8 GPU） | **1×1 GPU**（1 node, 1 GPU, 4 MPS slots）|
+| obs_dim | 視配置 | **192**（16×11 job + 1×6 GPU + 4 topo + 6 global）|
+| n_actions | 視配置 | **17**（16 job slots × 1 GPU + no-op）|
+| reward | wait-proxy / JCT-aligned | `jct_aligned`（每完成一 job 給 −JCT/scale）|
+| Alpha 調節 | N/A | auto-tune（SAC 標準）→ 最終改 fixed_alpha=0.1 |
+| 訓練步數 | 500k（PPO） | 50k online（DSAC + UTD=4）|
+
+### H.2 Score Baseline 修正（主要貢獻）
+
+本次 session 在 sim 端發現兩個 score scheduler 的系統性問題並修正：
+
+| Bug | 舊行為 | 修正後 |
+|---|---|---|
+| `f_mps_fit` | `mps_req / MPS_PER_GPU`（固定分母，偏大 job）| `mps_req / best_gpu.free_mps`（bin-pack，獎勵當前狀態最緊配適）|
+| `epsilon`（SJF kicker）| 0.0（完全關掉）| **0.30**（短 job 顯著加分）|
+| `f_fragmentation`（single-node）| 以 node-level 殘差計算 | 改為 per-GPU MPS 殘差（更精確）|
+
+這些修正讓 score baseline 從 7.067h → 5.381h（philly，**−24%**），在 sim 上已有顯著且可立即部署的改善。
+
+### H.3 DSAC 訓練結果（1×1 cluster，50k steps，3 family × 5 seeds）
+
+三次 eval，每次只改 alpha 配置，score baseline 固定（已修正版 5.381h）：
+
+| 配置 | Alpha | 訓練 trace | philly DSAC | burst DSAC | ali DSAC |
+|---|---|---|---|---|---|
+| Run A | 7.389（卡頂，原 bug）| philly-only | 2.663h | 3.513h | 1.145h |
+| Run B | 1.649（新上限 clamp）| mixed (p+b+a) | 7.476h | 4.455h | 3.214h |
+| Run C | **0.100（fixed）** | mixed (p+b+a) | 12.148h | 14.214h | 2.780h |
+
+**Score baseline（修正後，全三次相同）**：philly 5.381h / burst 6.775h / ali 0.786h
+
+Paired CI（Run C，正 = DSAC 比 Score 好）：
+
+| Family | Δ(score−dsac) | 95% CI | p | 結論 |
+|---|---:|---:|---:|---|
+| philly | −125.7% | [−262.6%, +11.1%] | 0.063 | 不顯著 |
+| burst | −109.8% | [−160.4%, −59.2%] | 0.004 | **顯著輸** |
+| ali | −253.5% | [−457.1%, −50.0%] | 0.026 | **顯著輸** |
+
+Run A 看起來 DSAC 贏，是因為 score baseline 尚未修正（7.067h 異常高）。修正後 DSAC 在所有配置下均輸給 score。
+
+### H.4 Alpha 訓練不穩定性分析
+
+| Run | 問題 | 根因 |
+|---|---|---|
+| Run A | alpha 全程 = 7.389（= e²，上限）| target_entropy_ratio=0.98 >> 遮罩環境最大熵 log(5)=1.61 → log_α 無限上升 |
+| Run B | alpha 全程 = 1.649（= e⁰·⁵，新上限）| Q-network 學到信心 → entropy < target → Adam 向上推 → 卡在新 clamp |
+| Run C | alpha 固定 = 0.100（no update）| `fixed_alpha=True`，policy 完全貪婪 → 但 Q-values 在 50k steps 內未收斂 → near-greedy bad Q = worse than random |
+
+**50k steps / 19 episodes 不足**：每個 episode 平均 ~2,600 env steps，共 19 個完整 episode。Q-function 見過的 job 配置組合太少，固定 alpha 後 near-greedy 策略強壓一個未收斂的 Q → JCT 比隨機更差。
+
+### H.5 Checkpoint 可用性驗證
+
+```bash
+from services.rl_scheduler.dsac import DSACAgent
+agent = DSACAgent.load('runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt')
+# → alpha=0.1000  log_alpha=-2.3026  fixed=True
+# → select_action(obs, mask, greedy=True) 正常回傳 action index
+```
+
+serve.py（FastAPI `/act` endpoint）可直接載入此 checkpoint 做 shadow-mode deployment，行為與 §E 的 PPO 版本相同（policy 尚不可信，abstain rate 預計 100%）。
+
+### H.6 結論
+
+1. **Score baseline 修正（epsilon=0.30 + bin-pack f_mps_fit）是本次 branch 最大的實質貢獻**，philly −24%，已 commit 且可立即部署。
+2. **DSAC 需要更長訓練**。50k steps（19 episodes）遠不足以讓 Q-function 收斂並勝過手工調校的 score heuristic。預估需要 500k–1M steps 才有機會競爭。
+3. **Infrastructure 完整**：MDP wrapper、DSAC agent、ReplayBuffer、sim training loop、FastAPI serve、live daemon、RLPD fine-tune scaffold 全部實作並測試通過（26 sim tests pass），具備繼續訓練的完整 pipeline。
+4. **下一步（若繼續）**：以 `--total-steps 500000 --trace philly` 專一訓練，或啟用 GPU（關掉 Steam 後）大幅加速。
+
+### H.7 重現
+
+```bash
+# Train + eval（50k steps，目前 baseline）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --n-nodes 1 --gpus-per-node 1 \
+    --total-steps 50000 --n-jobs 100 \
+    --trace-families philly burst ali \
+    --seeds 42 43 44 45 46
+
+# Load checkpoint smoke test
+PYTHONPATH=. .venv-m11/bin/python -c "
+from services.rl_scheduler.dsac import DSACAgent
+a = DSACAgent.load('runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt')
+print(a.alpha.item(), a.fixed_alpha)
+"
+```
+
+Artifacts：
+- `runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt` — 最新 checkpoint（fixed α=0.1）
+- `runs/eval_dsac_fixed_alpha_20260514-201111/eval_dsac_placement.csv` — Run C 完整結果
+- `runs/eval_dsac_fixed_20260514-183630/eval_dsac_placement.csv` — Run B 結果
