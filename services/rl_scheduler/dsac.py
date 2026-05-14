@@ -65,8 +65,9 @@ class DSACAgent:
         lr_alpha: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        init_alpha: float = 0.05,
+        init_alpha: float = 0.1,
         target_entropy_ratio: float = 0.1,
+        fixed_alpha: bool = True,
         layer_norm: bool = True,
         device: str = "cpu",
     ) -> None:
@@ -83,22 +84,18 @@ class DSACAgent:
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
+        self.fixed_alpha = fixed_alpha
         self.log_alpha = torch.tensor(
             math.log(init_alpha), dtype=torch.float32,
-            requires_grad=True, device=self.device,
+            requires_grad=not fixed_alpha, device=self.device,
         )
-        # Target entropy based on valid (unmasked) actions, not total n_actions.
-        # Action masking shrinks the effective action space — using log(n_actions)
-        # as target causes log_α to explode because the masked policy can never
-        # reach that entropy level. We store the ratio and compute dynamically
-        # from each batch's mask in update().
         self.target_entropy_ratio = target_entropy_ratio
-        # Fallback static target (used when mask info is unavailable)
         self.target_entropy = target_entropy_ratio * math.log(n_actions)
 
         self.opt_q = torch.optim.Adam(
             list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr_q)
-        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr_alpha)
+        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr_alpha) \
+            if not fixed_alpha else None
 
         self._update_count = 0
 
@@ -169,40 +166,44 @@ class DSACAgent:
             for p, pt in zip(src.parameters(), tgt.parameters()):
                 pt.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
 
-        # ---- Temperature update --------------------------------------
-        with torch.no_grad():
-            q_avg = (self.q1(obs) + self.q2(obs)) * 0.5
-            probs, log_probs = self._masked_policy(q_avg, masks)
-        entropy = -(probs * log_probs).sum(dim=-1).mean()
+        # ---- Temperature update (skipped when fixed_alpha=True) --------
+        loss_alpha_val = 0.0
+        entropy_val = float("nan")
+        target_entropy_val = float("nan")
+        n_valid_val = float("nan")
 
-        # Mask-aware target entropy: base on average number of VALID actions
-        # in this batch, not total n_actions.  Prevents log_α explosion when
-        # most actions are masked (common in small clusters).
-        n_valid = masks.float().sum(dim=-1).clamp(min=1.0).mean()
-        target_entropy = self.target_entropy_ratio * torch.log(n_valid)
+        if not self.fixed_alpha:
+            with torch.no_grad():
+                q_avg = (self.q1(obs) + self.q2(obs)) * 0.5
+                probs, log_probs = self._masked_policy(q_avg, masks)
+            entropy = -(probs * log_probs).sum(dim=-1).mean()
 
-        loss_alpha = self.log_alpha * (entropy - target_entropy).detach()
+            n_valid = masks.float().sum(dim=-1).clamp(min=1.0).mean()
+            target_entropy = self.target_entropy_ratio * torch.log(n_valid)
 
-        self.opt_alpha.zero_grad()
-        loss_alpha.backward()
-        self.opt_alpha.step()
+            loss_alpha = self.log_alpha * (entropy - target_entropy).detach()
+            self.opt_alpha.zero_grad()
+            loss_alpha.backward()
+            self.opt_alpha.step()
 
-        # Hard clamp + reset Adam momentum if boundary hit.
-        # Without momentum reset, Adam's accumulated upward push keeps log_α
-        # pinned at the ceiling even after the signal flips (warmup spike).
-        with torch.no_grad():
-            prev = self.log_alpha.item()
-            self.log_alpha.clamp_(-5.0, 0.5)   # α ∈ [0.007, 1.65]
-            if abs(self.log_alpha.item() - prev) > 1e-6:
-                self.opt_alpha.state[self.log_alpha] = {}
+            with torch.no_grad():
+                prev = self.log_alpha.item()
+                self.log_alpha.clamp_(-5.0, 0.5)
+                if abs(self.log_alpha.item() - prev) > 1e-6:
+                    self.opt_alpha.state[self.log_alpha] = {}
+
+            loss_alpha_val = loss_alpha.item()
+            entropy_val = entropy.item()
+            target_entropy_val = target_entropy.item()
+            n_valid_val = n_valid.item()
 
         return {
             "loss_q": loss_q.item(),
-            "loss_alpha": loss_alpha.item(),
+            "loss_alpha": loss_alpha_val,
             "alpha": self.alpha.item(),
-            "entropy": entropy.item(),
-            "target_entropy": target_entropy.item(),
-            "n_valid_actions": n_valid.item(),
+            "entropy": entropy_val,
+            "target_entropy": target_entropy_val,
+            "n_valid_actions": n_valid_val,
         }
 
     # ------------------------------------------------------------------
@@ -235,7 +236,8 @@ class DSACAgent:
             "q2_target": self.q2_target.state_dict(),
             "opt_q": self.opt_q.state_dict(),
             "log_alpha": self.log_alpha.item(),
-            "opt_alpha": self.opt_alpha.state_dict(),
+            "opt_alpha": self.opt_alpha.state_dict() if self.opt_alpha else None,
+            "fixed_alpha": self.fixed_alpha,
             "obs_dim": self.obs_dim,
             "n_actions": self.n_actions,
             "update_count": self._update_count,
@@ -244,7 +246,9 @@ class DSACAgent:
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "DSACAgent":
         data = torch.load(str(path), map_location="cpu", weights_only=False)
-        agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"], **kwargs)
+        fixed_alpha = data.get("fixed_alpha", False)
+        agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"],
+                    fixed_alpha=fixed_alpha, **kwargs)
         agent.q1.load_state_dict(data["q1"])
         agent.q2.load_state_dict(data["q2"])
         agent.q1_target.load_state_dict(data["q1_target"])
@@ -252,6 +256,7 @@ class DSACAgent:
         agent.opt_q.load_state_dict(data["opt_q"])
         with torch.no_grad():
             agent.log_alpha.copy_(torch.tensor(math.log(max(1e-8, data["log_alpha"]))))
-        agent.opt_alpha.load_state_dict(data["opt_alpha"])
+        if agent.opt_alpha and data.get("opt_alpha"):
+            agent.opt_alpha.load_state_dict(data["opt_alpha"])
         agent._update_count = data["update_count"]
         return agent
