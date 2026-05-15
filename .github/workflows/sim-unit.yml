@@ -3,9 +3,6 @@ name: sim-unit
 # Fast unit tests for the discrete-event simulator (no torch, no gymnasium).
 # Covers: Job dataclass + trace generators, Cluster MPS model, runner event loop,
 # score/fcfs/multifactor schedulers, MetricCollector.
-#
-# The DSAC / gym_env integration tests (which require torch) are intentionally
-# excluded here and run locally with .venv-m11.
 
 on:
   push:
@@ -27,12 +24,15 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Install deps
-        run: uv pip install --system pytest==8.2.2 numpy==1.26.4
-
       - name: Run sim unit tests (exclude torch-dependent tests)
         run: |
-          PYTHONPATH=. pytest sim/tests/ \
-            --ignore=sim/tests/test_dsac_sim_integration.py \
-            --ignore=sim/tests/test_gym_env_smoke.py \
-            -v --tb=short
+          uv run \
+            --python 3.11 \
+            --with "pytest==8.2.2" \
+            --with "numpy==1.26.4" \
+            pytest sim/tests/ \
+              --ignore=sim/tests/test_dsac_sim_integration.py \
+              --ignore=sim/tests/test_gym_env_smoke.py \
+              -v --tb=short
+        env:
+          PYTHONPATH: .

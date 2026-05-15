@@ -22,8 +22,5 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Install ruff
-        run: uv pip install --system ruff==0.4.7
-
       - name: ruff check
-        run: ruff check operator/ sim/ services/ eval/
+        run: uvx ruff@0.4.7 check operator/ sim/ services/ eval/
