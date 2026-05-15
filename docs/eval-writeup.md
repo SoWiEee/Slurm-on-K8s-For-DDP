@@ -264,3 +264,96 @@ PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
 Artifacts：
 - `runs/eval_mlp_20260514-210824/` — MLP 結果（checkpoint + CSV + JSON）
 - `runs/eval_attn_cuda_20260514-232827/` — Attention 結果（checkpoint + CSV + JSON）
+
+---
+
+## 6. 六項改進組合測試（v3, 500k steps）
+
+在確認 MLP 架構優於 Attention 後，v3 實驗將六項算法改進全部啟用並訓練至 500k steps：
+
+**啟用的改進項目：**
+
+| 項目 | 設定 |
+|------|------|
+| PER（優先經驗回放）| SumTree，α=0.6，β: 0.4→1.0 |
+| Potential shaping | φ(s) = −Σwait_time / (scale × n_jobs)，γ=0.99 |
+| CQL 正規化 | cql_alpha=0.1，抑制 Q 過估 |
+| Curriculum | n_jobs: 10（前 20%）→ 30（30%）→ 50（後 50%）|
+| n-step returns | n=10 |
+| Score warmup | 前期以 score scheduler 填充 buffer |
+
+訓練設定：500k steps，MLP 架構，CUDA，seeds 42–46，philly/burst/ali 混合訓練。
+
+---
+
+### 6.1 平均 JCT 結果
+
+| Family | v3 DSAC (500k) | MLP DSAC (200k，§5) | Score baseline | v3 vs Score | 200k vs Score |
+|--------|---------------|---------------------|----------------|-------------|---------------|
+| philly | 6.295h | 4.815h | 2.621h | −140.2%\* | −83.7%\* |
+| burst | 15.228h | 5.025h | 3.541h | −330.0%\* | −41.9%\* |
+| ali | 6.727h | 1.991h | 1.383h | −386.5% | −44.0% |
+
+`*` p < 0.05。Δ 為負代表 DSAC JCT 高於 score baseline（即 DSAC 較差）。
+
+v3 在三個 family 上均比前一版 MLP (200k steps) **更差**，尤其 burst 出現嚴重衰退（15.2h vs 5.0h）。
+
+---
+
+### 6.2 Per-seed 分佈
+
+**v3 per-seed JCT（小時）：**
+
+| seed | philly | burst | ali |
+|------|--------|-------|-----|
+| 42 | 3.910 | 5.767 | 4.128 |
+| 43 | 5.409 | 25.688 | 1.143 |
+| 44 | 5.851 | 20.014 | 7.797 |
+| 45 | 8.393 | 5.913 | 6.712 |
+| 46 | 7.913 | 18.758 | 13.853 |
+
+burst 的 seed 43/44/46 分別達到 25.7h / 20.0h / 18.8h，方差極大，顯示策略未收斂。
+
+---
+
+### 6.3 根因分析
+
+**為什麼 v3 比 200k MLP 更差：**
+
+1. **Curriculum 稀釋了目標環境的訓練量**。500k steps 的時間分配為：n_jobs=10 佔前 100k，n_jobs=30 佔中間 150k，n_jobs=50 僅佔最後 250k——實際上只有約 **24 個完整 episode**（每集 max_steps=10000）在目標規模下訓練，遠不足以讓 Q-function 對 n_jobs=50 的分佈收斂。
+
+2. **CQL 在高方差獎勵下過度保守**。CQL 正則化懲罰高 Q 估計，在 score heuristic warmup buffer 的條件下，可能使策略過度依賴 warmup action 的分佈，抑制探索。burst trace 的 job 到達模式波動大，CQL 限制了策略對新情況的適應。
+
+3. **Shaping + sparse reward 交互作用**。potential shaping 提供稠密信號（每步 φ 差分），但在 curriculum 的 n_jobs=10 小環境中校準的信號尺度，可能不符合 n_jobs=50 切換後的新環境，造成前期訓練的 Q-value 偏移難以修正。
+
+4. **多干預同步啟用無法定位問題**。PER + CQL + shaping + curriculum 同時開啟，任何一個設定出問題都會互相掩蓋，且 500k steps 不足以讓這些機制在最終 n_jobs=50 分佈上充分交互學習。
+
+---
+
+### 6.4 結論
+
+v3 實驗揭示了累積改進的陷阱：多項算法改進疊加並不保證效果相加，反而可能因 curriculum 設計與訓練量分配不當導致顯著衰退。
+
+**關鍵教訓：**
+
+- Curriculum 必須保證目標分佈（n_jobs=50）有足夠的 steps（建議 ≥ 200k）才能有效
+- CQL 在 sparse + noisy 獎勵環境下的 alpha 值需要仔細調校（0.1 可能已過大）
+- 改進應逐項 ablation 測試，而非一次全開
+
+目前已確認的最佳設定為 **MLP + 200k steps + n-step + score warmup**（§5 結果），其中 burst 5.025h / philly 4.815h 是現有最佳 DSAC 效果，但仍落後 score baseline 約 40–84%。
+
+根本瓶頸未變：**1×1 cluster 的 action space 太小、reward 信號稀疏**，下一步應擴展至 2×2 cluster 以提供更豐富的學習信號。
+
+---
+
+### 6.5 重現
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --n-nodes 1 --gpus-per-node 1 --total-steps 500000 \
+    --trace-families philly burst ali --seeds 42 43 44 45 46 \
+    --device cuda --curriculum
+    # PER + shaping + CQL=0.1 為預設，--curriculum 啟用 n_jobs ramp
+```
+
+Artifacts：`runs/eval_v3_20260515-092645/`（checkpoint + CSV + JSON）
