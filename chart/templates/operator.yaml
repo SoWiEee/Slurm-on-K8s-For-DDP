@@ -144,6 +144,14 @@ spec:
             - name: FRAGMENTATION_PARTITIONS
               value: {{ join "," .partitions | quote }}
             {{- end }}
+            {{- if .Values.monitoring.otel.enabled }}
+            - name: OTEL_ENABLED
+              value: "true"
+            - name: OTEL_SERVICE_NAME
+              value: "slurm-operator"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.{{ .Values.monitoring.namespace }}.svc.cluster.local:4317"
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8000

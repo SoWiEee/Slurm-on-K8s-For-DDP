@@ -48,6 +48,14 @@ spec:
               value: {{ $rl.entropyAbstain | quote }}
             - name: PRIORITY_BOOST
               value: {{ $rl.priorityBoost | quote }}
+            {{- if .Values.monitoring.otel.enabled }}
+            - name: OTEL_ENABLED
+              value: "true"
+            - name: OTEL_SERVICE_NAME
+              value: "slurm-rl-scheduler"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.{{ .Values.monitoring.namespace }}.svc.cluster.local:4317"
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /healthz

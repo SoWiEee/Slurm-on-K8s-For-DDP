@@ -71,6 +71,21 @@ def extract_context(traceparent: str):
         return None
 
 
+def current_trace_id() -> str:
+    """Return the hex trace ID of the current span, or '' if not tracing."""
+    if not _ENABLED:
+        return ""
+    try:
+        from opentelemetry import trace
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        if ctx and ctx.is_valid:
+            return format(ctx.trace_id, "032x")
+    except Exception:
+        pass
+    return ""
+
+
 def inject_traceparent(span) -> str:
     """Serialize the span's trace context to a W3C traceparent string."""
     if not _ENABLED or span is None:
