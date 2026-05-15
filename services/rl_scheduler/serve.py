@@ -40,7 +40,6 @@ from sim.gym_env import (
     TOPO_FEAT_DIM, TOP_K,
     env_dims,
 )
-from sim.loader import MPS_PER_GPU
 from services.rl_scheduler.dsac import DSACAgent
 
 

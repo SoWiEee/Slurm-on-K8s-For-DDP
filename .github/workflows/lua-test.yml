@@ -1,0 +1,32 @@
+name: lua-test
+
+# Unit tests for the Slurm Lua submission hook (rl_hook.lua).
+# Tests use a fake io.popen returning canned JSON, so no curl/network needed.
+# score_test.lua is excluded: it requires a rendered chart + running controller
+# pod (covered by verify-score-tests.sh on the k3s host instead).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'chart/lua/**'
+      - 'tests/lua/rl_hook_test.lua'
+      - '.github/workflows/lua-test.yml'
+  pull_request:
+    paths:
+      - 'chart/lua/**'
+      - 'tests/lua/rl_hook_test.lua'
+      - '.github/workflows/lua-test.yml'
+
+jobs:
+  lua:
+    name: luajit rl_hook_test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install luajit
+        run: sudo apt-get install -y luajit
+
+      - name: Run rl_hook_test.lua
+        run: luajit tests/lua/rl_hook_test.lua

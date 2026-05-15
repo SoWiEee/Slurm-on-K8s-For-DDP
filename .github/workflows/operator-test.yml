@@ -1,0 +1,36 @@
+name: operator-test
+
+# Unit tests for the Slurm operator (fragmentation detector, ghost-job detector).
+# Deps: prometheus-client, kubernetes (same as docker/operator/Dockerfile).
+# OTel deps are intentionally excluded — operator/otel.py degrades gracefully
+# when the SDK is not installed (OTEL_ENABLED defaults to false).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'operator/**'
+      - '.github/workflows/operator-test.yml'
+  pull_request:
+    paths:
+      - 'operator/**'
+      - '.github/workflows/operator-test.yml'
+
+jobs:
+  pytest:
+    name: pytest operator tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install deps
+        run: |
+          uv pip install --system \
+            pytest==8.2.2 \
+            prometheus-client==0.20.0 \
+            kubernetes==30.1.0
+
+      - name: Run operator tests
+        run: PYTHONPATH=operator pytest operator/tests/ -v --tb=short

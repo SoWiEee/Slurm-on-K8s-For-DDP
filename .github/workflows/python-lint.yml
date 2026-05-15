@@ -1,0 +1,29 @@
+name: python-lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.py'
+      - 'ruff.toml'
+      - '.github/workflows/python-lint.yml'
+  pull_request:
+    paths:
+      - '**.py'
+      - 'ruff.toml'
+      - '.github/workflows/python-lint.yml'
+
+jobs:
+  lint:
+    name: ruff check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install ruff
+        run: uv pip install --system ruff==0.4.7
+
+      - name: ruff check
+        run: ruff check operator/ sim/ services/ eval/

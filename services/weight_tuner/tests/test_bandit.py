@@ -46,7 +46,7 @@ class TestUCB1:
             return rewards[arm] + (random.Random(hash((arm, ctx))).random() - 0.5) * 0.05
 
         # 1 context (UCB1 ignores it), 200 rounds.
-        result = train(policy, pull, contexts=[(0.0,)], n_rounds=200, rng_seed=1)
+        train(policy, pull, contexts=[(0.0,)], n_rounds=200, rng_seed=1)
         pulls = policy.pulls()
         # Best arm should dominate (>= 50% of pulls after 200 rounds with c=0.5).
         best = max(pulls, key=pulls.get)

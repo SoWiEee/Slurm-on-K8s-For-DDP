@@ -1,0 +1,23 @@
+# Ruff configuration for Kelpflux.
+# Focus on real bugs (F8xx, E9xx) and avoid noisy style rules on legacy code.
+
+[lint]
+select = [
+    "E9",    # Syntax errors (always fatal)
+    "F811",  # Redefinition of unused name (catches shadowed imports)
+    "F821",  # Undefined name
+    "F841",  # Local variable assigned but never used
+    "W605",  # Invalid escape sequence
+]
+
+# Archived / experimental modules not in the active maintenance path.
+exclude = [
+    "services/rl_scheduler/hierarchical.py",
+    "services/rl_scheduler/ppo_train.py",
+    "services/rl_scheduler/ppo_masked_train.py",
+    "services/rl_scheduler/snapshot_agent.py",
+    "eval/scripts/eval_hierarchical.py",
+    "__pycache__",
+    ".venv*",
+    "runs/",
+]
