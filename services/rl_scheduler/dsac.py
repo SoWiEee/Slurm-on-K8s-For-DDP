@@ -4,7 +4,15 @@ Policy is implicit: π(a|s) = softmax(min(Q1,Q2)(s,·) / α), no separate actor.
 Twin Q-networks with LayerNorm (RLPD-recommended for stable offline+online mixing).
 Temperature α auto-tuned via gradient on log_α.
 
-Reference: Christodoulou, P. "Soft Actor-Critic for Discrete Action Spaces" 2019.
+Two Q-network architectures available via use_attention flag:
+  MLP  (default): flat concat of all obs dims → twin MLP Q-network.
+  Attn (this branch): self-attention over job queue tokens (permutation-
+        invariant) + linear cluster encoder → fused Q-head.
+
+References:
+  Christodoulou 2019, "Soft Actor-Critic for Discrete Action Spaces"
+  Kool et al. 2019 ICLR, "Attention, Learn to Solve Routing Problems!"
+  Lee et al. 2019 ICML, "Set Transformer"
 """
 from __future__ import annotations
 
@@ -29,7 +37,6 @@ def _build_mlp(in_dim: int, hidden: Sequence[int], out_dim: int,
         layers.append(nn.ReLU())
         prev = h
     layers.append(nn.Linear(prev, out_dim))
-    # Orthogonal init on all Linear layers (RLPD recommendation)
     for m in layers:
         if isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight, gain=1.0)
@@ -38,6 +45,7 @@ def _build_mlp(in_dim: int, hidden: Sequence[int], out_dim: int,
 
 
 class _QNet(nn.Module):
+    """Flat MLP Q-network (baseline)."""
     def __init__(self, obs_dim: int, n_actions: int,
                  hidden: Sequence[int], layer_norm: bool) -> None:
         super().__init__()
@@ -47,13 +55,100 @@ class _QNet(nn.Module):
         return self.net(obs)
 
 
+class _AttentionQNet(nn.Module):
+    """Q-network with self-attention over the job queue (permutation-invariant).
+
+    Observation layout (must match gym_env.py _build_obs):
+        obs = [job_0 (JOB_DIM), ..., job_{K-1} (JOB_DIM), cluster (obs_dim - K*JOB_DIM)]
+
+    Architecture:
+        1. job_embed:    Linear(JOB_DIM → d_model) + ReLU
+        2. transformer:  TransformerEncoder (pre-LN, batch_first)
+           → mean-pool non-padding tokens → queue_ctx (d_model)
+        3. cluster_embed: Linear(cluster_dim → d_model) + ReLU → cluster_ctx
+        4. q_head:       MLP([queue_ctx ‖ cluster_ctx] → n_actions)
+
+    Padding mask: job slots where all features == 0 are treated as padding
+    and excluded from the mean-pool (handles variable-length queues).
+    No positional encoding — job order is irrelevant for scheduling.
+    """
+
+    TOP_K: int = 16   # must match gym_env.TOP_K
+    JOB_DIM: int = 11  # features per job slot (must match gym_env.py)
+
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        self.top_k = self.TOP_K
+        self.job_dim = self.JOB_DIM
+        self.cluster_dim = obs_dim - self.TOP_K * self.JOB_DIM
+        assert self.cluster_dim > 0, (
+            f"obs_dim={obs_dim} too small for TOP_K={self.TOP_K} × JOB_DIM={self.JOB_DIM}"
+        )
+
+        self.job_embed = nn.Linear(self.JOB_DIM, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 2,
+            dropout=0.0, batch_first=True,
+            norm_first=True,   # pre-LN: more stable than post-LN
+        )
+        # enable_nested_tensor=False: norm_first=True doesn't support nested
+        # tensors; disabling avoids a PyTorch UserWarning with no perf impact
+        # on our fixed-size (B, TOP_K, d_model) input.
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
+        )
+        self.cluster_embed = nn.Linear(self.cluster_dim, d_model)
+        self.q_head = _build_mlp(d_model * 2, (d_model,), n_actions, layer_norm)
+
+        for m in [self.job_embed, self.cluster_embed]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # Split obs into job tokens and cluster state
+        job_flat = obs[:, :self.top_k * self.job_dim]          # (B, K*11)
+        cluster  = obs[:, self.top_k * self.job_dim:]           # (B, cluster_dim)
+
+        jobs = job_flat.view(-1, self.top_k, self.job_dim)      # (B, K, 11)
+
+        # Padding mask: slots where all features == 0 are empty queue entries
+        pad_mask = (jobs.abs().sum(dim=-1) == 0)                # (B, K)
+
+        job_tok = F.relu(self.job_embed(jobs))                  # (B, K, d)
+        job_enc = self.transformer(job_tok,
+                                   src_key_padding_mask=pad_mask)  # (B, K, d)
+
+        # Mean-pool over non-padding tokens → permutation-invariant queue ctx
+        non_pad = (~pad_mask).float().unsqueeze(-1)             # (B, K, 1)
+        n_valid = non_pad.sum(dim=1).clamp(min=1.0)            # (B, 1)
+        queue_ctx = (job_enc * non_pad).sum(dim=1) / n_valid   # (B, d)
+
+        cluster_ctx = F.relu(self.cluster_embed(cluster))       # (B, d)
+
+        fused = torch.cat([queue_ctx, cluster_ctx], dim=-1)    # (B, 2d)
+        return self.q_head(fused)                              # (B, n_actions)
+
+
 class DSACAgent:
     """Discrete SAC agent for masked scheduling environments.
 
+    Two Q-network backends selectable via use_attention:
+      False (default on DSAC branch): flat MLP, hidden=(256,256)
+      True  (DSAC-attention branch):  self-attention over job queue tokens
+
     Usage::
-        agent = DSACAgent(obs_dim=193, n_actions=17)
+        agent = DSACAgent(obs_dim=192, n_actions=17, use_attention=True)
         act = agent.select_action(obs, mask)
-        losses = agent.update(batch)   # batch from ReplayBuffer.sample()
+        losses = agent.update(batch)
     """
 
     def __init__(
@@ -65,34 +160,51 @@ class DSACAgent:
         lr_alpha: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        init_alpha: float = 0.2,
-        target_entropy_ratio: float = 0.98,
+        init_alpha: float = 0.1,
+        target_entropy_ratio: float = 0.1,
+        fixed_alpha: bool = True,
         layer_norm: bool = True,
+        use_attention: bool = True,   # True = attention Q-net on this branch
+        attn_d_model: int = 64,
+        attn_n_heads: int = 4,
+        attn_n_layers: int = 2,
         device: str = "cpu",
     ) -> None:
         self.obs_dim = obs_dim
         self.n_actions = n_actions
         self.gamma = gamma
         self.tau = tau
+        self.use_attention = use_attention
         self.device = torch.device(device)
 
-        self.q1 = _QNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
-        self.q2 = _QNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
-        self.q1_target = _QNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
-        self.q2_target = _QNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
+        def _make_q():
+            if use_attention:
+                return _AttentionQNet(obs_dim, n_actions,
+                                      d_model=attn_d_model,
+                                      n_heads=attn_n_heads,
+                                      n_layers=attn_n_layers,
+                                      layer_norm=layer_norm).to(self.device)
+            return _QNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
+
+        self.q1 = _make_q()
+        self.q2 = _make_q()
+        self.q1_target = _make_q()
+        self.q2_target = _make_q()
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
+        self.fixed_alpha = fixed_alpha
         self.log_alpha = torch.tensor(
             math.log(init_alpha), dtype=torch.float32,
-            requires_grad=True, device=self.device,
+            requires_grad=not fixed_alpha, device=self.device,
         )
-        # Target entropy: -0.98 * log(1/n_actions)
+        self.target_entropy_ratio = target_entropy_ratio
         self.target_entropy = target_entropy_ratio * math.log(n_actions)
 
         self.opt_q = torch.optim.Adam(
             list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr_q)
-        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr_alpha)
+        self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=lr_alpha) \
+            if not fixed_alpha else None
 
         self._update_count = 0
 
@@ -141,11 +253,14 @@ class DSACAgent:
         dones = _t("dones", torch.float32)
         masks = _t("masks", torch.bool)
         next_masks = _t("next_masks", torch.bool)
+        # gammas holds γ^n for n-step returns (γ^1 for 1-step)
+        gammas = _t("gammas") if "gammas" in batch else \
+            torch.full_like(rews, self.gamma)
 
         # ---- Critic update -------------------------------------------
         with torch.no_grad():
             v_next = self._soft_value(next_obs, next_masks, use_target=True)
-            target_q = rews + self.gamma * (1.0 - dones) * v_next
+            target_q = rews + gammas * (1.0 - dones) * v_next
 
         q1_a = self.q1(obs).gather(1, acts.unsqueeze(1)).squeeze(1)
         q2_a = self.q2(obs).gather(1, acts.unsqueeze(1)).squeeze(1)
@@ -163,22 +278,44 @@ class DSACAgent:
             for p, pt in zip(src.parameters(), tgt.parameters()):
                 pt.data.mul_(1.0 - self.tau).add_(p.data, alpha=self.tau)
 
-        # ---- Temperature update --------------------------------------
-        with torch.no_grad():
-            q_avg = (self.q1(obs) + self.q2(obs)) * 0.5
-            probs, log_probs = self._masked_policy(q_avg, masks)
-        entropy = -(probs * log_probs).sum(dim=-1).mean()
-        loss_alpha = self.log_alpha * (entropy - self.target_entropy).detach()
+        # ---- Temperature update (skipped when fixed_alpha=True) --------
+        loss_alpha_val = 0.0
+        entropy_val = float("nan")
+        target_entropy_val = float("nan")
+        n_valid_val = float("nan")
 
-        self.opt_alpha.zero_grad()
-        loss_alpha.backward()
-        self.opt_alpha.step()
+        if not self.fixed_alpha:
+            with torch.no_grad():
+                q_avg = (self.q1(obs) + self.q2(obs)) * 0.5
+                probs, log_probs = self._masked_policy(q_avg, masks)
+            entropy = -(probs * log_probs).sum(dim=-1).mean()
+
+            n_valid = masks.float().sum(dim=-1).clamp(min=1.0).mean()
+            target_entropy = self.target_entropy_ratio * torch.log(n_valid)
+
+            loss_alpha = self.log_alpha * (entropy - target_entropy).detach()
+            self.opt_alpha.zero_grad()
+            loss_alpha.backward()
+            self.opt_alpha.step()
+
+            with torch.no_grad():
+                prev = self.log_alpha.item()
+                self.log_alpha.clamp_(-5.0, 0.5)
+                if abs(self.log_alpha.item() - prev) > 1e-6:
+                    self.opt_alpha.state[self.log_alpha] = {}
+
+            loss_alpha_val = loss_alpha.item()
+            entropy_val = entropy.item()
+            target_entropy_val = target_entropy.item()
+            n_valid_val = n_valid.item()
 
         return {
             "loss_q": loss_q.item(),
-            "loss_alpha": loss_alpha.item(),
+            "loss_alpha": loss_alpha_val,
             "alpha": self.alpha.item(),
-            "entropy": entropy.item(),
+            "entropy": entropy_val,
+            "target_entropy": target_entropy_val,
+            "n_valid_actions": n_valid_val,
         }
 
     # ------------------------------------------------------------------
@@ -211,7 +348,9 @@ class DSACAgent:
             "q2_target": self.q2_target.state_dict(),
             "opt_q": self.opt_q.state_dict(),
             "log_alpha": self.log_alpha.item(),
-            "opt_alpha": self.opt_alpha.state_dict(),
+            "opt_alpha": self.opt_alpha.state_dict() if self.opt_alpha else None,
+            "fixed_alpha": self.fixed_alpha,
+            "use_attention": self.use_attention,
             "obs_dim": self.obs_dim,
             "n_actions": self.n_actions,
             "update_count": self._update_count,
@@ -220,14 +359,19 @@ class DSACAgent:
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "DSACAgent":
         data = torch.load(str(path), map_location="cpu", weights_only=False)
-        agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"], **kwargs)
+        fixed_alpha = data.get("fixed_alpha", False)
+        use_attention = data.get("use_attention", False)
+        agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"],
+                    fixed_alpha=fixed_alpha, use_attention=use_attention,
+                    **kwargs)
         agent.q1.load_state_dict(data["q1"])
         agent.q2.load_state_dict(data["q2"])
         agent.q1_target.load_state_dict(data["q1_target"])
         agent.q2_target.load_state_dict(data["q2_target"])
         agent.opt_q.load_state_dict(data["opt_q"])
         with torch.no_grad():
-            agent.log_alpha.copy_(torch.tensor(math.log(max(1e-8, data["log_alpha"]))))
-        agent.opt_alpha.load_state_dict(data["opt_alpha"])
+            agent.log_alpha.fill_(float(data["log_alpha"]))
+        if agent.opt_alpha and data.get("opt_alpha"):
+            agent.opt_alpha.load_state_dict(data["opt_alpha"])
         agent._update_count = data["update_count"]
         return agent

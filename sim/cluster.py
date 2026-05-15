@@ -78,8 +78,26 @@ class Cluster:
     def can_allocate(self, job: Job) -> bool:
         return self._plan(job) is not None
 
+    def can_allocate_on(self, job: Job, node_i: int, gpu_i: int) -> bool:
+        """Return True if job can be placed on the specific (node, gpu)."""
+        return self._plan_on(job, node_i, gpu_i) is not None
+
     def try_allocate(self, job: Job) -> Optional[List[Allocation]]:
         plan = self._plan(job)
+        if plan is None:
+            return None
+        for alloc in plan:
+            node = self.nodes[alloc.node_id]
+            for gi in alloc.gpu_indices:
+                node.gpus[gi].free_mps -= alloc.mps_per_gpu
+        self.active[job.job_id] = plan
+        return plan
+
+    def try_allocate_on(
+        self, job: Job, node_i: int, gpu_i: int
+    ) -> Optional[List[Allocation]]:
+        """Allocate job on the specified (node, gpu). Returns plan or None."""
+        plan = self._plan_on(job, node_i, gpu_i)
         if plan is None:
             return None
         for alloc in plan:
@@ -98,7 +116,44 @@ class Cluster:
             for gi in alloc.gpu_indices:
                 node.gpus[gi].free_mps += alloc.mps_per_gpu
 
-    # ----- planner -----
+    # ----- planners -----
+    def _plan_on(self, job: Job, node_i: int, gpu_i: int) -> Optional[List[Allocation]]:
+        """Plan placement on a specific (node, gpu).
+
+        For MPS jobs (gpu_count==1, mps_req < mps_per_gpu): place on gpu_i of node_i.
+        For whole-GPU jobs (gpu_count>1 or mps_req==mps_per_gpu): gpu_i is the
+        *starting* GPU; we greedily fill remaining GPUs from node_i first, then
+        other nodes.
+        """
+        if node_i >= self.n_nodes or gpu_i >= self.gpus_per_node:
+            return None
+
+        if job.gpu_count == 1 and job.mps_req < self.mps_per_gpu:
+            # MPS fractional — must fit on the requested GPU
+            if self.nodes[node_i].gpus[gpu_i].free_mps >= job.mps_req:
+                return [Allocation(job.job_id, node_i, [gpu_i], job.mps_req)]
+            return None
+
+        # Whole-GPU job: start from (node_i, gpu_i), fill greedily
+        needed = job.gpu_count
+        plan: List[Allocation] = []
+        node_order = [node_i] + [n for n in range(self.n_nodes) if n != node_i]
+        for ni in node_order:
+            if needed <= 0:
+                break
+            node = self.nodes[ni]
+            free = node.free_whole_gpus(self.mps_per_gpu)
+            if ni == node_i and gpu_i in free:
+                # Prefer the requested GPU first
+                ordered = [gpu_i] + [g for g in free if g != gpu_i]
+            else:
+                ordered = free
+            take = ordered[: min(needed, len(ordered))]
+            if take:
+                plan.append(Allocation(job.job_id, ni, take, self.mps_per_gpu))
+                needed -= len(take)
+        return plan if needed <= 0 else None
+
     def _plan(self, job: Job) -> Optional[List[Allocation]]:
         # Single-GPU fractional MPS request
         if job.gpu_count == 1 and job.mps_req < self.mps_per_gpu:

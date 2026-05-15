@@ -1,4 +1,4 @@
-"""M11 Phase A smoke tests: gym env reset/step + random policy episode."""
+"""Smoke tests: placement-aware gym env (Discrete(65) action space)."""
 from __future__ import annotations
 
 import numpy as np
@@ -8,11 +8,18 @@ gym = pytest.importorskip("gymnasium")
 
 from sim.gym_env import (
     GLOBAL_FEAT_DIM,
+    GPU_FEAT_DIM,
     JOB_FEAT_DIM,
-    KubefluxSchedEnv,
-    MAX_NODES,
-    NODE_FEAT_DIM,
+    N_ACTIONS,
+    N_GPUS,
+    N_NODES,
+    NO_OP,
+    OBS_DIM,
+    TOPO_FEAT_DIM,
     TOP_K,
+    KubefluxSchedEnv,
+    decode_action,
+    encode_action,
 )
 from sim.loader import generate_by_family
 
@@ -23,66 +30,165 @@ def _factory(n_jobs: int = 50, seed: int = 42, family: str = "philly"):
     return _build
 
 
+# ── obs / action space shape ─────────────────────────────────────────────
+
+def test_obs_dim_constant():
+    # Current deployment: 1 node × 1 GPU → 176 + 6 + 4 + 6 = 192
+    expected = TOP_K * JOB_FEAT_DIM + N_NODES * N_GPUS * GPU_FEAT_DIM + TOPO_FEAT_DIM + GLOBAL_FEAT_DIM
+    assert OBS_DIM == expected == 192
+
+
+def test_env_dims_helper():
+    from sim.gym_env import env_dims
+    obs, n_act = env_dims(1, 1)
+    assert obs == 192 and n_act == 17
+    obs2, n_act2 = env_dims(2, 2)
+    assert obs2 == 210 and n_act2 == 65
+
+
 def test_reset_returns_correct_shape():
-    env = KubefluxSchedEnv(_factory(), n_nodes=2, gpus_per_node=1)
+    env = KubefluxSchedEnv(_factory())
     obs, info = env.reset(seed=0)
-    expected = TOP_K * JOB_FEAT_DIM + MAX_NODES * NODE_FEAT_DIM + GLOBAL_FEAT_DIM
-    assert obs.shape == (expected,)
+    assert obs.shape == (OBS_DIM,)
     assert obs.dtype == np.float32
     assert not np.isnan(obs).any()
     env.close()
 
 
-def test_action_space_discrete_k_plus_one():
-    env = KubefluxSchedEnv(_factory(), n_nodes=2, gpus_per_node=1)
-    assert env.action_space.n == TOP_K + 1
+def test_action_space_size():
+    env = KubefluxSchedEnv(_factory())
+    assert env.action_space.n == N_ACTIONS == 17
     env.close()
 
 
-def test_action_mask_no_op_always_legal():
-    env = KubefluxSchedEnv(_factory(), n_nodes=2, gpus_per_node=1)
+# ── action codec roundtrip ───────────────────────────────────────────────
+
+def test_encode_decode_roundtrip():
+    for job_i in range(TOP_K):
+        for nj in range(N_NODES):
+            for gk in range(N_GPUS):
+                a = encode_action(job_i, nj, gk)
+                assert decode_action(a) == (job_i, nj, gk)
+
+
+def test_no_op_value():
+    # NO_OP = N_ACTIONS - 1 = TOP_K * N_NODES * N_GPUS = 16*1*1 = 16
+    assert NO_OP == N_ACTIONS - 1
+
+
+def test_decode_no_op_raises():
+    with pytest.raises(ValueError):
+        decode_action(NO_OP)
+
+
+# ── action mask ──────────────────────────────────────────────────────────
+
+def test_action_mask_shape_and_no_op():
+    env = KubefluxSchedEnv(_factory())
     env.reset(seed=0)
     mask = env.action_mask()
-    assert mask.shape == (TOP_K + 1,)
-    assert mask[TOP_K] == True  # noqa: E712
+    assert mask.shape == (N_ACTIONS,)
+    assert mask[NO_OP]
     env.close()
+
+
+def test_action_mask_illegal_placements_blocked():
+    """Actions targeting non-existent or full GPUs must be masked."""
+    env = KubefluxSchedEnv(_factory(n_jobs=20))
+    env.reset(seed=0)
+    mask = env.action_mask()
+    for a in np.where(mask)[0]:
+        if a == NO_OP:
+            continue
+        job_i, node_j, gpu_k = decode_action(a)
+        assert job_i < TOP_K
+        assert node_j < env.n_nodes
+        assert gpu_k < env.gpus_per_node
+    env.close()
+
+
+# ── episode dynamics ─────────────────────────────────────────────────────
+
+def _single_gpu_factory(n_jobs: int = 30, seed: int = 0):
+    """Factory generating only gpu_count=1 MPS jobs — fits any cluster size."""
+    from sim.loader import Job, MPS_PER_GPU
+    rng = np.random.default_rng(seed)
+
+    def _build():
+        jobs = []
+        for i in range(n_jobs):
+            mps = int(rng.choice([1, 2, 4]))   # fractions of MPS_PER_GPU
+            jobs.append(Job(
+                job_id=f"j{i}", user="u0", gpu_count=1, gpu_type="rtx4070",
+                submit_ts=float(i * 10), runtime=float(rng.integers(30, 300)),
+                mem_req=0.0, mps_req=mps,
+            ))
+        return jobs
+
+    return _build
 
 
 def test_random_policy_episode_terminates():
     rng = np.random.default_rng(0)
-    # Use 4-node × 4-GPU cluster (sim default) so 4-GPU and 8-GPU jobs fit
-    env = KubefluxSchedEnv(_factory(n_jobs=30), n_nodes=4, gpus_per_node=4, max_steps=10_000)
+    # Use single-GPU MPS jobs so every job fits in a 1×1 cluster.
+    env = KubefluxSchedEnv(_single_gpu_factory(n_jobs=30), max_steps=20_000)
     obs, _ = env.reset(seed=0)
     total_reward = 0.0
     steps = 0
     terminated = truncated = False
     while not (terminated or truncated):
-        mask = env.action_mask()
-        # Random legal action
-        legal = np.where(mask)[0]
+        legal = np.where(env.action_mask())[0]
         a = int(rng.choice(legal))
         obs, r, terminated, truncated, info = env.step(a)
         total_reward += r
         steps += 1
-    assert terminated, f"episode did not terminate naturally (truncated={truncated}, steps={steps})"
+    assert terminated, f"did not terminate (truncated={truncated}, steps={steps})"
     assert info["completed"] == info["n_jobs"]
     assert info["avg_jct"] > 0
-    print(f"\nrandom-policy episode: steps={steps}, total_reward={total_reward:.2f}, "
-          f"avg_jct={info['avg_jct']:.2f}, n_jobs={info['n_jobs']}")
+    print(f"\nrandom episode: steps={steps} reward={total_reward:.2f} "
+          f"avg_jct={info['avg_jct']:.0f}s")
     env.close()
 
 
-def test_noop_only_policy_eventually_completes():
-    """Sanity: pure no-op never schedules anything — episode should NOT complete.
-    Tests the env's truncation path, not natural completion."""
-    env = KubefluxSchedEnv(_factory(n_jobs=10), n_nodes=2, gpus_per_node=1, max_steps=200)
+def test_noop_policy_truncates():
+    env = KubefluxSchedEnv(_single_gpu_factory(n_jobs=10), max_steps=200)
     env.reset(seed=0)
     terminated = truncated = False
     while not (terminated or truncated):
-        obs, r, terminated, truncated, info = env.step(TOP_K)  # always no-op
-    # With pure no-op, no jobs get scheduled, so events drain (only submits),
-    # then events is empty + completed=0 < n_jobs → neither terminated nor truncated until max_steps.
-    # The env's terminated condition needs `completed >= n_jobs` AND `events empty`. Since we never
-    # schedule, completed stays 0 → terminated is False. Truncated when step_count >= max_steps.
+        _, _, terminated, truncated, info = env.step(NO_OP)
     assert truncated or info["completed"] < info["n_jobs"]
     env.close()
+
+
+def test_shaped_reward_mode():
+    env = KubefluxSchedEnv(_single_gpu_factory(n_jobs=20), reward_mode="shaped")
+    env.reward_betas = (1.0, 0.5)
+    rng = np.random.default_rng(1)
+    obs, _ = env.reset(seed=1)
+    for _ in range(50):
+        legal = np.where(env.action_mask())[0]
+        _, _, terminated, truncated, _ = env.step(int(rng.choice(legal)))
+        if terminated or truncated:
+            break
+    env.close()
+
+
+# ── placement-aware allocation ───────────────────────────────────────────
+
+def test_placement_action_schedules_on_correct_gpu():
+    """Verify that try_allocate_on places on the specified GPU."""
+    from sim.cluster import Cluster
+    from sim.loader import Job, MPS_PER_GPU
+
+    cluster = Cluster(n_nodes=2, gpus_per_node=2, mps_per_gpu=MPS_PER_GPU)
+    job = Job("j0", "u", 1, "rtx4070", 0.0, 100.0, 0.0, MPS_PER_GPU // 2)
+
+    free_before = cluster.nodes[0].gpus[1].free_mps
+    plan = cluster.try_allocate_on(job, node_i=0, gpu_i=1)
+    assert plan is not None, "allocation should succeed"
+    assert plan[0].node_id == 0
+    assert 1 in plan[0].gpu_indices
+    assert cluster.nodes[0].gpus[1].free_mps < free_before
+
+    # Other GPU on same node should be untouched
+    assert cluster.nodes[0].gpus[0].free_mps == free_before

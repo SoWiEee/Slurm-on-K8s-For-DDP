@@ -984,84 +984,221 @@ Round 2 的 score 幾乎回到 chart 預設水準，但 weight 組合已由 UCB1
 
 ---
 
-## G. M10 Phase E — Hierarchical DSAC scheduler 初跑結果（2026-05-14）
+## H. DSAC Branch — Placement-aware 1×1 Scheduler（2026-05-14）
 
-### G.1 設定
+### H.1 架構改動（vs §G 的 hierarchical DSAC）
 
-Phase E 把外層 bandit / contextual bandit 的「調權重」角色往上移一層：外層選
-reward shaping arm，內層 DSAC 直接做 masked scheduling action。這次 run 的外層
-arm 是：
+| 項目 | §G（舊） | §H（DSAC branch） |
+|---|---|---|
+| 演算法 | MaskablePPO（sb3-contrib） | Discrete SAC（自實作，twin Q + LayerNorm）|
+| Cluster | 2×2 GPU（4 nodes, 8 GPU） | **1×1 GPU**（1 node, 1 GPU, 4 MPS slots）|
+| obs_dim | 視配置 | **192**（16×11 job + 1×6 GPU + 4 topo + 6 global）|
+| n_actions | 視配置 | **17**（16 job slots × 1 GPU + no-op）|
+| reward | wait-proxy / JCT-aligned | `jct_aligned`（每完成一 job 給 −JCT/scale）|
+| Alpha 調節 | N/A | auto-tune（SAC 標準）→ 最終改 fixed_alpha=0.1 |
+| 訓練步數 | 500k（PPO） | 50k online（DSAC + UTD=4）|
 
-| outer round | arm | selection |
-|---:|---|---|
-| 5/5 | `Arm(β_jct=1.0, β_slow=0.5)` | UCB selected |
+### H.2 Score Baseline 修正（主要貢獻）
 
-內層 DSAC 持續 fine-tune 1000 steps，最後 500 steps 的 log：
+本次 session 在 sim 端發現兩個 score scheduler 的系統性問題並修正：
 
-| inner step | loss_q | alpha |
-|---:|---:|---:|
-| 500/1000 | 296.8741 | 40.0037 |
-| 1000/1000 | 4082.9038 | 72.6386 |
+| Bug | 舊行為 | 修正後 |
+|---|---|---|
+| `f_mps_fit` | `mps_req / MPS_PER_GPU`（固定分母，偏大 job）| `mps_req / best_gpu.free_mps`（bin-pack，獎勵當前狀態最緊配適）|
+| `epsilon`（SJF kicker）| 0.0（完全關掉）| **0.30**（短 job 顯著加分）|
+| `f_fragmentation`（single-node）| 以 node-level 殘差計算 | 改為 per-GPU MPS 殘差（更精確）|
 
-### G.2 結果
+這些修正讓 score baseline 從 7.067h → 5.381h（philly，**−24%**），在 sim 上已有顯著且可立即部署的改善。
 
-```
-JCT=1.576h  reward=-1.5759  elapsed=44s
-*** new best — dsac.pt updated ***
-Hierarchical DSAC best JCT : 1.576h (Arm(β_jct=1.0, β_slow=0.5))
-```
+### H.3 DSAC 訓練結果（1×1 cluster，50k steps，3 family × 5 seeds）
 
-這代表 hierarchical DSAC 在本次 5-round run 中找到新的 best checkpoint，並已把
-`dsac.pt` 更新到 `Arm(β_jct=1.0, β_slow=0.5)` 對應的 policy。reward 使用
-`−mean_JCT_hours`，所以 `reward=-1.5759` 與 `JCT=1.576h` 對齊。
+三次 eval，每次只改 alpha 配置，score baseline 固定（已修正版 5.381h）：
 
-### G.3 解讀
+| 配置 | Alpha | 訓練 trace | philly DSAC | burst DSAC | ali DSAC |
+|---|---|---|---|---|---|
+| Run A | 7.389（卡頂，原 bug）| philly-only | 2.663h | 3.513h | 1.145h |
+| Run B | 1.649（新上限 clamp）| mixed (p+b+a) | 7.476h | 4.455h | 3.214h |
+| Run C | **0.100（fixed）** | mixed (p+b+a) | 12.148h | 14.214h | 2.780h |
 
-- 這是 M10 Phase E 的第一個正向訓練訊號：DSAC + outer reward shaping 能在單次 run
-  內更新出 best checkpoint，且 wall-clock 成本低（44s）。
-- 這筆仍屬 **single-run / single-context result**，不能直接取代 §C/§D 的
-  3-family × 5-seed paired-CI 結論；正式 paired evaluation 見 §G.4。
+**Score baseline（修正後，全三次相同）**：philly 5.381h / burst 6.775h / ali 0.786h
 
-### G.4 正式 paired evaluation（philly / burst / ali × 5 seeds）
+Paired CI（Run C，正 = DSAC 比 Score 好）：
 
-Run：
+| Family | Δ(score−dsac) | 95% CI | p | 結論 |
+|---|---:|---:|---:|---|
+| philly | −125.7% | [−262.6%, +11.1%] | 0.063 | 不顯著 |
+| burst | −109.8% | [−160.4%, −59.2%] | 0.004 | **顯著輸** |
+| ali | −253.5% | [−457.1%, −50.0%] | 0.026 | **顯著輸** |
+
+Run A 看起來 DSAC 贏，是因為 score baseline 尚未修正（7.067h 異常高）。修正後 DSAC 在所有配置下均輸給 score。
+
+### H.4 Alpha 訓練不穩定性分析
+
+| Run | 問題 | 根因 |
+|---|---|---|
+| Run A | alpha 全程 = 7.389（= e²，上限）| target_entropy_ratio=0.98 >> 遮罩環境最大熵 log(5)=1.61 → log_α 無限上升 |
+| Run B | alpha 全程 = 1.649（= e⁰·⁵，新上限）| Q-network 學到信心 → entropy < target → Adam 向上推 → 卡在新 clamp |
+| Run C | alpha 固定 = 0.100（no update）| `fixed_alpha=True`，policy 完全貪婪 → 但 Q-values 在 50k steps 內未收斂 → near-greedy bad Q = worse than random |
+
+**50k steps / 19 episodes 不足**：每個 episode 平均 ~2,600 env steps，共 19 個完整 episode。Q-function 見過的 job 配置組合太少，固定 alpha 後 near-greedy 策略強壓一個未收斂的 Q → JCT 比隨機更差。
+
+### H.5 Checkpoint 可用性驗證
 
 ```bash
-.venv-m11/bin/python -u eval/scripts/eval_hierarchical.py \
-  --n-outer 5 --n-inner 1000 --utd-ratio 4 \
-  --seeds 42 43 44 45 46 \
-  --trace-families philly burst ali \
-  --n-jobs 300 --n-nodes 2 --gpus-per-node 2 \
-  --out-csv eval/results/hierarchical_full_20260514_formal.csv \
-  --out-base runs/hier_eval_20260514_formal
+from services.rl_scheduler.dsac import DSACAgent
+agent = DSACAgent.load('runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt')
+# → alpha=0.1000  log_alpha=-2.3026  fixed=True
+# → select_action(obs, mask, greedy=True) 正常回傳 action index
+```
+
+serve.py（FastAPI `/act` endpoint）可直接載入此 checkpoint 做 shadow-mode deployment，行為與 §E 的 PPO 版本相同（policy 尚不可信，abstain rate 預計 100%）。
+
+### H.6 結論
+
+1. **Score baseline 修正（epsilon=0.30 + bin-pack f_mps_fit）是本次 branch 最大的實質貢獻**，philly −24%，已 commit 且可立即部署。
+2. **DSAC 需要更長訓練**。50k steps（19 episodes）遠不足以讓 Q-function 收斂並勝過手工調校的 score heuristic。預估需要 500k–1M steps 才有機會競爭。
+3. **Infrastructure 完整**：MDP wrapper、DSAC agent、ReplayBuffer、sim training loop、FastAPI serve、live daemon、RLPD fine-tune scaffold 全部實作並測試通過（26 sim tests pass），具備繼續訓練的完整 pipeline。
+4. **下一步（若繼續）**：以 `--total-steps 500000 --trace philly` 專一訓練，或啟用 GPU 大幅加速。
+
+### H.7 重現
+
+```bash
+# Train + eval（50k steps，目前 baseline）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --n-nodes 1 --gpus-per-node 1 \
+    --total-steps 50000 --n-jobs 100 \
+    --trace-families philly burst ali \
+    --seeds 42 43 44 45 46
+
+# Load checkpoint smoke test
+PYTHONPATH=. .venv-m11/bin/python -c "
+from services.rl_scheduler.dsac import DSACAgent
+a = DSACAgent.load('runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt')
+print(a.alpha.item(), a.fixed_alpha)
+"
 ```
 
 Artifacts：
-- `eval/results/hierarchical_full_20260514_formal.csv`
-- `logs/m10_hier_eval_20260514_formal.log`
-- `runs/hier_eval_20260514_formal/<family>_seed<seed>/`
+- `runs/eval_dsac_fixed_alpha_20260514-201111/train/dsac.pt` — 最新 checkpoint（fixed α=0.1）
+- `runs/eval_dsac_fixed_alpha_20260514-201111/eval_dsac_placement.csv` — Run C 完整結果
+- `runs/eval_dsac_fixed_20260514-183630/eval_dsac_placement.csv` — Run B 結果
 
-Mean JCT（hours，越低越好）：
+---
 
-| Family | Score | Multifactor | Hierarchical DSAC |
-|---|---:|---:|---:|
-| philly | 11.742 | 11.853 | **7.638** |
-| burst | **10.430** | 10.039 | 15.226 |
-| ali | **0.822** | 0.818 | 1.525 |
+## I. DSAC-attention Branch — MLP vs Attention 架構比較（2026-05-15）
 
-Paired CI（`score − hier`，正 = DSAC 比 score 好）：
+### I.1 動機
 
-| Family | Δ(score−hier) | 95% CI | 結論 |
-|---|---:|---:|---|
-| philly | +4.104h (+35.0%) | [−4.651, +12.859]h | 平均贏，但 CI 跨 0，不顯著 |
-| burst | −4.796h (−46.0%) | [−13.002, +3.410]h | 平均輸，CI 跨 0 |
-| ali | −0.703h (−85.5%) | [−1.095, −0.311]h | **顯著輸給 score** |
+H 節確認 DSAC 在 fixed α=0.1 + 50k steps 下仍落後 score baseline。本節在
+DSAC-attention branch 加入三項算法改進後，比較兩種 Q-network 架構的效果：
 
-正式結論：hierarchical DSAC 在 philly heavy-contention case 有正向訊號，但
-跨 family 不穩；burst 退步、ali 顯著退步。因此 M10 不能宣稱 DSAC scheduler 已勝過
-score scheduler。這支持 §E 的保守立場：live path 可以保留 shadow / fallback，但
-production priority 仍應由 score + weight tuner 主導。
+**算法改進（相對於 H 節）：**
 
-注意：這是受控 simulator paired evaluation，不是 live cluster A/B。live cluster
-目前仍只有 shadow-mode decision 行為可看；要量 live JCT effect 需要實際提交對照 workload
-並讓 RL 非 shadow 改 priority。
+| 改進 | 說明 |
+|------|------|
+| n-step returns (n=10) | 預計算 10 步折扣回報再存入 replay buffer，降低稀疏 JCT reward 的 credit-assignment 延遲 |
+| Score-guided warmup | warmup 期間以 score scheduler 選 action，取代 uniform random，提升 buffer 初始品質 |
+| 短 episode (n_jobs=50) | 每集 50 個 job（原 100），同樣 steps 下產生約 2× 更多不同場景 |
+
+**兩種 Q-network 架構：**
+
+- **MLP**：twin Q + LayerNorm，obs → [256, 256] → n_actions（130k 參數）
+- **Attention**：16 個 job token（11 維）→ TransformerEncoder（d=64, 4 heads, 2 layers）→ mean-pool → fuse cluster state → Q-head（78k 參數），permutation invariant
+
+訓練設定：200k steps，CUDA，fixed α=0.1，UTD=4，n_jobs=50，seeds 42–46，philly/burst/ali 混合訓練。
+
+---
+
+### I.2 平均 JCT 結果
+
+| Family | MLP DSAC | Attention DSAC | Score baseline | MLP vs Score | Attn vs Score |
+|--------|----------|----------------|----------------|-------------|---------------|
+| philly | 4.815h | 5.396h | 2.621h | −83.7%\* | −105.9% |
+| burst | 5.025h | 7.754h | 3.541h | −41.9%\* | −119.0%\* |
+| ali | 1.991h | 3.952h | 1.383h | −44.0% | −185.9% |
+
+`*` p < 0.05（paired t-test，n=5 seeds）。Δ 為負代表 DSAC JCT 高於 score（即 DSAC 較差）。
+
+**MLP vs Attention 直接比較：**
+
+| Family | MLP | Attention | Attention 相對 MLP |
+|--------|-----|-----------|-------------------|
+| philly | 4.815h | 5.396h | +12% 更差 |
+| burst | 5.025h | 7.754h | +54% 更差 |
+| ali | 1.991h | 3.952h | +98% 更差 |
+
+---
+
+### I.3 Per-seed 分佈
+
+**MLP per-seed JCT（小時）：**
+
+| seed | philly | burst | ali |
+|------|--------|-------|-----|
+| 42 | 2.586 | 2.719 | 2.162 |
+| 43 | 4.405 | 4.364 | 1.883 |
+| 44 | 5.383 | 3.704 | 1.649 |
+| 45 | 6.462 | 5.609 | 2.742 |
+| 46 | 5.238 | 8.729 | 1.520 |
+
+**Attention per-seed JCT（小時）：**
+
+| seed | philly | burst | ali |
+|------|--------|-------|-----|
+| 42 | 3.966 | 2.664 | 7.703 |
+| 43 | 6.904 | 4.153 | 2.192 |
+| 44 | 4.160 | 9.212 | 1.892 |
+| 45 | 1.967 | 10.885 | 3.616 |
+| 46 | 9.984 | 11.857 | 4.359 |
+
+Attention 的 burst 結果呈現明顯遞增趨勢（seed 44→45→46：9.2→10.9→11.9h），顯示高方差與潛在發散。
+
+---
+
+### I.4 分析
+
+**Attention 為何在此設定下表現較差：**
+
+1. **Queue 規模太小**：16 個 job slot 對 TransformerEncoder 而言樣本數不足，attention 的 permutation invariance 優勢無法顯現；MLP 在小輸入下收斂更快。
+
+2. **Transformer critic 較難收斂**：DSAC 的 TD 目標本身帶有 bootstrap 雜訊，Transformer 的多層 attention 在此雜訊下需要更多 steps 才能穩定；200k steps 對 MLP 已接近收斂邊緣，對 Attention 可能仍在早期。
+
+3. **高方差**：Attention 各 seed 間的 JCT 差異（burst：2.7h 到 11.9h）遠大於 MLP（2.7h 到 8.7h），說明 Attention Q-net 對初始化敏感，訓練不穩定。
+
+4. **MLP 的 LayerNorm + 深層結構**在 DSAC 的 actor-critic 框架下已被廣泛驗證（DrQ-v2、RLPD 等），是更成熟的 inductive bias。
+
+算法改進（n-step、score warmup、短 episode）的貢獻難以單獨量化，因為 steps 從 50k 增至 200k、n_jobs 從 100 降至 50，兩者同步變動。但整體結果仍落後 score baseline，顯示核心瓶頸在於 reward 信號稀疏與 1×1 cluster 的訓練多樣性不足，並非架構本身。
+
+---
+
+### I.5 結論
+
+在當前 1×1 cluster（16-job queue）規模下：
+
+- **MLP 架構優於 Attention**：更穩定、方差更小、各 family 均較好
+- **Attention 需要更大 queue 或更多 steps** 才有意義（論文通常在 100+ job queue 下驗證）
+- **兩種架構均未超過 score baseline** — 根本問題為訓練多樣性不足（1×1 cluster action space 太小）與 JCT reward 稀疏性
+
+後續方向：(a) 增加 cluster 規模（2×2）擴大 queue + action space；(b) reward shaping 讓信號更密集；(c) RLPD 接入 live logs 提供真實分佈的 fine-tuning。
+
+---
+
+### I.6 重現
+
+```bash
+# MLP（預設架構）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --n-nodes 1 --gpus-per-node 1 --total-steps 200000 --n-jobs 50 \
+    --trace-families philly burst ali --seeds 42 43 44 45 46 \
+    --device cuda --no-attention
+
+# Attention
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --n-nodes 1 --gpus-per-node 1 --total-steps 200000 --n-jobs 50 \
+    --trace-families philly burst ali --seeds 42 43 44 45 46 \
+    --device cuda
+```
+
+Artifacts：
+- `runs/eval_mlp_20260514-210824/` — MLP 結果（checkpoint + CSV + JSON）
+- `runs/eval_attn_cuda_20260514-232827/` — Attention 結果（checkpoint + CSV + JSON）

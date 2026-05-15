@@ -1,38 +1,21 @@
-"""M11 Phase C-4: RLPD-style Sim2Real fine-tune scaffold.
+"""RLPD-style Sim2Real fine-tune for the placement-aware DSAC agent.
 
 RLPD (Ball et al., ICML 2023) — "Efficient Online RL with Offline Data".
 Key idea: keep an offline replay buffer (from sim) and an online buffer
-(from live cluster), and each training batch is half-sampled from each.
-LayerNorm + high UTD ratio = update-to-data 20:1 close the sim-to-real gap
-in ~10^3 live transitions.
-
-This file is the scaffold — actual fine-tuning runs once Phase D has
-emitted enough shadow-mode transitions for the online buffer to be non-trivial.
-The PPO-on-MaskablePPO path doesn't natively support off-policy replay, so
-RLPD here uses SAC-style off-policy: load the sim-trained policy + value
-heads as warm-start, then keep training off the mixed replay buffer.
+(from live cluster), each training batch drawn 50/50 from both.
+LayerNorm + high UTD ratio closes the sim-to-real gap in ~10^3 live
+transitions.
 
 Pieces:
-  ReplayBuffer       — minimal numpy-backed FIFO buffer (obs/act/rew/next_obs/done)
-  SimRolloutCollector — drive sim.gym_env to fill the offline buffer
-  LiveTransitionLogger — append to online buffer from a parsed shadow log
-  rlpd_train         — half-half sampler + warm-start fine-tune loop
+  ReplayBuffer         — FIFO numpy buffer (obs/act/rew/next_obs/done + masks)
+  collect_sim_rollouts — fill offline buffer with uniform-random sim rollouts
+  load_live_shadow_log — import live transitions from daemon JSONL logs
+  rlpd_train           — 50/50 batch sampler + DSAC gradient loop
 
-Notes / honest caveats:
-  - The sim policy is MaskablePPO with discrete action space. The cleanest
-    RLPD port would be MaskableDQN or MaskableSAC — both are missing from
-    sb3-contrib at time of writing. As a pragmatic stand-in this scaffold
-    runs PPO on the mixed buffer with importance correction off (so it's
-    biased but cheap); document the bias when reporting numbers.
-  - "Sim2Real gap" in our setting: sim ignores k8s pod start latency,
-    image-pull jitter, NFS write spikes, and real Slurm prio inflation.
-    The online buffer is what teaches the policy these.
-
-Run (once a shadow log is available — Phase D):
+Run (after live_daemon has collected shadow-mode transitions):
     .venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \\
-        --base-policy runs/m11_mppo_20260512-185937 \\
         --offline-steps 50000 --online-log shadow_logs/*.jsonl \\
-        --out-dir runs/m11_rlpd_$(date +%Y%m%d-%H%M%S)
+        --out-dir runs/rlpd_$(date +%Y%m%d-%H%M%S)
 """
 from __future__ import annotations
 
@@ -47,10 +30,7 @@ from typing import Optional
 
 import numpy as np
 
-try:
-    from sim.gym_env import KubefluxSchedGymEnv
-except ImportError:
-    KubefluxSchedGymEnv = None  # type: ignore
+from sim.gym_env import KubefluxSchedEnv
 
 
 @dataclass
@@ -67,7 +47,14 @@ class Transition:
 @dataclass
 class ReplayBuffer:
     """FIFO numpy-backed replay. Stored as parallel arrays for cheap batch
-    sampling. Pre-allocates to capacity to avoid repeated np.append."""
+    sampling. Pre-allocates to capacity to avoid repeated np.append.
+
+    The `gammas` field stores the effective discount for each transition.
+    For 1-step TD this is always γ.  For n-step returns (n>1) the caller
+    pre-computes the discounted sum r + γr' + ... + γ^{n-1}r'' and stores
+    γ^n here so the critic target becomes:
+        y = n_step_return + gammas * (1 - done) * V(s_{t+n})
+    """
     capacity: int
     obs_dim: int
     n_actions: int
@@ -78,6 +65,7 @@ class ReplayBuffer:
     dones: np.ndarray = field(init=False)
     masks: np.ndarray = field(init=False)
     next_masks: np.ndarray = field(init=False)
+    gammas: np.ndarray = field(init=False)   # γ^n per transition
     _size: int = 0
     _idx: int = 0
 
@@ -89,17 +77,19 @@ class ReplayBuffer:
         self.dones = np.zeros((self.capacity,), dtype=np.bool_)
         self.masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
         self.next_masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
+        self.gammas = np.full((self.capacity,), 0.99, dtype=np.float32)
 
     def __len__(self) -> int:
         return self._size
 
-    def add(self, t: Transition) -> None:
+    def add(self, t: Transition, gamma: float = 0.99) -> None:
         i = self._idx
         self.obs[i] = t.obs
         self.acts[i] = t.act
         self.rews[i] = t.rew
         self.next_obs[i] = t.next_obs
         self.dones[i] = t.done
+        self.gammas[i] = gamma
         if t.mask is not None:
             self.masks[i] = t.mask
         if t.next_mask is not None:
@@ -114,52 +104,51 @@ class ReplayBuffer:
             "rews": self.rews[idx], "next_obs": self.next_obs[idx],
             "dones": self.dones[idx], "masks": self.masks[idx],
             "next_masks": self.next_masks[idx],
+            "gammas": self.gammas[idx],
         }
 
 
 def collect_sim_rollouts(*, n_transitions: int, trace_family: str,
                          n_jobs: int, n_nodes: int, gpus_per_node: int,
                          seed: int = 42) -> ReplayBuffer:
-    """Drive sim.gym_env with a uniform-random masked policy to fill an
-    offline buffer. We deliberately don't use the trained policy here —
-    we want diverse states, not the policy's narrow trajectory."""
-    from sim.gym_env import KubefluxSchedGymEnv
+    """Fill offline buffer using a uniform-random masked policy in sim.
+
+    We deliberately avoid the trained policy here — we want diverse coverage
+    of the state space, not the policy's narrow on-policy trajectory.
+    """
     from sim.loader import generate_by_family
 
     rng = np.random.default_rng(seed)
 
-    def _factory():
-        return generate_by_family(trace_family, n_jobs=n_jobs,
-                                  seed=int(rng.integers(0, 2**31 - 1)))
+    total_gpus = n_nodes * gpus_per_node
 
-    env = KubefluxSchedGymEnv(
-        jobs_factory=_factory,
-        n_nodes=n_nodes,
-        gpus_per_node=gpus_per_node,
+    def _factory():
+        jobs = generate_by_family(trace_family, n_jobs=n_jobs,
+                                   seed=int(rng.integers(0, 2**31 - 1)))
+        return [j for j in jobs if j.gpu_count <= total_gpus]
+
+    env = KubefluxSchedEnv(
+        _factory, n_nodes=n_nodes, gpus_per_node=gpus_per_node,
         max_steps=n_jobs * 100,
     )
-    obs_dim = int(np.prod(env.observation_space.shape))
+    obs_dim   = int(np.prod(env.observation_space.shape))
     n_actions = int(env.action_space.n)
-    buf = ReplayBuffer(capacity=n_transitions, obs_dim=obs_dim,
-                       n_actions=n_actions)
+    buf = ReplayBuffer(capacity=n_transitions, obs_dim=obs_dim, n_actions=n_actions)
 
     obs, _ = env.reset()
     while len(buf) < n_transitions:
-        mask = env.action_masks().astype(bool)
+        mask  = env.action_mask()
         legal = np.flatnonzero(mask)
-        act = int(rng.choice(legal)) if len(legal) else 0
-        next_obs, rew, terminated, truncated, _info = env.step(act)
-        next_mask = env.action_masks().astype(bool)
+        act   = int(rng.choice(legal)) if len(legal) else 0
+        next_obs, rew, term, trunc, _ = env.step(act)
+        next_mask = env.action_mask()
         buf.add(Transition(
-            obs=obs.astype(np.float32).reshape(-1),
-            act=act, rew=float(rew),
-            next_obs=next_obs.astype(np.float32).reshape(-1),
-            done=bool(terminated or truncated),
-            mask=mask,
-            next_mask=next_mask,
+            obs=obs.astype(np.float32), act=act, rew=float(rew),
+            next_obs=next_obs.astype(np.float32),
+            done=bool(term or trunc), mask=mask, next_mask=next_mask,
         ))
         obs = next_obs
-        if terminated or truncated:
+        if term or trunc:
             obs, _ = env.reset()
     env.close()
     return buf
@@ -232,40 +221,40 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
                utd_ratio: int, batch_size: int, online_ratio: float,
                out_dir: Path,
                trace_family: str = "philly", n_jobs: int = 100,
-               n_nodes: int = 2, gpus_per_node: int = 2) -> None:
-    """Real DSAC-based RLPD fine-tune (replaces the biased PPO scaffold).
+               n_nodes: int = 1, gpus_per_node: int = 1) -> None:
+    """DSAC RLPD fine-tune: 50/50 offline+online batch, UTD gradient steps.
 
-    Uses Discrete SAC (Christodoulou 2019) with action masking + LayerNorm.
     Each gradient step draws a mixed batch: online_ratio from live data,
-    rest from sim. UTD ratio controls how many gradient steps per env step.
+    rest from sim offline buffer. High UTD closes the sim-to-real gap.
     """
     from .dsac import DSACAgent
     from sim.runner import run as sim_run
+    from sim.loader import generate_by_family
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    obs_dim = offline.obs_dim
+    obs_dim   = offline.obs_dim
     n_actions = offline.n_actions
 
     warm_start = out_dir / "dsac.pt"
     if warm_start.exists():
-        print(f"[rlpd] warm-starting DSAC from {warm_start}")
+        print(f"[rlpd] warm-starting from {warm_start}")
         agent = DSACAgent.load(warm_start)
     else:
         agent = DSACAgent(obs_dim=obs_dim, n_actions=n_actions, device="cpu")
 
-    rng = np.random.default_rng(0)
+    rng      = np.random.default_rng(0)
     log_path = out_dir / "rlpd_train.jsonl"
 
-    print(f"[rlpd] DSAC training: {n_updates} updates × UTD={utd_ratio} "
-          f"offline={len(offline)} online={len(online)}")
+    print(f"[rlpd] {n_updates} updates × UTD={utd_ratio}  "
+          f"offline={len(offline)}  online={len(online)}")
 
     with open(log_path, "w") as fh:
         for update in range(n_updates):
             loss_acc: dict = {}
             for _ in range(utd_ratio):
-                batch = mixed_batch(offline=offline, online=online,
-                                    batch_size=batch_size,
-                                    online_ratio=online_ratio, rng=rng)
+                batch  = mixed_batch(offline=offline, online=online,
+                                     batch_size=batch_size,
+                                     online_ratio=online_ratio, rng=rng)
                 losses = agent.update(batch)
                 for k, v in losses.items():
                     loss_acc[k] = loss_acc.get(k, 0.0) + v / utd_ratio
@@ -280,47 +269,48 @@ def rlpd_train(*, base_policy_dir: Path, offline: ReplayBuffer,
                       f"alpha={loss_acc.get('alpha', 0):.4f}  "
                       f"H={loss_acc.get('entropy', 0):.3f}")
 
-        agent.save(warm_start)
+    agent.save(warm_start)
 
     # Quick eval: 3 greedy episodes vs score baseline
-    print("\n[rlpd] evaluating DSAC (3 greedy episodes)...")
-    from sim.loader import generate_by_family
-    dsac_jcts = []
+    print("\n[rlpd] quick eval (3 seeds, greedy) ...")
+    total_gpus = n_nodes * gpus_per_node
+    dsac_jcts  = []
+    score_jcts = []
     for ep_seed in [42, 43, 44]:
-        jobs = generate_by_family(trace_family, n_jobs=n_jobs, seed=ep_seed)
-        env = KubefluxSchedGymEnv(
-            jobs_factory=lambda _s=ep_seed: generate_by_family(trace_family, n_jobs=n_jobs, seed=_s),
+        env = KubefluxSchedEnv(
+            lambda _s=ep_seed, _tg=total_gpus: [
+                j for j in generate_by_family(trace_family, n_jobs=n_jobs, seed=_s)
+                if j.gpu_count <= _tg
+            ],
             n_nodes=n_nodes, gpus_per_node=gpus_per_node,
-            max_steps=n_jobs * 100, reward_mode="jct_aligned",
+            max_steps=n_jobs * 200, reward_mode="jct_aligned",
         )
         obs, _ = env.reset()
         done = False
         info = {}
         while not done:
-            mask = env.action_masks()
-            act = agent.select_action(obs, mask, greedy=True)
-            obs, _, terminated, truncated, info = env.step(act)
-            done = terminated or truncated
+            mask = env.action_mask()
+            act  = agent.select_action(obs, mask, greedy=True)
+            obs, _, term, trunc, info = env.step(act)
+            done = term or trunc
         env.close()
-        jct = info.get("avg_jct", float("nan"))
-        dsac_jcts.append(jct)
+        dsac_jcts.append(info.get("avg_jct", float("nan")))
 
-    score_jcts = []
-    for ep_seed in [42, 43, 44]:
-        jobs = generate_by_family(trace_family, n_jobs=n_jobs, seed=ep_seed)
-        metrics, _ = sim_run(jobs, n_nodes=n_nodes, gpus_per_node=gpus_per_node,
-                              scheduler_name="score")
-        score_jcts.append(metrics.summary()["jct_mean"])
+        jobs = [j for j in generate_by_family(trace_family, n_jobs=n_jobs, seed=ep_seed)
+                if j.gpu_count <= total_gpus]
+        m, _ = sim_run(jobs, n_nodes=n_nodes, gpus_per_node=gpus_per_node,
+                        scheduler_name="score")
+        score_jcts.append(m.summary()["jct_mean"])
 
-    dsac_mean = float(np.nanmean(dsac_jcts))
+    dsac_mean  = float(np.nanmean(dsac_jcts))
     score_mean = float(np.mean(score_jcts))
-    pct = (score_mean - dsac_mean) / score_mean * 100
-    print(f"\n  DSAC mean JCT : {dsac_mean/3600:.3f}h")
-    print(f"  Score baseline: {score_mean/3600:.3f}h")
-    print(f"  Δ(score-DSAC) : {pct:+.1f}%  "
+    pct        = (score_mean - dsac_mean) / score_mean * 100
+    print(f"  DSAC  mean JCT : {dsac_mean/3600:.3f}h")
+    print(f"  Score mean JCT : {score_mean/3600:.3f}h")
+    print(f"  Δ              : {pct:+.1f}%  "
           f"({'DSAC wins' if pct > 0 else 'score wins'})")
-    print(f"\n[rlpd] policy saved: {warm_start}")
-    print(f"[rlpd] training log: {log_path}")
+    print(f"[rlpd] policy → {warm_start}")
+    print(f"[rlpd] log    → {log_path}")
 
 
 def main(argv=None) -> int:
@@ -335,8 +325,11 @@ def main(argv=None) -> int:
     p.add_argument("--online-ratio", type=float, default=0.5)
     p.add_argument("--trace-family", default="philly")
     p.add_argument("--n-jobs", type=int, default=300)
-    p.add_argument("--n-nodes", type=int, default=2)
-    p.add_argument("--gpus-per-node", type=int, default=2)
+    # Cluster shape — must match the live deployment.
+    # Current: 1 host × 1 GPU → obs_dim=192, n_actions=17.
+    # When second GPU is online: change both to 2 and retrain from scratch.
+    p.add_argument("--n-nodes", type=int, default=1)
+    p.add_argument("--gpus-per-node", type=int, default=1)
     p.add_argument("--out-dir",
                    default=f"runs/m11_rlpd_{time.strftime('%Y%m%d-%H%M%S')}")
     args = p.parse_args(argv)

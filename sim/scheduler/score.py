@@ -41,7 +41,7 @@ class ScoreScheduler(MultifactorScheduler):
         alpha: float = 0.40,    # mps_fit
         beta: float = 0.20,     # vram_fit
         delta: float = 0.20,    # fragmentation (subtractive)
-        epsilon: float = 0.0,   # f_runtime_short (M5 predictor); 0 = predictor disabled
+        epsilon: float = 0.30,  # f_runtime_short (SJF kicker); 0 = disabled
         score_gain: float = 1000.0,
         vram_tiers=_DEFAULT_TIERS_GB,
         mps_per_node: int = MPS_PER_GPU,  # per-GPU slot count
@@ -59,10 +59,25 @@ class ScoreScheduler(MultifactorScheduler):
         self.runtime_horizon = runtime_horizon
 
     # ---- factor implementations ------------------------------------
-    def f_mps_fit(self, j: Job) -> float:
-        if j.mps_req <= 0 or j.mps_req >= self.mps_per_node:
-            return 1.0
-        return j.mps_req / self.mps_per_node
+    def f_mps_fit(self, j: Job, cluster: Cluster) -> float:
+        """Bin-packing fit score: how tightly the job fills its best GPU slot.
+
+        score = mps_req / best_gpu_free_mps, where best_gpu is the one with
+        the smallest free_mps >= mps_req (first-fit-decreasing spirit).
+
+        1.0 = perfect fit (exactly fills the available slot).
+        Rewards small jobs on nearly-full GPUs as much as large jobs on full
+        GPUs — enables MPS colocation instead of monopolising with large jobs.
+        Returns 0.0 if the job cannot fit anywhere.
+        """
+        best_fit = None
+        for node in cluster.nodes:
+            for gpu in node.gpus:
+                if gpu.free_mps >= j.mps_req:
+                    fit = j.mps_req / gpu.free_mps   # 1.0 = tight, 0 = loose
+                    if best_fit is None or fit > best_fit:
+                        best_fit = fit
+        return best_fit if best_fit is not None else 0.0
 
     def f_vram_fit(self, j: Job) -> float:
         v = _gpu_type_to_vram(j.gpu_type)
@@ -75,10 +90,22 @@ class ScoreScheduler(MultifactorScheduler):
         return max(0.0, 1.0 - (fit_tier - v) / denom)
 
     def f_fragmentation(self, j: Job, cluster: Cluster) -> float:
-        # Penalise placements that would skew per-node free MPS.
+        # Penalise placements that would leave awkward MPS residuals.
+        # For single-node clusters: use per-GPU free residual after placement.
         free = cluster.free_mps_per_node()
-        if not free or len(free) == 1:
+        if not free:
             return 0.0
+        if len(free) == 1:
+            # Single-node: measure GPU-level fragmentation (residual after fit)
+            node = cluster.nodes[0]
+            residuals = []
+            for gpu in node.gpus:
+                if gpu.free_mps >= j.mps_req:
+                    residuals.append(gpu.free_mps - j.mps_req)
+            if not residuals:
+                return 1.0  # doesn't fit → max fragmentation penalty
+            best_residual = min(residuals)
+            return best_residual / cluster.mps_per_gpu  # 0 = perfect, 1 = worst
         # Heuristic: jobs at ~50% of a node's slots are worst (parabolic in
         # the lua plugin); multi-GPU jobs that span nodes evenly are best.
         if j.gpu_count >= 1 and j.mps_req >= self.mps_per_node:
@@ -99,7 +126,7 @@ class ScoreScheduler(MultifactorScheduler):
 
     def score(self, j: Job, cluster: Cluster) -> float:
         s = (
-            self.alpha * self.f_mps_fit(j)
+            self.alpha * self.f_mps_fit(j, cluster)
             + self.beta * self.f_vram_fit(j)
             - self.delta * self.f_fragmentation(j, cluster)
             + self.epsilon * self.f_runtime_short(j)
