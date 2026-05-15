@@ -414,9 +414,170 @@ Step 4: Q-values
 
 ---
 
+## 6. DRL 改進路線圖
+
+本節根據 §4–5 的實驗結果（Appendix H、I），系統整理尚未解決的問題及對應的改進方向，並評估 2023 年提出的 DSAC-T 算法的適用性。
+
+### 6.1 目前瓶頸診斷
+
+| 問題 | 現象 | 根因 |
+|------|------|------|
+| 落後 score baseline | MLP −42～−84%、Attention −106～−186% | JCT reward 稀疏、action space 太小 |
+| Attention 高方差 | burst seed range 2.7h→11.9h | Transformer 在小 queue 下收斂慢 |
+| Alpha 不穩定 | auto-tune 時 α 在 1.6～7.4 之間漂移 | entropy target 與 Q 收斂速度不同步 |
+| 訓練多樣性不足 | 1×1 cluster 只有 17 個 action | 真實排程場景更複雜 |
+
+---
+
+### 6.2 DSAC-T：是否適用？
+
+**DSAC-T**（Distributional Soft Actor-Critic with Three Refinements，arXiv 2310.05858，2023）是針對**連續動作空間**設計的改進版 Distributional SAC，三項 refinement 如下：
+
+| Refinement | 說明 |
+|------------|------|
+| Expected Value Substituting | 用期望值替換隨機 target return，穩定均值更新 |
+| Twin Value Distribution Learning | 雙 Q 學習完整回報分佈（Gaussian），降低過估 |
+| Variance-Based Critic Gradient Adjusting | 依方差縮放 critic 梯度，減少高方差區域的更新幅度 |
+
+**直接套用的問題**：DSAC-T 的 policy 輸出是連續動作（如機器人控制），整個框架假設 `a ∈ ℝⁿ`。我們的 action space 是離散的（`a ∈ {0,...,16}`），無法直接使用其 policy gradient 部分。
+
+**可借用的思想**：
+
+| DSAC-T 概念 | 離散版對應做法 | 適用於我們的系統 |
+|-------------|---------------|-----------------|
+| Distributional Q（Gaussian） | **C51 / IQN**（離散 distributional RL）| ✅ 可接入現有 twin Q 結構 |
+| Variance-based gradient scaling | Huber loss 已部分實現；可加顯式方差 clipping | ✅ 容易加 |
+| Twin value distribution | 我們已有 twin Q；distributional 化需改 output head | 中等難度 |
+
+**結論**：DSAC-T 本身不能直接移植，但其核心的「distributional critic + 方差控制」思想可透過**離散版 Distributional RL（IQN）**引入，解決我們的 Q 過估問題。
+
+---
+
+### 6.3 改進方向（按影響力排序）
+
+#### 優先級 A：解決根本問題
+
+**A1 — Reward Shaping（最高優先）**
+
+目前 JCT reward 只在 episode 結束時給一次，整個 episode 幾乎沒有梯度。改為 potential-based shaping：
+
+```
+φ(s) = −Σ_i  wait_time_i / scale        # 所有 pending job 的等待時間和
+r_shaped = r + γ·φ(s') − φ(s)           # Ng et al. 1999：不改變最優策略
+```
+
+每步都有信號，Q-net 收斂速度預計提升 5-10×，且不影響最優策略的最優性（理論保證）。
+
+**A2 — 擴大 Cluster 規模（2×2）**
+
+```python
+# sim/gym_env.py
+N_NODES, N_GPUS = 2, 2   # obs_dim → 210, n_actions → 65
+```
+
+更大 action space → 更多有意義的 placement 決策 → DRL 相對 score 的優勢才能體現。**需從頭重新訓練**（obs_dim 與 checkpoint 不相容）。
+
+---
+
+#### 優先級 B：算法改進
+
+**B1 — Prioritized Experience Replay (PER)**
+
+依 TD error 大小對 replay buffer 加權採樣：
+
+```
+P(i) ∝ |δᵢ|^α + ε       # α=0.6, β (IS weight) 從 0.4 退火到 1.0
+```
+
+讓 Q-net 重點學習高誤差轉移，對稀疏 reward 特別有效。實作成本低（在 `ReplayBuffer.sample()` 加 SumTree）。
+
+**B2 — Implicit Quantile Networks (IQN) for Discrete Actions**
+
+用 quantile regression 學習完整的 return 分佈而非均值：
+
+```
+Zτ(s,a) = f_θ(φ(s,a), ψ(τ))    # τ ~ Uniform(0,1)
+Loss = E_τ[ρτ(r + γZτ'(s',a*) − Zτ(s,a))]    # Huber quantile loss
+```
+
+這是 DSAC-T distributional 思想的離散版對應，可降低 Q 過估、減少方差。可直接替換現有 `_QNet` 的 output head。
+
+**B3 — Conservative Q-Learning (CQL) 調節係數**
+
+在 Q 更新中加入正則項，防止 out-of-distribution action 的 Q 值被過估：
+
+```
+min_Q  α·(E_{a~π}[Q(s,a)] − E_{a~D}[Q(s,a)]) + 標準 TD loss
+```
+
+對 warmup buffer 品質不高的早期訓練特別有幫助。
+
+---
+
+#### 優先級 C：訓練效率
+
+**C1 — Curriculum Learning**
+
+```
+Stage 1: n_jobs=10, total_steps=50k  → 學會基本 job 選擇
+Stage 2: n_jobs=30, total_steps=100k → 學 queue pressure
+Stage 3: n_jobs=50, total_steps=200k → 完整場景
+```
+
+避免早期 episode 太難學到隨機策略，有論文在排程問題上報告 2-3× sample efficiency 提升。
+
+**C2 — 更多 Training Steps（500k→1M）**
+
+目前 200k steps 下 MLP 收斂跡象不明顯（per-seed variance 仍大）。Decima 等工作用 1M+ steps，job scheduling RL 通常需要比連續控制更多步數。
+
+**C3 — RLPD Fine-tuning**
+
+`services/rl_scheduler/rlpd_finetune.py` 已實作。接入 live shadow logs 後可用真實 workload 分佈做 online fine-tuning，解決 sim-to-real gap。
+
+---
+
+### 6.4 建議實驗順序
+
+```
+Phase 1: Reward shaping (A1)
+  → 預計讓 DSAC 在 1×1 cluster 上超過 score baseline
+  → 驗證：eval_dsac_placement.py，比較有/無 shaping 的 delta_pct
+
+Phase 2: 2×2 cluster (A2) + Curriculum (C1)
+  → obs_dim=210, n_actions=65
+  → 需重新設計 env_dims() 和對應 loader
+
+Phase 3: PER (B1) + More steps (C2)
+  → 100k→500k steps，加 SumTree
+
+Phase 4: IQN (B2) [選做]
+  → 替換 _QNet output head，評估 vs 標準 twin Q
+```
+
+---
+
+### 6.5 與 DSAC-T 的完整對照
+
+| 面向 | DSAC-T（連續） | 我們的系統（離散）| 建議做法 |
+|------|---------------|-----------------|---------|
+| Action space | 連續 ℝⁿ | 離散 {0..16} | 保持 Discrete SAC |
+| Value function | Gaussian 分佈 | 均值 Q | 改為 IQN（quantile） |
+| Policy | reparameterization trick | softmax over Q | 不變 |
+| Gradient stability | Variance-based scaling | — | 加 gradient clipping (0.5) |
+| 過估問題 | Twin + distributional | Twin Q | Twin + IQN |
+| 適用場景 | 連續控制（機器人、MEC） | 離散排程 | — |
+
+DSAC-T 在 MEC 資源分配（連續頻譜分配）上有成功應用，但 job scheduling 的離散特性使直接移植不可行；IQN 是對應的離散版替代。
+
+---
+
 ## 附錄：引用文獻
 
 **主方法**
+- Duan et al., "DSAC-T: Distributional Soft Actor-Critic with Three Refinements", arXiv 2310.05858, 2023
+- Dabney et al., "Implicit Quantile Networks for Distributional Reinforcement Learning" (IQN), ICML 2018
+- Bellemare et al., "A Distributional Perspective on Reinforcement Learning" (C51), ICML 2017
+- Schaul et al., "Prioritized Experience Replay" (PER), ICLR 2016
 - Ball et al., "Efficient Online Reinforcement Learning with Offline Data" (RLPD), ICML 2023
 - Schulman et al., "Proximal Policy Optimization Algorithms", arXiv 2017
 - Russac et al., "Weighted Linear Bandits for Non-Stationary Environments" (D-LinUCB), NeurIPS 2019
