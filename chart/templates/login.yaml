@@ -72,6 +72,12 @@ spec:
                 chmod 0600 /root/.ssh/authorized_keys
               fi
               ssh-keygen -A >/dev/null 2>&1 || true
+              # Append external user keys if configured via values.login.ssh.authorizedKeys
+              if [[ -f /slurm-login-user-keys/authorized_keys ]]; then
+                cat /slurm-login-user-keys/authorized_keys >> /root/.ssh/authorized_keys
+                chmod 0600 /root/.ssh/authorized_keys
+                echo "[login] loaded $(wc -l < /slurm-login-user-keys/authorized_keys) external key(s)"
+              fi
               if [[ -d /opt/slurm-runtime-src ]]; then
                 install -d -m 0755 /opt/slurm-runtime
                 cp -f /opt/slurm-runtime-src/* /opt/slurm-runtime/ 2>/dev/null || true
@@ -112,6 +118,15 @@ spec:
             - name: slurm-ddp-runtime
               mountPath: /opt/slurm-runtime-src
               readOnly: true
+            - name: sshd-config
+              mountPath: /etc/ssh/sshd_config.d/99-hardened.conf
+              subPath: 99-hardened.conf
+              readOnly: true
+            {{- if .Values.login.ssh.authorizedKeys }}
+            - name: slurm-login-user-keys
+              mountPath: /slurm-login-user-keys
+              readOnly: true
+            {{- end }}
             {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
             - name: shared
               mountPath: /shared
@@ -143,6 +158,14 @@ spec:
             name: slurm-ddp-runtime
             defaultMode: 0755
             optional: true
+        - name: sshd-config
+          configMap:
+            name: slurm-login-sshd
+        {{- if .Values.login.ssh.authorizedKeys }}
+        - name: slurm-login-user-keys
+          configMap:
+            name: slurm-login-user-keys
+        {{- end }}
         {{- if and .Values.storage.enabled .Values.storage.mountInPods }}
         - name: shared
           persistentVolumeClaim:
@@ -171,12 +194,18 @@ metadata:
     {{- include "slurm-platform.labels" . | nindent 4 }}
     app: slurm-login
 spec:
+  {{- if gt (int .Values.login.ssh.nodePort) 0 }}
+  type: NodePort
+  {{- end }}
   selector:
     app: slurm-login
   ports:
     - name: ssh
       port: 22
       targetPort: 22
+      {{- if gt (int .Values.login.ssh.nodePort) 0 }}
+      nodePort: {{ .Values.login.ssh.nodePort }}
+      {{- end }}
 ---
 {{/*
 slurm-ddp-runtime ConfigMap — DDP networking helpers used inside login pod
@@ -227,3 +256,45 @@ data:
     source /opt/slurm-runtime/ddp-env.sh
     export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)}"
     srun bash -lc 'source /opt/slurm-runtime/ddp-env.sh && env | grep -E "^(MASTER_ADDR|MASTER_PORT|NCCL_SOCKET_IFNAME|GLOO_SOCKET_IFNAME|SLURM_DATA_IP)=" | sort'
+---
+{{/*
+slurm-login-sshd ConfigMap — hardened sshd_config.d snippet.
+Disables password auth; key-only login only. Placed in
+/etc/ssh/sshd_config.d/99-hardened.conf (requires OpenSSH >= 8.0 with
+Include /etc/ssh/sshd_config.d/*.conf in the main sshd_config).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-login-sshd
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  99-hardened.conf: |
+    PasswordAuthentication no
+    ChallengeResponseAuthentication no
+    KbdInteractiveAuthentication no
+    PermitRootLogin prohibit-password
+    PubkeyAuthentication yes
+    AuthorizedKeysFile .ssh/authorized_keys
+    X11Forwarding no
+    AllowTcpForwarding yes
+{{- if .Values.login.ssh.authorizedKeys }}
+---
+{{/*
+slurm-login-user-keys ConfigMap — external user public keys.
+Populated from values.login.ssh.authorizedKeys (one key per line).
+Mounted read-only; the startup script appends to /root/.ssh/authorized_keys.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-login-user-keys
+  namespace: {{ .Values.cluster.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  authorized_keys: |
+{{ .Values.login.ssh.authorizedKeys | indent 4 }}
+{{- end }}

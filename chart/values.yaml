@@ -620,3 +620,16 @@ secrets:
   munge: slurm-munge-key
   jwt: slurm-jwt-secret
   ssh: slurm-ssh-key
+
+# Login pod external SSH access (Phase 7-B).
+# Set nodePort to a value > 0 to expose SSH as NodePort (users can then
+# connect with: ssh -p <nodePort> root@<k3s-host-ip>).
+# Paste one public key per line into authorizedKeys to grant access.
+login:
+  ssh:
+    nodePort: 30022
+    # One public key per line. Example:
+    #   authorizedKeys: |
+    #     ssh-ed25519 AAAA... user@laptop
+    #     ssh-rsa AAAA... user@workstation
+    authorizedKeys: ""

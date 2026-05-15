@@ -384,7 +384,7 @@ bash scripts/verify-lmod.sh
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
 | 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合、`/shared/jobs/` 路徑、Worker preStop Hook；Helm chart |
 | 6：自訂 Slurm 排程 | ✅ 開發中 | DRL 模型排程器插件 |
-| 7：分散式追蹤 + SSH Login | 📋 規劃中 | OpenTelemetry job lifecycle trace（Tempo + Operator span + Prometheus exemplar）；Login pod 開放 SSH NodePort 取代 `kubectl exec` |
+| 7：分散式追蹤 + SSH Login | 🔄 進行中 | SSH Login（NodePort + key auth）✅；OpenTelemetry trace（Tempo + admin_comment propagation）📋 規劃中 |
 
 ---
 
@@ -454,9 +454,9 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 > Phase 5 已完成（Lmod + Helm chart cutover）；Phase 6 的 score-based scheduling 主線已完成到 M8 evaluation。下一步重點是 Phase 7 補齊使用者體驗（端到端 trace + SSH Login），以及把 Phase 6 的 live-cluster E7 驗證與 production rollout policy 補完。
 > 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為更後期擴充方向。
 
-## Phase 7：分散式追蹤 + SSH Login 📋 規劃中
+## Phase 7：分散式追蹤 + SSH Login
 
-### 7-A：OpenTelemetry 分散式追蹤
+### 7-A：OpenTelemetry 分散式追蹤 📋 規劃中
 
 **目標：** 一個 AI job 從提交到完成的完整鏈路變成一條可視化的 Trace，讓使用者清楚看到時間花在哪裡（排隊、K8s 啟動、實際執行）。
 
@@ -466,32 +466,43 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
     → [checkpoint write] → [Operator scale-down] → [job complete]
 ```
 
-每個 span 攜帶 `job_id`、`pool`、`gres`、`provisioning_latency` 等 attribute，用 Grafana Tempo 可視化。這是目前所有 Slurm-on-K8s 開源方案都沒有做到的端到端觀測視角。
+Trace context 傳播方式：`serve.py` 在 `/decide` 時建立 root span，將 W3C traceparent 寫入 Slurm job 的 `admin_comment`；Operator polling loop 讀取後 continue 同一條 trace。詳見 `docs/note.md § 7-A`。
 
 **需要做的事：**
-- Operator 加入 `opentelemetry-sdk`，在 `scale_action`、`loop_observation` 事件上建立 span
-- 部署 Grafana Tempo（chart `templates/monitoring/` 加 `enabled` flag）
+- `serve.py` 加入 `opentelemetry-sdk`，`/decide` 建立 `job_submit` span 並寫入 `admin_comment`
+- Operator（`app.py`）讀取 `admin_comment`，continue trace 建立後續 span
+- 部署 OTel Collector + Grafana Tempo（`chart/templates/monitoring/`）
 - Prometheus histogram exemplar → Tempo 連結，從 latency spike 直接跳到對應 trace
 
-### 7-B：SSH Login
+### 7-B：SSH Login ✅ 已完成
 
-**現狀問題：** 目前登入 login node 需要執行 `kubectl exec`，使用者必須先安裝 kubectl 並取得 kubeconfig。
-
-**目標：** 使用者用標準 SSH 直接進入 login pod，不需要知道 K8s 的存在。
+使用者可用標準 SSH 直接進入 login pod，不需要安裝 kubectl 或持有 kubeconfig。
 
 ```
-使用者電腦 → ssh -p 2222 user@<k3s-host-ip>
-                  ↓
-           NodePort :2222 → slurm-login pod
-                              ├── sbatch / squeue / sinfo
-                              └── /shared/（NFS 掛載，模型 + 輸出共用）
+ssh -p 30022 root@<k3s-host-ip>
+       ↓
+NodePort :30022 → slurm-login pod
+                   ├── sbatch / squeue / sinfo（Slurm 指令即開即用）
+                   └── /shared/（NFS 掛載，模型 + 輸出共用）
 ```
 
-**需要做的事：**
-- `docker/login/Dockerfile` 加入 `openssh-server`，設定 SSH key 認證（禁用密碼登入）
-- `chart/templates/login.yaml` Service 改為 NodePort，固定 port 2222
-- Login 容器啟動腳本加入 SSH host key 初始化（`ssh-keygen -A`）
-- 後續（多租戶時）：`scripts/add-user.sh` 同時在 Linux 和 Slurm（`sacctmgr`）建帳號
+**設定方式（`chart/values.yaml`）：**
+```yaml
+login:
+  ssh:
+    nodePort: 30022         # k3s NodePort 範圍 30000-32767；0 = 維持 ClusterIP
+    authorizedKeys: |
+      ssh-ed25519 AAAA... user@laptop
+```
+
+**快速新增/移除 key：**
+```bash
+bash scripts/add-ssh-key.sh add    "ssh-ed25519 AAAA... user@laptop"
+bash scripts/add-ssh-key.sh remove "ssh-ed25519 AAAA... user@laptop"
+bash scripts/add-ssh-key.sh list
+```
+
+sshd 已加固：`PasswordAuthentication no`、`PermitRootLogin prohibit-password`（key-only）。
 
 ---
 
