@@ -1,0 +1,103 @@
+{{/*
+Grafana Tempo — single-binary trace backend for Phase 7-A.
+Enabled by .Values.monitoring.otel.enabled (default: false).
+Data is stored in a PVC (monitoring.otel.tempoStorage, default: 5Gi).
+*/}}
+{{- if .Values.monitoring.otel.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: {{ .Values.monitoring.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: "0.0.0.0:4317"
+
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/traces
+        wal:
+          path: /var/tempo/wal
+
+    compactor:
+      compaction:
+        block_retention: 336h   # 14 days
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tempo
+  namespace: {{ .Values.monitoring.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: tempo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tempo
+  serviceName: tempo
+  template:
+    metadata:
+      labels:
+        {{- include "slurm-platform.labels" . | nindent 8 }}
+        app: tempo
+    spec:
+      containers:
+        - name: tempo
+          image: {{ .Values.monitoring.otel.tempoImage | default "grafana/tempo:2.4.2" }}
+          args: ["-config.file=/conf/tempo.yaml"]
+          ports:
+            - containerPort: 3200
+              name: http
+            - containerPort: 4317
+              name: otlp-grpc
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+            - name: data
+              mountPath: /var/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.monitoring.otel.tempoStorage | default "5Gi" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: {{ .Values.monitoring.namespace }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+    app: tempo
+spec:
+  selector:
+    app: tempo
+  ports:
+    - name: http
+      port: 3200
+      targetPort: 3200
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+{{- end }}

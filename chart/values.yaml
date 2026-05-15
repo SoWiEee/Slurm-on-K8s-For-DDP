@@ -582,6 +582,13 @@ monitoring:
     namespace: gpu-operator
     serviceName: nvidia-dcgm-exporter
     port: 9400
+  # Phase 7-A: OpenTelemetry distributed tracing (Tempo + OTel Collector).
+  # Set enabled: true to deploy Tempo + otel-collector and wire Grafana datasource.
+  otel:
+    enabled: false
+    collectorImage: "otel/opentelemetry-collector-contrib:0.102.0"
+    tempoImage: "grafana/tempo:2.4.2"
+    tempoStorage: "5Gi"
 
 # -- Shared storage add-on (Stage E) -----------------------------------------
 # Deploys the NFS subdir external provisioner (in its own namespace) and a
