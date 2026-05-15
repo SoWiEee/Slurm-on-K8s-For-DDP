@@ -35,3 +35,20 @@ storage:
 
 monitoring:
   enabled: true
+  # Phase 7-A: OpenTelemetry distributed tracing.
+  # Set otel.enabled: true to deploy Tempo + OTel Collector and wire Grafana.
+  # Operator and rl-scheduler will auto-receive OTEL_ENABLED env when enabled.
+  otel:
+    enabled: false
+    tempoStorage: "5Gi"
+
+# Phase 7-B: SSH Login — expose login pod via NodePort so users can SSH in
+# without kubectl. Add public keys under authorizedKeys (one per line).
+# Connect with: ssh -p 30022 root@192.168.0.111
+login:
+  ssh:
+    nodePort: 30022
+    authorizedKeys: ""
+    # Example:
+    #   authorizedKeys: |
+    #     ssh-ed25519 AAAA... user@laptop

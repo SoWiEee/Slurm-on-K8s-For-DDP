@@ -145,6 +145,22 @@ helm install slurm-platform ./chart \
 
 LAN IP 不一樣時用 `--set storage.nfsServer=<your-ip>` 覆寫。
 
+**Phase 7 選用功能**（在 `chart/values-k3s.yaml` 開啟）：
+
+| 功能 | 設定 | 說明 |
+|------|------|------|
+| SSH Login（7-B） | `login.ssh.authorizedKeys: \|` + 公鑰 | `ssh -p 30022 root@192.168.0.111` |
+| OpenTelemetry（7-A） | `monitoring.otel.enabled: true` | 部署 Tempo + OTel Collector，Grafana 自動加 datasource |
+
+```bash
+# 快速加 SSH key（不需重新 helm install）
+bash scripts/add-ssh-key.sh add "ssh-ed25519 AAAA... user@laptop"
+
+# 啟用 OTel（helm upgrade）
+helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm \
+  --set monitoring.otel.enabled=true
+```
+
 ## 7. 安裝 NVIDIA GPU Operator
 
 ```bash
