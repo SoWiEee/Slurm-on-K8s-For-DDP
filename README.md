@@ -79,7 +79,7 @@ demand rises and falls.
 
 > Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，獨立用 `scripts/install-gpu-operator.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
 
-> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 595 ✅️
+> 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 580 ✅️
 
 ## 1. 主機準備
 
@@ -383,7 +383,7 @@ bash scripts/verify-lmod.sh
 | 3：共享儲存 | ✅ 完成 | NFS + RWX PVC 掛載到所有節點，`sbatch -o /shared/out-%j.txt` 可直接取得輸出；多節點 E2E 驗證通過（含 slurmctld IP cache 修正） |
 | 4：可觀測性 | ✅ 完成 | Prometheus + Grafana 監控，統一呈現 Slurm 排程語意與 K8s 彈性伸縮行為，視覺化兩個世界的橋接過程 |
 | 5：平台封裝（Lmod + Helm） | ✅ 完成 | Lmod 整合、`/shared/jobs/` 路徑、Worker preStop Hook；Helm chart |
-| 6：自訂 Slurm 排程 | ✅ M1-M8 完成 | Score-based scheduling、runtime predictor、fragmentation requeue、trace replay simulator 與 evaluation 已落地；進階排程功能預設仍以 Helm flag 關閉，需按環境逐項啟用 |
+| 6：自訂 Slurm 排程 | ✅ 開發中 | DRL 模型排程器插件 |
 | 7：分散式追蹤 + SSH Login | 📋 規劃中 | OpenTelemetry job lifecycle trace（Tempo + Operator span + Prometheus exemplar）；Login pod 開放 SSH NodePort 取代 `kubectl exec` |
 
 ---
