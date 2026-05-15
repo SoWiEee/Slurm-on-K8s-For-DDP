@@ -233,6 +233,7 @@ class KubefluxSchedEnv:
         reward_mode: str = "jct_aligned",   # "jct_aligned" | "shaped"
         reward_scale: float = 1000.0,
         placement_reward_scale: float = 0.01,
+        potential_shaping: bool = False,
     ) -> None:
         if gym is None:
             raise ImportError("gymnasium is not installed")
@@ -249,6 +250,7 @@ class KubefluxSchedEnv:
         self.reward_scale           = float(reward_scale)
         self.placement_reward_scale = float(placement_reward_scale)
         self.reward_betas: tuple    = (1.0, 0.0)   # (β_jct, β_slowdown)
+        self.potential_shaping      = potential_shaping
 
         self._step_count = 0
         self._state: Optional[_RunState] = None
@@ -300,6 +302,7 @@ class KubefluxSchedEnv:
         top        = self._top_k_jobs()
         r_place    = 0.0
         scheduled  = False
+        phi_prev   = self._potential()
 
         if action != self._no_op:
             job_i, node_j, gpu_k = self._decode(action)
@@ -338,6 +341,8 @@ class KubefluxSchedEnv:
                 end_charge -= (st.now - j.submit_ts) / self.reward_scale
 
         reward = r_place + st.completion_reward + end_charge
+        if self.potential_shaping:
+            reward += 0.99 * self._potential() - phi_prev
         obs    = self._build_obs()
         info   = {
             "now": st.now, "queue_len": len(st.pending),
@@ -457,6 +462,20 @@ class KubefluxSchedEnv:
         glob   = _global_feat(st.pending, st.cluster, st.now)
 
         return np.concatenate([*job_feats, *gpu_feats, topo, glob]).astype(np.float32)
+
+    def _potential(self) -> float:
+        """φ(s) = −Σ wait_time_i / (reward_scale × n_jobs) for potential-based shaping.
+
+        Ng et al. 1999: F(s,s') = γφ(s') − φ(s) preserves the optimal policy.
+        Scheduling a job reduces total wait time → positive shaping bonus each step.
+        """
+        if self._state is None:
+            return 0.0
+        st  = self._state
+        now = st.now
+        n   = max(1, st.n_jobs)
+        return -sum(max(0.0, now - j.submit_ts)
+                    for j in st.pending) / (self.reward_scale * n)
 
     def render(self):
         return None

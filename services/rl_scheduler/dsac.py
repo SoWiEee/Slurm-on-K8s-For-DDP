@@ -138,6 +138,61 @@ class _AttentionQNet(nn.Module):
         return self.q_head(fused)                              # (B, n_actions)
 
 
+class _IQNQNet(nn.Module):
+    """Implicit Quantile Network for discrete actions (Dabney et al. ICML 2018).
+
+    Architecture:
+        1. State encoder : MLP(obs_dim → hidden → d) — same LayerNorm MLP as _QNet
+        2. Quantile embed : cos(π·i·τ) for i=1..N_COS → Linear → ReLU → d
+        3. Combine        : element-wise product of state and quantile embeddings
+        4. Q head         : Linear(d → n_actions)
+
+    forward(obs) returns mean Q over N_QUANT quantile samples → (B, n_actions).
+    quantile_q(obs, taus) returns (B, N_QUANT, n_actions) for training.
+    This allows drop-in replacement of _QNet for action selection, while
+    enabling quantile regression loss during critic updates.
+    """
+
+    N_QUANT: int = 32   # quantile samples per training step
+    N_COS:   int = 64   # cosine embedding dimension for τ
+
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        hidden: Sequence[int] = (256, 256),
+        layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        d = hidden[-1]
+        enc_hidden = hidden[:-1] if len(hidden) > 1 else ()
+        self.encoder    = _build_mlp(obs_dim, enc_hidden, d, layer_norm)
+        self.phi_embed  = nn.Linear(self.N_COS, d)
+        self.head       = nn.Linear(d, n_actions)
+        for m in [self.phi_embed, self.head]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+
+    def quantile_q(
+        self, obs: torch.Tensor, taus: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Returns (B, N_QUANT, n_actions)."""
+        B = obs.shape[0]
+        if taus is None:
+            taus = torch.rand(B, self.N_QUANT, device=obs.device)
+        s   = F.relu(self.encoder(obs))                         # (B, d)
+        i   = torch.arange(1, self.N_COS + 1,
+                           device=obs.device, dtype=obs.dtype)  # (N_COS,)
+        cos = torch.cos(math.pi * taus.unsqueeze(-1) * i)      # (B, N_QUANT, N_COS)
+        phi = F.relu(self.phi_embed(cos))                       # (B, N_QUANT, d)
+        combined = s.unsqueeze(1).expand_as(phi) * phi          # (B, N_QUANT, d)
+        return self.head(combined)                              # (B, N_QUANT, n_actions)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Mean Q over quantile samples — used for action selection."""
+        return self.quantile_q(obs).mean(dim=1)                 # (B, n_actions)
+
+
 class DSACAgent:
     """Discrete SAC agent for masked scheduling environments.
 
@@ -164,20 +219,29 @@ class DSACAgent:
         target_entropy_ratio: float = 0.1,
         fixed_alpha: bool = True,
         layer_norm: bool = True,
-        use_attention: bool = True,   # True = attention Q-net on this branch
+        use_attention: bool = False,
         attn_d_model: int = 64,
         attn_n_heads: int = 4,
         attn_n_layers: int = 2,
+        use_iqn: bool = False,        # Implicit Quantile Network critic
+        cql_alpha: float = 0.1,       # Conservative Q-Learning penalty weight
         device: str = "cpu",
     ) -> None:
-        self.obs_dim = obs_dim
-        self.n_actions = n_actions
-        self.gamma = gamma
-        self.tau = tau
+        self.obs_dim      = obs_dim
+        self.n_actions    = n_actions
+        self.gamma        = gamma
+        self.tau          = tau
         self.use_attention = use_attention
-        self.device = torch.device(device)
+        self.use_iqn      = use_iqn
+        self.cql_alpha    = cql_alpha
+        self.device       = torch.device(device)
+
+        if use_iqn and use_attention:
+            raise ValueError("use_iqn and use_attention are mutually exclusive")
 
         def _make_q():
+            if use_iqn:
+                return _IQNQNet(obs_dim, n_actions, hidden, layer_norm).to(self.device)
             if use_attention:
                 return _AttentionQNet(obs_dim, n_actions,
                                       d_model=attn_d_model,
@@ -240,31 +304,51 @@ class DSACAgent:
         return (probs * (q - self.alpha.detach() * log_probs)).sum(dim=-1)
 
     # ------------------------------------------------------------------
-    def update(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
-        """One gradient step. batch must contain:
-        obs, acts, rews, next_obs, dones, masks, next_masks."""
+    def update(self, batch: Dict[str, np.ndarray]) -> dict:
+        """One gradient step. Returns dict of scalar losses + td_errors array.
+
+        Supports optional batch keys:
+          'weights'  : IS correction weights from PrioritizedReplayBuffer
+          'indices'  : buffer indices (unused here; caller uses for PER update)
+          'gammas'   : per-transition γ^n for n-step returns
+        """
         def _t(k, dtype=torch.float32):
             return torch.as_tensor(batch[k], dtype=dtype, device=self.device)
 
-        obs = _t("obs")
-        acts = _t("acts", torch.long)
-        rews = _t("rews")
-        next_obs = _t("next_obs")
-        dones = _t("dones", torch.float32)
-        masks = _t("masks", torch.bool)
+        obs        = _t("obs")
+        acts       = _t("acts", torch.long)
+        rews       = _t("rews")
+        next_obs   = _t("next_obs")
+        dones      = _t("dones", torch.float32)
+        masks      = _t("masks", torch.bool)
         next_masks = _t("next_masks", torch.bool)
-        # gammas holds γ^n for n-step returns (γ^1 for 1-step)
-        gammas = _t("gammas") if "gammas" in batch else \
+        gammas     = _t("gammas") if "gammas" in batch else \
             torch.full_like(rews, self.gamma)
+        # IS weights from PER (all-ones = uniform sampling)
+        is_weights = _t("weights") if "weights" in batch else \
+            torch.ones(len(obs), device=self.device)
 
         # ---- Critic update -------------------------------------------
         with torch.no_grad():
-            v_next = self._soft_value(next_obs, next_masks, use_target=True)
+            v_next   = self._soft_value(next_obs, next_masks, use_target=True)
             target_q = rews + gammas * (1.0 - dones) * v_next
 
-        q1_a = self.q1(obs).gather(1, acts.unsqueeze(1)).squeeze(1)
-        q2_a = self.q2(obs).gather(1, acts.unsqueeze(1)).squeeze(1)
-        loss_q = F.mse_loss(q1_a, target_q) + F.mse_loss(q2_a, target_q)
+        if self.use_iqn:
+            loss_q, td_errors = self._iqn_critic_loss(obs, acts, target_q, is_weights)
+        else:
+            q1_all = self.q1(obs)
+            q2_all = self.q2(obs)
+            q1_a   = q1_all.gather(1, acts.unsqueeze(1)).squeeze(1)
+            q2_a   = q2_all.gather(1, acts.unsqueeze(1)).squeeze(1)
+            err1   = q1_a - target_q
+            err2   = q2_a - target_q
+            loss_q = (is_weights * (err1 ** 2 + err2 ** 2)).mean()
+            # CQL penalty: logsumexp over all actions − Q(s,a_taken)
+            if self.cql_alpha > 0.0:
+                cql = (torch.logsumexp(q1_all, dim=-1) - q1_a
+                     + torch.logsumexp(q2_all, dim=-1) - q2_a).mean()
+                loss_q = loss_q + self.cql_alpha * cql
+            td_errors = ((err1.abs() + err2.abs()) * 0.5).detach().cpu().numpy()
 
         self.opt_q.zero_grad()
         loss_q.backward()
@@ -310,13 +394,55 @@ class DSACAgent:
             n_valid_val = n_valid.item()
 
         return {
-            "loss_q": loss_q.item(),
-            "loss_alpha": loss_alpha_val,
-            "alpha": self.alpha.item(),
-            "entropy": entropy_val,
-            "target_entropy": target_entropy_val,
+            "loss_q":          loss_q.item(),
+            "loss_alpha":      loss_alpha_val,
+            "alpha":           self.alpha.item(),
+            "entropy":         entropy_val,
+            "target_entropy":  target_entropy_val,
             "n_valid_actions": n_valid_val,
+            "td_errors":       td_errors,   # np.ndarray — used by PER update
         }
+
+    # ------------------------------------------------------------------
+    def _iqn_critic_loss(
+        self,
+        obs: torch.Tensor,
+        acts: torch.Tensor,
+        target_q: torch.Tensor,
+        is_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, np.ndarray]:
+        """Quantile Huber loss for IQN critic. Returns (loss, td_errors)."""
+        assert isinstance(self.q1, _IQNQNet)
+        B      = obs.shape[0]
+        N      = self.q1.N_QUANT
+        taus   = torch.rand(B, N, device=self.device)
+
+        def _get_qa(qnet, taus):
+            zq = qnet.quantile_q(obs, taus)               # (B, N, n_actions)
+            return zq.gather(
+                2, acts.view(B, 1, 1).expand(-1, N, 1)
+            ).squeeze(2)                                   # (B, N)
+
+        z1 = _get_qa(self.q1, taus)
+        z2 = _get_qa(self.q2, taus)
+        t  = target_q.unsqueeze(1).expand(-1, N)           # (B, N)
+
+        def _qhuber(pred, target, taus_):
+            u      = target - pred                          # (B, N)
+            kappa  = 1.0
+            huber  = torch.where(
+                u.abs() < kappa,
+                0.5 * u ** 2,
+                kappa * (u.abs() - 0.5 * kappa),
+            )
+            tau_w  = (taus_ - (u.detach() < 0).float()).abs()
+            return (tau_w * huber).mean(dim=1)              # (B,)
+
+        per_sample = _qhuber(z1, t, taus) + _qhuber(z2, t, taus)
+        loss = (is_weights * per_sample).mean()
+        with torch.no_grad():
+            td_errors = per_sample.detach().cpu().numpy()
+        return loss, td_errors
 
     # ------------------------------------------------------------------
     def select_action(
@@ -342,27 +468,32 @@ class DSACAgent:
     # ------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
         torch.save({
-            "q1": self.q1.state_dict(),
-            "q2": self.q2.state_dict(),
-            "q1_target": self.q1_target.state_dict(),
-            "q2_target": self.q2_target.state_dict(),
-            "opt_q": self.opt_q.state_dict(),
-            "log_alpha": self.log_alpha.item(),
-            "opt_alpha": self.opt_alpha.state_dict() if self.opt_alpha else None,
-            "fixed_alpha": self.fixed_alpha,
+            "q1":           self.q1.state_dict(),
+            "q2":           self.q2.state_dict(),
+            "q1_target":    self.q1_target.state_dict(),
+            "q2_target":    self.q2_target.state_dict(),
+            "opt_q":        self.opt_q.state_dict(),
+            "log_alpha":    self.log_alpha.item(),
+            "opt_alpha":    self.opt_alpha.state_dict() if self.opt_alpha else None,
+            "fixed_alpha":  self.fixed_alpha,
             "use_attention": self.use_attention,
-            "obs_dim": self.obs_dim,
-            "n_actions": self.n_actions,
+            "use_iqn":      self.use_iqn,
+            "cql_alpha":    self.cql_alpha,
+            "obs_dim":      self.obs_dim,
+            "n_actions":    self.n_actions,
             "update_count": self._update_count,
         }, str(path))
 
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "DSACAgent":
         data = torch.load(str(path), map_location="cpu", weights_only=False)
-        fixed_alpha = data.get("fixed_alpha", False)
+        fixed_alpha   = data.get("fixed_alpha", False)
         use_attention = data.get("use_attention", False)
+        use_iqn       = data.get("use_iqn", False)
+        cql_alpha     = data.get("cql_alpha", 0.0)
         agent = cls(obs_dim=data["obs_dim"], n_actions=data["n_actions"],
                     fixed_alpha=fixed_alpha, use_attention=use_attention,
+                    use_iqn=use_iqn, cql_alpha=cql_alpha,
                     **kwargs)
         agent.q1.load_state_dict(data["q1"])
         agent.q2.load_state_dict(data["q2"])

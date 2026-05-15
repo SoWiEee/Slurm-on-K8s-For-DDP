@@ -127,9 +127,9 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--n-nodes",        type=int, default=1)
     p.add_argument("--gpus-per-node",  type=int, default=1)
-    p.add_argument("--total-steps",    type=int, default=30_000,
+    p.add_argument("--total-steps",    type=int, default=500_000,
                    help="sim training steps (ignored with --no-train)")
-    p.add_argument("--n-jobs",         type=int, default=100)
+    p.add_argument("--n-jobs",         type=int, default=50)
     p.add_argument("--seeds",          type=int, nargs="+",
                    default=[42, 43, 44, 45, 46])
     p.add_argument("--trace-families", nargs="+",
@@ -146,8 +146,18 @@ def main(argv=None) -> int:
     p.add_argument("--greedy",         action="store_true", default=True)
     p.add_argument("--device",         default="cpu",
                    help="torch device for DSAC: 'cpu' or 'cuda'")
-    p.add_argument("--no-attention",   action="store_true",
-                   help="use flat MLP Q-network instead of attention (default: attention)")
+    p.add_argument("--no-attention",         action="store_true",
+                   help="MLP Q-network instead of attention")
+    p.add_argument("--use-iqn",              action="store_true",
+                   help="IQN critic (quantile Huber loss)")
+    p.add_argument("--no-potential-shaping", action="store_true",
+                   help="disable per-step potential shaping")
+    p.add_argument("--no-per",               action="store_true",
+                   help="disable Prioritized Experience Replay")
+    p.add_argument("--cql-alpha",            type=float, default=0.1,
+                   help="CQL penalty weight (0 = disabled)")
+    p.add_argument("--curriculum",           action="store_true",
+                   help="ramp n_jobs 10→30→50 during training")
     args = p.parse_args(argv)
 
     out_dir = Path(args.out_dir)
@@ -166,7 +176,15 @@ def main(argv=None) -> int:
     else:
         trains = args.train_trace if len(args.train_trace) > 1 else args.train_trace[0]
         use_attention = not args.no_attention
-        arch_name = "MLP" if args.no_attention else "Attention"
+        arch_parts = []
+        if args.use_iqn:         arch_parts.append("IQN")
+        elif use_attention:       arch_parts.append("Attn")
+        else:                     arch_parts.append("MLP")
+        if not args.no_per:               arch_parts.append("PER")
+        if not args.no_potential_shaping: arch_parts.append("Shaping")
+        if args.cql_alpha > 0:            arch_parts.append(f"CQL={args.cql_alpha}")
+        if args.curriculum:               arch_parts.append("Curr")
+        arch_name = "+".join(arch_parts)
         print(f"[eval] training DSAC({arch_name}) for {args.total_steps:,} steps "
               f"(traces={trains}) ...")
         agent = sim_train(
@@ -177,6 +195,11 @@ def main(argv=None) -> int:
             log_every=max(1000, args.total_steps // 10),
             device=args.device,
             use_attention=use_attention,
+            use_iqn=args.use_iqn,
+            potential_shaping=not args.no_potential_shaping,
+            use_per=not args.no_per,
+            cql_alpha=args.cql_alpha,
+            curriculum=args.curriculum,
         )
         print()
 

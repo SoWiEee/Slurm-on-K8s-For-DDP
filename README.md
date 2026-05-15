@@ -164,121 +164,74 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
-## 9. 執行 Phase 6 M8 evaluation（離線模擬 + 出圖）
+## 9. DRL Scheduler 訓練與評估
 
-論文 evaluation 章節的 7 張圖跟主表，純跑在離線模擬器上，不需要 cluster 跑著。約 5 分鐘出齊全部 raw data + figures。
+> 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
+
+### 快速訓練（本機 CPU）
 
 ```bash
-# 一次性：venv + 依賴
-uv venv .venv-m5
-uv pip install --python .venv-m5/bin/python pytest matplotlib
+# 預設：500k steps, n-step=10, PER, potential shaping, CQL=0.1
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
+    --n-nodes 1 --gpus-per-node 1 \
+    --trace philly burst ali \
+    --total-steps 500000 \
+    --out-dir runs/dsac_sim_$(date +%Y%m%d)
 
-# 1. 跑 E1..E6（FCFS / multifactor / score-M3 / score-M5 / score-M7 +
-#    9-cell sensitivity grid），輸出到 eval/results/
-bash eval/scripts/run_all.sh
-
-# 2. 出圖到 eval/figures/{fig1..fig7}.{png,pdf}
-.venv-m5/bin/python eval/scripts/plot_all.py
-
-# 3. 印主表到 stdout
-.venv-m5/bin/python eval/scripts/print_summary.py
-
-# 4. （可選）E7 真機 50-job mix —— 需要 kubeconfig 指到一個跑 chart 的 cluster
-bash eval/scripts/run_e7_live.sh our      # 我們的 stack (M3+M5+M7)
-# 翻成 vendor baseline 後再跑一次：
-# helm upgrade ... -f vendor-baseline.yaml
-bash eval/scripts/run_e7_live.sh vendor
+# 加 GPU 加速
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
+    --device cuda --total-steps 500000 \
+    --curriculum \
+    --out-dir runs/dsac_cuda_$(date +%Y%m%d)
 ```
 
-論述跟結論寫在 `docs/eval-writeup.md`（headline：mean JCT 12.6h → 2.62h，
-比 Slurm vendor multifactor 多砍 28.6%）。`eval/results/` 已 gitignore，
-重跑 `run_all.sh` 會重產。
-
-## 10. 執行 M11 Deep RL scheduler 實驗（PPO sim 訓練 + live shadow）
-
-M11 把 M3 score function 換成 sim-trained MaskablePPO policy，並用 lua hook
-在 live cluster 跑 shadow mode 收 decision log。**Honest negative result**：sim
-上 score 全面贏 PPO（philly Δ=−7849、burst Δ=−36293、ali NaN），詳見
-`docs/eval-writeup.md §C–§E`。
-
-**一鍵執行**（venv 自動建、stages 自由選）：
+### 完整評估（3 families × 5 seeds，對比 score baseline）
 
 ```bash
-bash scripts/run-m11-experiment.sh                  # B + C + D 全跑
-STAGES=B bash scripts/run-m11-experiment.sh         # 只訓練 + paired-CI
-STAGES=C bash scripts/run-m11-experiment.sh         # serve / lua / rlpd smoke
-STAGES=D SKIP_BUILD=1 bash scripts/run-m11-experiment.sh  # live shadow，重用既有 image
-# 其他旋鈕：TOTAL_STEPS / N_JOBS / N_NODES / GPUS_PER_NODE / TRACE_FAMILY / SEEDS
-```
-
-以下是腳本拆解的逐 phase 命令（懂手動跑時參考）：
-
-```bash
-# 一次性：建 M11 專用 venv
-uv venv .venv-m11
-uv pip install --python .venv-m11/bin/python \
-    "stable-baselines3==2.8.0" "sb3-contrib==2.8.0" \
-    "torch>=2.4" gymnasium numpy fastapi uvicorn pydantic
-
-# --- Phase B：sim PPO 訓練（500k steps，~5–10 min on CPU）---------------
-.venv-m11/bin/python -m services.rl_scheduler.ppo_masked_train \
-    --total-steps 500000 --eval-freq 25000 --n-envs 4 \
-    --n-jobs 300 --n-nodes 2 --gpus-per-node 2 \
-    --trace-family philly
-# → 輸出到 runs/m11_mppo_<timestamp>/{policy.zip, vecnormalize.pkl, eval_log.csv}
-
-# --- Phase B-3：paired-CI 評估 vs heuristic baselines（3 family × 5 seed）-
-RUN=$(ls -td runs/m11_mppo_* | head -1)
-.venv-m11/bin/python -m services.rl_scheduler.eval_paired \
-    --policy-dir "$RUN" --seeds 42 43 44 45 46 \
+# 完整評估（所有改進開啟，CUDA）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --n-nodes 1 --gpus-per-node 1 \
+    --total-steps 500000 \
     --trace-families philly burst ali \
-    --n-jobs 300 --n-nodes 2 --gpus-per-node 2
-# → stdout 印 §C.4/§D.3 那種 Δ + 95% CI 表
+    --seeds 42 43 44 45 46 \
+    --device cuda \
+    --curriculum \
+    --out-dir runs/eval_dsac_$(date +%Y%m%d-%H%M%S)
 
-# --- Phase C-1：serve endpoint smoke（本機 FastAPI）---------------------
-.venv-m11/bin/python -m services.rl_scheduler.serve \
-    --policy-dir "$RUN" --port 8002 &
-.venv-m11/bin/python -m services.rl_scheduler.snapshot_agent \
-    --serve-url http://127.0.0.1:8002 --source sim --once
-curl -fsS http://127.0.0.1:8002/healthz
+# 僅 MLP（無 attention，停用 shaping/PER 作為 ablation baseline）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --no-attention --no-per --no-potential-shaping --cql-alpha 0 \
+    --total-steps 200000 --device cuda \
+    --out-dir runs/eval_mlp_ablation_$(date +%Y%m%d-%H%M%S)
 
-# --- Phase C-3：lua hook 單元測試（不需 Slurm）-------------------------
-lua5.3 tests/lua/rl_hook_test.lua    # 5 個 case 都該 ok
+# IQN critic（quantile Huber loss）
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --use-iqn --device cuda \
+    --out-dir runs/eval_iqn_$(date +%Y%m%d-%H%M%S)
 
-# --- Phase C-4：RLPD fine-tune scaffold smoke ---------------------------
-.venv-m11/bin/python -m services.rl_scheduler.rlpd_finetune \
-    --base-policy "$RUN" --offline-steps 2000 \
-    --n-updates 5 --utd-ratio 2 --n-jobs 100
-
-# --- Phase D：live shadow on k3s ----------------------------------------
-# 1) build + 載入 image 進 k3s containerd
-docker build -f services/rl_scheduler/Dockerfile -t slurm-rl-scheduler:m11 .
-docker save slurm-rl-scheduler:m11 | sudo k3s ctr images import -
-
-# 2) 開 rl-scheduler + lua hook（shadowMode=true 預設，不會改 priority）
-helm upgrade slurm-platform chart/ -n slurm -f chart/values-k3s.yaml \
-    --reset-then-reuse-values --no-hooks \
-    --set rlScheduler.enabled=true --set rlScheduler.lua.enabled=true
-sudo kubectl -n slurm rollout restart sts/slurm-controller
-sudo kubectl -n slurm wait --for=condition=Ready pod -l app=slurm-controller --timeout=120s
-
-# 3) push 一次 snapshot，再 sbatch 一批 job 觀察 lua → /decide → log
-RL_SVC=$(sudo kubectl -n slurm get svc rl-scheduler -o jsonpath='{.spec.clusterIP}')
-.venv-m11/bin/python -m services.rl_scheduler.snapshot_agent \
-    --serve-url http://$RL_SVC:8002 --source sim --once --n-jobs 50
-LOGIN=$(sudo kubectl -n slurm get pod -l app=slurm-login -o name | head -1)
-for i in $(seq 1 10); do
-  sudo kubectl -n slurm exec "$LOGIN" -- \
-      sbatch --wrap='sleep 3' --job-name=rl-test-$i -p cpu
-done
-
-# 4) 撈 shadow log
-sudo kubectl -n slurm logs slurm-controller-0 --tail=400 | grep -E '\[rl\]|\[score-m3\]'
-sudo kubectl -n slurm logs deploy/rl-scheduler --tail=50      # uvicorn /decide hits
+# 載入已有 checkpoint，跳過訓練直接評估
+PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
+    --ckpt runs/dsac_sim/dsac.pt --no-train
 ```
 
-Artifact：訓練曲線 `runs/m11_mppo_*/eval_log.csv`；live shadow log 範例存在
-`docs/m11_phase_d/`。
+### 架構與改進 flags 對照
+
+| Flag | 說明 | 預設 |
+|------|------|------|
+| `--curriculum` | n_jobs 從 10→30→50 漸進 | 關 |
+| `--no-per` | 停用 Prioritized Experience Replay | PER 開 |
+| `--no-potential-shaping` | 停用 per-step 等待時間 shaping | Shaping 開 |
+| `--cql-alpha` | CQL 正則化係數（0=停用） | 0.1 |
+| `--use-iqn` | IQN critic（quantile Huber loss） | 關 |
+| `--no-attention` | MLP Q-network（非 attention） | 關 |
+
+### 執行單元測試
+
+```bash
+.venv-m11/bin/python -m pytest sim/tests/ -q
+```
+
+---
 
 ## 🗑️ 清理環境
 
@@ -500,17 +453,6 @@ kubectl -n slurm exec -it deploy/slurm-login -- bash
 
 > Phase 5 已完成（Lmod + Helm chart cutover）；Phase 6 的 score-based scheduling 主線已完成到 M8 evaluation。下一步重點是 Phase 7 補齊使用者體驗（端到端 trace + SSH Login），以及把 Phase 6 的 live-cluster E7 驗證與 production rollout policy 補完。
 > 目前以**單一使用者**情境為主，多租戶（Fair-Share / 帳號配額）為更後期擴充方向。
-
-## Phase 6：自訂 Slurm 排程策略 ✅ M1-M8 完成
-
-> 目標是針對本平台特有的 DDP / MPS / 跨 pool 共用情境，加入超出原生 Slurm backfill 的排程邏輯。詳細 roadmap 與驗收紀錄見 [`docs/scheduler.md`](docs/scheduler.md#phase-6-roadmap--score-based-scheduling-開發追蹤r17)，evaluation writeup 見 [`docs/eval-writeup.md`](docs/eval-writeup.md)。
-
-- **M1-M3：Slurm + Lua score path**：Helm values expose backfill / multifactor knobs；`job_submit.lua` 實作 `mps_fit`、`vram_fit`、fragmentation proxy，將 score 作為 priority kicker。
-- **M4-M6：trace replay + runtime predictor**：`sim/` 可離線重播 Philly-like trace；FastAPI + LightGBM predictor 可由 Lua submit plugin 呼叫並覆寫過鬆的 `--time`。
-- **M7：fragmentation requeue**：Operator 加入 fragmentation detector / decider，預設 `shadowMode=true`，可觀察解卡決策後再開實際 `scontrol requeue`。
-- **M8：evaluation**：`eval/results/`、`eval/figures/` 與 `docs/eval-writeup.md` 已產出；目前主要結論是 E5（score + predictor + fragmentation）相對 vendor multifactor mean JCT 改善約 28.6%。
-- **M9-M10：adaptive / DRL scheduler**：M9 UCB1 weight tuner 已有 offline + live service；M10 hierarchical DSAC paired eval 顯示 philly 平均改善 35% 但 CI 跨 0，burst 平均退步 46%，ali 顯著退步 85.5%，因此 production 仍維持 score + weight tuner、RL 僅 shadow / fallback。
-- **仍待補強**：E7 live-cluster 50-job 驗證、checkpoint resume cost 實測、更多 trace / sensitivity sweep，以及 M10 hierarchical DSAC paired multi-seed evaluation。
 
 ## Phase 7：分散式追蹤 + SSH Login 📋 規劃中
 

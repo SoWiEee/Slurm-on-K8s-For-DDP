@@ -33,6 +33,149 @@ import numpy as np
 from sim.gym_env import KubefluxSchedEnv
 
 
+class SumTree:
+    """Binary SumTree for O(log n) priority sampling (used by PER).
+
+    Leaves at indices [capacity, 2*capacity). tree[1] = total priority sum.
+    tree[i] = tree[2i] + tree[2i+1].
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity, dtype=np.float64)
+
+    def update(self, data_idx: int, priority: float) -> None:
+        idx = data_idx + self.capacity
+        self.tree[idx] = priority
+        while idx > 1:
+            idx >>= 1
+            self.tree[idx] = self.tree[2 * idx] + self.tree[2 * idx + 1]
+
+    def sample_one(self, val: float) -> int:
+        idx = 1
+        while idx < self.capacity:
+            left = 2 * idx
+            if val <= self.tree[left]:
+                idx = left
+            else:
+                val -= self.tree[left]
+                idx = left + 1
+        return idx - self.capacity
+
+    @property
+    def total(self) -> float:
+        return float(self.tree[1])
+
+    @property
+    def max_priority(self) -> float:
+        leaf_max = float(self.tree[self.capacity:].max())
+        return leaf_max if leaf_max > 0 else 1.0
+
+
+class PrioritizedReplayBuffer:
+    """Replay buffer with Prioritized Experience Replay (PER, Schaul et al. 2016).
+
+    Same add() / sample() interface as ReplayBuffer.  sample() additionally
+    returns 'weights' (IS correction) and 'indices' (for priority updates).
+    Call update_priorities(indices, td_errors) after each agent.update().
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        obs_dim: int,
+        n_actions: int,
+        alpha: float = 0.6,
+        beta_start: float = 0.4,
+        beta_end: float = 1.0,
+        beta_steps: int = 100_000,
+    ) -> None:
+        self.capacity   = capacity
+        self.obs_dim    = obs_dim
+        self.n_actions  = n_actions
+        self.alpha      = alpha
+        self.beta_start = beta_start
+        self.beta_end   = beta_end
+        self.beta_steps = beta_steps
+        self._beta_step = 0
+        self._tree      = SumTree(capacity)
+
+        self.obs       = np.zeros((capacity, obs_dim),    dtype=np.float32)
+        self.acts      = np.zeros((capacity,),            dtype=np.int64)
+        self.rews      = np.zeros((capacity,),            dtype=np.float32)
+        self.next_obs  = np.zeros((capacity, obs_dim),    dtype=np.float32)
+        self.dones     = np.zeros((capacity,),            dtype=np.bool_)
+        self.masks     = np.ones((capacity, n_actions),   dtype=np.bool_)
+        self.next_masks= np.ones((capacity, n_actions),   dtype=np.bool_)
+        self.gammas    = np.full((capacity,), 0.99,       dtype=np.float32)
+        self._size     = 0
+        self._idx      = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def add(self, t: "Transition", gamma: float = 0.99) -> None:
+        i = self._idx
+        self.obs[i]        = t.obs
+        self.acts[i]       = t.act
+        self.rews[i]       = t.rew
+        self.next_obs[i]   = t.next_obs
+        self.dones[i]      = t.done
+        self.gammas[i]     = gamma
+        if t.mask is not None:
+            self.masks[i]      = t.mask
+        if t.next_mask is not None:
+            self.next_masks[i] = t.next_mask
+        # New transitions get max priority → sampled at least once before update
+        priority = self._tree.max_priority ** self.alpha
+        self._tree.update(i, priority)
+        self._idx  = (i + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    @property
+    def _beta(self) -> float:
+        frac = min(1.0, self._beta_step / max(1, self.beta_steps))
+        return self.beta_start + frac * (self.beta_end - self.beta_start)
+
+    def sample(self, n: int, rng: np.random.Generator) -> dict:
+        total   = self._tree.total
+        segment = total / n
+        indices    = np.zeros(n, dtype=np.int64)
+        priorities = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            val      = rng.uniform(segment * i, segment * (i + 1))
+            data_idx = self._tree.sample_one(val)
+            data_idx = min(data_idx, self._size - 1)
+            indices[i]    = data_idx
+            priorities[i] = self._tree.tree[data_idx + self._tree.capacity]
+
+        probs   = priorities / total
+        beta    = self._beta
+        self._beta_step += 1
+        weights = (self._size * probs) ** (-beta)
+        weights /= weights.max()
+
+        return {
+            "obs":        self.obs[indices],
+            "acts":       self.acts[indices],
+            "rews":       self.rews[indices],
+            "next_obs":   self.next_obs[indices],
+            "dones":      self.dones[indices],
+            "masks":      self.masks[indices],
+            "next_masks": self.next_masks[indices],
+            "gammas":     self.gammas[indices],
+            "weights":    weights.astype(np.float32),
+            "indices":    indices,
+        }
+
+    def update_priorities(
+        self, indices: np.ndarray, td_errors: np.ndarray
+    ) -> None:
+        priorities = (np.abs(td_errors) + 1e-6) ** self.alpha
+        for idx, p in zip(indices, priorities):
+            self._tree.update(int(idx), float(p))
+
+
 @dataclass
 class Transition:
     obs: np.ndarray
