@@ -502,20 +502,36 @@ NodePort :30022 → slurm-login pod
                    └── /shared/（NFS 掛載，模型 + 輸出共用）
 ```
 
-**設定方式（`chart/values.yaml`）：**
+**初次設定 SSH Key（在 k3s host 上執行）：**
+```bash
+# 1. 生成 key pair（私鑰存在 ~/.ssh/slurm_login_key）
+ssh-keygen -t ed25519 -f ~/.ssh/slurm_login_key -C "slurm-login"
+
+# 2. 把公鑰填進 chart/values-k3s.yaml 的 login.ssh.authorizedKeys
+cat ~/.ssh/slurm_login_key.pub
+
+# 3. 套用
+helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm --no-hooks
+
+# 4. 連線
+ssh -i ~/.ssh/slurm_login_key -p 30022 root@<k3s-host-ip>
+```
+
+**之後新增/移除 key（不需重新 helm install）：**
+```bash
+bash scripts/add-ssh-key.sh add    "ssh-ed25519 AAAA... user@laptop"
+bash scripts/add-ssh-key.sh remove "ssh-ed25519 AAAA... user@laptop"
+bash scripts/add-ssh-key.sh list
+```
+
+**`chart/values-k3s.yaml` 設定格式：**
 ```yaml
 login:
   ssh:
     nodePort: 30022         # k3s NodePort 範圍 30000-32767；0 = 維持 ClusterIP
     authorizedKeys: |
-      ssh-ed25519 AAAA... user@laptop
-```
-
-**快速新增/移除 key：**
-```bash
-bash scripts/add-ssh-key.sh add    "ssh-ed25519 AAAA... user@laptop"
-bash scripts/add-ssh-key.sh remove "ssh-ed25519 AAAA... user@laptop"
-bash scripts/add-ssh-key.sh list
+      ssh-ed25519 AAAA... user@laptop   # 一行一個 key
+      ssh-ed25519 AAAA... user@workstation
 ```
 
 sshd 已加固：`PasswordAuthentication no`、`PermitRootLogin prohibit-password`（key-only）。
