@@ -1,58 +1,17 @@
 # Kubeflux — Scheduler Evaluation
 
 > 對應 thesis evaluation 章節。圖表 → [`eval/figures/`](../eval/figures/)；原始資料 → [`eval/results/`](../eval/results/)；完整 milestone 規格 → [`docs/scheduler.md`](scheduler.md)。
->
-> 重現實驗：`bash eval/scripts/run_all.sh && .venv-m5/bin/python eval/scripts/plot_all.py`（sim）、`bash eval/scripts/e7_one_pass.sh <tag>`（live）。
-
----
-
-## 摘要
-
-Kubeflux 把 Slurm 跑在 Kubernetes 上做 GPU/MPS workload 排程，並用一組可調權重的 score function 取代 Slurm 內建 multifactor priority。本章驗證五件事：
-
-1. **vendor backfill 已經做了大部分功**（FCFS 12.6h → multifactor 4.5h mean JCT，−72%），剩下空間有限。
-2. **M5 runtime predictor 是真正的 win**：在三個 synthetic trace（philly、burst、ali）上跑 5 seeds × 3 family，paired same-seed 比較顯示 predictor 在有 contention 的 trace 上 statistically significant 改善 mean JCT 20–29%（CI 不跨 0）。
-3. **M7 fragmentation reconciler 在所有三個 trace 上都是 net negative**（philly +33%、burst +61%、ali +6%）。這個 negative result 跨 distribution 一致，不是單一 trace artefact，且問題出在 victim 的 lost progress 大於排程改善。
-4. **動態 weight tuning（M9 UCB1）能用 1/3 sim 預算找到接近 M8 grid 最佳的權重組合**。但因為 oracle vs 靜態最佳只差 2.5%，contextual tuning（LinUCB、PPO）沒有發揮空間。
-5. **Live cluster 驗證 M3 score 部署無誤**，但因為 workload runtime 只跨 6× 範圍（vs sim 的 100×），predictor 的 ε·f_runtime_short 信號被 score 其他因子蓋過。Predictor 在 production 環境裡能不能發揮，取決於三件事：workload 本身夠 heterogeneous、predictor 在 matched distribution 上 retrain、score weights 配合 workload 跨度調整。少一個就看不到改善。
-
-整套 evaluation 跨 465 sim runs（3 trace × 5 seed × 31 config）+ 4 live passes（vendor / our M3 / our_pred / hetero v2）+ 360 M9 bandit pulls，附 8 張 figure 加 cross-trace 比較。所有 raw data + 腳本 + 模型訓練流程都 commit 在 repo 內可重現。
 
 ---
 
 ## 1. 動機與貢獻
-
-### 1.1 問題
 
 用 Slurm 排程 HPC workload 已經是標準做法，但有兩個現實沒被內建 scheduler 直接處理：
 
 1. **GPU 共用透過 NVIDIA MPS**。一張卡可切成 100 個 mps slot 給多個 job 同時跑。Slurm 預設 priority 不知道「mps:25 的小 job 應該比 mps:100 的大 job 先排」，所以容易讓一個大 job 卡住一堆小 job。
 2. **Job runtime 不可預知**。同一個 user 提交相似 job 的實際時間可以差兩個數量級（幾分鐘到幾小時）。FCFS 跟 multifactor 都假設 runtime 不可知，SJF 反過來要求先知道誰短。
 
-我們想回答的問題：**一個簡單可解釋的 score function 加上 runtime predictor，能不能在 GPU/MPS workload 上打贏 Slurm 預設？** 哪個因子貢獻最多、哪些子組件其實沒幫上忙？
-
-### 1.2 我們做了什麼
-
-1. **M3 五因子 score function**：`priority = α·f_mps_fit + β·f_vram_fit − δ·f_fragmentation + ε·f_runtime_short`。每個因子都是 [0, 1]，可解釋、可獨立 ablation。
-2. **M5 runtime predictor service**：LightGBM 模型 + FastAPI service，從 sacct 歷史 train、預測 (user, gpu, mps, hour) → runtime。lua plugin 在 sbatch 時呼叫。
-3. **M7 fragmentation reconciler**：Slurm 沒看到的死角——當 head pending job 被卡住而某個低 priority running job 釋放就能放它過去時，主動 requeue 那個 victim。Operator 端做 detect → decide → actuate，預設 shadow mode。
-4. **M8 evaluation 基建**：discrete-event simulator 跑三個 trace family、5 seeds 每組、paired CIs；live cluster 4 個 pass 驗證部署。
-5. **M9 weight tuning**：UCB1 + LinUCB 在 sim 上比靜態 grid search 省 sim 預算。
-6. **Operator hardening**：根據 live 實驗踩到的 wedge 狀態，加 ghost-job detector + 對應 Prometheus alert。
-
-### 1.3 主要結論一覽
-
-| Claim | 證據 | 狀態 |
-|---|---|---|
-| C1 vendor backfill 已吃掉大部分改善空間（FCFS → multifactor −72%）| sim cross-trace | ✅ |
-| C2 純 M3 score 不顯著改善 mean JCT | E2 vs E3 paired ≈ 0 | ✅ |
-| **C3 M5 predictor 在 contention-heavy trace 上 −20.1%（philly）/ −28.7%（burst）, CI 不跨 0** | E4 vs E2 paired | ✅ statistically significant |
-| C3b Predictor 在 sparse trace 上沒效（ali −0.08%，util 才 0.30）| E4 vs E2 on ali | ✅ |
-| **C4 M7 fragmentation 在三個 trace 上都 net negative** | paired diffs all CI > 0 | ❌ negative result |
-| C5 Score weight sensitivity 跟 contention pressure 正相關（ali 0.1%、philly 10.6%、burst 28.5%）| E6 5×5 grid | ✅ |
-| C6 UCB1 用 120 sim runs 拿到 +3% vs M8 grid-best 的 375 runs | M9 sim 結果 | ✅ |
-| C7 Live cluster 驗證部署正確，但 e7 workload 跨度不足以讓 predictor 發揮 | 4 個 pass | ✅ scoped |
-| **C8 M9 UCB1 weight-tuner live 上線；`f_pred_runtime` 接通 predictor；score 0.200→0.497** | Appendix F | ✅ |
+我們想回答的問題：**透過設計 DRL 排程器，能不能在 GPU/MPS workload 上打贏 Slurm 預設？** 
 
 ---
 
@@ -77,21 +36,7 @@ priority = α · f_mps_fit + β · f_vram_fit − δ · f_fragmentation + ε · 
 
 預設權重 (α, β, δ, ε) = (0.40, 0.20, 0.20, 0.30)、β 為次要因子鎖在 0.20。M3 完成時 ε=0、M5 接上後切到 0.30。
 
-### 2.2 Predictor
-
-Service 是 FastAPI + LightGBM。Features 取自 `job_desc`：`user_name`、`gpu_count`、`mps_req`、`gpu_type`、`hour_of_week`、`user_freq`、`user_mean_log_rt`。後兩項從歷史 sacct rolling 統計來——所以新 user 會 fallback 到 bootstrap mode（回 `min(user_time_limit, 4h)` 常數）。
-
-lua plugin 用 `curl --max-time 200ms` 呼叫，response timeout / 解析失敗都安全降級（不動 priority）。
-
-### 2.3 Fragmentation reconciler
-
-Operator 每 15 秒 poll slurmrestd：
-
-1. **Detect**：取 pending head 跟所有 running job。
-2. **Decide**：head 卡住 ⇔ 沒有單一 node 容得下，但若 release 某個低 priority running job 就能容下時，挑那個 victim。需通過 `FRAGMENTATION_PRIORITY_GAP` 跟 `FRAGMENTATION_MAX_REQUEUES_PER_HOUR`。
-3. **Actuate**（shadow mode 時只 log；live 才 `scontrol requeue`）。
-
-### 2.4 Architecture（簡圖）
+### 2.2 Architecture（簡圖）
 
 ```
 sbatch → [slurm-login] ──► slurmctld ──[lua job_submit]──► [predictor service]
