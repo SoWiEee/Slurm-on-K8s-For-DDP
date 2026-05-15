@@ -79,6 +79,7 @@ function rl_call_decide(job_desc, mps_req, gpu_count, runtime_s)
     value              = _num_field(resp, "value") or 0.0,
     entropy            = _num_field(resp, "entropy") or 0.0,
     rl_selected_job_id = _str_field(resp, "rl_selected_job_id"),
+    otel_traceparent   = _str_field(resp, "otel_traceparent"),
   }, nil
 end
 
@@ -101,6 +102,11 @@ function rl_apply(job_desc, mps_req, gpu_count, runtime_s)
     _log(string.format("[rl] abstain (value=%.3f entropy=%.3f)",
                        rl.value, rl.entropy))
     return false, rl
+  end
+  -- Phase 7-A: write OTel traceparent into admin_comment so the Operator
+  -- can continue the trace when it first sees this job in squeue.
+  if rl.otel_traceparent and rl.otel_traceparent ~= "" then
+    job_desc.admin_comment = "otel=" .. rl.otel_traceparent
   end
   if rl.priority_boost > 0 then
     job_desc.priority = (job_desc.priority or 0) + rl.priority_boost

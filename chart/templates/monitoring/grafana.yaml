@@ -39,6 +39,24 @@ data:
         jsonData:
           httpMethod: POST
           timeInterval: {{ .Values.monitoring.prometheus.scrapeIntervalSeconds }}s
+          {{- if .Values.monitoring.otel.enabled }}
+          exemplarTraceIdDestinations:
+            - name: traceID
+              datasourceUid: tempo
+          {{- end }}
+      {{- if .Values.monitoring.otel.enabled }}
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        url: http://tempo.{{ $mNs }}.svc.cluster.local:3200
+        access: proxy
+        editable: false
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: prometheus
+          serviceMap:
+            datasourceUid: prometheus
+      {{- end }}
 
   dashboards.yaml: |
     apiVersion: 1

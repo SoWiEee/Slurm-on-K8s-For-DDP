@@ -32,6 +32,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from services.rl_scheduler import serve_otel as _otel
+
 from sim.gym_env import (
     GPU_FEAT_DIM, GPU_TYPES,
     GLOBAL_FEAT_DIM, JOB_FEAT_DIM, MPS_PER_GPU,
@@ -111,6 +113,7 @@ class DecideResponse(BaseModel):
     rl_selected_job_id: Optional[str]
     node_j:             Optional[int]    # placement: node index (0-based)
     gpu_k:              Optional[int]    # placement: gpu index (0-based)
+    otel_traceparent:   Optional[str] = None  # W3C traceparent for Phase 7-A OTel
     value:              float
     entropy:            float
     shadow:             bool
@@ -341,8 +344,6 @@ def act(req: ActRequest):
 
 @app.post("/decide", response_model=DecideResponse)
 def decide(req: DecideRequest):
-    if _holder is None:
-        raise HTTPException(status_code=503, detail="model not loaded")
     snap = _snapshot
     age  = (time.time() - snap.ts) if snap else None
     if snap is None or age is None or age > SNAPSHOT_TTL_S:
@@ -404,6 +405,18 @@ def decide(req: DecideRequest):
     else:
         boost = PRIORITY_BOOST if rl_picked_me else 0
 
+    # OTel Phase 7-A: emit job_submit span; pass traceparent back so the Lua
+    # hook can write it to job_desc.admin_comment as "otel=<traceparent>".
+    traceparent = ""
+    if _otel.enabled():
+        with _otel.job_submit_span(
+            job_id=req.job_id,
+            partition=getattr(_snapshot, "partition", "unknown") if _snapshot else "unknown",
+            gres=f"gpu:{req.gpu_count}" if req.gpu_count else "",
+            requested_cpus=0,
+        ) as tp:
+            traceparent = tp
+
     return DecideResponse(
         priority_boost=boost, rl_selected=rl_picked_me,
         abstain=abstain, abstain_reason=reason,
@@ -411,6 +424,7 @@ def decide(req: DecideRequest):
         node_j=node_j if not abstain else None,
         gpu_k=gpu_k  if not abstain else None,
         value=value, entropy=entropy, shadow=SHADOW_MODE,
+        otel_traceparent=traceparent or None,
     )
 
 

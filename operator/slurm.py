@@ -79,6 +79,19 @@ class SlurmRestClient:
                 last_exc = exc
         raise last_exc
 
+    def _patch(self, path: str, body: dict) -> dict:
+        import json as _json
+        url = f"{self.base_url}{path}"
+        data = _json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="PATCH")
+        req.add_header("X-SLURM-USER-NAME", self.username)
+        if self._jwt_key is not None:
+            req.add_header("X-SLURM-USER-TOKEN", self._make_token())
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return _json.loads(resp.read().decode()) if resp.length else {}
+
     def ping(self) -> bool:
         try:
             self._get(f"/slurm/{self.api_version}/diag")
@@ -98,6 +111,26 @@ class SlurmRestClient:
             if j.get("partition") == partition
             and j.get("job_state") in ("PENDING", "RUNNING", "COMPLETING")
         ]
+
+    def get_job_admin_comment(self, job_id: str) -> str:
+        """Return the admin_comment field for a single job (used by OTel trace propagation)."""
+        try:
+            data = self._get(f"/slurm/{self.api_version}/job/{job_id}")
+            jobs = data.get("jobs", [])
+            return jobs[0].get("admin_comment", "") if jobs else ""
+        except Exception:
+            return ""
+
+    def set_job_admin_comment(self, job_id: str, comment: str) -> bool:
+        """Write admin_comment to a Slurm job via slurmrestd PATCH."""
+        try:
+            self._patch(
+                f"/slurm/{self.api_version}/job/{job_id}",
+                {"job": {"admin_comment": comment}},
+            )
+            return True
+        except Exception:
+            return False
 
     def list_nodes(self) -> list[dict]:
         data = self._get(f"/slurm/{self.api_version}/nodes")

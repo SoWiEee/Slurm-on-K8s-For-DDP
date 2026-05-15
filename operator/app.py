@@ -35,6 +35,8 @@ from prometheus_client import start_http_server
 
 import os
 
+import otel as _otel
+
 from collector import ClusterStateCollector, PartitionConfigLoader
 from fragmentation import (
     FragmentationDetector,
@@ -163,6 +165,12 @@ class OperatorApp:
         # Checkpoint missing-since tracking: pool → timestamp when file was first not found.
         # Used to implement grace period before blocking scale-down on missing checkpoint.
         self._checkpoint_missing_since: dict[str, float] = {}
+        # OTel: job_id → (traceparent str, open queue_wait span ctx).
+        # Populated when we first see a PENDING job with an OTel admin_comment.
+        self._job_pending_trace: dict[str, tuple[str, Any]] = {}
+        # OTel: job_id → open job_running span ctx.
+        # Populated when a tracked job enters RUNNING; closed when it leaves.
+        self._job_running_trace: dict[str, Any] = {}
         # Circuit-breaker state: tracks consecutive loop-level errors for exponential backoff.
         self._consecutive_errors: int = 0
         # R21: event-driven plumbing.
@@ -531,9 +539,27 @@ class OperatorApp:
             ready = self.client.get_ready_replicas(key)
             _PODS_READY.labels(pool=key).set(ready)
             if key in self._provisioning:
-                prov_start, prov_target = self._provisioning[key]
+                prov_start, prov_target, prov_ctx = self._provisioning[key]
                 if ready >= prov_target:
-                    _PROVISIONING_LATENCY.labels(pool=key).observe(time.time() - prov_start)
+                    latency = time.time() - prov_start
+                    if _otel.enabled():
+                        with _otel.start_span(
+                            "k8s_provisioning",
+                            parent_context=prov_ctx,
+                            attributes={
+                                "pool": key,
+                                "target_replicas": prov_target,
+                                "latency_seconds": latency,
+                            },
+                            start_time_ns=int(prov_start * 1e9),
+                        ):
+                            tid = _otel.current_trace_id()
+                        _PROVISIONING_LATENCY.labels(pool=key).observe(
+                            latency,
+                            exemplar={"traceID": tid} if tid else None,
+                        )
+                    else:
+                        _PROVISIONING_LATENCY.labels(pool=key).observe(latency)
                     del self._provisioning[key]
 
             # E7 hardening — ghost-job detector. If slurmrestd reports
@@ -586,6 +612,82 @@ class OperatorApp:
             cooldown_elapsed = now - self.last_scale_up_at[key]
             cooldown_remaining = max(partition_cfg.scale_down_cooldown - int(cooldown_elapsed), 0)
 
+            # OTel: track job lifecycle spans (queue_wait → job_running).
+            if _otel.enabled() and self.rest is not None:
+                raw_jobs = self.rest.list_jobs(partition_cfg.partition)
+                visible_ids = {str(j.get("job_id", "")) for j in raw_jobs}
+
+                for jraw in raw_jobs:
+                    jid = str(jraw.get("job_id", ""))
+                    jstate = jraw.get("job_state", "")
+                    if not jid:
+                        continue
+
+                    if jstate == "PENDING" and jid not in self._job_pending_trace:
+                        # First time seeing this PENDING job — try to read traceparent.
+                        comment = self.rest.get_job_admin_comment(jid)
+                        tp = ""
+                        for part in (comment or "").split(";"):
+                            if part.strip().startswith("otel="):
+                                tp = part.strip()[5:]
+                                break
+                        parent_ctx = _otel.extract_context(tp) if tp else None
+                        span_ctx = _otel.start_span(
+                            "queue_wait",
+                            parent_context=parent_ctx,
+                            attributes={
+                                "job_id": jid,
+                                "partition": partition_cfg.partition,
+                                "pending_jobs": state.pending_jobs,
+                            },
+                        )
+                        span_ctx.__enter__()
+                        self._job_pending_trace[jid] = (tp, span_ctx)
+
+                    elif jstate == "RUNNING":
+                        if jid in self._job_pending_trace:
+                            # Transition PENDING → RUNNING: close queue_wait, open job_running.
+                            tp, qw_ctx = self._job_pending_trace.pop(jid)
+                            qw_ctx.__exit__(None, None, None)
+                            parent_ctx = _otel.extract_context(tp) if tp else None
+                            run_ctx = _otel.start_span(
+                                "job_running",
+                                parent_context=parent_ctx,
+                                attributes={
+                                    "job_id": jid,
+                                    "partition": partition_cfg.partition,
+                                    "nodes": jraw.get("nodes", ""),
+                                    "cpus": jraw.get("cpus", {}).get("allocated", 0)
+                                        if isinstance(jraw.get("cpus"), dict)
+                                        else jraw.get("num_cpus", 0),
+                                    "gres": str(jraw.get("gres_detail", "")),
+                                },
+                            )
+                            run_ctx.__enter__()
+                            self._job_running_trace[jid] = (tp, run_ctx)
+                        elif jid not in self._job_running_trace:
+                            # Job was already RUNNING when operator started — open span without parent.
+                            run_ctx = _otel.start_span(
+                                "job_running",
+                                attributes={
+                                    "job_id": jid,
+                                    "partition": partition_cfg.partition,
+                                    "nodes": jraw.get("nodes", ""),
+                                },
+                            )
+                            run_ctx.__enter__()
+                            self._job_running_trace[jid] = ("", run_ctx)
+
+                # Close spans for jobs that have left the visible set.
+                for jid in list(self._job_pending_trace):
+                    if jid not in visible_ids:
+                        _, span_ctx = self._job_pending_trace.pop(jid)
+                        span_ctx.__exit__(None, None, None)
+                for jid in list(self._job_running_trace):
+                    if jid not in visible_ids:
+                        _, span_ctx = self._job_running_trace.pop(jid)
+                        span_ctx.__exit__(None, None, None)
+
             self.logger.emit(
                 "loop_observation",
                 policy=self.cfg.policy_name,
@@ -616,7 +718,24 @@ class OperatorApp:
                 pass
         self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
         self.last_scale_up_at[key] = now
-        self._provisioning[key] = (now, decision.target_replicas)
+        # Emit scale_up_decision span and store context for the subsequent
+        # k8s_provisioning span (which is emitted when pods become ready).
+        _prov_ctx = None
+        if _otel.enabled():
+            with _otel.start_span(
+                "scale_up_decision",
+                attributes={
+                    "pool": key,
+                    "partition": partition_cfg.partition,
+                    "from_replicas": state.current_replicas,
+                    "to_replicas": decision.target_replicas,
+                    "reason": decision.reason,
+                    "pending_jobs": state.pending_jobs,
+                },
+            ) as _span:
+                from opentelemetry import context as _octx
+                _prov_ctx = _octx.get_current()
+        self._provisioning[key] = (now, decision.target_replicas, _prov_ctx)
         try:
             self.client.set_annotation(
                 "statefulset", partition_cfg.worker_statefulset,
