@@ -1,9 +1,12 @@
 name: lua-test
 
-# Unit tests for the Slurm Lua submission hook (rl_hook.lua).
-# Tests use a fake io.popen returning canned JSON, so no curl/network needed.
-# score_test.lua is excluded: it requires a rendered chart + running controller
-# pod (covered by verify-score-tests.sh on the k3s host instead).
+# Unit tests for the Slurm Lua submission plugin's standalone helpers:
+#   rl_hook.lua       — RL scheduler client (mocks io.popen for curl)
+#   submit_helper.lua — R19 sbatch helper (auto --mem / partition / qos)
+# Both modules are pure-Lua and require no external services.
+#
+# score_test.lua is excluded: it requires a rendered chart + running
+# controller pod (covered by verify-score-tests.sh on the k3s host).
 
 on:
   push:
@@ -11,16 +14,18 @@ on:
     paths:
       - 'chart/lua/**'
       - 'tests/lua/rl_hook_test.lua'
+      - 'tests/lua/submit_helper_test.lua'
       - '.github/workflows/lua-test.yml'
   pull_request:
     paths:
       - 'chart/lua/**'
       - 'tests/lua/rl_hook_test.lua'
+      - 'tests/lua/submit_helper_test.lua'
       - '.github/workflows/lua-test.yml'
 
 jobs:
   lua:
-    name: luajit rl_hook_test
+    name: luajit standalone module tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,3 +35,6 @@ jobs:
 
       - name: Run rl_hook_test.lua
         run: luajit tests/lua/rl_hook_test.lua
+
+      - name: Run submit_helper_test.lua
+        run: luajit tests/lua/submit_helper_test.lua

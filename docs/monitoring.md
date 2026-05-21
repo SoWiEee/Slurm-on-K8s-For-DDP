@@ -165,7 +165,11 @@ phase4/
     └── verify-monitoring.sh               # 驗證 metrics 可正常抓取
 chart/
 └── dashboards/
-    └── gpu.json                           # GPU Utilisation (DCGM) dashboard
+    ├── bridge-overview.json               # Slurm↔K8s Bridge Overview
+    ├── gpu.json                           # GPU Utilisation (DCGM) — cluster-wide
+    ├── operator.json                      # K8s Elastic Operator
+    ├── per-job-gpu.json                   # R20 (v5) Per-Job GPU Profile (DCGM + OTel)
+    └── sla-efficiency.json                # SLA / efficiency
 ```
 
 ---
@@ -221,6 +225,24 @@ chart/
 - VRAM Used (Now)：目前各 GPU 的 VRAM 使用量 stat panel
 
 > 這個 dashboard 取代早期用 Slurm allocation count 推估 GPU utilization 的做法。Slurm allocation count 只能表示「排程器分配了 GPU」，DCGM 才能回答「硬體實際忙不忙」。
+
+### Per-Job GPU Profile (R20)
+
+`chart/dashboards/per-job-gpu.json`，dashboard uid `slurm-k8s-per-job-gpu`，是 v5 review 補上的「per-job × per-GPU × full-lifecycle」差異化面板。
+
+**設計取捨：** dcgm-exporter 標籤上沒有 `slurm_job_id`（NVIDIA 上游沒做這層 join），所以 dashboard 用兩個 template variable 串起來：
+
+- `$hostname` — 從 `DCGM_FI_DEV_GPU_UTIL` 的 `Hostname` label 拉出選單；使用者用 `squeue -j <jobid> -o '%N'` 查到 worker 後手選
+- `$gpu` — 同一 host 上的 GPU index；預設 `All`
+- `$job_id` — textbox，用來組裝 Tempo TraceQL 連結（`job_id=$job_id`），需 Phase 7-A OTel 啟用
+
+**Panels：**
+
+1. **GPU profile（4 個 timeseries）**：SM%、VRAM、Memory Copy Util、Power、Temperature — 全部 filter by `$hostname / $gpu`
+2. **Pool provisioning latency p95**：`slurm_operator_provisioning_latency_seconds_bucket`，**exemplar 啟用** → 任一資料點上的 exemplar 點按下去會跳到 Tempo 的 OTel trace
+3. **Open Tempo trace 連結**：deep-link 到 Grafana Explore，TraceQL 預填 `job_id=$job_id`
+
+這個 dashboard 對應 Slinky/SUNK/ParallelCluster 都沒有的「single-job lifecycle drill-down」差異化功能，請見 [`docs/review.md §4.2`](review.md)。
 
 ---
 

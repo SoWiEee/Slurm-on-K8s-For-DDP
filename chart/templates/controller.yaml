@@ -93,6 +93,17 @@ spec:
                 SLURMRESTD_SECURITY=disable_user_check \
                 /usr/sbin/slurmrestd -a rest_auth/jwt -s openapi/v0.0.37 0.0.0.0:6820 &
               wait $CTLD_PID
+          # K1 (v5 review): explicit requests/limits → Guaranteed QoS. slurmctld
+          # in-memory state grows with queue depth; default 2Gi limit covers
+          # ~10k concurrent jobs. Raise `.Values.slurm.controllerResources` for
+          # larger deployments.
+          resources:
+            requests:
+              cpu: {{ .Values.slurm.controllerResources.requests.cpu | default "200m" | quote }}
+              memory: {{ .Values.slurm.controllerResources.requests.memory | default "512Mi" | quote }}
+            limits:
+              cpu: {{ .Values.slurm.controllerResources.limits.cpu | default "2" | quote }}
+              memory: {{ .Values.slurm.controllerResources.limits.memory | default "2Gi" | quote }}
           ports:
             - containerPort: 22
               name: ssh

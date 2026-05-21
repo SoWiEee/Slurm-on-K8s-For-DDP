@@ -152,6 +152,17 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://otel-collector.{{ .Values.monitoring.namespace }}.svc.cluster.local:4317"
             {{- end }}
+          # K1 (v5 review): explicit requests/limits put the pod into the
+          # Guaranteed QoS class so it's not the first thing evicted when
+          # the k3s host is under pressure. Defaults sized for a single-host
+          # 1×GPU cluster; raise limits for multi-pool deployments.
+          resources:
+            requests:
+              cpu: {{ .Values.operator.resources.requests.cpu | default "100m" | quote }}
+              memory: {{ .Values.operator.resources.requests.memory | default "256Mi" | quote }}
+            limits:
+              cpu: {{ .Values.operator.resources.limits.cpu | default "500m" | quote }}
+              memory: {{ .Values.operator.resources.limits.memory | default "512Mi" | quote }}
           ports:
             - name: metrics
               containerPort: 8000

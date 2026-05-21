@@ -10,18 +10,27 @@ plus a single reconcile consumer:
                                                   │
                             measure event_lag_seconds (event_ts → reconcile_start)
 
-The previous polling-only loop was rebuilt around a `_PoolEventQueue` so
+The previous polling-only loop was rebuilt around a ``_PoolEventQueue`` so
 scale events trigger within sub-second of being observed by the K8s API
 or by squeue, while a 60s timer-driven reconcile runs as a safety net so
 a missed watch event cannot leave a pool stuck out of sync.
 
-Also contains JsonLogger (structured log emitter) and StatefulSetActuator
-(thin wrapper around K8sClient.patch_replicas kept for separation of concerns).
+This module owns:
+  - OperatorApp.__init__       (wiring + state restore from annotations)
+  - OperatorApp.run            (startup + main consumer loop + circuit breaker)
+  - _PoolEventQueue            (pool-keyed dedup queue)
+  - JsonLogger                 (structured log emitter)
+  - StatefulSetActuator        (thin wrapper around K8sClient.patch_replicas)
+
+The watcher threads, reconcile dispatcher, scale actuators, and
+fragmentation loop live in dedicated modules and are mixed into
+OperatorApp via inheritance — see v5 review C2 for the refactor rationale.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import queue
 import threading
@@ -30,49 +39,30 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
-from kubernetes import watch as k8s_watch
 from prometheus_client import start_http_server
-
-import os
-
-import otel as _otel
 
 from collector import ClusterStateCollector, PartitionConfigLoader
 from fragmentation import (
     FragmentationDetector,
     FragmentationReconciler,
     RequeueDecider,
-    jobs_from_slurm_rest,
-    nodes_from_slurm_rest,
 )
+from fragmentation_loop import FragmentationLoopMixin
 from k8s import K8sClient
 from metrics import (
-    _CHECKPOINT_GUARD_BLOCKS_TOTAL,
     _CIRCUIT_BREAKER_ERRORS,
-    _CURRENT_REPLICAS,
-    _DRAIN_TIMEOUT_TOTAL,
-    _DRAIN_TOTAL,
     _EVENT_LAG_SECONDS,
-    _FRAGMENTATION_BLOCKED_JOBS,
-    _FRAGMENTATION_SCORE,
-    _GHOST_DETECTED_TOTAL,
-    _GHOST_JOBS_PRESENT,
-    _PODS_READY,
     _POLL_DURATION,
-    _PROVISIONING_LATENCY,
     _QUEUE_DEDUP_DROPS,
     _RECONCILES_TOTAL,
-    _REQUEUE_TOTAL,
-    _REQUEUE_VICTIMS,
-    _SCALE_DOWN_TOTAL,
-    _SCALE_SKIPPED_TOTAL,
-    _SCALE_UP_TOTAL,
 )
 from models import Config, PartitionConfig, PartitionState
 from policy import CheckpointAwareQueuePolicy
+from reconciler import ReconcilerMixin
+from scale_actions import _COOLDOWN_ANNOTATION, ScaleActionsMixin
 from slurm import SlurmRestClient
+from watchers import WatcherMixin
 
-_COOLDOWN_ANNOTATION = "slurm.k8s/last-scale-up-at"
 _TIMER_SOURCE = "timer"
 
 
@@ -83,7 +73,7 @@ class _PoolEventQueue:
     enqueue the same pool key simultaneously; the consumer only needs to
     reconcile each pool once per "burst" so we collapse pending entries.
 
-    `put` returns False (and increments a metric) if the pool already has
+    ``put`` returns False (and increments a metric) if the pool already has
     an entry sitting in the queue — the existing entry will be consumed
     soon enough.
     """
@@ -131,7 +121,22 @@ class StatefulSetActuator:
         self.client.patch_replicas(statefulset, replicas)
 
 
-class OperatorApp:
+class OperatorApp(
+    WatcherMixin,
+    ReconcilerMixin,
+    ScaleActionsMixin,
+    FragmentationLoopMixin,
+):
+    """Multi-pool elastic operator.
+
+    Mixins provide:
+      - WatcherMixin           : _watch_statefulsets / _watch_pods /
+                                 _poll_slurm_state / _periodic_timer
+      - ReconcilerMixin        : _process_pool (the per-pool decision loop)
+      - ScaleActionsMixin      : _do_scale_up / _do_scale_down / _do_keep
+      - FragmentationLoopMixin : _fragmentation_loop / _fragmentation_tick
+    """
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.logger = JsonLogger()
@@ -152,9 +157,9 @@ class OperatorApp:
         # restart does not reset the cooldown clock and cause an immediate
         # scale-down that was previously guarded against.
         self.last_scale_up_at: dict[str, float] = {}
-        # Track pending provisioning: pool → (scale_up_timestamp, target_replicas).
+        # Track pending provisioning: pool → (scale_up_timestamp, target_replicas, otel_ctx).
         # Cleared once readyReplicas reaches the target; used to emit _PROVISIONING_LATENCY.
-        self._provisioning: dict[str, tuple[float, int]] = {}
+        self._provisioning: dict[str, tuple[float, int, Any]] = {}
         # Drain-then-scale: pool → set of node names that have been drained and are
         # waiting for running jobs to finish before replicas are patched down.
         self._draining_nodes: dict[str, set[str]] = {}
@@ -296,7 +301,7 @@ class OperatorApp:
             )
         # Prime the queue so the first reconcile happens immediately, before
         # any watcher fires. Without this the readiness probe waits up to
-        # `slurm_poll_interval` seconds for the first slurm diff.
+        # ``slurm_poll_interval`` seconds for the first slurm diff.
         for key in self._cfg_by_key:
             self._event_queue.put(key, source="startup")
 
@@ -346,561 +351,3 @@ class OperatorApp:
             _POLL_DURATION.observe(time.time() - _loop_start)
             pathlib.Path("/tmp/operator-alive").touch()
             pathlib.Path("/tmp/operator-ready").touch()
-
-    # ---------- watcher threads (R21) ---------------------------------------
-
-    def _watch_statefulsets(self) -> None:
-        """Watch StatefulSet ADD/MODIFY/DELETE for our worker pools."""
-        pool_keys = set(self._cfg_by_key.keys())
-        while True:
-            try:
-                w = k8s_watch.Watch()
-                for ev in w.stream(
-                    self.client._apps.list_namespaced_stateful_set,
-                    namespace=self.cfg.namespace,
-                    timeout_seconds=300,
-                ):
-                    obj = ev.get("object")
-                    if obj is None:
-                        continue
-                    name = getattr(obj.metadata, "name", "")
-                    if name in pool_keys:
-                        self._event_queue.put(name, source=f"k8s-sts:{ev.get('type', '?')}")
-            except Exception as exc:  # noqa: BLE001
-                self.logger.emit(
-                    "error", level="WARN",
-                    message=f"sts watch interrupted, reconnecting in 2s: {exc}",
-                )
-                time.sleep(2)
-
-    def _watch_pods(self) -> None:
-        """Watch worker Pods. StatefulSet pod naming is `<sts>-<ordinal>` so we
-        route by name prefix instead of label selector — that survives a chart
-        relabelling and stays correct without RBAC changes.
-        """
-        pool_keys = list(self._cfg_by_key.keys())
-        while True:
-            try:
-                w = k8s_watch.Watch()
-                for ev in w.stream(
-                    self.client._core.list_namespaced_pod,
-                    namespace=self.cfg.namespace,
-                    timeout_seconds=300,
-                ):
-                    obj = ev.get("object")
-                    if obj is None:
-                        continue
-                    pod_name = getattr(obj.metadata, "name", "")
-                    for sts_name in pool_keys:
-                        if pod_name.startswith(f"{sts_name}-"):
-                            self._event_queue.put(sts_name, source=f"k8s-pod:{ev.get('type', '?')}")
-                            break
-            except Exception as exc:  # noqa: BLE001
-                self.logger.emit(
-                    "error", level="WARN",
-                    message=f"pod watch interrupted, reconnecting in 2s: {exc}",
-                )
-                time.sleep(2)
-
-    def _poll_slurm_state(self) -> None:
-        """Diff Slurm state every `slurm_poll_interval_seconds`. Slurm 21.08
-        has no event stream so this is the closest we get to event-driven
-        for queue and node state changes.
-        """
-        interval = max(self.cfg.slurm_poll_interval_seconds, 0.5)
-        while True:
-            try:
-                states = self.collector.collect_all_partition_states()
-                for key, state in states.items():
-                    prev = self._slurm_state_cache.get(key)
-                    if prev is None or state != prev:
-                        self._event_queue.put(key, source="slurm-diff")
-                    self._slurm_state_cache[key] = state
-            except Exception as exc:  # noqa: BLE001
-                # Don't spam — circuit breaker in the main loop will surface this.
-                self.logger.emit(
-                    "error", level="DEBUG",
-                    message=f"slurm-diff poll failed (will retry): {exc}",
-                )
-            time.sleep(interval)
-
-    def _fragmentation_loop(self) -> None:
-        """Periodic fragmentation reconcile (M7).
-
-        Runs at ``FRAGMENTATION_MIN_INTERVAL_SECONDS`` cadence. The
-        decider's own rate limiter is what prevents bursty requeues —
-        this loop is just the scheduler. Errors are logged but never
-        crash the thread (the operator's circuit breaker only covers the
-        scaling reconcile path).
-        """
-        assert self._fragmentation_reconciler is not None
-        while True:
-            time.sleep(max(1.0, self._fragmentation_interval))
-            try:
-                self._fragmentation_tick()
-            except Exception as exc:  # noqa: BLE001
-                self.logger.emit(
-                    "fragmentation_error", level="WARN",
-                    error=type(exc).__name__, message=str(exc),
-                )
-
-    def _fragmentation_tick(self) -> None:
-        """Single detect → decide → (optional) actuate cycle."""
-        if self.rest is None or self._fragmentation_reconciler is None:
-            return
-        partitions = self._fragmentation_partitions or tuple(
-            p.partition for p in self.partition_cfgs
-        )
-        # Pull a single union of jobs across the partitions we care about.
-        rest_jobs: list[dict] = []
-        for part in partitions:
-            try:
-                rest_jobs.extend(self.rest.list_jobs(part))
-            except Exception as exc:  # noqa: BLE001
-                self.logger.emit(
-                    "fragmentation_error", level="WARN",
-                    error=f"list_jobs({part}):{type(exc).__name__}", message=str(exc),
-                )
-                return
-        try:
-            rest_nodes = self.rest.list_nodes()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.emit(
-                "fragmentation_error", level="WARN",
-                error=f"list_nodes:{type(exc).__name__}", message=str(exc),
-            )
-            return
-
-        mps_per_node = self._fragmentation_reconciler.detector.mps_per_node
-        jobs = jobs_from_slurm_rest(rest_jobs, mps_per_node=mps_per_node)
-        nodes = nodes_from_slurm_rest(rest_nodes, mps_per_node=mps_per_node)
-        result = self._fragmentation_reconciler.reconcile(jobs, nodes, now=time.time())
-
-        _FRAGMENTATION_SCORE.set(result.snapshot.score)
-        _FRAGMENTATION_BLOCKED_JOBS.set(len(result.snapshot.pending_blocked))
-
-        # Log + count by reason bucket. The decider's `reason` is one of
-        # "no-fragmentation" | "rate-limited:..." | "no-candidates-..." |
-        # "<unblock detail>"; bucket them so Prometheus cardinality stays
-        # bounded.
-        reason_label = (
-            "rate-limited" if result.reason.startswith("rate-limited")
-            else "no-fragmentation" if result.reason == "no-fragmentation"
-            else "no-victims" if result.reason.startswith("no-")
-            else "unblock"
-        )
-        _REQUEUE_TOTAL.labels(reason=reason_label).inc()
-
-        log_fields: dict[str, Any] = {
-            "score": round(result.snapshot.score, 4),
-            "blocked": [j.job_id for j in result.snapshot.pending_blocked[:5]],
-            "reason": result.reason,
-            "shadow": result.shadow,
-        }
-        if result.decision is not None:
-            log_fields["target_jobs"] = list(result.decision.target_job_ids)
-            log_fields["unblocks"] = list(result.decision.blocked_job_ids)
-            log_fields["requeued_jobs"] = list(result.requeued)
-            if result.actuator_errors:
-                log_fields["actuator_errors"] = list(result.actuator_errors)
-            for _ in result.requeued:
-                _REQUEUE_VICTIMS.inc()
-            self.logger.emit("requeue_decision", **log_fields)
-        else:
-            # Quiet by default — only log non-trivial reasons. A
-            # "no-fragmentation" tick every 60s would flood slurm log.
-            if reason_label != "no-fragmentation":
-                self.logger.emit("requeue_skipped", **log_fields)
-
-    def _periodic_timer(self) -> None:
-        """Safety-net reconcile every `reconcile_period_seconds`.
-
-        The main consumer loop already wakes on queue.get(timeout=...) so
-        this thread only exists to enqueue an explicit timer event whenever
-        the queue has been quiet — which lets the timer-source metric and
-        the explicit `timer` log line stay distinguishable from an idle
-        consumer wake-up. The consumer treats a None dequeue as a timer.
-        We don't need to enqueue here; the consumer already handles it.
-        """
-        # Intentionally a no-op thread today — kept as a hook so future
-        # changes can switch to explicit timer events without restructuring
-        # the consumer. Sleeping forever would be cleanest, but a long
-        # sleep keeps the thread name visible in py-spy / faulthandler.
-        while True:
-            time.sleep(3600)
-
-    def _process_pool(self, partition_cfg: PartitionConfig, all_states: dict) -> None:
-        key = partition_cfg.worker_statefulset
-        try:
-            state = all_states[key]
-            _CURRENT_REPLICAS.labels(pool=key).set(state.current_replicas)
-
-            # Pods-ready gauge + provisioning latency tracking
-            ready = self.client.get_ready_replicas(key)
-            _PODS_READY.labels(pool=key).set(ready)
-            if key in self._provisioning:
-                prov_start, prov_target, prov_ctx = self._provisioning[key]
-                if ready >= prov_target:
-                    latency = time.time() - prov_start
-                    if _otel.enabled():
-                        with _otel.start_span(
-                            "k8s_provisioning",
-                            parent_context=prov_ctx,
-                            attributes={
-                                "pool": key,
-                                "target_replicas": prov_target,
-                                "latency_seconds": latency,
-                            },
-                            start_time_ns=int(prov_start * 1e9),
-                        ):
-                            tid = _otel.current_trace_id()
-                        _PROVISIONING_LATENCY.labels(pool=key).observe(
-                            latency,
-                            exemplar={"traceID": tid} if tid else None,
-                        )
-                    else:
-                        _PROVISIONING_LATENCY.labels(pool=key).observe(latency)
-                    del self._provisioning[key]
-
-            # E7 hardening — ghost-job detector. If slurmrestd reports
-            # running jobs but the StatefulSet has scaled to zero AND no
-            # pod is Ready, those "running" jobs are orphaned: their
-            # worker pod died without slurmd reporting the epilog, so
-            # the controller's job table is wedged. Left untreated this
-            # blocks every future scale-up (no pending → scheduler hands
-            # off → no pod → loop). We surface it via metric + log so
-            # alerting can page; we deliberately don't auto-recover
-            # because the safe recovery (scontrol DOWN/RESUME on each
-            # node, or `kubectl delete pod slurm-controller-0`) has a
-            # non-trivial blast radius if mis-fired during a real burst.
-            ghost = (state.current_replicas == 0 and ready == 0
-                     and state.running_jobs > 0)
-            _GHOST_JOBS_PRESENT.labels(pool=key).set(1 if ghost else 0)
-            if ghost:
-                _GHOST_DETECTED_TOTAL.labels(pool=key).inc()
-                self.logger.emit(
-                    "ghost_jobs_detected",
-                    policy=self.cfg.policy_name,
-                    partition=partition_cfg.partition,
-                    statefulset=key,
-                    running_jobs=state.running_jobs,
-                    current_replicas=state.current_replicas,
-                    ready_replicas=ready,
-                    severity="warning",
-                    remediation=(
-                        "scontrol update NodeName=<pool>-[0-N] State=DOWN; "
-                        "sleep 2; State=RESUME — or kubectl delete pod "
-                        "slurm-controller-0 to force slurmctld state rebuild. "
-                        "See docs/note.md #16."
-                    ),
-                )
-
-            checkpoint_age = self.collector.get_checkpoint_age_seconds(partition_cfg.checkpoint_path)
-
-            # Track when the checkpoint file was first seen as missing so the
-            # grace period in evaluate() can allow early scale-downs.
-            if partition_cfg.checkpoint_path and checkpoint_age is None:
-                self._checkpoint_missing_since.setdefault(key, time.time())
-            else:
-                self._checkpoint_missing_since.pop(key, None)
-            _missing_first = self._checkpoint_missing_since.get(key)
-            _missing_since = (time.time() - _missing_first) if _missing_first is not None else None
-
-            decision = self.policy.evaluate(partition_cfg, state, checkpoint_age, _missing_since)
-
-            now = time.time()
-            cooldown_elapsed = now - self.last_scale_up_at[key]
-            cooldown_remaining = max(partition_cfg.scale_down_cooldown - int(cooldown_elapsed), 0)
-
-            # OTel: track job lifecycle spans (queue_wait → job_running).
-            if _otel.enabled() and self.rest is not None:
-                raw_jobs = self.rest.list_jobs(partition_cfg.partition)
-                visible_ids = {str(j.get("job_id", "")) for j in raw_jobs}
-
-                for jraw in raw_jobs:
-                    jid = str(jraw.get("job_id", ""))
-                    jstate = jraw.get("job_state", "")
-                    if not jid:
-                        continue
-
-                    if jstate == "PENDING" and jid not in self._job_pending_trace:
-                        # First time seeing this PENDING job — try to read traceparent.
-                        comment = self.rest.get_job_admin_comment(jid)
-                        tp = ""
-                        for part in (comment or "").split(";"):
-                            if part.strip().startswith("otel="):
-                                tp = part.strip()[5:]
-                                break
-                        parent_ctx = _otel.extract_context(tp) if tp else None
-                        span_ctx = _otel.start_span(
-                            "queue_wait",
-                            parent_context=parent_ctx,
-                            attributes={
-                                "job_id": jid,
-                                "partition": partition_cfg.partition,
-                                "pending_jobs": state.pending_jobs,
-                            },
-                        )
-                        span_ctx.__enter__()
-                        self._job_pending_trace[jid] = (tp, span_ctx)
-
-                    elif jstate == "RUNNING":
-                        if jid in self._job_pending_trace:
-                            # Transition PENDING → RUNNING: close queue_wait, open job_running.
-                            tp, qw_ctx = self._job_pending_trace.pop(jid)
-                            qw_ctx.__exit__(None, None, None)
-                            parent_ctx = _otel.extract_context(tp) if tp else None
-                            run_ctx = _otel.start_span(
-                                "job_running",
-                                parent_context=parent_ctx,
-                                attributes={
-                                    "job_id": jid,
-                                    "partition": partition_cfg.partition,
-                                    "nodes": jraw.get("nodes", ""),
-                                    "cpus": jraw.get("cpus", {}).get("allocated", 0)
-                                        if isinstance(jraw.get("cpus"), dict)
-                                        else jraw.get("num_cpus", 0),
-                                    "gres": str(jraw.get("gres_detail", "")),
-                                },
-                            )
-                            run_ctx.__enter__()
-                            self._job_running_trace[jid] = (tp, run_ctx)
-                        elif jid not in self._job_running_trace:
-                            # Job was already RUNNING when operator started — open span without parent.
-                            run_ctx = _otel.start_span(
-                                "job_running",
-                                attributes={
-                                    "job_id": jid,
-                                    "partition": partition_cfg.partition,
-                                    "nodes": jraw.get("nodes", ""),
-                                },
-                            )
-                            run_ctx.__enter__()
-                            self._job_running_trace[jid] = ("", run_ctx)
-
-                # Close spans for jobs that have left the visible set.
-                for jid in list(self._job_pending_trace):
-                    if jid not in visible_ids:
-                        _, span_ctx = self._job_pending_trace.pop(jid)
-                        span_ctx.__exit__(None, None, None)
-                for jid in list(self._job_running_trace):
-                    if jid not in visible_ids:
-                        _, span_ctx = self._job_running_trace.pop(jid)
-                        span_ctx.__exit__(None, None, None)
-
-            self.logger.emit(
-                "loop_observation",
-                policy=self.cfg.policy_name,
-                partition=partition_cfg.partition,
-                state=asdict(state),
-                decision=asdict(decision),
-                checkpoint_age_seconds=checkpoint_age,
-                cooldown_remaining_seconds=cooldown_remaining,
-            )
-
-            if decision.action == "scale_up":
-                self._do_scale_up(partition_cfg, state, decision, key, now)
-            elif decision.action == "scale_down":
-                self._do_scale_down(partition_cfg, state, decision, key, cooldown_elapsed, cooldown_remaining)
-            else:
-                self._do_keep(partition_cfg, state, decision, key, checkpoint_age)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.emit("error", level="ERROR", partition=partition_cfg.partition, statefulset=key, message=str(exc))
-
-    def _do_scale_up(self, partition_cfg: PartitionConfig, state, decision, key: str, now: float) -> None:
-        # If nodes were draining for a previous scale-down, cancel so they can accept jobs again.
-        draining = self._draining_nodes.pop(key, set())
-        self._draining_started.pop(key, None)
-        for node_name in draining:
-            try:
-                self.client.resume_slurm_node(node_name)
-            except Exception:  # noqa: BLE001
-                pass
-        self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
-        self.last_scale_up_at[key] = now
-        # Emit scale_up_decision span and store context for the subsequent
-        # k8s_provisioning span (which is emitted when pods become ready).
-        _prov_ctx = None
-        if _otel.enabled():
-            with _otel.start_span(
-                "scale_up_decision",
-                attributes={
-                    "pool": key,
-                    "partition": partition_cfg.partition,
-                    "from_replicas": state.current_replicas,
-                    "to_replicas": decision.target_replicas,
-                    "reason": decision.reason,
-                    "pending_jobs": state.pending_jobs,
-                },
-            ) as _span:
-                from opentelemetry import context as _octx
-                _prov_ctx = _octx.get_current()
-        self._provisioning[key] = (now, decision.target_replicas, _prov_ctx)
-        try:
-            self.client.set_annotation(
-                "statefulset", partition_cfg.worker_statefulset,
-                _COOLDOWN_ANNOTATION, str(now),
-            )
-        except Exception:  # noqa: BLE001
-            pass  # best-effort; in-memory value is still correct for this cycle
-        _SCALE_UP_TOTAL.labels(pool=key).inc()
-        self.logger.emit(
-            "scale_action",
-            policy=self.cfg.policy_name,
-            partition=partition_cfg.partition,
-            action="scale_up",
-            statefulset=partition_cfg.worker_statefulset,
-            from_replicas=state.current_replicas,
-            to_replicas=decision.target_replicas,
-            reason=decision.reason,
-            pending_jobs=state.pending_jobs,
-            running_jobs=state.running_jobs,
-            busy_nodes=state.busy_nodes,
-        )
-
-    def _do_scale_down(self, partition_cfg: PartitionConfig, state, decision, key: str,
-                       cooldown_elapsed: float, cooldown_remaining: int) -> None:
-        if cooldown_elapsed < partition_cfg.scale_down_cooldown:
-            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="cooldown").inc()
-            self.logger.emit(
-                "scale_skipped",
-                policy=self.cfg.policy_name,
-                partition=partition_cfg.partition,
-                action="scale_down",
-                statefulset=partition_cfg.worker_statefulset,
-                from_replicas=state.current_replicas,
-                to_replicas=decision.target_replicas,
-                reason="scale_down_cooldown",
-                cooldown_remaining_seconds=cooldown_remaining,
-                pending_jobs=state.pending_jobs,
-                running_jobs=state.running_jobs,
-                busy_nodes=state.busy_nodes,
-            )
-            return
-
-        # Drain-then-scale: mark the nodes being removed as DRAIN so no new jobs
-        # land on them, then wait for running jobs to finish before patching replicas.
-        nodes_to_drain = {
-            f"{partition_cfg.worker_statefulset}-{i}"
-            for i in range(decision.target_replicas, state.current_replicas)
-        }
-        draining = self._draining_nodes.get(key, set())
-        started = self._draining_started.setdefault(key, {})
-        new_nodes = nodes_to_drain - draining
-        now_ts = time.time()
-        for node_name in new_nodes:
-            try:
-                self.client.drain_slurm_node(node_name)
-            except Exception:  # noqa: BLE001
-                pass
-            started[node_name] = now_ts
-        if new_nodes:
-            draining = draining | new_nodes
-            self._draining_nodes[key] = draining
-            _DRAIN_TOTAL.labels(pool=key).inc()
-            self.logger.emit(
-                "drain_initiated",
-                policy=self.cfg.policy_name,
-                partition=partition_cfg.partition,
-                statefulset=partition_cfg.worker_statefulset,
-                draining_nodes=sorted(new_nodes),
-                target_replicas=decision.target_replicas,
-            )
-
-        # R1: force-kill any node whose drain has exceeded drain_timeout_seconds.
-        # Otherwise a hung srun step keeps cpu_alloc != 0 forever and the pool
-        # never shrinks.
-        timeout = partition_cfg.drain_timeout_seconds
-        force_killed: set[str] = set()
-        if timeout > 0:
-            for node_name in list(draining):
-                drain_started = started.get(node_name)
-                if drain_started is None:
-                    continue
-                if self.client.get_node_cpu_alloc(node_name) == 0:
-                    continue
-                age = now_ts - drain_started
-                if age <= timeout:
-                    continue
-                try:
-                    self.client.cancel_jobs_on_node(node_name)
-                    self.client.down_slurm_node(node_name, reason="drain-timeout")
-                except Exception:  # noqa: BLE001
-                    pass
-                force_killed.add(node_name)
-                _DRAIN_TIMEOUT_TOTAL.labels(pool=key, node=node_name).inc()
-                self.logger.emit(
-                    "drain_timeout_force_kill",
-                    level="WARN",
-                    policy=self.cfg.policy_name,
-                    partition=partition_cfg.partition,
-                    statefulset=partition_cfg.worker_statefulset,
-                    node=node_name,
-                    drained_for_seconds=int(age),
-                    drain_timeout_seconds=timeout,
-                )
-
-        all_idle = all(
-            n in force_killed or self.client.get_node_cpu_alloc(n) == 0
-            for n in draining
-        )
-        if all_idle:
-            self.actuator.patch_replicas(partition_cfg.worker_statefulset, decision.target_replicas)
-            self._draining_nodes.pop(key, None)
-            self._draining_started.pop(key, None)
-            _SCALE_DOWN_TOTAL.labels(pool=key).inc()
-            self.logger.emit(
-                "scale_action",
-                policy=self.cfg.policy_name,
-                partition=partition_cfg.partition,
-                action="scale_down",
-                statefulset=partition_cfg.worker_statefulset,
-                from_replicas=state.current_replicas,
-                to_replicas=decision.target_replicas,
-                reason=decision.reason,
-                pending_jobs=state.pending_jobs,
-                running_jobs=state.running_jobs,
-                busy_nodes=state.busy_nodes,
-            )
-        else:
-            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="draining").inc()
-            self.logger.emit(
-                "scale_skipped",
-                policy=self.cfg.policy_name,
-                partition=partition_cfg.partition,
-                action="scale_down",
-                statefulset=partition_cfg.worker_statefulset,
-                from_replicas=state.current_replicas,
-                to_replicas=decision.target_replicas,
-                reason="waiting_for_drain",
-                draining_nodes=sorted(draining),
-                pending_jobs=state.pending_jobs,
-                running_jobs=state.running_jobs,
-                busy_nodes=state.busy_nodes,
-            )
-
-    def _do_keep(self, partition_cfg: PartitionConfig, state, decision, key: str,
-                 checkpoint_age: int | None) -> None:
-        _guard_reasons = (
-            "checkpoint_unknown_block_scale_down",
-            "checkpoint_stale_block_scale_down",
-        )
-        if decision.reason in _guard_reasons:
-            _CHECKPOINT_GUARD_BLOCKS_TOTAL.labels(pool=key).inc()
-            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="checkpoint_guard").inc()
-        else:
-            _SCALE_SKIPPED_TOTAL.labels(pool=key, reason="no_action").inc()
-        self.logger.emit(
-            "scale_skipped",
-            policy=self.cfg.policy_name,
-            partition=partition_cfg.partition,
-            action="keep",
-            statefulset=partition_cfg.worker_statefulset,
-            from_replicas=state.current_replicas,
-            to_replicas=decision.target_replicas,
-            reason=decision.reason,
-            checkpoint_age_seconds=checkpoint_age,
-            pending_jobs=state.pending_jobs,
-            running_jobs=state.running_jobs,
-            busy_nodes=state.busy_nodes,
-        )

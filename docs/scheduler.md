@@ -94,7 +94,7 @@ Sim 評估（120 rounds）：UCB1 達到 eval JCT 2.587h（random 3.217h，−19
 - Action：Discrete(17)，16 個 job slot + no-op（job 選擇，不含 placement）
 - Reward：`jct_aligned`（−JCT/scale）或 `shaped`（β_jct·(−JCT/scale) + β_slow·(−log(slowdown))）
 
-**Hierarchical**：D-LinUCB outer loop（小時尺度，選 β_jct × β_slow 9 個 arm）+ DSAC inner loop（per-decision）。`services/rl_scheduler/hierarchical.py`。
+**Hierarchical（archived 2026-05）**：D-LinUCB outer loop（小時尺度，選 β_jct × β_slow 9 個 arm）+ DSAC inner loop（per-decision）。M10 後改用 flat DSAC + RLPD，原始程式碼可在 git history 找到（`git log --all -- services/rl_scheduler/hierarchical.py`）。
 
 **Sim2Real（RLPD）**：offline sim buffer + online live buffer 混合，UTD ratio=4，在 `services/rl_scheduler/rlpd_finetune.py`。
 

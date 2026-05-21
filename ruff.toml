@@ -10,13 +10,7 @@ select = [
     "W605",  # Invalid escape sequence
 ]
 
-# Archived / experimental modules not in the active maintenance path.
 exclude = [
-    "services/rl_scheduler/hierarchical.py",
-    "services/rl_scheduler/ppo_train.py",
-    "services/rl_scheduler/ppo_masked_train.py",
-    "services/rl_scheduler/snapshot_agent.py",
-    "eval/scripts/eval_hierarchical.py",
     "__pycache__",
     ".venv*",
     "runs/",

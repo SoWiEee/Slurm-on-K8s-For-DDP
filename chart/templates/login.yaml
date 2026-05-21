@@ -92,6 +92,18 @@ spec:
               /usr/sbin/sshd
               echo "[login] ready: munged+sshd running"
               tail -f /dev/null
+          # K1 (v5 review): login pod is the user shell home. Without limits a
+          # fork bomb or accidental large allocation can OOM the entire node
+          # and take down the controller alongside. Defaults sized to allow a
+          # comfortable interactive session (4 CPU, 8Gi) while still bounding
+          # blast radius. Override via .Values.login.resources for shared hosts.
+          resources:
+            requests:
+              cpu: {{ .Values.login.resources.requests.cpu | default "200m" | quote }}
+              memory: {{ .Values.login.resources.requests.memory | default "512Mi" | quote }}
+            limits:
+              cpu: {{ .Values.login.resources.limits.cpu | default "4" | quote }}
+              memory: {{ .Values.login.resources.limits.memory | default "8Gi" | quote }}
           ports:
             - containerPort: 22
               name: ssh

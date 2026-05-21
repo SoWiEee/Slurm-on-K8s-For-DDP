@@ -111,6 +111,16 @@ pools:
     devicePluginConfig: rtx4080-exclusive
 
 slurm:
+  # K1 (v5 review): slurmctld in-memory state grows with queue depth. 2Gi limit
+  # covers ~10k concurrent jobs; raise for larger deployments. Pinned to
+  # Guaranteed QoS so slurmctld is not the first thing evicted under pressure.
+  controllerResources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
   # Header values for slurm.conf. Defaults match the current
   # render-core.py output verbatim, so Stage A produces a byte-equivalent
   # ConfigMap. Override per-environment in values-k3s.yaml / values-dev.yaml.
@@ -291,6 +301,47 @@ slurm:
       # GPU-type label sent when the job's --constraint doesn't carry
       # one. Aligns with the predictor's one-hot alphabet.
       defaultGpuType: rtx4070
+    # R19 (v5 review): submit helper — auto-completes --mem / --partition /
+    # --qos when the user didn't set them. All helpers are silently no-op
+    # when disabled or when the user already provided a value.
+    helper:
+      # Master switch. When false, none of the three helpers run.
+      enabled: true
+      # --mem: heuristic memory request when user didn't set --mem.
+      # Computed as gpuCount * memPerGpuMB + cpus * memPerCpuMB, floored
+      # at minMemoryMB. Set memory: false to disable just the --mem helper.
+      memory:
+        enabled: true
+        memPerGpuMB: 4096   # ~half of a typical AI training mini-batch
+        memPerCpuMB: 256
+        minMemoryMB: 1024
+        maxMemoryMB: 65536  # safety cap so a 16-GPU request doesn't blow past node RAM
+      # --partition: route based on tres_per_node GRES content. First match wins.
+      # The fallback partition is used when no GRES match (typically CPU jobs).
+      partition:
+        enabled: true
+        fallback: "cpu"
+        # Each rule: { gres: "<substring>", partition: "<name>" }
+        # Matching is case-insensitive substring on job_desc.tres_per_node.
+        rules:
+          - gres: "gpu:rtx4080"
+            partition: "gpu-rtx4080"
+          - gres: "gpu:rtx4070"
+            partition: "gpu-rtx4070"
+          - gres: "gpu:"           # generic GPU fallback
+            partition: "gpu-rtx4070"
+      # --qos: account → qos mapping. The "default" key is used when the
+      # user's account isn't matched. Empty rules + default="" disables.
+      qos:
+        enabled: true
+        default: "normal"
+        rules:
+          # Example: high-priority account always gets the 'high' qos.
+          # - account: "research"
+          #   qos: "high"
+          # - account: "ci"
+          #   qos: "low"
+          []
 
 # -- Image references (used Stage B onwards) ---------------------------------
 image:
@@ -378,6 +429,16 @@ imagePuller:
 
 # -- Operator (Stage C) ------------------------------------------------------
 operator:
+  # K1 (v5 review): Guaranteed-QoS resource pinning. Defaults sized for the
+  # 1×GPU dev cluster; multi-pool deployments should raise limits.cpu to ≥1
+  # and limits.memory to ≥1Gi (operator caches partition state in memory).
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
   # R21: legacy polling cadence — kept for backwards-compat, used by code
   # paths that still call `time.sleep(poll_interval)` directly. The
   # event-driven loop (default since R21) does not block on this.
@@ -633,6 +694,16 @@ secrets:
 # connect with: ssh -p <nodePort> root@<k3s-host-ip>).
 # Paste one public key per line into authorizedKeys to grant access.
 login:
+  # K1 (v5 review): bound user-shell blast radius. Comfortable for an
+  # interactive session (4 CPU, 8Gi) but stops a fork bomb from taking
+  # the node down. Raise for shared multi-user hosts.
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
   ssh:
     nodePort: 30022
     # One public key per line. Example:

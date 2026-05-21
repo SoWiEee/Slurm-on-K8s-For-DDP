@@ -27,6 +27,10 @@ Reference: docs/scheduler-score-spec.md.
 {{- $rll := $rls.lua | default dict }}
 {{- $wt := .Values.weightTuner | default dict }}
 {{- $wtl := $wt.lua | default dict }}
+{{- $hlp := $js.helper | default dict }}
+{{- $hlpMem := $hlp.memory | default dict }}
+{{- $hlpPart := $hlp.partition | default dict }}
+{{- $hlpQos := $hlp.qos | default dict }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -310,6 +314,38 @@ data:
     end
 
     -- ------------------------------------------------------------------
+    -- R19 (v5 review) — submit helper. Auto-completes --mem / --partition
+    -- / --qos when the user didn't set them. Each helper silently no-ops
+    -- when disabled or when job_desc already carries a user-provided
+    -- value, so this never overrides explicit user intent.
+    -- ------------------------------------------------------------------
+    local HLP_ENABLED       = {{ if $hlp.enabled }}true{{ else }}false{{ end }}
+
+    local HLP_MEM_ENABLED   = {{ if $hlpMem.enabled }}true{{ else }}false{{ end }}
+    local HLP_MEM_PER_GPU   = {{ default 4096 $hlpMem.memPerGpuMB }}
+    local HLP_MEM_PER_CPU   = {{ default 256  $hlpMem.memPerCpuMB }}
+    local HLP_MEM_MIN       = {{ default 1024 $hlpMem.minMemoryMB }}
+    local HLP_MEM_MAX       = {{ default 65536 $hlpMem.maxMemoryMB }}
+
+    local HLP_PART_ENABLED  = {{ if $hlpPart.enabled }}true{{ else }}false{{ end }}
+    local HLP_PART_FALLBACK = {{ default "cpu" $hlpPart.fallback | quote }}
+    local HLP_PART_RULES    = {
+    {{- range $i, $r := default (list) $hlpPart.rules }}
+      { gres = {{ $r.gres | quote }}, partition = {{ $r.partition | quote }} }{{ if lt (add1 $i) (len $hlpPart.rules) }},{{ end }}
+    {{- end }}
+    }
+
+    local HLP_QOS_ENABLED   = {{ if $hlpQos.enabled }}true{{ else }}false{{ end }}
+    local HLP_QOS_DEFAULT   = {{ default "" $hlpQos.default | quote }}
+    local HLP_QOS_RULES     = {
+    {{- range $i, $r := default (list) $hlpQos.rules }}
+      { account = {{ $r.account | quote }}, qos = {{ $r.qos | quote }} }{{ if lt (add1 $i) (len $hlpQos.rules) }},{{ end }}
+    {{- end }}
+    }
+
+{{ .Files.Get "lua/submit_helper.lua" | indent 4 }}
+
+    -- ------------------------------------------------------------------
     -- M11 Phase D — RL scheduler hook. SHADOW_MODE on the serve side
     -- means /decide never returns a non-zero boost; we still call it so
     -- that the live cluster emits decision events for offline analysis.
@@ -343,6 +379,12 @@ data:
 
     function slurm_job_submit(job_desc, part_list, submit_uid)
       log_summary("submit", job_desc)
+
+      -- R19 — submit helper runs FIRST so subsequent steps (score factors,
+      -- predictor, RL) see fully populated job_desc fields. Each helper
+      -- is a no-op if the user already set the field, so this never
+      -- overrides explicit user intent.
+      pcall(apply_submit_helpers, job_desc)
 
       -- Demo path (kept from M2 for plumbing tests).
       if DEMO_BOOST_PRIORITY > 0

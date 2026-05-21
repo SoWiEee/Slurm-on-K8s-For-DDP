@@ -1,0 +1,222 @@
+{
+  "uid": "slurm-k8s-per-job-gpu",
+  "title": "Per-Job GPU Profile (DCGM + OTel)",
+  "description": "R20 (v5 review) — per-job × per-GPU × full-lifecycle profile. Drill-down view scoped by $hostname (the worker node Slurm allocated to the job) and $job_id (used to deep-link into Tempo traces). DCGM metrics are per-host/per-GPU (the dcgm-exporter does not carry slurm_job_id labels by default); operator provisioning-latency exemplars link to the OTel trace so the user can pivot to the full job lifecycle span tree.",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "tags": ["slurm", "gpu", "dcgm", "otel", "per-job"],
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "GPU Utilisation (cluster-wide)",
+      "url": "/d/slurm-k8s-gpu",
+      "type": "link",
+      "icon": "external link"
+    },
+    {
+      "title": "K8s Elastic Operator",
+      "url": "/d/slurm-k8s-operator",
+      "type": "link",
+      "icon": "external link"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "hostname",
+        "label": "Worker node",
+        "description": "DCGM Hostname label. Pick the Slurm worker pod that ran your job (e.g. slurm-worker-gpu-rtx4070-0). Find it via `squeue -j <jobid> -o '%N'`.",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(DCGM_FI_DEV_GPU_UTIL, Hostname)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "sort": 1
+      },
+      {
+        "name": "gpu",
+        "label": "GPU index",
+        "description": "Per-host GPU ordinal (0..N-1). Set to .* to show all GPUs on the host.",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(DCGM_FI_DEV_GPU_UTIL{Hostname=\"$hostname\"}, gpu)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "sort": 3
+      },
+      {
+        "name": "job_id",
+        "label": "Slurm job_id",
+        "description": "Used to deep-link into Tempo. Set freely; this dashboard does not query Slurm by job_id (slurm-exporter exposes aggregate metrics only — drill into Tempo for per-job trace).",
+        "type": "textbox",
+        "current": { "value": "" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Job context (lookup via Slurm CLI)",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "text",
+      "title": "How to use this dashboard",
+      "gridPos": { "x": 0, "y": 1, "w": 24, "h": 4 },
+      "options": {
+        "mode": "markdown",
+        "content": "1. **Find your job's worker node**: `squeue -j $job_id -o '%N'` (or check `sacct -j $job_id`)\n2. Pick that hostname in the **Worker node** dropdown above; leave **GPU index** as `All` unless you only want one device.\n3. Type the Slurm `job_id` in the textbox to populate the **Open Tempo trace** link panel below.\n4. The GPU panels show DCGM SM%/VRAM/copy-util/power/temp for the selected host across the time window — overlay your job's [start, end] times to read its profile.\n5. The provisioning-latency panel shows operator scale-up events; click any **exemplar dot** to jump into the OTel trace for that decision in Tempo."
+      }
+    },
+    {
+      "id": 3,
+      "type": "row",
+      "title": "GPU profile — $hostname (gpu=$gpu)",
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "SM Utilisation (%)",
+      "description": "DCGM_FI_DEV_GPU_UTIL — true streaming-multiprocessor busy percentage. Sustained < 40% suggests compute-bound bottlenecks elsewhere (data pipeline, all-reduce, ckpt I/O).",
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100, "color": { "mode": "palette-classic" } }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL{Hostname=\"$hostname\",gpu=~\"$gpu\"}",
+          "legendFormat": "gpu={{gpu}} {{modelName}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "VRAM Used (MiB)",
+      "description": "DCGM_FI_DEV_FB_USED — frame-buffer in use. Compare against device total for over/under-provisioning analysis.",
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "decmbytes", "min": 0, "color": { "mode": "palette-classic" } }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED{Hostname=\"$hostname\",gpu=~\"$gpu\"}",
+          "legendFormat": "gpu={{gpu}} used",
+          "refId": "A"
+        },
+        {
+          "expr": "DCGM_FI_DEV_FB_FREE{Hostname=\"$hostname\",gpu=~\"$gpu\"}",
+          "legendFormat": "gpu={{gpu}} free",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Memory Copy Util (%)",
+      "description": "DCGM_FI_DEV_MEM_COPY_UTIL — memory-controller busy ratio. High values during DDP all-reduce phases indicate bandwidth-bound training.",
+      "gridPos": { "x": 0, "y": 14, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_MEM_COPY_UTIL{Hostname=\"$hostname\",gpu=~\"$gpu\"}",
+          "legendFormat": "gpu={{gpu}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Power Draw (W)",
+      "description": "DCGM_FI_DEV_POWER_USAGE — current board power. Useful for spotting throttling (sustained at TDP limit) or idle waste.",
+      "gridPos": { "x": 8, "y": 14, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "watt", "min": 0 } },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_POWER_USAGE{Hostname=\"$hostname\",gpu=~\"$gpu\"}",
+          "legendFormat": "gpu={{gpu}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Temperature (°C)",
+      "description": "DCGM_FI_DEV_GPU_TEMP — die temperature. Sustained > 85 °C on consumer cards (RTX 4070) suggests airflow problems.",
+      "gridPos": { "x": 16, "y": 14, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "celsius", "min": 0 } },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP{Hostname=\"$hostname\",gpu=~\"$gpu\"}",
+          "legendFormat": "gpu={{gpu}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Job lifecycle (operator + OTel)",
+      "gridPos": { "x": 0, "y": 21, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Pool provisioning latency (p95) — click exemplar dot to open Tempo trace",
+      "description": "slurm_operator_provisioning_latency_seconds_bucket — wall-clock seconds from scale_up_decision to pod readyReplicas reaching target, per pool. Exemplars carry the OTel traceID and link directly into Tempo so you can see the full submit → queue → running → provisioning span tree.",
+      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 } },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["max", "mean"] }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(slurm_operator_provisioning_latency_seconds_bucket[5m])) by (le, pool))",
+          "legendFormat": "p95 {{pool}}",
+          "refId": "A",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "text",
+      "title": "Open Tempo trace for job_id=$job_id",
+      "gridPos": { "x": 0, "y": 30, "w": 24, "h": 4 },
+      "options": {
+        "mode": "markdown",
+        "content": "**[Search Tempo for traces tagged `job_id=$job_id`](/explore?left=%5B%22now-3h%22,%22now%22,%22tempo%22,%7B%22queryType%22:%22traceqlSearch%22,%22filters%22:%5B%7B%22id%22:%221%22,%22tag%22:%22job_id%22,%22operator%22:%22%3D%22,%22value%22:%5B%22$job_id%22%5D,%22valueType%22:%22string%22%7D%5D%7D%5D)** — opens Grafana Explore with Tempo TraceQL pre-filled. Requires Phase 7-A (monitoring.otel.enabled=true) and a job_id span attribute on the root span emitted by serve.py's /decide handler.\n\nFor the operator's view of this job (scale_up_decision + k8s_provisioning spans), exemplars on the p95 latency panel above will deep-link into the same trace."
+      }
+    }
+  ]
+}
