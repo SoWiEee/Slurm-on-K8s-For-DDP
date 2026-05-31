@@ -75,52 +75,36 @@ demand rises and falls.
 
 # 🚀 Getting Started
 
-部署統一使用 Helm，baseline 在 `chart/values.yaml`（Kind dev / 無 GPU），生產環境用 `chart/values-k3s.yaml` overlay。
+部署統一使用 Helm；目前實機部署固定以 Linux + k3s + GPU 為目標，主要 values 使用 `chart/values-k3s.yaml`。`chart/values.yaml` 保留為 chart default，不作為目前的實際部署路徑。
 
 > Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，獨立用 `scripts/install-gpu-operator.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
 
 > 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 580 ✅️
 
-## 1. 主機準備
+## 1. 準備 k3s/GPU 部署前置資源
 
-安裝 NVIDIA Container Toolkit + k3s + helm，並複製 kubeconfig：
+`deploy-1.sh` 會整合原本部署步驟 1~4，並輸出時間戳 log：
+
+- 檢查 Linux、NVIDIA driver、Docker、k3s、kubectl、Helm 與 kubeconfig
+- 建置 controller、worker、operator、slurm-exporter 映像
+- 匯入映像到 k3s containerd
+- 建立或重用 munge、ssh、JWT secrets（由 deploy-1.sh 內建處理）
+- 套用 NVIDIA RuntimeClass 與 Slurm accounting backend（mysql + slurmdbd）
 
 ```bash
-sudo bash scripts/setup-linux-gpu.sh
 export KUBECONFIG=~/.kube/config
-
-nvidia-smi
-kubectl get nodes
-helm version --short    # 需要 v3.16+
+bash scripts/deploy-1.sh
 ```
 
-## 2. 建置容器映像並匯入 k3s
+若主機尚未完成 Linux + k3s + GPU 基礎安裝，先執行 `sudo bash scripts/setup-linux-gpu.sh --k3s`。一般重跑部署時可用下列環境變數略過已完成的階段：
 
 ```bash
-docker build -t slurm-controller:latest         -f docker/controller/Dockerfile         docker/controller
-docker build -t slurm-worker:latest             -f docker/worker/Dockerfile             docker/worker
-docker build -t slurm-elastic-operator:latest   -f docker/operator/Dockerfile           .
-docker build -t slurm-exporter:latest           -f docker/slurm-exporter/Dockerfile     docker/slurm-exporter
-
-for img in slurm-controller:latest slurm-worker:latest slurm-elastic-operator:latest slurm-exporter:latest; do
-  docker save "$img" | sudo k3s ctr images import -
-done
+SKIP_BUILD=1 SKIP_IMPORT=1 bash scripts/deploy-1.sh
+SKIP_SECRETS=1 SKIP_PREREQS=1 bash scripts/deploy-1.sh
+REGENERATE_SECRETS=true SKIP_BUILD=1 SKIP_IMPORT=1 SKIP_PREREQS=1 bash scripts/deploy-1.sh
 ```
 
-## 3. 建立 secrets (munge/ssh/JWT)
-
-```bash
-bash scripts/create-secrets.sh
-```
-
-## 4. 套用必要的 cluster-scoped 資源 + accounting 後端
-
-```bash
-kubectl apply -f manifests/gpu/runtime-class.yaml          # NVIDIA RuntimeClass（GPU pool 用）
-kubectl apply -f manifests/core/slurm-accounting.yaml      # mysql + slurmdbd（chart 之外的 prerequisite）
-```
-
-## 5. 主機 NFS server + LAN exports (Optional)
+## 2. 主機 NFS server + LAN exports (Optional)
 
 ```bash
 sudo bash scripts/setup-nfs-server.sh
@@ -128,7 +112,7 @@ cat /etc/exports                       # 必須含 pod CIDR (10.0.0.0/8) AND LAN
 sudo exportfs -ra
 ```
 
-## 6. 透過 Helm 部署整套平台
+## 3. 透過 Helm 部署整套平台
 
 ```bash
 helm install slurm-platform ./chart \
@@ -161,7 +145,7 @@ helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm \
   --set monitoring.otel.enabled=true
 ```
 
-## 7. 安裝 NVIDIA GPU Operator
+## 4. 安裝 NVIDIA GPU Operator
 
 ```bash
 bash scripts/install-gpu-operator.sh    # 進 gpu-operator namespace，PSS=privileged
@@ -169,7 +153,7 @@ bash scripts/install-gpu-operator.sh    # 進 gpu-operator namespace，PSS=privi
 
 腳本是 idempotent 的，重跑等於 helm upgrade。`--set driver.enabled=false --set toolkit.enabled=false` 因為 host 已經由 setup-linux-gpu.sh 裝好驅動。
 
-## 8. 驗證
+## 5. 驗證
 
 ```bash
 KUBE_CONTEXT=default bash scripts/verify-helm.sh           # chart 渲染 + dry-run + helm-unittest
@@ -180,7 +164,7 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
-## 9. DRL Scheduler
+## 6. DRL Scheduler
 
 > 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
 
@@ -325,7 +309,7 @@ sudo systemctl stop nfs-kernel-server
 
 ## 部署監控
 
-`monitoring.enabled=true`（k3s overlay 預設打開，Kind baseline 預設關閉）。
+`monitoring.enabled=true`（k3s overlay 預設打開；chart default 預設關閉）。
 
 ```bash
 # 存取 Grafana

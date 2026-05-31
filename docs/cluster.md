@@ -119,7 +119,7 @@ graph TD
 |------|------|------|
 | 0. 系統 / GPU driver | `bash scripts/setup-linux-gpu.sh` | 安裝 nvidia-driver + container-toolkit + 設 k3s default runtime |
 | 1. NFS server | `sudo bash scripts/setup-nfs-server.sh` | host 上 export `/srv/nfs/k8s` |
-| 2. Secrets | `bash scripts/create-secrets.sh` | munge / ssh / jwt / mysql Secret |
+| 2. Secrets | `bash scripts/deploy-1.sh` | munge / ssh / jwt / mysql Secret |
 | 3. GPU Operator | `DEFAULT_CONFIG_KEY=rtx4070-mps bash scripts/install-gpu-operator.sh` | 安裝 NVIDIA GPU Operator（獨立 helm release） |
 | 4. Slurm 平台 | `helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm` | 一鍵部署 controller / workers / login / operator / exporter / monitoring / storage |
 | 5. Accounting（暫時保留） | `kubectl apply -f manifests/core/slurm-accounting.yaml` | slurmdbd + mysql + 對應 Secret，尚未併入 chart |
@@ -287,7 +287,7 @@ NetworkPolicy 已預留 `app=slurmdbd`、`app=mysql` 的選擇器，因此搭配
 
 ### 3.4 Secrets
 
-由 `scripts/create-secrets.sh` 建立，chart 不渲染 secret 物件、僅以
+由 `scripts/deploy-1.sh` 建立，chart 不渲染 secret 物件、僅以
 `projected volume` 掛載：
 
 | Secret | 內容 | 用途 | 掛載對象 |
@@ -826,7 +826,7 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
 | `slurm-ddp-runtime` | ConfigMap | chart | DDP runtime helper |
 | `slurm-modulefile-{openmpi,python3,cuda}` | ConfigMap | manifests/core/lmod-modulefiles.yaml | Lmod modulefile |
 | `slurmdbd-config`, `mysql-initdb` | ConfigMap | manifests/core/slurm-accounting.yaml | accounting config |
-| `slurm-munge-key` / `slurm-ssh-key` / `slurm-jwt-secret` / `slurm-mysql-secret` | Secret | scripts/create-secrets.sh | 認證金鑰 |
+| `slurm-munge-key` / `slurm-ssh-key` / `slurm-jwt-secret` / `slurm-mysql-secret` | Secret | scripts/deploy-1.sh + manifests/core/slurm-accounting.yaml | 認證金鑰 |
 | `slurm-elastic-operator` | ServiceAccount + Role + RoleBinding | chart | namespace-scoped RBAC |
 | `*-pdb` × 7 | PodDisruptionBudget | chart | controller=minAvailable 1；workers=maxUnavailable 1 等 |
 | 16 條 NetworkPolicy | NetworkPolicy | chart | 詳見 §8 |

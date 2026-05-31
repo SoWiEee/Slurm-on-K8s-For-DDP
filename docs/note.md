@@ -516,7 +516,7 @@ E7 兩次撞死結之後，我認為 operator 有一個值得加的功能：**in
 - **GPU Operator 的 driver / toolkit 子模組關掉**：host 已用 `apt install nvidia-driver-535` + `nvidia-container-toolkit` 裝好，重複裝會撞。Operator 只負責 device-plugin、MPS daemon、DCGM exporter（可選）、gpu-feature-discovery、node-feature-discovery。
 - 自寫的 `manifests/gpu/nvidia-device-plugin.yaml` + `manifests/gpu/mps-daemonset.yaml` 廢棄。
 - `slurm.conf` ConfigMap 拆成 **`slurm-config-static`**（ClusterName / Auth / Plugin / AccountingStorageTRES，幾乎不變）+ **`slurm-config-nodes`**（NodeName / PartitionName，每次 pool 變動都重產）。worker 只 mount 後者 → 改一個 pool 的 `maxReplicas` 不會 rolling restart 全部 worker。
-- secret（munge.key / slurm-jwt-key）**不由 chart 產生**，install 前要先跑 `scripts/create-secrets.sh`（chart 用 `helm.sh/hook-pre-install` 檢查存在性即可）。
+- secret（munge.key / slurm-jwt-key）**不由 chart 產生**，install 前要先跑 `scripts/deploy-1.sh`（chart 用 `helm.sh/hook-pre-install` 檢查存在性即可）。
 
 ### Chart 目錄結構
 

@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# setup-linux-gpu.sh — Linux host prerequisites for GPU + MPS
+# setup-linux-gpu.sh - Linux host prerequisites for GPU + MPS
 #
-# Run ONCE on the Linux host (as root) before bootstrap.sh.
-# Installs: NVIDIA Container Toolkit, configures containerd runtime,
-# optionally installs k3s.
+# Run ONCE on the Linux host (as root) if the host is not already ready.
+# Installs NVIDIA Container Toolkit, configures the containerd runtime,
+# and can install k3s when requested.
 #
 # Usage:
-#   sudo bash scripts/setup-linux-gpu.sh             # NVIDIA CT + configure containerd
-#   sudo bash scripts/setup-linux-gpu.sh --k3s       # also install k3s
-#   sudo bash scripts/setup-linux-gpu.sh --k3s --kind # install k3s AND configure Kind GPU
+#   sudo bash scripts/setup-linux-gpu.sh        # NVIDIA CT + configure containerd
+#   sudo bash scripts/setup-linux-gpu.sh --k3s  # also install k3s when missing
 
 set -euo pipefail
 
 INSTALL_K3S=${INSTALL_K3S:-false}
-INSTALL_KIND_GPU=${INSTALL_KIND_GPU:-false}
 for arg in "$@"; do
   case "$arg" in
     --k3s) INSTALL_K3S=true ;;
-    --kind) INSTALL_KIND_GPU=true ;;
+    *)
+      echo "Unknown argument: $arg" >&2
+      echo "Usage: sudo bash scripts/setup-linux-gpu.sh [--k3s]" >&2
+      exit 1
+      ;;
   esac
 done
 
@@ -65,16 +67,12 @@ fi
 echo ""
 echo "=== [3] Configuring container runtime ==="
 
-if [[ "$INSTALL_K3S" == "true" ]]; then
-  # k3s uses containerd; configure before k3s install so it picks up the runtime.
-  nvidia-ctk runtime configure --runtime=containerd --config=/etc/containerd/config.toml
-  echo "containerd configured for NVIDIA (k3s path)"
-else
-  # Docker (used by Kind).
-  nvidia-ctk runtime configure --runtime=docker
-  systemctl restart docker
-  echo "Docker configured for NVIDIA"
+# k3s uses containerd; configure before k3s install so it picks up the runtime.
+nvidia-ctk runtime configure --runtime=containerd --config=/etc/containerd/config.toml
+if systemctl is-active --quiet k3s 2>/dev/null; then
+  systemctl restart k3s
 fi
+echo "containerd configured for NVIDIA (k3s path)"
 
 # ---------------------------------------------------------------------------
 # Step 4 (optional): Install k3s with NVIDIA runtime
@@ -105,7 +103,7 @@ if [[ "$INSTALL_K3S" == "true" ]]; then
     chmod 600 "${HOME}/.kube/config"
 
     echo "k3s installed. Kubeconfig: ${HOME}/.kube/config"
-    echo "Context: default (use KUBE_CONTEXT=default with bootstrap.sh)"
+    echo "Context: default (use KUBECONFIG=~/.kube/config with deploy-1.sh)"
     echo "NOTE: if you ran this with sudo, copy kubeconfig to your user home:"
     echo "  mkdir -p ~/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config"
     echo "  sudo chown \$(id -u):\$(id -g) ~/.kube/config && chmod 600 ~/.kube/config"
@@ -117,30 +115,14 @@ if [[ "$INSTALL_K3S" == "true" ]]; then
   kubectl get nodes
 fi
 
-# ---------------------------------------------------------------------------
-# Step 5 (optional): Kind GPU config hint
-# ---------------------------------------------------------------------------
-if [[ "$INSTALL_KIND_GPU" == "true" ]]; then
-  echo ""
-  echo "=== [5] Kind GPU config ==="
-  echo "Use kind-config-gpu.yaml when creating the Kind cluster:"
-  echo "  KIND_CONFIG=kind-config-gpu.yaml bash scripts/bootstrap.sh"
-  echo ""
-  echo "The config mounts /dev/nvidia* and sets runtimeClassName to nvidia."
-fi
-
 echo ""
 echo "=== Host GPU setup complete ==="
 echo ""
 echo "Next steps:"
-if [[ "$INSTALL_K3S" == "true" ]]; then
-  echo "  K8S_RUNTIME=k3s REAL_GPU=true bash scripts/bootstrap.sh"
-  echo "  bash scripts/bootstrap-gpu.sh   # device-plugin (sharing.mps built-in)"
-  echo ""
-  echo "  # Label each GPU node so device-plugin picks the right sharing config:"
-  echo "  kubectl label node <RTX4070-NODE> nvidia.com/device-plugin.config=rtx4070-mps"
-  echo "  kubectl label node <RTX4080-NODE> nvidia.com/device-plugin.config=rtx4080-exclusive"
-else
-  echo "  KIND_CONFIG=kind-config-gpu.yaml bash scripts/bootstrap.sh"
-  echo "  bash scripts/bootstrap-gpu.sh"
-fi
+echo "  export KUBECONFIG=~/.kube/config"
+echo "  bash scripts/deploy-1.sh"
+echo "  helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm --create-namespace"
+echo ""
+echo "Optional GPU node labels for per-model MPS/exclusive policies:"
+echo "  kubectl label node <RTX4070-NODE> nvidia.com/device-plugin.config=rtx4070-mps"
+echo "  kubectl label node <RTX4080-NODE> nvidia.com/device-plugin.config=rtx4080-exclusive"

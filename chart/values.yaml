@@ -675,7 +675,7 @@ storage:
     image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
     pullPolicy: IfNotPresent
 
-# -- Pre-existing secrets (created by scripts/create-secrets.sh, not by chart)
+# -- Pre-existing secrets (created by scripts/deploy-1.sh, not by chart)
 secrets:
   munge: slurm-munge-key
   jwt: slurm-jwt-secret
