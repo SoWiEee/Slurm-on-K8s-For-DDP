@@ -1,5 +1,7 @@
 __pycache__/
 .claude/
+.pytest_cache/
+.ruff_cache/
 CLAUDE.md
 sim/data/out/
 sim/data/philly_subsample.json
