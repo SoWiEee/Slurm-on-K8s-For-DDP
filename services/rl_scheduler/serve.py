@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import uvicorn
 from fastapi import FastAPI, HTTPException
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -582,6 +581,7 @@ def main(argv=None) -> int:
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
     )
     RL_READY.set(1.0)
+    import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
