@@ -20,6 +20,7 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 │                                                                 │
 │  slurm-exporter  ──→  /metrics（Slurm queue / node states）    │
 │  slurm-elastic-operator  ──→  /metrics（scale events, guard）  │
+│  rl-scheduler  ──→  /metrics（DSAC decisions / live mode）     │
 │  nvidia-dcgm-exporter（gpu-operator ns）──→ /metrics（GPU SM/VRAM）│
 └────────────────────────────┬────────────────────────────────────┘
                              │ scrape
@@ -33,7 +34,8 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 │    ├─ Bridge Overview Dashboard（主 demo 看板）                  │
 │    ├─ Slurm Cluster State Dashboard                            │
 │    ├─ K8s Operator Dashboard                                   │
-│    └─ GPU Utilisation (DCGM) Dashboard                         │
+│    ├─ GPU Utilisation (DCGM) Dashboard                         │
+│    └─ Scheduler Live Resource View（DSAC / queue / MPS）        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -133,6 +135,37 @@ monitoring:
 DCGM 指標補上了 Slurm-only monitoring 的盲點：Slurm 知道「GPU 被分配」，
 但不知道該 GPU 是否真的在算、VRAM 是否接近 OOM、或是否只是 idle allocation。
 
+### 5. RL Scheduler / DSAC Metrics
+
+- 來源：自製（`services/rl_scheduler/serve.py`）
+- 部署方式：`rl-scheduler` Deployment，部署於 `slurm` namespace，透過 `/snapshot` 接收 cluster snapshot，透過 `/decide` 讓 Slurm `job_submit.lua` 取得 DSAC priority boost。
+- 監控用途：確認 RL 是否真的處於 live mode、是否有對 job 做出 boost、snapshot 是否過期，以及最近一次 DSAC 選到的 job / node / GPU。
+
+**Port：** `8002`（`/metrics` endpoint）
+
+核心 metrics：
+
+| Metric | 類型 | 說明 |
+|--------|------|------|
+| `rl_scheduler_ready` | Gauge | DSAC model 是否已載入，1 表示 ready |
+| `rl_scheduler_shadow_mode` | Gauge | 1 表示 shadow mode，0 表示 live mode |
+| `rl_scheduler_decisions_total` | Counter | DSAC 決策次數，label: `result=selected/no_boost/abstain` |
+| `rl_scheduler_priority_boost_total` | Counter | 回傳正 priority boost 的累積次數 |
+| `rl_scheduler_last_priority_boost` | Gauge | 最近一次 `/decide` 回傳的 priority boost |
+| `rl_scheduler_policy_value` | Gauge | 最近一次 DSAC decision 的 value estimate |
+| `rl_scheduler_policy_entropy` | Gauge | 最近一次 DSAC policy entropy |
+| `rl_scheduler_snapshot_age_seconds` | Gauge | 目前 cached snapshot 的年齡秒數 |
+| `rl_scheduler_snapshot_pending_jobs` | Gauge | snapshot 中 pending jobs 數 |
+| `rl_scheduler_snapshot_free_mps` | Gauge | snapshot 中可用 MPS slot 總量 |
+| `rl_scheduler_last_action` | Gauge | 最近一次 DSAC 選到的 flat action index |
+| `rl_scheduler_last_job_index` | Gauge | 最近一次 DSAC 選到的 job slot，no-op / abstain 為 -1 |
+| `rl_scheduler_last_node_index` | Gauge | 最近一次 DSAC 選到的 node index，no-op / abstain 為 -1 |
+| `rl_scheduler_last_gpu_index` | Gauge | 最近一次 DSAC 選到的 GPU index，no-op / abstain 為 -1 |
+
+Prometheus 從 `monitoring` namespace scrape `rl-scheduler.slurm.svc.cluster.local:8002`。
+因為 `slurm` namespace 有 default-deny NetworkPolicy，chart 也會建立
+`allow-prometheus-scrape-rl-scheduler`，放行 Prometheus 到 `rl-scheduler:8002` 的 ingress。
+
 ---
 
 ## 檔案結構
@@ -169,6 +202,7 @@ chart/
     ├── gpu.json                           # GPU Utilisation (DCGM) — cluster-wide
     ├── operator.json                      # K8s Elastic Operator
     ├── per-job-gpu.json                   # R20 (v5) Per-Job GPU Profile (DCGM + OTel)
+    ├── scheduler-live.json                # Scheduler Live Resource View (DSAC / queue / MPS)
     └── sla-efficiency.json                # SLA / efficiency
 ```
 
@@ -244,6 +278,29 @@ chart/
 
 這個 dashboard 對應 Slinky/SUNK/ParallelCluster 都沒有的「single-job lifecycle drill-down」差異化功能，請見 [`docs/review.md §4.2`](review.md)。
 
+### Scheduler Live Resource View
+
+`chart/dashboards/scheduler-live.json`，dashboard uid `slurm-scheduler-live`，title 為
+`Scheduler Live Resource View`。這個 dashboard 是給一般使用者看的 live 資源流向面板，第一排用非圖表的流程圖呈現：
+
+```text
+Submit → DSAC → Priority → Workers
+```
+
+**Panels：**
+
+- Resource Flow：用圖示式流程區塊說明 job 從 `sbatch`、DSAC 決策、priority boost 到 worker 執行的路徑
+- Pending / Running / Oldest Wait：`slurm_queue_pending`、`slurm_queue_running`、`slurm_job_queue_oldest_wait_seconds`
+- DSAC Live Mode：`1 - rl_scheduler_shadow_mode`，確認目前不是 shadow mode
+- Last Priority Boost：`rl_scheduler_last_priority_boost`
+- Snapshot Age：`rl_scheduler_snapshot_age_seconds`
+- DSAC Decisions：`increase(rl_scheduler_decisions_total{result=...}[5m])`
+- Last DSAC Action：`rl_scheduler_last_job_index`、`rl_scheduler_last_node_index`、`rl_scheduler_last_gpu_index`
+- DSAC Confidence Signals：`rl_scheduler_policy_value`、`rl_scheduler_policy_entropy`
+- Free MPS Slots in Snapshot：`rl_scheduler_snapshot_free_mps`
+- GPU Utilization and VRAM：`DCGM_FI_DEV_GPU_UTIL`、`DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_TOTAL`
+- Worker Replicas and Ready Ratio：`slurm_operator_current_replicas`、`slurm_operator_pods_ready`
+
 ---
 
 ## Prometheus Scrape Config
@@ -258,6 +315,10 @@ scrape_configs:
   - job_name: slurm-operator
     static_configs:
       - targets: ['slurm-elastic-operator.slurm.svc.cluster.local:8000']
+
+  - job_name: rl-scheduler
+    static_configs:
+      - targets: ['rl-scheduler.slurm.svc.cluster.local:8002']
 
   - job_name: kube-state-metrics
     static_configs:
@@ -311,6 +372,23 @@ curl -s http://localhost:9400/metrics | grep -E 'DCGM_FI_DEV_GPU_UTIL|DCGM_FI_DE
 # Prometheus 查詢
 kubectl -n monitoring port-forward svc/prometheus 9090:9090
 # 在 Prometheus UI 查 DCGM_FI_DEV_GPU_UTIL / DCGM_FI_DEV_FB_USED
+```
+
+### RL Scheduler / DSAC 驗證
+
+```bash
+# 直接看 raw metrics
+kubectl -n slurm port-forward svc/rl-scheduler 8002:8002
+curl -s http://localhost:8002/metrics | grep rl_scheduler
+
+# Prometheus 查詢
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+# 在 Prometheus UI 查：
+#   rl_scheduler_ready
+#   rl_scheduler_shadow_mode
+#   rl_scheduler_decisions_total
+#   rl_scheduler_last_priority_boost
+#   rl_scheduler_snapshot_free_mps
 ```
 
 ---
