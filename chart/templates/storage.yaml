@@ -13,7 +13,7 @@ core Slurm pods can mount it once Stage F wires that up.
 
 Why a separate namespace: the provisioner needs an emptyDir-like host
 mount for the NFS root, but we want PSS=baseline on cluster.namespace —
-matching the legacy bootstrap-storage.sh layout keeps audit posture
+matching the chart-managed storage layout keeps audit posture
 unchanged after the migration.
 
 helm.sh/resource-policy=keep on the StorageClass prevents `helm

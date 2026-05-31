@@ -1,7 +1,7 @@
 -- Phase 6 M3: unit tests for chart/templates/configmap-job-submit.yaml
 --
 -- Pure-lua, no busted / luarocks dependency. Run via:
---   bash scripts/verify-score-tests.sh
+--   lua tests/lua/score_test.lua
 -- which renders the lua from the chart, copies this file + the rendered
 -- lua into the controller pod, and runs `lua5.2 score_test.lua`.
 --

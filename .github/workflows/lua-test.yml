@@ -6,7 +6,7 @@ name: lua-test
 # Both modules are pure-Lua and require no external services.
 #
 # score_test.lua is excluded: it requires a rendered chart + running
-# controller pod (covered by verify-score-tests.sh on the k3s host).
+# controller pod (covered by scripts/verify-live.sh on the k3s host).
 
 on:
   push:

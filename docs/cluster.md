@@ -120,10 +120,10 @@ graph TD
 | 0. 系統 / GPU driver | `bash scripts/setup-linux-gpu.sh` | 安裝 nvidia-driver + container-toolkit + 設 k3s default runtime |
 | 1. NFS server | `sudo bash scripts/setup-nfs-server.sh` | host 上 export `/srv/nfs/k8s` |
 | 2. Secrets | `bash scripts/deploy-1.sh` | munge / ssh / jwt / mysql Secret |
-| 3. GPU Operator | `DEFAULT_CONFIG_KEY=rtx4070-mps bash scripts/install-gpu-operator.sh` | 安裝 NVIDIA GPU Operator（獨立 helm release） |
+| 3. 平台 + GPU Operator + DSAC | `bash scripts/deploy-2.sh` | 一次收斂 Helm chart、GPU Operator 與 live DSAC scheduler |
 | 4. Slurm 平台 | `helm install slurm-platform ./chart -f chart/values-k3s.yaml -n slurm` | 一鍵部署 controller / workers / login / operator / exporter / monitoring / storage |
 | 5. Accounting（暫時保留） | `kubectl apply -f manifests/core/slurm-accounting.yaml` | slurmdbd + mysql + 對應 Secret，尚未併入 chart |
-| 6. Lmod | `bash scripts/bootstrap-lmod.sh` | 在 NFS 上佈署 modulefiles + sample job |
+| 6. Lmod | `bash scripts/verify-live.sh` | Lmod 已由 chart 整合，live 驗證會檢查 module load/purge |
 
 ---
 
@@ -370,7 +370,7 @@ flowchart TD
 
 ## 5. GPU Operator + MPS（gpu-operator namespace）
 
-由 NVIDIA 官方 helm chart `nvidia/gpu-operator` 安裝（`scripts/install-gpu-operator.sh`，**獨立 helm release，不在 slurm-platform chart 內**），但 chart 仍負責：
+由 `scripts/deploy-2.sh` 透過 NVIDIA 官方 helm chart `nvidia/gpu-operator` 安裝（**獨立 helm release，不在 slurm-platform chart 內**），但 chart 仍負責：
 
 - 建立 `gpu-operator` namespace（`pod-security.kubernetes.io/enforce: privileged`），加上 `helm.sh/resource-policy: keep`
 - 寫入 device-plugin 設定 ConfigMap `slurm-platform-device-plugin-config`（key: `default`、`rtx4070-mps`、`rtx4080-exclusive`）
@@ -486,7 +486,7 @@ flowchart LR
 /shared/
 ├── jobs/             # job 輸出（sbatch --output / --error）
 ├── checkpoints/      # 訓練 checkpoint
-├── modulefiles/      # bootstrap-lmod.sh 寫入 + ConfigMap 同步
+├── modulefiles/      # chart ConfigMap 同步
 └── scripts/          # 使用者自己的 sbatch script
 ```
 
@@ -753,7 +753,7 @@ kubectl get nodes --show-labels | grep gpu-host-class
 `values-k3s.yaml` 已啟用 GPU Operator 相關設定；`values-2x2.yaml` 只調整 Slurm worker pools。套用前確認：
 
 ```bash
-DEFAULT_CONFIG_KEY=rtx4070-mps bash scripts/install-gpu-operator.sh
+bash scripts/deploy-2.sh
 kubectl -n gpu-operator get daemonset,pod
 kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
 ```

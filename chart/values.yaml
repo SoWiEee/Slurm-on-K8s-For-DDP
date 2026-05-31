@@ -346,7 +346,7 @@ image:
 # This chart only renders the device-plugin-config ConfigMap and the
 # post-install Job that labels GPU nodes. NVIDIA GPU Operator itself is
 # installed separately into its own namespace via
-# `scripts/install-gpu-operator.sh`; see Chart.yaml notes.
+# `scripts/deploy-2.sh`; see Chart.yaml notes.
 gpu:
   enabled: false                                   # Kind dev mode: GPU off
   autoLabel: true                                  # post-install Job to apply
@@ -355,7 +355,7 @@ gpu:
   # Namespace where NVIDIA GPU Operator's components live. The
   # device-plugin-config ConfigMap is created here (not in cluster.namespace)
   # because GPU Operator's device-plugin DaemonSet only reads ConfigMaps
-  # from its own namespace. install-gpu-operator.sh creates this namespace
+  # from its own namespace. deploy-2.sh creates this namespace
   # too, but we also create it from the chart so install order is flexible.
   targetNamespace: gpu-operator
   # PodSecurity standard for the gpu-operator namespace. Must be
@@ -627,7 +627,7 @@ monitoring:
     scrapeIntervalSeconds: 15
   # R5: scrape the GPU Operator's bundled DCGM exporter for true SM% / VRAM /
   # Tensor Core utilisation. The DCGM DaemonSet is enabled by
-  # scripts/install-gpu-operator.sh (`--set dcgmExporter.enabled=true`); this
+  # scripts/deploy-2.sh (`--set dcgmExporter.enabled=true`); this
   # block only wires Prometheus to the Service it creates. Disable if running
   # without GPUs.
   dcgmExporter:
@@ -664,7 +664,7 @@ storage:
   storageClassName: slurm-shared-nfs
   # Provisioner identifier baked into the StorageClass + Deployment env. Must
   # match an EXISTING cluster's value when re-installing on top of a legacy
-  # bootstrap-storage.sh deploy — provisioner names are immutable on
+  # chart deploy — provisioner names are immutable on
   # StorageClass, so changing this would force a teardown of all PVs/PVCs.
   provisionerName: k8s-sigs.io/slurm-nfs-subdir-external-provisioner
   sharedPvc:

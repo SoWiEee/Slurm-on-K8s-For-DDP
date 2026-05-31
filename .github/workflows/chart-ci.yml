@@ -10,7 +10,7 @@ name: chart-ci
 # CI: the chart now uses CRDs shipped by GPU Operator (NFD's NodeFeatureRule
 # from R4) and would need a matching cluster fixture, which doesn't match
 # the production target (k3s + RTX 4070, see docs/cluster.md). The
-# maintainer runs scripts/verify-helm.sh on the real k3s host before
+# maintainer runs scripts/verify-live.sh on the real k3s host before
 # pushing — that's the authoritative server-side validation.
 #
 # Skipped: real cluster install + verify-*.sh (those need image builds +
@@ -21,12 +21,12 @@ on:
     branches: [main, helm]
     paths:
       - 'chart/**'
-      - 'scripts/verify-helm.sh'
+      - 'scripts/verify-live.sh'
       - '.github/workflows/chart-ci.yml'
   pull_request:
     paths:
       - 'chart/**'
-      - 'scripts/verify-helm.sh'
+      - 'scripts/verify-live.sh'
       - '.github/workflows/chart-ci.yml'
 
 jobs:

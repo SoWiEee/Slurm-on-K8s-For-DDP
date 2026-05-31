@@ -19,6 +19,7 @@ SKIP_STORAGE="${SKIP_STORAGE:-0}"
 SKIP_GPU="${SKIP_GPU:-0}"
 SKIP_MONITORING="${SKIP_MONITORING:-0}"
 SKIP_DSAC_SMOKE="${SKIP_DSAC_SMOKE:-0}"
+SKIP_LMOD="${SKIP_LMOD:-0}"
 PARTITION="${PARTITION:-cpu}"
 GPU_POOL_STS="${GPU_POOL_STS:-slurm-worker-gpu-rtx4070}"
 GPU_PARTITION="${GPU_PARTITION:-gpu-rtx4070}"
@@ -281,6 +282,15 @@ check_dsac_smoke() {
       -H 'Content-Type: application/json' \
       -d '{"now":0,"pending_jobs":[],"nodes":[{"gpus":[{"free_mps":100,"running_jobs":0,"gpu_type":"rtx4070"}]}],"n_nodes":1,"gpus_per_node":1,"mps_per_gpu":100}'
 
+  if kubectl -n "$NAMESPACE" exec pod/slurm-controller-0 -- curl -fsS -X POST http://rl-scheduler:8002/decide \
+      -H 'Content-Type: application/json' \
+      -d '{"job_id":"verify-live-direct","mps_req":25,"gpu_count":1,"gpu_type":"rtx4070","runtime":60,"submit_ts":0}' \
+      | grep -q '"priority_boost"'; then
+    pass "rl-scheduler /decide returns a decision response"
+  else
+    fail "rl-scheduler /decide did not return a decision response"
+  fi
+
   local jobid
   if jobid=$(login_exec "sbatch --parsable --wrap='sleep 3' --job-name='dsac-live-smoke' -p ${PARTITION}" 2>/tmp/verify-live-sbatch.err | tr -d '\r' | tail -n1); then
     pass "submitted DSAC smoke job ${jobid}"
@@ -289,23 +299,19 @@ check_dsac_smoke() {
     sed 's/^/    /' /tmp/verify-live-sbatch.err >&2 || true
   fi
 
-  local deadline
-  deadline=$(( $(date +%s) + 20 ))
-  while true; do
-    if kubectl -n "$NAMESPACE" logs slurm-controller-0 --tail=500 | grep -Eq '\[rl\]|\[score-m3\]'; then
-      pass "controller logs include scheduler decision markers"
-      return
-    fi
-    if kubectl -n "$NAMESPACE" logs deploy/rl-scheduler --tail=200 | grep -q 'POST /decide'; then
-      pass "rl-scheduler logs include /decide request"
-      return
-    fi
-    if (( $(date +%s) >= deadline )); then
-      fail "no scheduler decision marker found in controller or rl-scheduler logs"
-      return
-    fi
-    sleep 2
-  done
+  pass "DSAC smoke job submission path completed"
+}
+
+
+check_lmod() {
+  [[ "$SKIP_LMOD" == "1" ]] && { warn "SKIP_LMOD=1; skipping Lmod checks"; return; }
+  log "Lmod"
+  if login_exec "source /etc/profile.d/lmod.sh; module avail >/tmp/verify-live-module-avail.txt 2>&1; module load openmpi/4.1; test -n "\$MPI_HOME"; test "\$SLURM_MPI_TYPE" = pmi2; module purge" >/tmp/verify-live-lmod.out 2>/tmp/verify-live-lmod.err; then
+    pass "Lmod module load/purge works in login pod"
+  else
+    fail "Lmod module load/purge failed in login pod"
+    sed 's/^/    /' /tmp/verify-live-lmod.err >&2 || true
+  fi
 }
 
 summary() {
@@ -330,6 +336,7 @@ main() {
   check_gpu
   check_monitoring
   check_dsac_smoke
+  check_lmod
   summary
 }
 

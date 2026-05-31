@@ -24,7 +24,7 @@ kind: ConfigMap
 metadata:
   name: slurm-platform-device-plugin-config
   # Lives in the gpu-operator namespace, not slurm — that's where the
-  # device-plugin DaemonSet reads from. install-gpu-operator.sh references
+  # device-plugin DaemonSet reads from. deploy-2.sh references
   # this ConfigMap by name in its --set devicePlugin.config.name= flag.
   namespace: {{ .Values.gpu.targetNamespace }}
   labels:

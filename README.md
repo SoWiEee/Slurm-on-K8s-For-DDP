@@ -77,7 +77,7 @@ demand rises and falls.
 
 部署統一使用 Helm；目前實機部署固定以 Linux + k3s + GPU 為目標，主要 values 使用 `chart/values-k3s.yaml`。`chart/values.yaml` 保留為 chart default，不作為目前的實際部署路徑。
 
-> Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，獨立用 `scripts/install-gpu-operator.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
+> Helm chart 名為 `slurm-platform`，把 namespace、ConfigMap、controller/worker StatefulSet、operator、login、NetworkPolicy、device-plugin-config、monitoring（Prometheus/Grafana/Alertmanager/exporters）、storage（NFS subdir provisioner + RWX PVC）全部納入。GPU Operator 因為 PSS=privileged 需求，透過 `scripts/deploy-2.sh` 裝到自己的 `gpu-operator` namespace。完整背景見 [`docs/note.md §5-A`](docs/note.md)。
 
 > 驗證環境：Ubuntu 24.04 x86\_64 + k3s v1.34 + RTX 4070 + NVIDIA driver 580 ✅️
 
@@ -161,7 +161,7 @@ helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm \
 
 ## 4. 驗證 live cluster
 
-`verify-live.sh` 會在 Linux + k3s + GPU live 環境一次完成部署後驗證，涵蓋 chart render、核心 workload rollout、NFS RWX、GPU/GRES、Prometheus/Grafana 與 DSAC smoke job。
+`verify-live.sh` 會在 Linux + k3s + GPU live 環境一次完成部署後驗證，涵蓋 chart render、核心 workload rollout、NFS RWX、GPU/GRES、Prometheus/Grafana、DSAC smoke job 與 Lmod 基本檢查。
 
 ```bash
 export KUBECONFIG=~/.kube/config
@@ -173,7 +173,7 @@ bash scripts/verify-live.sh
 ```bash
 SKIP_HELM_RENDER=1 bash scripts/verify-live.sh
 SKIP_STORAGE=1 SKIP_GPU=1 bash scripts/verify-live.sh
-SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 bash scripts/verify-live.sh
+SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 SKIP_LMOD=1 bash scripts/verify-live.sh
 ```
 
 ## 5. DSAC 訓練與評估
@@ -282,14 +282,7 @@ bash scripts/verify-live.sh
 
 ## Lmod 模組系統（已整合至核心）
 
-Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`helm install` 起來後即可使用 `module load`。Modulefile 定義在 `manifests/core/lmod-modulefiles.yaml`，以 ConfigMap 管理（chart 之外，獨立 apply）。
-
-執行一次以確保 NFS job 輸出路徑存在（**需先完成 §4**）：
-
-```bash
-kubectl apply -f manifests/core/lmod-modulefiles.yaml
-bash scripts/bootstrap-lmod.sh
-```
+Lmod 已整合進 `docker/controller` 與 `docker/worker` image，`deploy-2.sh` 部署後即可使用 `module load`。Modulefile 定義由 chart 管理，live 驗證由 `scripts/verify-live.sh` 覆蓋。
 
 **部署後的操作體驗：**
 
@@ -332,13 +325,7 @@ sbatch /tmp/my-mpi-job.sh
 > `sbatch` 執行腳本時使用非互動、非 login 的 bash，`/etc/profile.d/` 不會自動載入。  
 > 明確 source 是標準 HPC 做法，與 TACC、NCHC 等真實系統的 job script 寫法一致。
 
-驗證腳本：
-
-```bash
-bash scripts/verify-lmod.sh
-```
-
-驗證項目包含：Lmod 安裝確認 → `module avail` 顯示三個模組 → `module load` 設定 MPI_HOME → `module purge` 清除環境 → sbatch 提交雙 task MPI job → 確認 rank:0 / rank:1 在 job 內正確執行。
+`scripts/verify-live.sh` 會檢查 login pod 內 `module avail`、`module load openmpi/4.1`、`MPI_HOME`、`SLURM_MPI_TYPE` 與 `module purge`。
 
 目前內建模組如下：
 

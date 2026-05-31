@@ -3,7 +3,7 @@
 gpu-operator namespace.
 
 Created by this chart so the device-plugin-config ConfigMap can land in
-it during `helm install slurm-platform`. install-gpu-operator.sh later
+it during `helm install slurm-platform`. deploy-2.sh later
 runs `helm install gpu-operator ... --create-namespace -n gpu-operator`,
 which is a no-op if the namespace already exists. Order between the two
 helm installs is flexible.

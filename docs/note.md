@@ -94,7 +94,7 @@ Lmod 在每次 `source /etc/profile.d/lmod.sh` 時都會讀這個檔案，不論
 
 在真實 HPC：所有節點共享 NFS，`/home/user/` 或 `/scratch/` 上的 output 到處都能讀。
 
-最終解法（Lmod + NFS 整合）：`bootstrap-lmod.sh` 掛載 NFS 到所有 Pod，並確保 `/shared/jobs/` 目錄存在。job script 輸出路徑改為：
+最終解法（Lmod + NFS 整合）：chart 掛載 NFS 到所有 Pod，並確保 job script 輸出路徑使用共享路徑：
 ```bash
 #SBATCH --output=/shared/jobs/phase5-verify-%j.out
 #SBATCH --error=/shared/jobs/phase5-verify-%j.err
@@ -512,7 +512,7 @@ E7 兩次撞死結之後，我認為 operator 有一個值得加的功能：**in
 
 - 主體不拆 subchart；monitoring / storage / gpu 用 `enabled` flag 控制。
 - `render-core.py` 廢棄，`slurm.conf` / `gres.conf` 改由 `_helpers.tpl` 從 `values.yaml` 的 `pools` 列表產生。
-- **GPU 子系統用 NVIDIA GPU Operator，但獨立安裝（不是 chart dependency）**——見上面修訂版 3 banner。本 chart 只在 `gpu-operator` namespace 放 device-plugin-config ConfigMap + 一個 cluster-wide 的 node-labeler Job 把 GPU 節點標上 `nvidia.com/device-plugin.config=<key>`。GPU Operator 由 `scripts/install-gpu-operator.sh` 用 `helm install gpu-operator nvidia/gpu-operator -n gpu-operator --create-namespace --set driver.enabled=false --set toolkit.enabled=false` 裝進自己的 PSS=privileged namespace。Operator 內建的 `mps-control-daemon` DaemonSet 解決 v0.15–v0.17.x device-plugin 內建 MPS 的 spawn race。
+- **GPU 子系統用 NVIDIA GPU Operator，但獨立安裝（不是 chart dependency）**——見上面修訂版 3 banner。本 chart 只在 `gpu-operator` namespace 放 device-plugin-config ConfigMap + 一個 cluster-wide 的 node-labeler Job 把 GPU 節點標上 `nvidia.com/device-plugin.config=<key>`。GPU Operator 由 `scripts/deploy-2.sh` 用 Helm 裝進自己的 PSS=privileged namespace，並設定 `driver.enabled=false`、`toolkit.enabled=false`。Operator 內建的 `mps-control-daemon` DaemonSet 解決 v0.15–v0.17.x device-plugin 內建 MPS 的 spawn race。
 - **GPU Operator 的 driver / toolkit 子模組關掉**：host 已用 `apt install nvidia-driver-535` + `nvidia-container-toolkit` 裝好，重複裝會撞。Operator 只負責 device-plugin、MPS daemon、DCGM exporter（可選）、gpu-feature-discovery、node-feature-discovery。
 - 自寫的 `manifests/gpu/nvidia-device-plugin.yaml` + `manifests/gpu/mps-daemonset.yaml` 廢棄。
 - `slurm.conf` ConfigMap 拆成 **`slurm-config-static`**（ClusterName / Auth / Plugin / AccountingStorageTRES，幾乎不變）+ **`slurm-config-nodes`**（NodeName / PartitionName，每次 pool 變動都重產）。worker 只 mount 後者 → 改一個 pool 的 `maxReplicas` 不會 rolling restart 全部 worker。
@@ -553,7 +553,7 @@ chart/
 ```
 
 > [!WARNING]
-> GPU Operator 預設會把 driver / toolkit / DCGM exporter 一起裝，跟 host 已裝的 `nvidia-driver-535` + `nvidia-container-toolkit` 衝突——`install-gpu-operator.sh` 用 `--set driver.enabled=false --set toolkit.enabled=false` 把這兩個子模組關掉。
+> GPU Operator 預設會把 driver / toolkit / DCGM exporter 一起裝，跟 host 已裝的 `nvidia-driver-535` + `nvidia-container-toolkit` 衝突——`scripts/deploy-2.sh` 用 `--set driver.enabled=false --set toolkit.enabled=false` 把這兩個子模組關掉。
 
 
 
@@ -1201,7 +1201,7 @@ NodeName=slurm-worker-gpu-rtx4070-0 Name=gpu Type=rtx4070 Count=4 File=/dev/nvid
 ```
 Linux Host（k3s 單節點）
 ┌────────────────────────────────────────────────────────────────────────────┐
-│  namespace: gpu-operator (PSS=privileged，scripts/install-gpu-operator.sh)  │
+│  namespace: gpu-operator (PSS=privileged，scripts/deploy-2.sh)  │
 │  ┌─────────────────────────────┐  ┌───────────────────────────────────┐    │
 │  │ nvidia-device-plugin DS     │  │ nvidia-mps-control-daemon DS      │    │
 │  │  讀 ConfigMap:               │  │  per-GPU MPS server（前景模式）   │    │
@@ -1229,7 +1229,7 @@ Linux Host（k3s 單節點）
 
 - sharing 策略宣告式：每張卡的 MPS replicas / time-slicing / exclusive 由 ConfigMap 定義，不是腳本邏輯
 - per-pool 配置：rtx4070 與 rtx4080 走不同的 ConfigMap key，藉 node label 自動匹配
-- chart 不擁有 GPU Operator：`scripts/install-gpu-operator.sh` 把它獨立裝到 PSS=privileged 的 `gpu-operator` namespace；`slurm-platform` chart 只貢獻 device-plugin-config ConfigMap 與 node-labeler Job
+- `scripts/deploy-2.sh` 把 GPU Operator 獨立裝到 PSS=privileged 的 `gpu-operator` namespace；`slurm-platform` chart 只貢獻 device-plugin-config ConfigMap 與 node-labeler Job
 
 
 注意：兩張卡的 `File=` 都是 `/dev/nvidia0`，因為 Slurm 是從 worker pod 的視角看裝置——每個 worker pod 只看到自己被分配的那張 GPU（kubelet + libnvidia-container 注入），所以 pod 內永遠是 `/dev/nvidia0`。

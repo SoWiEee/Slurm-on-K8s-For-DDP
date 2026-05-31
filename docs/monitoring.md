@@ -98,7 +98,7 @@ Prometheus 收集 + Grafana 呈現             ──→   scale skipped
 
 - 來源：NVIDIA GPU Operator 內建的 `nvidia-dcgm-exporter`
 
-- 部署方式：`scripts/install-gpu-operator.sh` 安裝 GPU Operator 時開啟：
+- 部署方式：`scripts/deploy-2.sh` 安裝 GPU Operator 時開啟：
 
 ```bash
 --set dcgmExporter.enabled=true

@@ -13,7 +13,7 @@ continuously, so the label survives:
 
 GPU Operator ships NFD by default, so the CRD
 `nodefeaturerules.nfd.k8s-sigs.io` is already present after
-`scripts/install-gpu-operator.sh`. The rule here is cluster-scoped (NFD
+`scripts/deploy-2.sh`. The rule here is cluster-scoped (NFD
 master watches all NodeFeatureRule across the cluster regardless of
 namespace), which is why it's NOT wrapped in a Namespace.
 
