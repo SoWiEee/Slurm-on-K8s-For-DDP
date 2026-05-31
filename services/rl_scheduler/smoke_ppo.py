@@ -1,6 +1,9 @@
-"""M11 Phase A SB3 PPO smoke test: 1000 steps on a 30-job synthetic trace.
+"""Historical SB3 PPO smoke test for the simulator API.
 
-Verifies:
+This is not the live scheduler algorithm. Production/live deployments use
+DSAC via services.rl_scheduler.dsac + serve.py; PPO is kept only as a quick
+compatibility smoke test that verifies:
+
 - gym env is SB3-compatible (Box obs + Discrete action)
 - PPO runs end-to-end without NaN
 - GPU is utilized if CUDA available

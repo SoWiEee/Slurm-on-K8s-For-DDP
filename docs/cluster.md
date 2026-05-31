@@ -700,6 +700,12 @@ bash scripts/verify-helm.sh        # lint + template + unittest + dry-run
 bash scripts/verify-storage.sh     # NFS RWX 端對端
 bash scripts/verify-gpu.sh         # GPU + MPS 端對端
 
+# 2×2 DRL 實驗 overlay（需要兩個 Slurm GPU worker，每個 worker 2 GPU）
+sudo helm upgrade slurm-platform ./chart \
+  -f chart/values-k3s.yaml \
+  -f chart/values-2x2.yaml \
+  -n slurm
+
 # 一鍵拆掉 chart（保留 namespace / secrets / PVC，因為都掛了 keep）
 sudo helm uninstall slurm-platform -n slurm
 
@@ -709,7 +715,94 @@ sudo helm uninstall slurm-platform -n slurm
 
 ---
 
-## 12. 附錄：K8s 物件速查表
+## 12. 2×2 DRL 實驗叢集設定
+
+`chart/values-2x2.yaml` 是給 DRL evaluation 用的 overlay，目標是讓 live topology 對齊 simulator 的 `--n-nodes 2 --gpus-per-node 2`。它不是單張 RTX 4070 demo 的預設值；只有在 Kubernetes 叢集確實能提供兩個 GPU worker pod、且每個 pod 可取得兩張 GPU 時才套用。
+
+### 12.1 第二台機器加入 k3s
+
+在第一台 k3s server 上取得 join token 與 server IP：
+
+```bash
+sudo cat /var/lib/rancher/k3s/server/node-token
+hostname -I
+```
+
+在第二台 Ubuntu 24.04 機器上安裝 NVIDIA driver / container toolkit，然後加入同一個 k3s cluster：
+
+```bash
+# 先完成 GPU host setup。這會安裝 driver、container toolkit，並讓 k3s 可使用 nvidia runtime。
+bash scripts/setup-linux-gpu.sh
+
+# 將 <SERVER_IP> 與 <NODE_TOKEN> 換成第一台機器的值。
+curl -sfL https://get.k3s.io | \
+  K3S_URL=https://<SERVER_IP>:6443 \
+  K3S_TOKEN=<NODE_TOKEN> \
+  INSTALL_K3S_EXEC='agent --node-label gpu-host-class=rtx4070' \
+  sh -
+```
+
+回到第一台 server 驗證 node 與 GPU labels：
+
+```bash
+kubectl get nodes -o wide
+kubectl label node <second-node-name> gpu-host-class=rtx4070 --overwrite
+kubectl get nodes --show-labels | grep gpu-host-class
+```
+
+### 12.2 GPU Operator / MPS 對齊
+
+`values-k3s.yaml` 已啟用 GPU Operator 相關設定；`values-2x2.yaml` 只調整 Slurm worker pools。套用前確認：
+
+```bash
+DEFAULT_CONFIG_KEY=rtx4070-mps bash scripts/install-gpu-operator.sh
+kubectl -n gpu-operator get daemonset,pod
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+```
+
+若 GPU Operator 的 MPS sharing 以 replicas 方式廣告 `nvidia.com/gpu`，Kubernetes 只能看到 share slots，不一定保證一個 pod 的兩個 slots 落在兩張不同 physical GPUs。若要嚴格做「每個 Slurm node 兩張 physical GPUs」，建議用兩張 GPU 的 worker host 搭配 exclusive allocation，或把每張 GPU 建成獨立 Slurm worker pod，並在 simulator evaluation 中明確標註拓撲差異。
+
+### 12.3 部署 2×2 overlay
+
+```bash
+helm upgrade slurm-platform ./chart \
+  -f chart/values-k3s.yaml \
+  -f chart/values-2x2.yaml \
+  -n slurm
+
+kubectl -n slurm rollout status sts/slurm-controller --timeout=180s
+kubectl -n slurm get sts slurm-worker-gpu-rtx4070 -o yaml | grep -E 'replicas:|nvidia.com/gpu'
+```
+
+確認 Slurm node / GRES：
+
+```bash
+kubectl -n slurm exec slurm-controller-0 -- sinfo -Nel
+kubectl -n slurm exec slurm-controller-0 -- scontrol show node slurm-worker-gpu-rtx4070-0
+kubectl -n slurm exec slurm-controller-0 -- scontrol show node slurm-worker-gpu-rtx4070-1
+```
+
+### 12.4 DSAC 2×2 training / live 注意事項
+
+2×2 topology 需要重新訓練 checkpoint，不能直接沿用 1×1 的 `dsac.pt`：
+
+```bash
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
+  --n-nodes 2 --gpus-per-node 2 \
+  --trace philly burst ali \
+  --total-steps 500000 \
+  --out-dir runs/dsac_2x2_$(date +%Y%m%d)
+```
+
+訓練完成後，將 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 指到新的 checkpoint，重新 build/import `slurm-rl-scheduler:m11`，再套用 Helm。live snapshot collector 或手動 `/snapshot` payload 也必須送：
+
+```json
+{"n_nodes":2,"gpus_per_node":2,"mps_per_gpu":100}
+```
+
+---
+
+## 13. 附錄：K8s 物件速查表
 
 ### `slurm` namespace（chart 渲染 + 外掛 accounting/lmod）
 

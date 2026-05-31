@@ -1,0 +1,99 @@
+# =============================================================================
+# slurm-platform — 2×2 DRL experiment overlay
+# =============================================================================
+# Layer after values-k3s.yaml when the live cluster has capacity for two Slurm
+# GPU worker pods, each exposing two physical GPUs:
+#
+#   helm upgrade slurm-platform ./chart \
+#     -f chart/values-k3s.yaml \
+#     -f chart/values-2x2.yaml \
+#     -n slurm
+#
+# This is an experiment profile, not the single-GPU production default. It is
+# meant to align live topology with DSAC training runs using
+# `--n-nodes 2 --gpus-per-node 2` and action space 2*2*TOP_K + no-op.
+#
+# Helm replaces lists instead of merging them, so this file repeats the full
+# pools list from values.yaml with the GPU pool adjusted for 2×2.
+
+pools:
+  - id: cpu
+    statefulset: slurm-worker-cpu
+    appLabel: slurm-worker-cpu
+    workerClass: cpu-standard
+    partition: cpu
+    minReplicas: 1
+    maxReplicas: 4
+    replicas: 1
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 4
+    features: [cpu]
+    gres: []
+    matchGres: []
+    fallback: true
+
+  - id: gpu-rtx4070-2x2
+    statefulset: slurm-worker-gpu-rtx4070
+    appLabel: slurm-worker-gpu-rtx4070
+    workerClass: gpu-rtx4070-2x2
+    partition: gpu-rtx4070
+    minReplicas: 0
+    maxReplicas: 2
+    replicas: 0
+    scaleCooldownSeconds: 60
+    cpus: 8
+    realMemory: 7000
+    sockets: 1
+    coresPerSocket: 4
+    threadsPerCore: 2
+    maxNodes: 2
+    features: [gpu, gpu-rtx4070, topology-2x2]
+    gres:
+      - name: gpu
+        type: rtx4070
+        count: 2
+      - name: mps
+        count: 200
+    matchGres: ["gpu:rtx4070", "mps"]
+    devicePluginConfig: rtx4070-mps
+
+  # Keep the 4080 pool declared for partition compatibility, but leave it
+  # empty in this experiment profile. Remove it only if the corresponding
+  # partition and submit-helper route are also removed.
+  - id: gpu-rtx4080
+    statefulset: slurm-worker-gpu-rtx4080
+    appLabel: slurm-worker-gpu-rtx4080
+    workerClass: gpu-rtx4080
+    partition: gpu-rtx4080
+    minReplicas: 0
+    maxReplicas: 0
+    replicas: 0
+    scaleCooldownSeconds: 60
+    cpus: 4
+    realMemory: 3500
+    sockets: 1
+    coresPerSocket: 2
+    threadsPerCore: 2
+    maxNodes: 0
+    features: [gpu, gpu-rtx4080]
+    gres:
+      - name: gpu
+        type: rtx4080
+        count: 1
+    matchGres: ["gpu:rtx4080"]
+    devicePluginConfig: rtx4080-exclusive
+
+slurm:
+  jobSubmit:
+    # The Lua submit score uses per-GPU MPS capacity, not total node MPS.
+    # A 2-GPU Slurm node therefore still uses 100 here while its GRES has
+    # mps:200 total capacity.
+    mpsPerNode: 100
+
+rlScheduler:
+  snapshotTtlSeconds: 30

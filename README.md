@@ -188,6 +188,8 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 
 以下指令會把 DSAC scheduler 部署到 k3s live cluster，並讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`。`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`；`valueAbstain=-100000` 用於單機實驗環境，避免目前 checkpoint 的 value scale 讓所有 decision 都被 guardrail 擋掉。單機環境目前沒有常駐 snapshot collector，所以 `snapshotTtlSeconds=86400` 讓手動推送的 snapshot 可以支撐 demo/實驗。
 
+目前 live scheduler 主線是 **DSAC**。`services/rl_scheduler/smoke_ppo.py` 只是歷史 PPO smoke test，用來快速檢查 simulator API 與 SB3 相容性；不是目前 live cluster 使用的演算法。
+
 ```bash
 export KUBECONFIG=~/.kube/config
 
@@ -248,6 +250,13 @@ PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
     --device cuda --total-steps 500000 \
     --curriculum \
     --out-dir runs/dsac_cuda_$(date +%Y%m%d)
+
+# 2×2 DRL 實驗：需搭配 chart/values-2x2.yaml 與新的 dsac.pt checkpoint。
+PYTHONPATH=. .venv-m11/bin/python -m services.rl_scheduler.sim_train \
+    --n-nodes 2 --gpus-per-node 2 \
+    --trace philly burst ali \
+    --total-steps 500000 \
+    --out-dir runs/dsac_2x2_$(date +%Y%m%d)
 ```
 
 ### 完整評估（3 families × 5 seeds，對比 score baseline）

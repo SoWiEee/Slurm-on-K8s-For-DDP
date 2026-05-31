@@ -70,6 +70,27 @@ sbatch → [slurm-login] ──► slurmctld ──[lua job_submit]──► [pr
 
 每 family 跑 5 seeds（42–46），用 paired same-seed diff 做主要比較。Paired diff 把「不同 seed 帶來的 trace 變動」消掉，CI 比 unpaired 緊一個量級。
 
+### 3.2 Live submit-path chaos smoke（2026-05-31）
+
+目的：驗證 optional ML services 失效時，`sbatch` submit path 仍能成功並維持低 latency。測試指令：
+
+```bash
+KUBECONFIG=/home/acane/.kube/config SAMPLES=5 PARTITION=cpu \
+  bash scripts/chaos/submit-with-services-down.sh
+```
+
+環境：live k3s `slurm` namespace；`rl-scheduler` deployment 存在並由 script 暫時 scale to 0 / restore to 1。`runtime-predictor` 與 `weight-tuner` 在本次 live 環境未部署，script 以 warning skip；這仍驗證了 Lua submit path 在 optional service absent/down 時不阻塞提交。原始 TSV：`/tmp/kelpflux-submit-chaos-20260531-235939/latency.tsv`。
+
+| Phase | n | fail | p50 ms | p95 ms | p99 ms | max ms |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 5 | 0 | 94 | 98 | 98 | 98 |
+| rl-scheduler-down | 5 | 0 | 99 | 105 | 105 | 105 |
+| runtime-predictor-down | 5 | 0 | 91 | 110 | 110 | 110 |
+| weight-tuner-down | 5 | 0 | 90 | 91 | 91 | 91 |
+| all-optional-services-down | 5 | 0 | 95 | 250 | 250 | 250 |
+
+結論：本次 smoke run 中所有 25 次 submit 皆成功，`rl-scheduler` down 時 p95 仍約 105 ms，符合 safe fallback 設計。`all-optional-services-down` 的單筆 250 ms outlier 仍低於目前 Lua curl timeout budget。正式論文數據建議把 `SAMPLES` 提高到 50 或 100，並在 runtime-predictor / weight-tuner 實際部署後重跑。
+
 ---
 
 ## 4. DSAC Branch — Placement-aware 1×1 Scheduler（2026-05-14）
