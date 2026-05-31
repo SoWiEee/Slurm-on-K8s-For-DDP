@@ -112,14 +112,24 @@ cat /etc/exports                       # 必須含 pod CIDR (10.0.0.0/8) AND LAN
 sudo exportfs -ra
 ```
 
-## 3. 透過 Helm 部署整套平台
+## 3. 部署平台、GPU Operator 與 DSAC Scheduler
+
+`deploy-2.sh` 會把平台主體、GPU Operator 與 live DSAC scheduler 一次收斂到最終狀態。它會先 build/import `slurm-rl-scheduler:m11`，再用一次 `helm upgrade --install` 部署 `slurm-platform` 並直接開啟 DSAC live 設定，最後用一次 Helm install/upgrade 收斂 NVIDIA GPU Operator；不需要額外 rollout restart。
 
 ```bash
-helm install slurm-platform ./chart \
-  -f chart/values-k3s.yaml \
-  -n slurm \
-  --create-namespace
+export KUBECONFIG=~/.kube/config
+bash scripts/deploy-2.sh
 ```
+
+一般重跑時可用下列環境變數略過已完成的階段：
+
+```bash
+SKIP_BUILD=1 SKIP_IMPORT=1 bash scripts/deploy-2.sh
+SKIP_GPU_OPERATOR=1 bash scripts/deploy-2.sh
+SKIP_WAIT=1 bash scripts/deploy-2.sh
+```
+
+DSAC scheduler 會讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`；`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`。`valueAbstain=-100000` 與 `snapshotTtlSeconds=86400` 是目前單機 live 實驗設定，用來避免 checkpoint value scale 與缺少常駐 snapshot collector 時讓所有 decision 都被 guardrail 擋掉。
 
 預設行為（k3s overlay）：
 
@@ -127,14 +137,18 @@ helm install slurm-platform ./chart \
 - `monitoring.enabled=true`：Prometheus + Alertmanager + Grafana + kube-state-metrics + slurm-exporter（namespace `monitoring`）
 - `storage.enabled=true` + `nfsServer=192.168.0.111`：NFS subdir provisioner + StorageClass `slurm-shared-nfs` + 20Gi RWX PVC
 
-LAN IP 不一樣時用 `--set storage.nfsServer=<your-ip>` 覆寫。
+LAN IP 不一樣時用 `VALUES_FILE=<your-values.yaml>` 或 Helm values 檔調整 `storage.nfsServer`。GPU Operator 使用 `driver.enabled=false` 與 `toolkit.enabled=false`，因為 host 已經由 `setup-linux-gpu.sh` 裝好驅動與 NVIDIA Container Toolkit。
 
-**Phase 7 選用功能**（在 `chart/values-k3s.yaml` 開啟）：
+目前 live scheduler 主線是 **DSAC**。`services/rl_scheduler/smoke_ppo.py` 只是歷史 PPO smoke test，用來快速檢查 simulator API 與 SB3 相容性；不是目前 live cluster 使用的演算法。
+
+> 注意：目前 `slurm-rl-scheduler:m11` 映像會載入 `runs/eval_mlp_20260514-210824/train/dsac.pt`。若要換成新的 DSAC checkpoint，更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 後重新執行 `bash scripts/deploy-2.sh`。
+
+**選用功能**（在 `chart/values-k3s.yaml` 開啟）：
 
 | 功能 | 設定 | 說明 |
 |------|------|------|
-| SSH Login（7-B） | `login.ssh.authorizedKeys: \|` + 公鑰 | `ssh -p 30022 root@192.168.0.111` |
-| OpenTelemetry（7-A） | `monitoring.otel.enabled: true` | 部署 Tempo + OTel Collector，Grafana 自動加 datasource |
+| SSH Login | `login.ssh.authorizedKeys: \|` + 公鑰 | `ssh -p 30022 root@192.168.0.111` |
+| OpenTelemetry | `monitoring.otel.enabled: true` | 部署 Tempo + OTel Collector，Grafana 自動加 datasource |
 
 ```bash
 # 快速加 SSH key（不需重新 helm install）
@@ -145,15 +159,7 @@ helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm \
   --set monitoring.otel.enabled=true
 ```
 
-## 4. 安裝 NVIDIA GPU Operator
-
-```bash
-bash scripts/install-gpu-operator.sh    # 進 gpu-operator namespace，PSS=privileged
-```
-
-腳本是 idempotent 的，重跑等於 helm upgrade。`--set driver.enabled=false --set toolkit.enabled=false` 因為 host 已經由 setup-linux-gpu.sh 裝好驅動。
-
-## 5. 驗證
+## 4. 驗證腳本與 live smoke
 
 ```bash
 KUBE_CONTEXT=default bash scripts/verify-helm.sh           # chart 渲染 + dry-run + helm-unittest
@@ -164,40 +170,9 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
-## 6. DRL Scheduler
-
-> 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
-
-### 實際部署
-
-以下指令會把 DSAC scheduler 部署到 k3s live cluster，並讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`。`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`；`valueAbstain=-100000` 用於單機實驗環境，避免目前 checkpoint 的 value scale 讓所有 decision 都被 guardrail 擋掉。單機環境目前沒有常駐 snapshot collector，所以 `snapshotTtlSeconds=86400` 讓手動推送的 snapshot 可以支撐 demo/實驗。
-
-目前 live scheduler 主線是 **DSAC**。`services/rl_scheduler/smoke_ppo.py` 只是歷史 PPO smoke test，用來快速檢查 simulator API 與 SB3 相容性；不是目前 live cluster 使用的演算法。
+DSAC live smoke：
 
 ```bash
-export KUBECONFIG=~/.kube/config
-
-# 重新打包目前 DSAC serve.py + dsac.pt checkpoint。
-docker build -t slurm-rl-scheduler:m11 \
-  -f services/rl_scheduler/Dockerfile .
-docker save slurm-rl-scheduler:m11 | sudo k3s ctr images import -
-
-helm upgrade slurm-platform ./chart \
-  -f chart/values-k3s.yaml \
-  -n slurm \
-  --reset-then-reuse-values \
-  --no-hooks \
-  --set slurm.jobSubmit.enabled=true \
-  --set rlScheduler.enabled=true \
-  --set rlScheduler.lua.enabled=true \
-  --set rlScheduler.shadowMode=false \
-  --set rlScheduler.valueAbstain=-100000 \
-  --set rlScheduler.snapshotTtlSeconds=86400
-
-kubectl -n slurm rollout restart deploy/rl-scheduler
-kubectl -n slurm rollout status deploy/rl-scheduler --timeout=180s
-kubectl -n slurm rollout status sts/slurm-controller --timeout=180s
-
 # 確認 controller 可以連到 DSAC scheduler；healthz 應看到 obs_dim/n_actions。
 kubectl -n slurm exec slurm-controller-0 -- \
   curl -fsS http://rl-scheduler:8002/healthz
@@ -217,7 +192,9 @@ kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score-m3
 kubectl -n slurm logs deploy/rl-scheduler --tail=80
 ```
 
-> 注意：目前 `slurm-rl-scheduler:m11` 映像會載入 `runs/eval_mlp_20260514-210824/train/dsac.pt`。若要換成新的 DSAC checkpoint，更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 後重新 build/import image。
+## 5. DSAC 訓練與評估
+
+> 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
 
 ### 快速訓練（本機 CPU）
 

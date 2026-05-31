@@ -203,12 +203,12 @@ apply_prereqs() {
 }
 
 summary() {
-  log "deployment step 1-4 complete"
-  log "next README step: install/upgrade Helm chart"
+  log "deployment step 1 complete: k3s/GPU prerequisites are ready"
+  log "next README step: bash scripts/deploy-2.sh"
   printf '\nUseful checks:\n'
   printf '  export KUBECONFIG=%q\n' "$KUBECONFIG"
   printf '  kubectl -n %q get pods\n' "$NAMESPACE"
-  printf '  helm install slurm-platform ./chart -f chart/values-k3s.yaml -n %q --create-namespace\n' "$NAMESPACE"
+  printf '  bash scripts/deploy-2.sh\n'
 }
 
 main() {
