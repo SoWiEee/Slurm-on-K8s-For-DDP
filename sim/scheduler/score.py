@@ -12,6 +12,8 @@ list match the chart defaults — keep them in sync when tuning::
 from __future__ import annotations
 
 import statistics
+import re
+from dataclasses import dataclass
 from typing import List, Optional
 
 from ..cluster import Cluster
@@ -30,6 +32,99 @@ def _gpu_type_to_vram(gpu_type: str) -> Optional[int]:
         "a10": 24,
         "h100": 80,
     }.get(gpu_type.lower())
+
+
+def clamp01(x: float) -> float:
+    if x != x:
+        return 0.0
+    return max(0.0, min(1.0, x))
+
+
+def parse_submit_mps_req(tres_per_node: str | None) -> int:
+    """Parse the live Lua job_submit mps:N / mps=N convention."""
+    if not tres_per_node:
+        return 0
+    match = re.search(r"mps[:=](\d+)", tres_per_node)
+    return int(match.group(1)) if match else 0
+
+
+def parse_submit_vram_req(features: str | None) -> int:
+    """Parse the live Lua job_submit vram-Ng feature convention."""
+    if not features:
+        return 0
+    match = re.search(r"vram-(\d+)g", features)
+    return int(match.group(1)) if match else 0
+
+
+@dataclass(frozen=True)
+class SubmitScoreFactors:
+    score: float
+    mps_fit: float
+    vram_fit: float
+    topology: float
+    fragmentation: float
+    pred_runtime: float
+
+
+def submit_score_factors(
+    *,
+    tres_per_node: str | None = None,
+    features: str | None = None,
+    mps_per_node: int = 100,
+    vram_tiers=_DEFAULT_TIERS_GB,
+    alpha: float = 0.40,
+    beta: float = 0.20,
+    gamma: float = 0.00,
+    delta: float = 0.20,
+    epsilon: float = 0.00,
+    pred_runtime: float = 0.5,
+) -> SubmitScoreFactors:
+    """Reference implementation for the live Lua submit-time score.
+
+    The production Lua plugin cannot see full placement state during submit,
+    so this intentionally mirrors its stateless proxy instead of
+    ScoreScheduler's cluster-aware simulator factors.
+    """
+    mps_req = parse_submit_mps_req(tres_per_node)
+    vram_req = parse_submit_vram_req(features)
+    tiers = sorted(vram_tiers)
+    vram_max = max(tiers)
+
+    if mps_req <= 0:
+        mps_fit = 1.0
+    elif mps_req > mps_per_node:
+        mps_fit = 0.0
+    else:
+        mps_fit = clamp01(mps_req / mps_per_node)
+
+    if vram_req == 0:
+        vram_fit = 0.5
+    else:
+        fit_tier = next((tier for tier in tiers if tier >= vram_req), None)
+        vram_fit = 0.0 if fit_tier is None else clamp01(1 - (fit_tier - vram_req) / vram_max)
+
+    if mps_req <= 0 or mps_req >= mps_per_node:
+        fragmentation = 0.0
+    else:
+        x = mps_req / mps_per_node
+        fragmentation = clamp01(4 * x * (1 - x))
+
+    topology = 0.5
+    score = clamp01(
+        alpha * mps_fit
+        + beta * vram_fit
+        + gamma * topology
+        - delta * fragmentation
+        + epsilon * pred_runtime
+    )
+    return SubmitScoreFactors(
+        score=score,
+        mps_fit=mps_fit,
+        vram_fit=vram_fit,
+        topology=topology,
+        fragmentation=fragmentation,
+        pred_runtime=pred_runtime,
+    )
 
 
 class ScoreScheduler(MultifactorScheduler):

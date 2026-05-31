@@ -1,0 +1,45 @@
+name: score-parity-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'chart/templates/configmap-job-submit.yaml'
+      - 'chart/values.yaml'
+      - 'sim/scheduler/score.py'
+      - 'tests/test_score_parity.py'
+      - '.github/workflows/score-parity-test.yml'
+  pull_request:
+    paths:
+      - 'chart/templates/configmap-job-submit.yaml'
+      - 'chart/values.yaml'
+      - 'sim/scheduler/score.py'
+      - 'tests/test_score_parity.py'
+      - '.github/workflows/score-parity-test.yml'
+
+jobs:
+  parity:
+    name: rendered Lua score matches Python reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y lua5.2
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+
+      - name: Run parity test
+        run: |
+          uv run \
+            --python 3.11 \
+            --with "pytest==8.2.2" \
+            --with "numpy==1.26.4" \
+            pytest tests/test_score_parity.py -v --tb=short
+        env:
+          PYTHONPATH: .
