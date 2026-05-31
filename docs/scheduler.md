@@ -1,605 +1,451 @@
-# Scheduler Design
+# Scheduler Production Spec
 
-## 1. Slurm 內建調度設定與邊界
+本文件描述目前 Kelpflux 上線中的排程規格。範圍包含 Slurm 內建排程、`job_submit.lua` submit-time scoring、runtime predictor、weight tuner、DSAC live scheduler、fallback policy 與可觀測性。歷史開發階段、實驗路線圖與已淘汰設計不再列入本規格。
 
-Slurm 的調度行為由三組正交設定控制，寫在 `slurm.conf`：
+## 1. 上線架構
 
-| 設定 | 作用 |
+```text
+sbatch / srun
+    |
+    v
+Slurm job_submit.lua
+    |-- submit helper: 補齊 partition / memory / qos
+    |-- score function: MPS / VRAM / fragmentation / runtime signal
+    |-- runtime predictor: 可選，用於短工優先與 walltime 建議
+    |-- weight tuner: 可選，載入目前最佳 score 係數
+    |-- DSAC scheduler: live 模式時可回傳 priority boost
+    v
+Slurm priority + backfill + select/cons_tres
+    v
+worker pool: CPU / GPU / MPS slots
+```
+
+核心原則：
+
+- Slurm 仍是最終資源分配與 job lifecycle owner。
+- `job_submit.lua` 只在提交時調整 priority / metadata，不阻塞 Slurm 的基本行為。
+- DSAC live scheduler 以 priority boost 介入排序；任何失敗都 fallback 到 score / Slurm 原生排程。
+- GPU live migration 不在上線規格內；若要處理 running job，只能走 application-level checkpoint + requeue。
+
+## 2. Job Submit 決策流程
+
+以下 Mermaid 圖示意一個 job submit 後，系統如何補齊 job metadata、計算排序訊號、呼叫 DSAC，最後交給 Slurm 分配硬體資源。
+
+```mermaid
+flowchart TD
+    A["User submits job<br/>sbatch / srun"] --> B["Slurm controller<br/>loads job_submit.lua"]
+
+    B --> C["Submit helper"]
+    C --> C1["Fill missing partition<br/>CPU or GPU pool"]
+    C --> C2["Fill missing memory<br/>from CPU/GPU request"]
+    C --> C3["Fill default QoS<br/>normal or account rule"]
+
+    C1 --> D["Build scheduling signals"]
+    C2 --> D
+    C3 --> D
+
+    D --> E["Score function"]
+    E --> E1["MPS fit<br/>requested slots vs 100-slot GPU"]
+    E --> E2["VRAM fit<br/>requested tier vs node tier"]
+    E --> E3["Fragmentation penalty<br/>partial MPS usage cost"]
+    E --> E4["Runtime signal<br/>optional predictor"]
+    E1 --> F["priority_delta<br/>scoreGain * score"]
+    E2 --> F
+    E3 --> F
+    E4 --> F
+
+    D --> G{"RL scheduler enabled?"}
+    G -- "no" --> H["Use score priority only"]
+    G -- "yes" --> I["POST /decide<br/>rl-scheduler"]
+    I --> J{"DSAC returns boost?"}
+    J -- "selected" --> K["Add priority_boost"]
+    J -- "abstain / no-op / error" --> H
+
+    F --> L["Final job priority"]
+    H --> L
+    K --> L
+
+    L --> M["Slurm priority queue"]
+    M --> N["Backfill scheduler"]
+    N --> O["select/cons_tres"]
+    O --> P{"Requested hardware"}
+
+    P -- "CPU job" --> Q["CPU worker pod<br/>slurm-worker-cpu-*"]
+    P -- "GPU job" --> R["GPU worker pod<br/>slurm-worker-gpu-*"]
+    R --> S["NVIDIA runtime<br/>physical GPU access"]
+    R --> T["Slurm GRES<br/>gpu + mps slots"]
+
+    Q --> U["Job starts"]
+    S --> U
+    T --> U
+
+    U --> V["Accounting / metrics"]
+    V --> W["Prometheus + Grafana<br/>queue, GPU, DSAC decisions"]
+```
+
+決策重點：
+
+- helper 只補缺值，不覆蓋使用者已指定的 partition、memory 或 QoS。
+- score function 產生穩定的 submit-time priority delta，是 DSAC 不可用時的主要 fallback。
+- DSAC live scheduler 目前只加 priority boost，不直接指定 worker、node 或 GPU；實際硬體 placement 仍由 Slurm `select/cons_tres` 決定。
+- GPU job 的硬體資源由 Kubernetes worker pod、NVIDIA runtime、Slurm GRES 與 MPS slot 共同約束。
+
+## 3. Slurm 基礎排程設定
+
+上線使用 Slurm 原生能力作為穩定底座：
+
+| 設定 | 上線值 / 行為 | 用途 |
+|------|---------------|------|
+| `SchedulerType` | `sched/backfill` | 允許不延後高優先 job 的前提下安排短 job 插隊 |
+| `SelectType` | `select/cons_tres` | 以 TRES 表示 CPU / GPU / MPS 資源 |
+| `SelectTypeParameters` | `CR_Core` | CPU core 級資源選擇；placement 仍由 Slurm 管理 |
+| `PriorityType` | `priority/multifactor` | 保留 Slurm age / job size / partition / qos 等基本排序 |
+| `AccountingStorageTRES` | `gres/gpu,gres/mps` | 讓 GPU 與 MPS usage 進 accounting |
+| `PreemptType` | 預設關閉 | 上線不主動踢 running job |
+
+上線邊界：
+
+| 能力 | 狀態 |
 |------|------|
-| `SchedulerType` | 主調度演算法，`sched/backfill`（預設）在主排程後找可插隊的小 job |
-| `SelectType` | 資源 fit 演算法；GPU/MPS 場景必須用 `select/cons_tres` |
-| `SelectTypeParameters` | fit 細部策略：`CR_Pack_Nodes`（bin-pack，塞滿一台再開下一台）vs `CR_LLN`（spread，平均分散，預設） |
-| `PriorityType` | job 排序；`priority/multifactor` 支援 age / fairshare / jobSize / QoS 加權 |
-| `PreemptType` / `PreemptMode` | 是否允許強制踢走 running job；`REQUEUE` 是 GPU 場景唯一有效模式（`SUSPEND` 留 CUDA context，無實用） |
+| 新 job 進來時依 priority 重新排序 | 支援 |
+| backfill 短 job | 支援 |
+| GPU / MPS 作為 Slurm GRES | 支援 |
+| GPU runtime live migration | 不支援 |
+| 跨節點 GPU memory 搬移 | 不支援 |
+| 強制 requeue running job | 非預設上線行為 |
 
-**Backfill** 的核心假設是「已知每個 job 還剩多久」——它用 `--time`（user 填的 wall time）做規劃。使用者傾向高估 wall time，導致 backfill 空間被壓縮。準確的 runtime 預測可顯著提升 backfill 效益（NERSC Cori 實驗：+5–15% 利用率）。
+## 4. Submit Helper
 
-### 調度邊界
+`job_submit.lua` 會先執行 submit helper，讓後續 score 與 DSAC 看到較完整的 job 描述。helper 不覆蓋使用者明確指定的欄位。
 
-| 能力 | Slurm 內建 |
-|------|-----------|
-| 新 job 進來時挑「填得最滿」的 node/GPU | ✅ `CR_Pack_Nodes` |
-| 大 job 等待時讓小 job 插隊（不延後大 job） | ✅ backfill 預設開 |
-| 高優先 job 強制踢低優先 job（kill + requeue） | ✅ `PreemptMode=REQUEUE` |
-| 依 QoS / age / runtime 多因子排序 | ✅ `priority/multifactor` |
-| GPU memory state 保留的 suspend/resume | ❌ CUDA context 無法凍存 |
-| Runtime 把跑到一半的 job 從 GPU1 搬到 GPU0 | ❌ 無任何內建機制 |
-| 主動解 fragmentation（evict low-priority running job） | ❌ 不會主動觸發，需外部驅動 |
+| Helper | 行為 | 預設 |
+|--------|------|------|
+| memory | 使用 GPU 數與 CPU 數估算 `--mem` | enabled |
+| partition | 依 `tres_per_node` 內容選擇 `cpu` / `gpu-rtx4070` / `gpu-rtx4080` | enabled |
+| qos | 依 account rule 或 default 補 `qos` | enabled，default=`normal` |
 
-最後兩列是核心問題：任何主流叢集排程器（K8s / Kueue / Volcano）都無法做到 GPU live migration；能做的只有 **preempt + requeue**，由 application 自己負責 checkpoint resume。
+partition rule 預設：
 
----
+| Match | Partition |
+|-------|-----------|
+| `gpu:rtx4080` | `gpu-rtx4080` |
+| `gpu:rtx4070` | `gpu-rtx4070` |
+| `gpu:` | `gpu-rtx4070` |
+| no GPU match | `cpu` |
 
-## 2. 企業解決方案概覽
+## 5. Score Function
 
-| 系統 | 架構 | 對 GPU fragmentation 的處理 |
-|------|------|---------------------------|
-| **AWS ParallelCluster** | Slurm 包一層，對接 EC2 autoscaling | 靠 scale-out 稀釋；單機多卡場景無解 |
-| **AWS Batch / GCP Batch** | VM-level bin-pack（`bin-pack` / `spread` placement group）| 整卡或 MIG slice，不做卡內碎片重整 |
-| **GKE + kube-scheduler** | `NodeResourcesFit(MostAllocated)` = bin-pack | 與 Slurm `CR_Pack_Nodes` 概念相同 |
-| **Volcano** | K8s 批次，gang scheduling（DDP 必需）、fairshare、preempt plugin | preempt + requeue，無 live migration |
-| **Kueue** | Hierarchical quota + cohort，workload preemption | 同上 |
-| **Microsoft Singularity** | GPU 時分多工 + checkpoint 感知 preemption | 最接近 live migration，但仍依賴 app-level ckpt |
-| **Gandiva (MSR)** | time-slicing + intra-job migration（同節點 GPU 間） | 唯一做到 GPU 間搬移的系統，需 GPU memory snapshot 支援 |
+score function 是 submit-time heuristic，用來產生 priority delta。分數越高，job 越值得被提前考慮。
 
-**共通結論**：生產系統面對 GPU fragmentation 一律走兩條路——靠規模稀釋、或 preempt+requeue。沒有人在生產線上做跨節點 GPU live migration。Gandiva 做到同節點 GPU 間搬移，代價是需要特製的 memory snapshot 基礎設施。
+```text
+score(J, P) = α * f_mps_fit(J, P)
+            + β * f_vram_fit(J, P)
+            + γ * f_topology(J, P)
+            - δ * f_fragmentation(J, P)
+            + ε * f_pred_runtime(J)
 
----
-
-## 3. 目前客製排程機制
-
-### 整體架構
-
-```
-Layer 1 — Score Function + Slurm（全時運作）
-Layer 2 — UCB1 Weight Tuner（自適應係數，live）
-Layer 3 — DSAC Deep RL（sim 訓練，shadow mode）
+score = clamp(score, 0, 1)
+priority_delta = round(scoreGain * score)
 ```
 
-三層疊加，下層是上層的 fallback。Layer 1 在任何情況下都不停止。
+上線套用方式：
 
-### Layer 1：Score Function
-
-每個 job 在 `sbatch` 時由 `job_submit.lua` 算 score，寫入 `job_desc.priority`：
-
-```
-priority = score_gain × (
-    α · f_mps_fit        +  // MPS slot 利用率配適
-    β · f_vram_fit        +  // VRAM 容量配適
-  − δ · f_fragmentation   +  // 放置後碎片代價
-    ε · f_pred_runtime       // 短工優先（SJF inspired）
-)
+```text
+if scoreApply=true and priority_delta > 0 and job_desc.priority is empty:
+    job_desc.priority = priority_delta
 ```
 
-`f_pred_runtime` 呼叫 **M5 runtime predictor**（LightGBM，FastAPI），從 `job_submit.lua` 透過 `io.popen("curl …")` 取回預測秒數，正規化為 `clamp01(1 − pred_s / horizon)`。Predictor 掛掉時 `pcall` 保護，fallback 到 0.5。
+`scoreGain` 預設為 `1000`，用來把 `[0,1]` score 轉成 Slurm priority delta。
 
-**Fragmentation reconciler（Gandiva-lite）**：Operator 每 15 秒掃 slurmrestd，偵測 pending 高優先 job 被 fragmentation 卡住時，`scontrol requeue` 最低優先的 victim job，讓 GPU slot 釋出。受 rate limit 保護（預設 5 次/小時）。
+### 5.1 係數
 
-> **M8 評估結論**：M5 runtime predictor 在有排隊壓力的 trace 上顯著改善 JCT（philly −20.1%、burst −28.7%）。Fragmentation reconciler 在三個 trace 上全為 net negative（philly +33%、burst +61%、ali +6%），原因是 victim 重跑損失 in-flight progress 大於解卡收益；目前維持 `shadowMode=true`，不啟動實際 requeue。
+chart 預設係數：
 
-目前 live 係數（UCB1 best arm）：α=0.10, β=0.20, δ=0.05, ε=0.30。
+| Factor | Symbol | Default | 說明 |
+|--------|--------|---------|------|
+| MPS fit | α | `0.40` | 偏好 MPS request 與 GPU slot 配適 |
+| VRAM fit | β | `0.20` | 避免小 VRAM job 佔用大 VRAM tier |
+| Topology | γ | `0.00` | 保留欄位，目前不影響上線結果 |
+| Fragmentation cost | δ | `0.20` | 懲罰容易留下 MPS 碎片的 request |
+| Predicted runtime | ε | `0.00` | predictor 啟用且係數非 0 時，短 job 會拿較高分 |
 
-### Layer 2：UCB1 Weight Tuner
+若 `weight-tuner` 啟用，Lua plugin load 時會從 `GET /weights` 載入 `(α, δ, ε)`，`β` 固定，`γ` 維持 chart 設定。
 
-`services/weight_tuner/` 將 (α, δ, ε) 組成 27 個離散 arm，背景每 300 秒拉 slurmrestd 收集 completed jobs 的 JCT，計算 reward = −mean_JCT，更新 UCB1 policy。`job_submit.lua` 在 plugin load 時 `curl GET /weights` 拿最新係數。
+### 5.2 `f_mps_fit`
 
-Sim 評估（120 rounds）：UCB1 達到 eval JCT 2.587h（random 3.217h，−19.6%），接近 grid-search best 2.511h。
+衡量 job MPS request 與單 GPU MPS 容量的配適程度。
 
-### Layer 3：Discrete SAC (DSAC) + Hierarchical
+| 項目 | 規格 |
+|------|------|
+| Input | `job_desc.tres_per_node`，例如 `gpu:rtx4070:1,mps:25` |
+| MPS 容量 | `slurm.jobSubmit.mpsPerNode`，預設 `100` |
+| Formula | `mps_req / mpsPerNode`，clamp 到 `[0,1]` |
+| no MPS request | 回傳 `1.0` |
+| request 超過容量 | 回傳 `0.0` |
 
-`services/rl_scheduler/dsac.py` 實作 Discrete SAC：隱式 policy π(a|s) = softmax(min(Q₁,Q₂)/α)，twin Q-networks + LayerNorm + auto-temperature + action masking（invalid slot → Q = −1e9）。
+### 5.3 `f_vram_fit`
 
-**MDP（目前版本）**：
-- State obs_dim=193：16 jobs × 11 feats + 4 nodes × 3 feats + 5 global feats
-- Action：Discrete(17)，16 個 job slot + no-op（job 選擇，不含 placement）
-- Reward：`jct_aligned`（−JCT/scale）或 `shaped`（β_jct·(−JCT/scale) + β_slow·(−log(slowdown))）
+依 `--constraint` 中的 `vram-*g` 需求選擇最小可用 VRAM tier，避免過度配置。
 
-**Hierarchical（archived 2026-05）**：D-LinUCB outer loop（小時尺度，選 β_jct × β_slow 9 個 arm）+ DSAC inner loop（per-decision）。M10 後改用 flat DSAC + RLPD，原始程式碼可在 git history 找到（`git log --all -- services/rl_scheduler/hierarchical.py`）。
+| 項目 | 規格 |
+|------|------|
+| Input | `job_desc.features`，例如 `vram-12g+` |
+| VRAM tiers | `slurm.jobSubmit.vramTiers`，預設 `[12, 24]` |
+| Formula | `1 - (fit_tier - req) / max_tier`，clamp 到 `[0,1]` |
+| 無 VRAM constraint | 回傳 `0.5` |
+| 無 tier 可容納 | 回傳 `0.0` |
 
-**Sim2Real（RLPD）**：offline sim buffer + online live buffer 混合，UTD ratio=4，在 `services/rl_scheduler/rlpd_finetune.py`。
+### 5.4 `f_topology`
 
-**M10 paired evaluation（philly/burst/ali × 5 seeds，n_inner=1000）**：
+目前為保留欄位，Lua 回傳中性值 `0.5`。因 chart 預設 `γ=0`，此因子不影響上線 priority。
 
-| Family | score JCT | hier DSAC JCT | Δ | 顯著 |
-|--------|----------:|---------------:|---|------|
-| philly | 11.7h | 7.6h | +35% | 不顯著（CI 跨 0） |
-| burst  | 10.4h | 15.2h | −46% | 不顯著 |
-| ali    | 0.8h  | 1.5h  | −86% | **顯著回退** |
+### 5.5 `f_fragmentation`
 
-結論：DSAC 1000 inner steps 訓練不足，ali 短 JCT 場景顯著回退。Layer 3 維持 shadow / fallback，不接管 live production。
+目前使用 submit-time proxy，不讀 live cluster state。它懲罰最容易留下碎片的 MPS request。
 
----
+| 項目 | 規格 |
+|------|------|
+| Input | `mps_req` |
+| Formula | `4 * x * (1 - x)`，其中 `x = mps_req / mpsPerNode` |
+| `mps_req <= 0` | 回傳 `0.0` |
+| `mps_req >= mpsPerNode` | 回傳 `0.0` |
+| `mps_req = 50%` | 回傳接近 `1.0`，碎片化代價最高 |
 
-## 4. DRL Scheduler ✅
+### 5.6 `f_pred_runtime`
 
-### 目標
+runtime predictor 啟用時，短 job 取得較高 score。predictor 不可用時回傳中性值。
 
-把 Layer 1 + Layer 2 + Layer 3 整合成**單一 DRL policy**，讓模型同時學習：
+| 項目 | 規格 |
+|------|------|
+| Endpoint | `POST /predict`，預設 `http://runtime-predictor:8080/predict` |
+| Timeout | `slurm.jobSubmit.predictor.timeoutMs`，預設 `200ms` |
+| Formula | `1 - pred_seconds / fallback_seconds`，clamp 到 `[0,1]` |
+| fallback seconds | `fallbackHours * 3600`，預設 `4h` |
+| predictor disabled | 回傳 `0.5` |
+| timeout / 5xx / invalid body | 回傳 `0.5` |
 
-1. **Job 選擇**：哪個 job 應該現在跑
-2. **Placement**：應該放到哪個 node、哪張 GPU、哪段 MPS slot
+Predictor request body：
 
-取代現有的「score 決定順序 + Slurm 決定 placement」分工，讓 placement 也進入 reward 迴路。環境約束：2 台主機 × 2 GPU × MPS enabled（RTX 4070，每 GPU 4 slot）。
-
-### 新 MDP 設計
-
-**State Space（obs_dim ≈ 210）**
-
-```
-job queue feats    : TOP_K=16 jobs × 11 dims  = 176
-GPU slot feats     : 2 nodes × 2 GPUs × 6 dims =  24
-topology feats     : 4 dims
-global feats       : 6 dims
-```
-
-GPU slot feats（6 dims/GPU）：`free_mps_ratio, running_jobs, vram_used_ratio, gpu_type_onehot(3)`
-
-Topology feats：`intra_bw_ratio`（節點內頻寬），`inter_bw_ratio`（節點間），`ddp_job_ratio`（queue 中多 GPU job 比例），`cross_node_active`（目前跨節點 job 數）
-
-**Action Space — Discrete(65)**
-
-```
-A = (job_i, node_j, gpu_k) : i ∈ [0,16), j ∈ {0,1}, k ∈ {0,1}
-  + no-op
-= 16 × 2 × 2 + 1 = 65
-```
-
-Action masking：`job_i` 的 `mps_req > gpu[j][k].free_mps` 時 mask = False；multi-GPU job 需要的 GPU 不夠時 mask = False。DSAC 對 masked action 設 Q = −1e9。
-
-**Reward**
-
-```
-r_t = r_placement + r_completion
-
-r_placement（每次 action）：
-    α · f_mps_fit(job, gpu)          // 選此 GPU 後剩餘 MPS 配適度
-  + β · f_vram_fit(job, gpu)         // VRAM 配適
-  − δ · f_fragmentation(state)       // 放置後的碎片代價
-  （scale 為小值，例如 × 0.01）
-
-r_completion（job 完成時）：
-    β_jct · (−JCT / scale)
-  + β_slow · (−log(slowdown))
+```json
+{
+  "user": "alice",
+  "partition": "gpu-rtx4070",
+  "gpu_count": 1,
+  "mps_req": 25,
+  "gpu_type": "rtx4070",
+  "user_time_limit_seconds": 3600
+}
 ```
 
-Reward 因子直接繼承 score function 的設計語義，將 heuristic 轉為學習目標。
+Predictor response：
 
-### DSAC + RLPD 架構圖
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        DSAC + RLPD Agent                            │
-│                                                                     │
-│  Observation S_t (210 dims)                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────┐   │
-│  │ Job Queue    │  │ GPU Slots    │  │ Topology   │  │ Global   │   │
-│  │ 16×11 = 176  │  │ 2×2×6 = 24   │  │ 4 dims     │  │ 6 dims   │   │
-│  └──────┬───────┘  └──────┬───────┘  └─────┬──────┘  └────┬─────┘   │
-│         └─────────────────┴────────────────┴───────────────┘        │
-│                                   │                                 │
-│                             Concat → 210                            │
-│                                   │                                 │
-│                   ┌───────────────▼──────────────────┐              │
-│                   │   Shared Trunk  MLP(210→256→128) │              │
-│                   └───────────┬──────────────────────┘              │
-│                               │                                     │
-│             ┌─────────────────┼─────────────────┐                   │
-│             ▼                                   ▼                   │
-│   ┌──────────────────┐                ┌──────────────────┐          │
-│   │  Q-Network 1     │                │  Q-Network 2     │          │
-│   │  MLP(128→65)     │                │  MLP(128→65)     │          │
-│   │  Q₁(s,·)         │                │  Q₂(s,·)         │          │
-│   └────────┬─────────┘                └────────┬─────────┘          │
-│            └──────────────┬────────────────────┘                    │
-│                           ▼                                         │
-│               min(Q₁, Q₂)  →  apply action mask (−1e9)              │
-│                           ▼                                         │
-│               π(a|s) = softmax( min(Q₁,Q₂) / α )                    │
-│                           │                                         │
-│              ┌────────────▼─────────────┐                           │
-│              │  Action a ∈ Discrete(65) │                           │
-│              │  (job_i, node_j, gpu_k)  │                           │
-│              │   or  no-op              │                           │
-│              └──────────────────────────┘                           │
-│                                                                     │
-│   Temperature α: auto-tuned via  ∂L_α/∂α = 0  (target entropy)      │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────────┐
-│                        RLPD Training Loop                            │
-│                                                                      │
-│   Sim Env (unlimited)          Live Cluster (~200 decisions/day)     │
-│   ┌─────────────────┐          ┌──────────────────────────────┐      │
-│   │ KubefluxSchedEnv│          │ Slurm queue poller           │      │
-│   │ gym_env.py      │          │ srun --nodelist --gres=mps:N │      │
-│   └────────┬────────┘          └──────────────┬───────────────┘      │
-│            │  rollout                         │  observe r, s'       │
-│            ▼                                  ▼                      │
-│   ┌─────────────────┐          ┌──────────────────────────────┐      │
-│   │  Offline Buffer │          │  Online Buffer               │      │
-│   │  D_sim (large)  │          │  D_live (small, growing)     │      │
-│   └────────┬────────┘          └──────────────┬───────────────┘      │
-│            └──────────── 50% ┃ 50% ───────────┘                      │
-│                              ▼                                       │
-│              ┌──────────────────────────────────┐                    │
-│              │   Mini-batch B (256 transitions) │                    │
-│              │   UTD ratio = 4–20 updates/step  │                    │
-│              └──────────────────────────────────┘                    │
-│                              │                                       │
-│          ┌───────────────────▼───────────────────────┐               │
-│          │  Critic update:  L_Q = E[(Q-y)²]          │               │
-│          │  y = r + γ · V_soft(s')                   │               │
-│          │  V_soft(s') = Σ_a π[min(Q₁,Q₂) − α log π] │               │
-│          │  Alpha update:  L_α = E[−α(log π + H̄)]    │               │
-│          │  Soft target:   θ' ← τθ + (1−τ)θ'         │               │
-│          └───────────────────────────────────────────┘               │
-│                                                                      │
-│   Safety fallback: if V(s) < V_threshold → score scheduler           │
-└──────────────────────────────────────────────────────────────────────┘
+```json
+{
+  "pred_seconds": 1146.28,
+  "pred_minutes": 19.10,
+  "model_version": "lgbm-v1",
+  "bootstrap": false,
+  "latency_ms": 1.12
+}
 ```
 
-### 算法改進（v2，2026-05-14）
+`applyTimeLimit=true` 時，Lua 可把 `job_desc.time_limit` 改成預測值；上線建議只有在 predictor 經過校準後才開啟，避免模型低估造成 job timeout。
 
-三項針對稀疏 JCT reward 和 sample efficiency 的改進，已實作整合進 `sim_train.py`：
+## 6. Weight Tuner
 
-#### 1. n-step Returns（n=10）
+`weight-tuner` 是可選 FastAPI service，用 UCB1 在離散 arm 空間中調整 score function 的 `(α, δ, ε)`。
 
-**問題**：JCT reward 在 job 完成時才給，對應的 scheduling decision 可能在 500+ 步前。1-step TD 的 credit assignment 路徑極長，Q-function 收斂慢。
+| Endpoint | 說明 |
+|----------|------|
+| `GET /weights` | 回傳目前 best arm 與統計資料 |
+| `POST /feedback` | 以 reward 更新指定 arm |
+| `GET /stats` | 回傳所有 arms 的 pulls 與 mean reward |
+| `GET /healthz` | health check |
 
-**方法**：滑動視窗累積 n 步 discounted reward，commit 給 replay buffer：
+行為：
 
+- Lua plugin 只在 load 時抓一次 `/weights`。
+- 抓取失敗時沿用 chart 預設係數。
+- `β` 不由 tuner 調整。
+- live reward 以 completed jobs 的 mean JCT 轉換為負 reward。
+
+## 7. DSAC Live Scheduler
+
+`rl-scheduler` 是 FastAPI service，載入目前 image 內的 DSAC checkpoint，提供 Slurm Lua hook 查詢。
+
+| Endpoint | 說明 |
+|----------|------|
+| `GET /healthz` | model readiness、obs/action shape、snapshot age、shadow mode |
+| `POST /snapshot` | 更新 cached cluster snapshot |
+| `POST /decide` | 對提交中的 job 回傳 priority boost / abstain / selected placement |
+| `GET /metrics` | Prometheus metrics |
+
+目前 live 介入方式是 **priority boost**：
+
+```text
+job_submit.lua -> POST /decide
+    if rl_selected=true and priority_boost>0:
+        job_desc.priority += priority_boost
 ```
-stored_reward = r_t + γ·r_{t+1} + ... + γ^{n-1}·r_{t+n-1}
-stored_gamma  = γ^n   (或 γ^k 若在 k < n 處觸到 done)
-TD target: y = stored_reward + stored_gamma · (1 − done) · V_soft(s_{t+n})
+
+DSAC 不直接執行 `srun --nodelist`，也不直接覆蓋 Slurm placement。`node_j` 與 `gpu_k` 會回傳並記錄，用於分析與後續 placement-aware 設計；目前上線仍讓 Slurm `select/cons_tres` 做實際 placement。
+
+### 7.1 Snapshot Schema
+
+```json
+{
+  "now": 0,
+  "pending_jobs": [],
+  "nodes": [
+    {
+      "gpus": [
+        {"free_mps": 100, "running_jobs": 0, "gpu_type": "rtx4070"}
+      ]
+    }
+  ],
+  "n_nodes": 1,
+  "gpus_per_node": 1,
+  "mps_per_gpu": 100
+}
 ```
 
-實作於 `_flush_nstep()` (sim_train.py)，ReplayBuffer 新增 `gammas` 欄位，DSAC `update()` 從 batch 讀取 `gammas` 取代固定 `self.gamma`。
+`/decide` 會在 snapshot 缺失或超過 `snapshotTtlSeconds` 時 abstain。
 
-#### 2. Score-guided Warmup
+### 7.2 Decision Schema
 
-**問題**：uniform random warmup 填入品質低的 transition，Q-network 初始訓練信號噪聲大。
+Lua hook 送出的 request：
 
-**方法**：warmup 期間改用 score scheduler 選 action（`score_warmup=True` 為預設）。Score scheduler 帶有正確的 state→action 相關性，為 Q-network 提供更好的初始訓練樣本。
+```json
+{
+  "job_id": "123",
+  "mps_req": 25,
+  "gpu_count": 1,
+  "gpu_type": "rtx4070",
+  "runtime_s": 3600,
+  "now": 0
+}
+```
 
-#### 3. 短 Episode（n_jobs=50，預設）
+Service response：
 
-**問題**：n_jobs=100 → ~2600 steps/episode → 50k steps 只有 19 episodes，Q-function 泛化差。
+```json
+{
+  "priority_boost": 1000,
+  "rl_selected": true,
+  "abstain": false,
+  "abstain_reason": null,
+  "rl_selected_job_id": "123",
+  "node_j": 0,
+  "gpu_k": 0,
+  "value": -180.06,
+  "entropy": 0.0,
+  "shadow": false
+}
+```
 
-**方法**：預設 n_jobs=50 → ~800 steps/episode → 50k steps 約 62 episodes（3.3× 提升）。
+### 7.3 Live Safety Gates
+
+| Gate | 行為 |
+|------|------|
+| `shadowMode=true` | service 回傳 shadow decision，不實際 boost |
+| stale snapshot | abstain，`priority_boost=0` |
+| low value | 若 `value < valueAbstain`，abstain |
+| high entropy | 若 `entropy > entropyAbstain`，abstain |
+| no-op action | 不 boost |
+| invalid / masked action | 不 boost |
+| network / parse / Lua error | Lua hook no-op，submission 繼續 |
+
+目前 live deployment 使用 DSAC checkpoint，`shadowMode=false` 時會實際套用 positive `priority_boost`。
+
+## 8. Boundary Policy
+
+| Failure | 行為 |
+|---------|------|
+| `job_submit.lua` Lua error | `pcall` 保護；回傳 `slurm.SUCCESS`，priority 不動 |
+| predictor timeout / malformed response | `f_pred_runtime=0.5` |
+| weight tuner unavailable | 使用 chart 預設 weights |
+| RL scheduler unavailable | `rl_apply` no-op；submission 不失敗 |
+| score < 0 | clamp 到 0 |
+| score > 1 | clamp 到 1 |
+| `scoreGain=0` | score 只記錄，不改 priority |
+| `scoreApply=false` | score 只記錄，不改 priority |
+| DSAC abstain | 不加 boost，交給 score + Slurm |
+
+## 9. Monitoring Metrics
+
+`rl-scheduler` 暴露 Prometheus metrics，Grafana dashboard `Scheduler Live Resource View` 會使用這些指標。
+
+| Metric | 說明 |
+|--------|------|
+| `rl_scheduler_ready` | DSAC model 是否載入 |
+| `rl_scheduler_shadow_mode` | 1=shadow，0=live |
+| `rl_scheduler_decisions_total{result}` | selected / no_boost / abstain 次數 |
+| `rl_scheduler_priority_boost_total` | positive boost 累積次數 |
+| `rl_scheduler_last_priority_boost` | 最近一次 boost |
+| `rl_scheduler_policy_value` | 最近一次 value estimate |
+| `rl_scheduler_policy_entropy` | 最近一次 entropy |
+| `rl_scheduler_snapshot_age_seconds` | snapshot age |
+| `rl_scheduler_snapshot_pending_jobs` | snapshot pending jobs |
+| `rl_scheduler_snapshot_free_mps` | snapshot free MPS slots |
+| `rl_scheduler_last_action` | 最近一次 flat action index |
+| `rl_scheduler_last_job_index` | 最近一次 selected job slot |
+| `rl_scheduler_last_node_index` | 最近一次 selected node index |
+| `rl_scheduler_last_gpu_index` | 最近一次 selected GPU index |
+
+## 10. Deployment Knobs
+
+常用 Helm values：
+
+```yaml
+slurm:
+  jobSubmit:
+    enabled: true
+    scoreApply: true
+    scoreGain: 1000
+    mpsPerNode: 100
+    predictor:
+      enabled: false
+      applyTimeLimit: false
+
+rlScheduler:
+  enabled: true
+  shadowMode: false
+  snapshotTtlSeconds: 86400
+  valueAbstain: -100000
+  entropyAbstain: 1.5
+  priorityBoost: 1000
+  lua:
+    enabled: true
+
+weightTuner:
+  enabled: false
+```
+
+Live smoke check：
 
 ```bash
-# 新預設（三項改進全開，CUDA 版）
-PYTHONPATH=. .venv-m11/bin/python eval/scripts/eval_dsac_placement.py \
-    --n-nodes 1 --gpus-per-node 1 \
-    --total-steps 200000 --n-jobs 50 \
-    --trace-families philly burst ali \
-    --seeds 42 43 44 45 46 --device cuda
+kubectl -n slurm exec slurm-controller-0 -- \
+  curl -fsS http://rl-scheduler:8002/healthz
+
+kubectl -n slurm exec slurm-controller-0 -- \
+  curl -fsS http://rl-scheduler:8002/metrics | grep rl_scheduler
+
+LOGIN_POD=$(kubectl -n slurm get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
+kubectl -n slurm exec "$LOGIN_POD" -- \
+  sbatch --wrap='sleep 3' --job-name='dsac-live-smoke' -p cpu
+
+kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score'
 ```
 
-### Live Training 策略
-
-目標：直接在 live cluster 上訓練（不依賴大量模擬預訓練）。
-
-**推薦演算法：DSAC（Discrete SAC）+ RLPD hybrid**
-
-DSAC 已實作，action masking、twin Q 防止過估計、auto-temperature 適配 sparse reward。RLPD hybrid 在 live sample 稀少的情況下混合 sim rollout（offline buffer）維持穩定性。
-
-```
-Live step:
-  1. agent 觀測 S_t，根據 DSAC policy 選 (job, node, gpu)
-  2. 執行 srun / scontrol（Slurm API）
-  3. 觀測 r_t，存入 live buffer
-  4. 每 N 步：從 sim buffer（50%）+ live buffer（50%）取 batch，UTD=4–20 梯度更新
-```
-
-Safety：value head 估值低或 policy entropy 高時，fallback 到 score scheduler；live buffer 累積 < 500 transitions 前固定 fallback。
-
-**演算法選型對比**
-
-| 演算法 | 離散 action | ~1K live samples | 主風險 | 推薦 |
-|--------|:-----------:|:----------------:|--------|:----:|
-| **DSAC + RLPD** | ✅ 原生支援 | ✅（sim buffer 補足） | reward shaping 工 | ✅ 主軸 |
-| **DreamerV3** | ✅（categorical dist） | ✅ ~100K steps 收斂 | world model 建模 scheduling dynamics 難 | ⭐ 研究備選 |
-| **IQL（offline）** | ✅ | ⚠️ 受限 dataset 天花板 | 無法超越 offline dataset | warm-start 用 |
-| **TD3 / SAC** | ❌ 連續 action only | — | action space 不符 | ❌ |
-| **TD-MPC2** | ❌ | ❌ 需 1M+ steps | 針對連續控制設計；MPPI planning 不適合離散 scheduling | ❌ |
-| **PPO (Maskable)** | ✅ | ❌ 需大 batch | live 樣本遠不足 | sim-only 才適用 |
-
-TD-MPC2 的主要問題：(1) 所有 benchmark（DMControl / Meta-World / ManiSkill2）均為連續控制，其 latent world model 假設 smooth dynamics，不適合離散 job arrival 的 stochastic transition；(2) inference 時 MPPI 需要對 candidate action 序列做數百次 world model rollout，scheduling 決策延遲不可接受；(3) 收斂需 1M+ environment steps，live cluster 每天僅 ~200 decisions，差距達 10–40 倍。
-
-**DreamerV3** 是唯一值得列為備選的 model-based 方法：支援離散 action（categorical distribution）、~100K steps 可收斂、world model 可在 sim 中 pre-train 再 fine-tune。但實作量大，建議 DSAC live 驗證通過後再考慮作為研究對照。
-
-### 實作規劃
-
-| 階段 | 內容 | 狀態 |
-|------|------|------|
-| **Step 1** | 擴展 `sim/gym_env.py`：placement-aware MDP, Discrete(17)，GPU slot + topology feats，env_dims() helper | ✅ |
-| **Step 2** | `sim/cluster.py`：`try_allocate_on(job, node, gpu)`, `can_allocate_on()`, `_plan_on()` | ✅ |
-| **Step 3** | 5 integration tests：dims match，buffer fill，update loss finite，mask compliance，200-step stability | ✅ |
-| **Step 4** | `sim_train.py`：online DSAC training loop（UTD=4，job filter for cluster size）；`eval_dsac_placement.py`：paired t-test + 95% CI vs score baseline | ✅ |
-| **Step 5** | `serve.py`：DSAC FastAPI（/healthz /snapshot /decide /act，backward-compat Lua hook，placement node_j+gpu_k in response）；`live_daemon.py`：squeue poller → obs build → srun → transition log，SHADOW_MODE=true default | ✅ |
-| **Step 6** | `rlpd_finetune.py`：DSAC-native（KubefluxSchedEnv，gpu_count filter，clean up PPO legacy）；混合 offline sim + online live JSONL；UTD=4–20 | ✅ |
-
-### 與現有架構的關係
-
-```
-現在：
-  job_submit.lua (score) → priority → Slurm backfill → select/cons_tres (placement)
-
-新：
-  DRL policy(S) → (job, node, gpu) → srun --nodelist --gres
-                                      （繞過 Slurm placement，直接指定）
-  score scheduler 降為 safety fallback
-```
-
-Slurm `SelectType` 仍保留，但 DRL 接管時改用 `--nodelist` + `--gres` 強制指定 placement，不讓 Slurm 自行選卡。
-
----
-
-## 5. Attention 架構
-
-### 5.1 問題：MLP 對 Job Queue 的結構盲點
-
-目前 DSAC 把 16 個 job slot 的特徵 flat concatenate 成 176 維向量餵給 MLP。這個設計有兩個根本缺陷：
-
-1. **Permutation sensitivity**：queue 中 job 的順序通常是 submit 時間排序，但最優決策應該與順序無關（「第 3 個 job 最好」vs「最需要 SJF 的 job 最好」）。MLP 必須從頭學 permutation invariance，參數利用率低。
-2. **固定 queue 長度**：concat 要求輸入維度固定（16 slots），不同 episode 的 pending job 數不同只能用 padding 解決，增加噪聲。
-
-### 5.2 Attention 為什麼適合 Job Scheduling
-
-Job queue 天生是一個 **set**（無序集合）。Attention 機制對 set 的關鍵優勢：
-
-- **Permutation invariant**：self-attention 對 input 的排列不敏感（Q, K, V 計算與順序無關）
-- **Pairwise interaction**：每個 job 能看到其他所有 job 的特徵（「這個 job 是否會和其他 pending job 搶同一張 GPU？」）
-- **Variable-length input**：mask 掉 padding token 即可，不需要固定 queue 長度
-
-### 5.3 相關論文
-
-| 論文 | 核心貢獻 | 與本系統相關性 |
-|------|---------|-------------|
-| **Decima** (Mao et al., SIGCOMM 2019) | GNN + REINFORCE 對 DAG job scheduling；node embedding → scheduling policy | 最直接的 RL + 結構化 graph model 先例。我們的 job queue 是退化的 DAG（無 dependency）|
-| **Attention, Learn to Solve Routing Problems** (Kool et al., ICLR 2019) | Transformer encoder 對 TSP/VRP；pointer attention 直接輸出「選哪個 node」| 架構幾乎可以直接移植：job = node，「選哪個 job 排程」= pointer |
-| **Pointer Networks** (Vinyals et al., NIPS 2015) | 用 attention 作為 pointer 指向 input set 的某個元素；解 TSP | 理論基礎；明確提出「combinatorial optimization over set = pointer over attention scores」|
-| **Set Transformer** (Lee et al., ICML 2019) | 用 Induced Set Attention Block（ISAB）實現 O(mn) 複雜度的 set-to-set 變換 | 直接提供 permutation-invariant set encoding，可作為 Q-network 的 encoder |
-| **L2D** (Zhang et al., NeurIPS 2020) | GNN + PPO 對 Job Shop Scheduling（JSP）；disjunctive graph 表示機器衝突 | JSP = 固定 machine，我們是 dynamic GPU。架構啟發但 graph 建法需調整 |
-| **Schedformer** 方向 | Transformer 作為排程策略（HPC domain）| 無單一主論文，但有 workshop paper 展示 attention 對 HPC 的適用 |
-
-### 5.4 建議架構：Queue Attention Q-Network
-
-把 DSAC 的 `_QNet` 改為 attention-based encoder：
-
-```
-Input:
-  jobs     (B, 16, 11)   ← 16 job slots × 11 features
-  gpu      (B, 6)         ← GPU state
-  topo     (B, 4)         ← topology
-  global   (B, 6)         ← global queue stats
-
-Step 1: Per-job embedding
-  job_emb = Linear(11 → 64) + ReLU      → (B, 16, 64)
-
-Step 2: Self-attention over job set
-  x = TransformerEncoder(d_model=64, nhead=4, nlayers=2)  → (B, 16, 64)
-  queue_ctx = x.mean(dim=1)              → (B, 64)   # permutation-invariant
-
-Step 3: Fuse with cluster state
-  cluster_ctx = Linear(6+4+6=16 → 64) + ReLU  → (B, 64)
-  fused = Concat([queue_ctx, cluster_ctx])      → (B, 128)
-
-Step 4: Q-values
-  Q = Linear(128 → 17)                  → (B, 17)
-```
-
-**參數量比較**（雙 Q-network）：
-- 原 MLP(192→256→256→17)：~130k params
-- Attention Q-Network：~50k params（更小，更快，更泛化）
-
-### 5.5 實作考量
-
-- **Padding mask**：當 pending jobs < 16 時，padding slot 應在 self-attention 中被 mask（`src_key_padding_mask`）
-- **Positional encoding**：不需要（set 沒有位置意義；加了反而破壞 permutation invariance）
-- **與 action mask 的關係**：self-attention 發生在 encoder 層，output 仍是 17 個 Q-value；action masking 依然在 Q-value 層套用，不影響 attention 計算
-- **Training stability**：TransformerEncoderLayer 內建 LayerNorm；搭配現有 DSAC 的 orthogonal init 和 twin Q-network 應可穩定訓練
-
-### 5.6 預期效益
-
-理論上，attention 架構主要解決 **sample efficiency** 問題：
-
-- Permutation invariance → 同樣的 job 組合不論排列順序都能泛化，有效樣本數倍增
-- 不需要 MLP 浪費容量學 symmetry，更多容量用於學真正的 scheduling heuristic
-- Variable-length queue → 在 episode 早期（queue 長）和後期（queue 短）使用同一個 encoder
-
-預計對 50k steps 這個樣本量有最直接的幫助，因為當前 MLP 的 sample complexity 限制正好是瓶頸。
-
----
-
-## 6. DRL 改進路線圖
-
-本節根據 §4–5 的實驗結果（Appendix H、I），系統整理尚未解決的問題及對應的改進方向，並評估 2023 年提出的 DSAC-T 算法的適用性。
-
-### 6.1 目前瓶頸診斷
-
-| 問題 | 現象 | 根因 |
-|------|------|------|
-| 落後 score baseline | MLP −42～−84%、Attention −106～−186% | JCT reward 稀疏、action space 太小 |
-| Attention 高方差 | burst seed range 2.7h→11.9h | Transformer 在小 queue 下收斂慢 |
-| Alpha 不穩定 | auto-tune 時 α 在 1.6～7.4 之間漂移 | entropy target 與 Q 收斂速度不同步 |
-| 訓練多樣性不足 | 1×1 cluster 只有 17 個 action | 真實排程場景更複雜 |
-
----
-
-### 6.2 DSAC-T：是否適用？
-
-**DSAC-T**（Distributional Soft Actor-Critic with Three Refinements，arXiv 2310.05858，2023）是針對**連續動作空間**設計的改進版 Distributional SAC，三項 refinement 如下：
-
-| Refinement | 說明 |
-|------------|------|
-| Expected Value Substituting | 用期望值替換隨機 target return，穩定均值更新 |
-| Twin Value Distribution Learning | 雙 Q 學習完整回報分佈（Gaussian），降低過估 |
-| Variance-Based Critic Gradient Adjusting | 依方差縮放 critic 梯度，減少高方差區域的更新幅度 |
-
-**直接套用的問題**：DSAC-T 的 policy 輸出是連續動作（如機器人控制），整個框架假設 `a ∈ ℝⁿ`。我們的 action space 是離散的（`a ∈ {0,...,16}`），無法直接使用其 policy gradient 部分。
-
-**可借用的思想**：
-
-| DSAC-T 概念 | 離散版對應做法 | 適用於我們的系統 |
-|-------------|---------------|-----------------|
-| Distributional Q（Gaussian） | **C51 / IQN**（離散 distributional RL）| ✅ 可接入現有 twin Q 結構 |
-| Variance-based gradient scaling | Huber loss 已部分實現；可加顯式方差 clipping | ✅ 容易加 |
-| Twin value distribution | 我們已有 twin Q；distributional 化需改 output head | 中等難度 |
-
-**結論**：DSAC-T 本身不能直接移植，但其核心的「distributional critic + 方差控制」思想可透過**離散版 Distributional RL（IQN）**引入，解決我們的 Q 過估問題。
-
----
-
-### 6.3 改進方向（按影響力排序）
-
-#### 優先級 A：解決根本問題
-
-**A1 — Reward Shaping（最高優先）**
-
-目前 JCT reward 只在 episode 結束時給一次，整個 episode 幾乎沒有梯度。改為 potential-based shaping：
-
-```
-φ(s) = −Σ_i  wait_time_i / scale        # 所有 pending job 的等待時間和
-r_shaped = r + γ·φ(s') − φ(s)           # Ng et al. 1999：不改變最優策略
-```
-
-每步都有信號，Q-net 收斂速度預計提升 5-10×，且不影響最優策略的最優性（理論保證）。
-
-**A2 — 擴大 Cluster 規模（2×2）**
-
-```python
-# sim/gym_env.py
-N_NODES, N_GPUS = 2, 2   # obs_dim → 210, n_actions → 65
-```
-
-更大 action space → 更多有意義的 placement 決策 → DRL 相對 score 的優勢才能體現。**需從頭重新訓練**（obs_dim 與 checkpoint 不相容）。
-
----
-
-#### 優先級 B：算法改進
-
-**B1 — Prioritized Experience Replay (PER)**
-
-依 TD error 大小對 replay buffer 加權採樣：
-
-```
-P(i) ∝ |δᵢ|^α + ε       # α=0.6, β (IS weight) 從 0.4 退火到 1.0
-```
-
-讓 Q-net 重點學習高誤差轉移，對稀疏 reward 特別有效。實作成本低（在 `ReplayBuffer.sample()` 加 SumTree）。
-
-**B2 — Implicit Quantile Networks (IQN) for Discrete Actions**
-
-用 quantile regression 學習完整的 return 分佈而非均值：
-
-```
-Zτ(s,a) = f_θ(φ(s,a), ψ(τ))    # τ ~ Uniform(0,1)
-Loss = E_τ[ρτ(r + γZτ'(s',a*) − Zτ(s,a))]    # Huber quantile loss
-```
-
-這是 DSAC-T distributional 思想的離散版對應，可降低 Q 過估、減少方差。可直接替換現有 `_QNet` 的 output head。
-
-**B3 — Conservative Q-Learning (CQL) 調節係數**
-
-在 Q 更新中加入正則項，防止 out-of-distribution action 的 Q 值被過估：
-
-```
-min_Q  α·(E_{a~π}[Q(s,a)] − E_{a~D}[Q(s,a)]) + 標準 TD loss
-```
-
-對 warmup buffer 品質不高的早期訓練特別有幫助。
-
----
-
-#### 優先級 C：訓練效率
-
-**C1 — Curriculum Learning**
-
-```
-Stage 1: n_jobs=10, total_steps=50k  → 學會基本 job 選擇
-Stage 2: n_jobs=30, total_steps=100k → 學 queue pressure
-Stage 3: n_jobs=50, total_steps=200k → 完整場景
-```
-
-避免早期 episode 太難學到隨機策略，有論文在排程問題上報告 2-3× sample efficiency 提升。
-
-**C2 — 更多 Training Steps（500k→1M）**
-
-目前 200k steps 下 MLP 收斂跡象不明顯（per-seed variance 仍大）。Decima 等工作用 1M+ steps，job scheduling RL 通常需要比連續控制更多步數。
-
-**C3 — RLPD Fine-tuning**
-
-`services/rl_scheduler/rlpd_finetune.py` 已實作。接入 live shadow logs 後可用真實 workload 分佈做 online fine-tuning，解決 sim-to-real gap。
-
----
-
-### 6.4 建議實驗順序
-
-```
-Phase 1: Reward shaping (A1)
-  → 預計讓 DSAC 在 1×1 cluster 上超過 score baseline
-  → 驗證：eval_dsac_placement.py，比較有/無 shaping 的 delta_pct
-
-Phase 2: 2×2 cluster (A2) + Curriculum (C1)
-  → obs_dim=210, n_actions=65
-  → 需重新設計 env_dims() 和對應 loader
-
-Phase 3: PER (B1) + More steps (C2)
-  → 100k→500k steps，加 SumTree
-
-Phase 4: IQN (B2) [選做]
-  → 替換 _QNet output head，評估 vs 標準 twin Q
-```
-
----
-
-### 6.5 與 DSAC-T 的完整對照
-
-| 面向 | DSAC-T（連續） | 我們的系統（離散）| 建議做法 |
-|------|---------------|-----------------|---------|
-| Action space | 連續 ℝⁿ | 離散 {0..16} | 保持 Discrete SAC |
-| Value function | Gaussian 分佈 | 均值 Q | 改為 IQN（quantile） |
-| Policy | reparameterization trick | softmax over Q | 不變 |
-| Gradient stability | Variance-based scaling | — | 加 gradient clipping (0.5) |
-| 過估問題 | Twin + distributional | Twin Q | Twin + IQN |
-| 適用場景 | 連續控制（機器人、MEC） | 離散排程 | — |
-
-DSAC-T 在 MEC 資源分配（連續頻譜分配）上有成功應用，但 job scheduling 的離散特性使直接移植不可行；IQN 是對應的離散版替代。
-
----
-
-## 附錄：引用文獻
-
-**主方法**
-- Duan et al., "DSAC-T: Distributional Soft Actor-Critic with Three Refinements", arXiv 2310.05858, 2023
-- Dabney et al., "Implicit Quantile Networks for Distributional Reinforcement Learning" (IQN), ICML 2018
-- Bellemare et al., "A Distributional Perspective on Reinforcement Learning" (C51), ICML 2017
-- Schaul et al., "Prioritized Experience Replay" (PER), ICLR 2016
-- Ball et al., "Efficient Online Reinforcement Learning with Offline Data" (RLPD), ICML 2023
-- Schulman et al., "Proximal Policy Optimization Algorithms", arXiv 2017
-- Russac et al., "Weighted Linear Bandits for Non-Stationary Environments" (D-LinUCB), NeurIPS 2019
-
-**DRL 排程先導**
-- Mao et al., "Resource Management with Deep Reinforcement Learning" (DeepRM), HotNets 2016
-- Mao et al., "Learning Scheduling Algorithms for Data Processing Clusters" (Decima), SIGCOMM 2019
-
-**Attention for Combinatorial Optimization**
-- Vinyals et al., "Pointer Networks", NIPS 2015
-- Kool et al., "Attention, Learn to Solve Routing Problems!", ICLR 2019
-- Lee et al., "Set Transformer: A Framework for Attention-based Permutation-Invariant Neural Networks", ICML 2019
-- Zhang et al., "Learning to Dispatch for Job Shop Scheduling via Deep Reinforcement Learning", NeurIPS 2020
-
-**Model-based RL 備選**
-- Hafner et al., "Mastering Diverse Domains through World Models" (DreamerV3), Nature 2025
-
-**架構元件**
-- Zaheer et al., "Deep Sets", NeurIPS 2017
-- Lee et al., "Set Transformer", ICML 2019
-
-**系統對照**
-- Xiao et al., "Gandiva: Introspective Cluster Scheduling for Deep Learning", OSDI 2018
-- Zheng et al., "Shockwave: Fair and Efficient Cluster Scheduling", NSDI 2023
-- Jayaram Subramanya et al., "Sia: Heterogeneity-aware Goodput-Optimized ML-cluster Scheduling", SOSP 2023
+## 11. Files
+
+| Path | Purpose |
+|------|---------|
+| `chart/templates/configmap-job-submit.yaml` | Generates `job_submit.lua` |
+| `chart/lua/rl_hook.lua` | Lua client for DSAC `/decide` |
+| `services/rl_scheduler/serve.py` | DSAC FastAPI service |
+| `services/rl_scheduler/dsac.py` | Discrete SAC implementation |
+| `services/runtime_predictor/` | Runtime prediction service |
+| `services/weight_tuner/` | UCB1 weight tuner |
+| `chart/dashboards/scheduler-live.json` | Live scheduler Grafana dashboard |
+| `docs/monitoring.md` | Monitoring metrics and dashboard details |

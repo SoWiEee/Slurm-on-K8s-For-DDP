@@ -8,7 +8,7 @@ Phase 6 M5 — runtime-predictor service.
 
 Disabled by default. The M2 lua plugin (M6) reads
 slurm.predictor.url and falls back gracefully when this Deployment is
-absent — see scheduler.md M6 risks.
+absent — see docs/scheduler.md.
 */}}
 {{- if .Values.runtimePredictor.enabled }}
 {{- $rp := .Values.runtimePredictor -}}

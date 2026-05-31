@@ -1,5 +1,5 @@
 {{/*
-Weekly retrain CronJob — see scheduler.md M5 acceptance bullet #3.
+Weekly retrain CronJob — see docs/scheduler.md.
 
 The pod runs ``python -m runtime_predictor.train --rotate`` against a
 trace JSON exported to the shared NFS mount (Slurm controller dumps it
