@@ -542,7 +542,7 @@ flowchart LR
 sudo kubectl -n monitoring port-forward svc/grafana 3000:3000
 sudo kubectl -n monitoring port-forward svc/prometheus 9090:9090
 sudo kubectl -n monitoring port-forward svc/alertmanager 9093:9093
-bash scripts/verify-monitoring.sh   # 一鍵驗 24 個 metric endpoint
+bash scripts/verify-live.sh   # 一鍵驗 live cluster：rollout / storage / GPU / monitoring / DSAC
 ```
 
 ---
@@ -693,12 +693,10 @@ sudo kubectl get nodes -o jsonpath='{.items[*].metadata.labels}{"\n"}' | tr , '\
 
 # 監控
 sudo kubectl -n monitoring port-forward svc/grafana 3000:3000
-bash scripts/verify-monitoring.sh
+bash scripts/verify-live.sh
 
-# 驗證
-bash scripts/verify-helm.sh        # lint + template + unittest + dry-run
-bash scripts/verify-storage.sh     # NFS RWX 端對端
-bash scripts/verify-gpu.sh         # GPU + MPS 端對端
+# 驗證 live cluster
+bash scripts/verify-live.sh        # chart render + rollout + NFS RWX + GPU/GRES + monitoring + DSAC smoke
 
 # 2×2 DRL 實驗 overlay（需要兩個 Slurm GPU worker，每個 worker 2 GPU）
 sudo helm upgrade slurm-platform ./chart \

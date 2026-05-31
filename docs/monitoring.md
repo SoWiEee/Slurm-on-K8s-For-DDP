@@ -195,7 +195,7 @@ phase4/
 │       └── slurm-exporter-deployment.yaml # Deployment + Service（REST API 模式，無需 exec RBAC）
 └── scripts/
     ├── bootstrap-monitoring.sh            # 一鍵部署監控堆疊
-    └── verify-monitoring.sh               # 驗證 metrics 可正常抓取
+    └── verify-live.sh               # 驗證 metrics 可正常抓取
 chart/
 └── dashboards/
     ├── bridge-overview.json               # Slurm↔K8s Bridge Overview
@@ -343,7 +343,7 @@ scrape_configs:
 
 ```bash
 bash scripts/bootstrap-monitoring.sh   # 一鍵部署
-bash scripts/verify-monitoring.sh      # 驗證（所有 metrics endpoint 可抓）
+bash scripts/verify-live.sh      # 驗證（所有 metrics endpoint 可抓）
 ```
 
 ### 存取方式

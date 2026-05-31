@@ -165,7 +165,7 @@ COMPLETING 在 Slurm 裡代表「batch script 結束，等 slurmstepd 回報 epi
 
 ---
 
-## 問題 10：verify-gpu.sh 的 job output 讀不到
+## 問題 10：舊版 GPU 驗證的 job output 讀不到
 
 **現象**
 
@@ -267,7 +267,7 @@ login_exec "sinfo -t drain,drained -N --noheader -o '%N' 2>/dev/null \
 
 ## 問題 13：MPS job 拿不到 `CUDA_MPS_PIPE_DIRECTORY`，CUDA 跳過 MPS 直連 GPU
 
-`scripts/verify-gpu.sh` 的 step 6 過去長期出現：
+舊版 GPU/MPS 驗證過去長期出現：
 
 ```
 PASS: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 injected by Slurm prolog
@@ -303,7 +303,7 @@ Slurm 會解析 prolog stdout 的 `export X=Y` 行，把這些變數注入 job s
 
 **驗證**
 
-修法後 verify-gpu.sh step 6：
+修法後 GPU/MPS 驗證：
 
 ```
 MPS job stdout:
@@ -320,7 +320,7 @@ batch step 與 srun step 都拿到 socket 路徑，CUDA runtime 真的會走 MPS
 
 **踩坑插曲（驗證階段）**
 
-1. 一開始用 sbatch 直接接 `--gres=gpu:rtx4070:1,mps:25` 會被拒（`Invalid gres specification`）— 拆成兩段、或單獨 `--gres=mps:25` 都會失敗。改成 `--gres=gpu:rtx4070:1` 單獨 sbatch，再讓 verify-gpu.sh 自己組合 GRES 才正常（這是 Slurm 21.08 + cons_tres 對混合 GRES 的解析限制）。
+1. 一開始用 sbatch 直接接 `--gres=gpu:rtx4070:1,mps:25` 會被拒（`Invalid gres specification`）— 拆成兩段、或單獨 `--gres=mps:25` 都會失敗。改成 `--gres=gpu:rtx4070:1` 單獨 sbatch，再讓驗證腳本自己組合 GRES 才正常（這是 Slurm 21.08 + cons_tres 對混合 GRES 的解析限制）。
 2. 替換 ConfigMap 後 kubelet 大約要 60 秒才把 symlink 切到新內容，期間 prolog 還是舊版。要 `until grep -q <new-marker> /etc/slurm/prolog.d/10-mps-env.sh; do sleep 5; done` 才能確認生效。
 3. operator 預設 cooldown 60s + preStop 會 DRAIN，導致驗證 job 一直 NODE_FAIL。debug 期間先 `kubectl scale deploy slurm-elastic-operator --replicas=0` 把 operator 停掉，避免它在驗證中途縮容。驗證完記得 scale 回 1。
 

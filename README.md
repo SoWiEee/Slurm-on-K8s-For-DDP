@@ -159,37 +159,21 @@ helm upgrade slurm-platform ./chart -f chart/values-k3s.yaml -n slurm \
   --set monitoring.otel.enabled=true
 ```
 
-## 4. 驗證腳本與 live smoke
+## 4. 驗證 live cluster
+
+`verify-live.sh` 會在 Linux + k3s + GPU live 環境一次完成部署後驗證，涵蓋 chart render、核心 workload rollout、NFS RWX、GPU/GRES、Prometheus/Grafana 與 DSAC smoke job。
 
 ```bash
-KUBE_CONTEXT=default bash scripts/verify-helm.sh           # chart 渲染 + dry-run + helm-unittest
-KUBE_CONTEXT=default bash scripts/verify-storage.sh        # PVC Bound、跨 pod 讀寫
-KUBE_CONTEXT=default bash scripts/verify-storage-e2e.sh    # 多節點 sbatch 寫共用儲存
-KUBE_CONTEXT=default bash scripts/verify-monitoring.sh     # Prometheus 抓得到 slurm-exporter / operator
-K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
-K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
+export KUBECONFIG=~/.kube/config
+bash scripts/verify-live.sh
 ```
 
-DSAC live smoke：
+需要略過特定驗證時可用環境變數：
 
 ```bash
-# 確認 controller 可以連到 DSAC scheduler；healthz 應看到 obs_dim/n_actions。
-kubectl -n slurm exec slurm-controller-0 -- \
-  curl -fsS http://rl-scheduler:8002/healthz
-
-# 推一個 DSAC 格式的最小 snapshot；沒有 snapshot 時 /decide 會 snapshot_stale 並 abstain。
-kubectl -n slurm exec slurm-controller-0 -- \
-  curl -fsS -X POST http://rl-scheduler:8002/snapshot \
-    -H 'Content-Type: application/json' \
-    -d '{"now":0,"pending_jobs":[],"nodes":[{"gpus":[{"free_mps":100,"running_jobs":0,"gpu_type":"rtx4070"}]}],"n_nodes":1,"gpus_per_node":1,"mps_per_gpu":100}'
-
-# 送一個 smoke job，controller log 應出現 [rl] selected / no-boost / abstain。
-LOGIN_POD=$(kubectl -n slurm get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
-kubectl -n slurm exec "$LOGIN_POD" -- \
-  sbatch --wrap='sleep 3' --job-name='dsac-live-smoke' -p cpu
-
-kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score-m3\]'
-kubectl -n slurm logs deploy/rl-scheduler --tail=80
+SKIP_HELM_RENDER=1 bash scripts/verify-live.sh
+SKIP_STORAGE=1 SKIP_GPU=1 bash scripts/verify-live.sh
+SKIP_MONITORING=1 SKIP_DSAC_SMOKE=1 bash scripts/verify-live.sh
 ```
 
 ## 5. DSAC 訓練與評估
@@ -293,7 +277,7 @@ sudo systemctl stop nfs-kernel-server
 kubectl -n monitoring port-forward svc/grafana 3000:3000
 
 # 驗證 Prometheus 抓得到 slurm-exporter / operator / kube-state-metrics
-bash scripts/verify-monitoring.sh
+bash scripts/verify-live.sh
 ```
 
 ## Lmod 模組系統（已整合至核心）

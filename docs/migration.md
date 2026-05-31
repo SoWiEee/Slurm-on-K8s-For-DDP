@@ -72,7 +72,7 @@ rtx4070-timeslicing: |-
 
 對 demo / 單機 RTX 4070 多 job 並行，time-slicing 已足夠。`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 由 Slurm prolog 注入（`render-core.py` 已內建），time-slicing 模式下因為沒有 daemon、這個變數實際不影響 SM 配額——保留是為了切到 GPU Operator 之後不必改 prolog。
 
-`verify-gpu.sh` step 1–5（device-plugin、GPU 切片、`--gres=gpu:rtx4070:1` 的 Slurm job）會通過；step 6（`--gres=mps:25` 檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`）會 fail，這是預期的，等 GPU Operator 上來才會綠。
+舊版 GPU 驗證中，device-plugin、GPU 切片、`--gres=gpu:rtx4070:1` 的 Slurm job 會通過；`--gres=mps:25` 檢查 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` 會 fail，這是當時預期的，等 GPU Operator 上來才會綠。
 
 ### 跑完現況
 
@@ -83,8 +83,8 @@ rtx4070-timeslicing: |-
 | Slurm controller / slurmdbd / slurm-worker-cpu / slurm-login | ✅ Running |
 | Slurm partitions `cpu` / `gpu-rtx4070` / `gpu-rtx4080` | ✅ |
 | nvidia-device-plugin DaemonSet（time-slicing 4 replicas） | ✅ |
-| `--gres=gpu:rtx4070:1` 路徑（verify-gpu.sh step 1–5） | ✅ |
-| `--gres=mps:N` 路徑（MPS daemon，verify-gpu.sh step 6） | ❌ upstream bug，需換 GPU Operator |
+| `--gres=gpu:rtx4070:1` 路徑（舊版 GPU 驗證） | ✅ |
+| `--gres=mps:N` 路徑（MPS daemon，舊版 GPU 驗證） | ❌ upstream bug，需換 GPU Operator |
 
 ---
 

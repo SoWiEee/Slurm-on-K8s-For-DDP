@@ -10,7 +10,7 @@ runs in MPS sharing mode — into the user's job.
 Without this, sbatch from the login pod (which has no MPS env) gives the
 job CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=N (set by Slurm itself) but
 CUDA_MPS_PIPE_DIRECTORY=unset, so the CUDA runtime falls back to direct
-GPU access and the MPS daemon is bypassed entirely. See verify-gpu.sh
+GPU access and the MPS daemon is bypassed entirely. See verify-live.sh
 step 6 — the WARN line is exactly this gap.
 
 The script is intentionally CPU-pool safe: every `export` is conditional on
