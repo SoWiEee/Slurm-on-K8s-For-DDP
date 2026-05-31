@@ -180,9 +180,58 @@ K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify-gpu.sh
 K8S_RUNTIME=k3s REAL_GPU=true KUBE_CONTEXT=default bash scripts/verify.sh
 ```
 
-## 9. DRL Scheduler 訓練與評估
+## 9. DRL Scheduler
 
 > 以下步驟需要 `.venv-m11`（含 PyTorch）。`PYTHONPATH=.` 確保 `sim/` 和 `services/` 可被找到。
+
+### 實際部署
+
+以下指令會把 DSAC scheduler 部署到 k3s live cluster，並讓 `job_submit.lua` 在 `sbatch` 時呼叫 `/decide`。`shadowMode=false` 代表 DSAC 回傳的 `priority_boost` 會實際加到 `job_desc.priority`；`valueAbstain=-100000` 用於單機實驗環境，避免目前 checkpoint 的 value scale 讓所有 decision 都被 guardrail 擋掉。單機環境目前沒有常駐 snapshot collector，所以 `snapshotTtlSeconds=86400` 讓手動推送的 snapshot 可以支撐 demo/實驗。
+
+```bash
+export KUBECONFIG=~/.kube/config
+
+# 重新打包目前 DSAC serve.py + dsac.pt checkpoint。
+docker build -t slurm-rl-scheduler:m11 \
+  -f services/rl_scheduler/Dockerfile .
+docker save slurm-rl-scheduler:m11 | sudo k3s ctr images import -
+
+helm upgrade slurm-platform ./chart \
+  -f chart/values-k3s.yaml \
+  -n slurm \
+  --reset-then-reuse-values \
+  --no-hooks \
+  --set slurm.jobSubmit.enabled=true \
+  --set rlScheduler.enabled=true \
+  --set rlScheduler.lua.enabled=true \
+  --set rlScheduler.shadowMode=false \
+  --set rlScheduler.valueAbstain=-100000 \
+  --set rlScheduler.snapshotTtlSeconds=86400
+
+kubectl -n slurm rollout restart deploy/rl-scheduler
+kubectl -n slurm rollout status deploy/rl-scheduler --timeout=180s
+kubectl -n slurm rollout status sts/slurm-controller --timeout=180s
+
+# 確認 controller 可以連到 DSAC scheduler；healthz 應看到 obs_dim/n_actions。
+kubectl -n slurm exec slurm-controller-0 -- \
+  curl -fsS http://rl-scheduler:8002/healthz
+
+# 推一個 DSAC 格式的最小 snapshot；沒有 snapshot 時 /decide 會 snapshot_stale 並 abstain。
+kubectl -n slurm exec slurm-controller-0 -- \
+  curl -fsS -X POST http://rl-scheduler:8002/snapshot \
+    -H 'Content-Type: application/json' \
+    -d '{"now":0,"pending_jobs":[],"nodes":[{"gpus":[{"free_mps":100,"running_jobs":0,"gpu_type":"rtx4070"}]}],"n_nodes":1,"gpus_per_node":1,"mps_per_gpu":100}'
+
+# 送一個 smoke job，controller log 應出現 [rl] selected / no-boost / abstain。
+LOGIN_POD=$(kubectl -n slurm get pod -l app=slurm-login -o jsonpath='{.items[0].metadata.name}')
+kubectl -n slurm exec "$LOGIN_POD" -- \
+  sbatch --wrap='sleep 3' --job-name='dsac-live-smoke' -p cpu
+
+kubectl -n slurm logs slurm-controller-0 --tail=500 | grep -E '\[rl\]|\[score-m3\]'
+kubectl -n slurm logs deploy/rl-scheduler --tail=80
+```
+
+> 注意：目前 `slurm-rl-scheduler:m11` 映像會載入 `runs/eval_mlp_20260514-210824/train/dsac.pt`。若要換成新的 DSAC checkpoint，更新 `services/rl_scheduler/Dockerfile` 的 `COPY ... /models/dsac.pt` 後重新 build/import image。
 
 ### 快速訓練（本機 CPU）
 

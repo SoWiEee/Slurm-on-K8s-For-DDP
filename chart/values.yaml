@@ -508,7 +508,7 @@ rlScheduler:
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits:   { cpu: 2,    memory: 2Gi   }
-  shadowMode: true        # never mutates priority while true
+  shadowMode: false       # allow RL-selected jobs to receive priorityBoost
   snapshotTtlSeconds: 30  # /decide abstains if snapshot older than this
   valueAbstain: -1.0      # abstain if policy value head < this
   entropyAbstain: 1.5     # abstain if policy entropy > this
