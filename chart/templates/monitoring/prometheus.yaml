@@ -40,6 +40,11 @@ data:
       - job_name: slurm-operator
         static_configs:
           - targets: ['slurm-elastic-operator.{{ $sNs }}.svc.cluster.local:8000']
+      {{- if .Values.rlScheduler.enabled }}
+      - job_name: rl-scheduler
+        static_configs:
+          - targets: ['rl-scheduler.{{ $sNs }}.svc.cluster.local:8002']
+      {{- end }}
       - job_name: kube-state-metrics
         static_configs:
           - targets: ['kube-state-metrics.{{ $mNs }}.svc.cluster.local:8080']

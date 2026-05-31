@@ -391,6 +391,7 @@ spec:
 Cross-namespace allowances for the monitoring stack:
   • Prometheus (in monitoring namespace) → slurm-elastic-operator:8000
   • Prometheus (in monitoring namespace) → slurm-exporter:9341
+  • Prometheus (in monitoring namespace) → rl-scheduler:8002
   • slurm-exporter (in slurm namespace)  → controller:6820 (slurmrestd)
 */}}
 ---
@@ -435,6 +436,27 @@ spec:
       ports:
         - protocol: TCP
           port: 9341
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape-rl-scheduler
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slurm-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: rl-scheduler
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+      ports:
+        - protocol: TCP
+          port: 8002
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

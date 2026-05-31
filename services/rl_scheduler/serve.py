@@ -30,7 +30,15 @@ from typing import List, Optional
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    generate_latest,
+)
 from pydantic import BaseModel, Field
+from starlette.responses import Response
 
 from services.rl_scheduler import serve_otel as _otel
 
@@ -293,12 +301,116 @@ _snapshot: Optional[Snapshot]     = None
 
 app = FastAPI(title="kubeflux-dsac-scheduler", version="1.0")
 
+METRICS_REGISTRY = CollectorRegistry()
+RL_DECISIONS = Counter(
+    "rl_scheduler_decisions_total",
+    "DSAC scheduler decisions by result",
+    ["result"],
+    registry=METRICS_REGISTRY,
+)
+RL_PRIORITY_BOOSTS = Counter(
+    "rl_scheduler_priority_boost_total",
+    "DSAC decisions that returned a positive priority boost",
+    registry=METRICS_REGISTRY,
+)
+RL_POLICY_VALUE = Gauge(
+    "rl_scheduler_policy_value",
+    "Value estimate for the last DSAC decision",
+    registry=METRICS_REGISTRY,
+)
+RL_POLICY_ENTROPY = Gauge(
+    "rl_scheduler_policy_entropy",
+    "Policy entropy for the last DSAC decision",
+    registry=METRICS_REGISTRY,
+)
+RL_SNAPSHOT_AGE = Gauge(
+    "rl_scheduler_snapshot_age_seconds",
+    "Age of the cached cluster snapshot",
+    registry=METRICS_REGISTRY,
+)
+RL_SNAPSHOT_PENDING = Gauge(
+    "rl_scheduler_snapshot_pending_jobs",
+    "Pending jobs in the cached snapshot",
+    registry=METRICS_REGISTRY,
+)
+RL_SNAPSHOT_FREE_MPS = Gauge(
+    "rl_scheduler_snapshot_free_mps",
+    "Total free MPS slots in the cached snapshot",
+    registry=METRICS_REGISTRY,
+)
+RL_LAST_PRIORITY_BOOST = Gauge(
+    "rl_scheduler_last_priority_boost",
+    "Priority boost returned by the last DSAC decision",
+    registry=METRICS_REGISTRY,
+)
+RL_LAST_ACTION = Gauge(
+    "rl_scheduler_last_action",
+    "Flat action index selected by the last DSAC decision",
+    registry=METRICS_REGISTRY,
+)
+RL_LAST_JOB_INDEX = Gauge(
+    "rl_scheduler_last_job_index",
+    "Job slot selected by the last DSAC decision; -1 for no-op or abstain",
+    registry=METRICS_REGISTRY,
+)
+RL_LAST_NODE_INDEX = Gauge(
+    "rl_scheduler_last_node_index",
+    "Node index selected by the last DSAC decision; -1 for no-op or abstain",
+    registry=METRICS_REGISTRY,
+)
+RL_LAST_GPU_INDEX = Gauge(
+    "rl_scheduler_last_gpu_index",
+    "GPU index selected by the last DSAC decision; -1 for no-op or abstain",
+    registry=METRICS_REGISTRY,
+)
+RL_SHADOW_MODE = Gauge(
+    "rl_scheduler_shadow_mode",
+    "1 when DSAC scheduler is in shadow mode, 0 when live",
+    registry=METRICS_REGISTRY,
+)
+RL_READY = Gauge(
+    "rl_scheduler_ready",
+    "1 when the DSAC model is loaded",
+    registry=METRICS_REGISTRY,
+)
+
+RL_SHADOW_MODE.set(1.0 if SHADOW_MODE else 0.0)
+RL_READY.set(0.0)
+for _result in ("selected", "no_boost", "abstain"):
+    RL_DECISIONS.labels(result=_result)
+
+
+def _set_last_decision(
+    *,
+    result: str,
+    value: float,
+    entropy: float,
+    boost: int,
+    action: int = -1,
+    job_i: int = -1,
+    node_j: int = -1,
+    gpu_k: int = -1,
+) -> None:
+    RL_DECISIONS.labels(result=result).inc()
+    if boost > 0:
+        RL_PRIORITY_BOOSTS.inc()
+    RL_POLICY_VALUE.set(value)
+    RL_POLICY_ENTROPY.set(entropy)
+    RL_LAST_PRIORITY_BOOST.set(boost)
+    RL_LAST_ACTION.set(action)
+    RL_LAST_JOB_INDEX.set(job_i)
+    RL_LAST_NODE_INDEX.set(node_j)
+    RL_LAST_GPU_INDEX.set(gpu_k)
+
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/healthz")
 def healthz():
     snap_age = (time.time() - _snapshot.ts) if _snapshot else None
+    RL_READY.set(1.0 if _holder is not None else 0.0)
+    if snap_age is not None:
+        RL_SNAPSHOT_AGE.set(snap_age)
     return {
         "ready": _holder is not None,
         "obs_dim": _holder.agent.obs_dim if _holder else None,
@@ -308,10 +420,22 @@ def healthz():
     }
 
 
+@app.get("/metrics")
+def metrics():
+    snap_age = (time.time() - _snapshot.ts) if _snapshot else None
+    if snap_age is not None:
+        RL_SNAPSHOT_AGE.set(snap_age)
+    return Response(generate_latest(METRICS_REGISTRY), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/snapshot")
 def push_snapshot(snap: Snapshot):
     global _snapshot
     _snapshot = snap
+    free_mps = sum(g.free_mps for node in snap.nodes for g in node.gpus)
+    RL_SNAPSHOT_AGE.set(0.0)
+    RL_SNAPSHOT_PENDING.set(len(snap.pending_jobs))
+    RL_SNAPSHOT_FREE_MPS.set(free_mps)
     return {"ok": True, "ts": snap.ts,
             "pending": len(snap.pending_jobs), "nodes": len(snap.nodes)}
 
@@ -346,6 +470,9 @@ def decide(req: DecideRequest):
     snap = _snapshot
     age  = (time.time() - snap.ts) if snap else None
     if snap is None or age is None or age > SNAPSHOT_TTL_S:
+        _set_last_decision(result="abstain", value=0.0, entropy=0.0, boost=0)
+        if age is not None:
+            RL_SNAPSHOT_AGE.set(age)
         return DecideResponse(
             priority_boost=0, rl_selected=False, abstain=True,
             abstain_reason=f"snapshot_stale (age={age}s)",
@@ -375,6 +502,9 @@ def decide(req: DecideRequest):
     no_op        = TOP_K * n_placements
 
     if action == no_op:
+        _set_last_decision(
+            result="no_boost", value=value, entropy=entropy, boost=0, action=action,
+        )
         return DecideResponse(
             priority_boost=0, rl_selected=False, abstain=False,
             abstain_reason=None, rl_selected_job_id=None,
@@ -403,6 +533,14 @@ def decide(req: DecideRequest):
         boost = 0
     else:
         boost = PRIORITY_BOOST if rl_picked_me else 0
+
+    result = "abstain" if abstain else ("selected" if boost > 0 else "no_boost")
+    _set_last_decision(
+        result=result, value=value, entropy=entropy, boost=boost, action=action,
+        job_i=(-1 if abstain else job_i),
+        node_j=(-1 if abstain else node_j),
+        gpu_k=(-1 if abstain else gpu_k),
+    )
 
     # OTel Phase 7-A: emit job_submit span; pass traceparent back so the Lua
     # hook can write it to job_desc.admin_comment as "otel=<traceparent>".
@@ -443,6 +581,7 @@ def main(argv=None) -> int:
         Path(args.policy_dir),
         n_nodes=args.n_nodes, gpus_per_node=args.gpus_per_node,
     )
+    RL_READY.set(1.0)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
